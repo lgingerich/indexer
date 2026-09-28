@@ -12,7 +12,8 @@ workspace = true
 
 # No `[[bin]]` yet: the transform is built and tested, but the broker source and
 # sink that would drive it are not, so a binary here would have nothing to do. It
-# lands with that stage.
+# lands with that stage. `examples/decode_logs.rs` runs the transform over a JSON
+# file of raw envelopes instead, which is enough to see real decoded output.
 
 [dependencies]
 # The dynamic decoder. Static `sol!` decoding cannot cover an open-ended set of

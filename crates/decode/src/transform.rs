@@ -105,6 +105,7 @@ impl<R: AbiRegistry> Transform<R> {
             log_index: log.log_index,
             block_number: log.block_number,
             block_hash: log.block_hash,
+            block_timestamp: log.block_timestamp,
         })
     }
 }

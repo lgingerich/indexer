@@ -10,6 +10,11 @@
 //! | [`Receipt`] | `eth_getBlockReceipts` / `eth_getTransactionReceipt` | `transaction_hash` |
 //! | [`Log`] | a receipt's `logs` array | `(transaction_hash, log_index)` |
 //!
+//! Every dataset that outlives its block carries `block_timestamp`, denormalized
+//! from the block header. A store partitions and clusters on time rather than
+//! height, and the alternative is a join back to the [`Block`] row, which may not be
+//! in the same batch.
+//!
 //! Datasets reference each other by scalar key, never by embedding: a block holds
 //! its transactions' hashes, not the transactions. That keeps a row a fixed shape
 //! and lets a store load children by key.
@@ -26,6 +31,8 @@
 use alloy_primitives::{Address, B64, B256, BlockHash, Bloom, Bytes, TxHash, U256};
 use alloy_rpc_types_eth::{AccessList, SignedAuthorization};
 use serde::{Deserialize, Serialize};
+
+use crate::typed::TypedValue;
 
 /// Block header and metadata, from `eth_getBlockByNumber`.
 ///
@@ -306,6 +313,13 @@ pub struct Log {
     pub block_number: u64,
     /// Hash of the block containing this log.
     pub block_hash: BlockHash,
+    /// Timestamp of the block containing this log, denormalized from its header.
+    ///
+    /// Carried on every dataset that outlives its block, because a store partitions
+    /// and clusters on time rather than height, and reaching it otherwise means
+    /// joining back to a [`Block`] that may not be in the same batch.
+    #[serde(with = "alloy_serde::quantity")]
+    pub block_timestamp: u64,
 }
 
 impl Log {
@@ -317,4 +331,22 @@ impl Log {
             self.block_number, self.transaction_hash, self.log_index
         )
     }
+}
+
+/// One decoded event argument: its ABI name, and its typed value.
+///
+/// The name is not decoration. A decoded record is usually read to build a typed
+/// column — `amount0` becoming `token_sold_amount_raw` — and a positional argument
+/// would force that mapping to hardcode an index, which breaks silently when an ABI
+/// revision reorders or inserts a parameter. The name is what makes the value
+/// addressable rather than merely typed.
+///
+/// This is the wire equivalent of a decoder's own `params` map, kept as a sequence
+/// so argument order is preserved while the name travels with the value.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DecodedArg {
+    /// The parameter name from the ABI, for example `amount0`.
+    pub name: String,
+    /// The value, with its Solidity type.
+    pub value: TypedValue,
 }

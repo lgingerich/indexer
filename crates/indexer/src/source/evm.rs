@@ -358,6 +358,7 @@ fn decode_events(
                 position as u64,
                 number,
                 hash,
+                block.0.inner.header.inner.timestamp,
             )?)));
         }
     }
@@ -487,6 +488,7 @@ fn log_record(
     fallback_index: u64,
     block_number: u64,
     block_hash: B256,
+    block_timestamp: u64,
 ) -> Result<Log, SourceError> {
     const CONTEXT: &str = "eth_getBlockReceipts";
     let transaction_hash = log
@@ -506,6 +508,7 @@ fn log_record(
         removed: log.removed,
         block_number,
         block_hash,
+        block_timestamp,
     })
 }
 

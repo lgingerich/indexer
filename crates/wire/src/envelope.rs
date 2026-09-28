@@ -9,8 +9,8 @@
 //!   so the EVM records live in [`crate::datasets::evm`]; Solana's would be a sibling
 //!   module and a variant here.
 //! - **Derived** ([`Event::Decoded`]): a record the decode stage produces from a
-//!   dataset, carrying its typed arguments. It is a dataset, not a control signal,
-//!   and it only ever appears on a decoded stream.
+//!   dataset, carrying its typed arguments under their ABI names. It is a dataset,
+//!   not a control signal, and it only ever appears on a decoded stream.
 //! - **Control** ([`Reorg`], [`Finalized`]): signals about the indexer's own state,
 //!   not records of a chain. They carry no verbatim payload and exist to drive a
 //!   consumer's state machine, so they are defined here.
@@ -53,7 +53,7 @@ use std::fmt;
 use alloy_primitives::{Address, B256};
 use serde::{Deserialize, Serialize};
 
-pub use crate::datasets::evm::{Block, Log, Receipt, Transaction};
+pub use crate::datasets::evm::{Block, DecodedArg, Log, Receipt, Transaction};
 pub use crate::typed::TypedValue;
 
 /// The version of the envelope's wire shape.
@@ -61,7 +61,13 @@ pub use crate::typed::TypedValue;
 /// Stamped on every serialized [`Envelope`] as `v`, so a consumer can tell which
 /// shape it is reading without out-of-band knowledge. Bumped only for a breaking
 /// change; see the compatibility policy in the module docs.
-pub const SCHEMA_VERSION: u16 = 1;
+///
+/// - **1** — the initial shape.
+/// - **2** — [`Decoded`] carries named arguments ([`DecodedArg`]) and its event's
+///   `signature`; `Decoded` and [`Log`] both carry `block_timestamp`. Breaking:
+///   `Decoded`'s `indexed` and `body` changed from bare values to named ones, so a
+///   v1 consumer cannot read a v2 record.
+pub const SCHEMA_VERSION: u16 = 2;
 
 /// Identifies the chain an event came from, for example `ethereum` or `solana`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -148,20 +154,29 @@ pub struct Decoded {
     pub address: Address,
     /// The event selector, `keccak256` of its signature.
     pub selector: B256,
+    /// The event's human-readable signature, for example
+    /// `Transfer(address,address,uint256)`.
+    ///
+    /// Carried because a selector alone is not a readable name, and a consumer
+    /// debugging a decode should not have to compute one back from the selector.
+    pub signature: String,
     /// The [`Log::dedupe_key`] of the raw log this was decoded from.
     ///
     /// The link back to the source record, so a decoded row can be traced to the log
     /// that produced it and a re-decode can be recognized as one.
     pub source: String,
-    /// The indexed arguments, in ABI order.
-    pub indexed: Vec<TypedValue>,
-    /// The non-indexed arguments, in ABI order.
-    pub body: Vec<TypedValue>,
+    /// The indexed arguments, in ABI order, each carrying its name.
+    pub indexed: Vec<DecodedArg>,
+    /// The non-indexed arguments, in ABI order, each carrying its name.
+    pub body: Vec<DecodedArg>,
     /// Height of the block containing this log.
     #[serde(with = "alloy_serde::quantity")]
     pub block_number: u64,
     /// Hash of the block containing this log.
     pub block_hash: B256,
+    /// Timestamp of the block containing this log, denormalized from its header.
+    #[serde(with = "alloy_serde::quantity")]
+    pub block_timestamp: u64,
 }
 
 impl Decoded {
@@ -309,8 +324,8 @@ mod tests {
     use alloy_primitives::{Address, B256, TxHash, U256};
 
     use super::{
-        Block, ChainId, Decoded, Envelope, Event, Finalized, Log, Receipt, Reorg, SCHEMA_VERSION,
-        Transaction, TypedValue,
+        Block, ChainId, Decoded, DecodedArg, Envelope, Event, Finalized, Log, Receipt, Reorg,
+        SCHEMA_VERSION, Transaction, TypedValue,
     };
 
     fn chain() -> ChainId {
@@ -361,7 +376,7 @@ mod tests {
         assert_eq!(value["number"], "0x5");
         assert_eq!(value["hash"], format!("0x{}", "09".repeat(32)));
         assert_eq!(value["chain"], "ethereum");
-        assert_eq!(value["v"], 1);
+        assert_eq!(value["v"], SCHEMA_VERSION);
     }
 
     /// The wire object carries exactly the envelope's keys (`chain`, `sequence`)
@@ -383,7 +398,7 @@ mod tests {
         assert_eq!(value["hash"], format!("0x{}", "11".repeat(32)));
         assert_eq!(value["sequence"], 7);
         assert_eq!(value["chain"], "ethereum");
-        assert_eq!(value["v"], 1);
+        assert_eq!(value["v"], SCHEMA_VERSION);
         assert_eq!(value.as_object().expect("object").len(), 6);
     }
 
@@ -405,7 +420,7 @@ mod tests {
         // A line from before versioning: no `v`, everything else as it was.
         value.as_object_mut().expect("object").remove("v");
         let decoded: Envelope = serde_json::from_value(value).expect("legacy line parses");
-        assert_eq!(decoded.schema_version, 1);
+        assert_eq!(decoded.schema_version, SCHEMA_VERSION);
         assert_eq!(decoded, envelope);
     }
 
@@ -483,17 +498,25 @@ mod tests {
                 name: "Transfer".to_owned(),
                 address: Address::from([0x22; 20]),
                 selector: hash(0x07),
+                signature: "Transfer(address,address,uint256)".to_owned(),
                 source: "5:0x1111111111111111111111111111111111111111111111111111111111111111:1"
                     .to_owned(),
-                indexed: vec![TypedValue::Address {
-                    value: Address::from([0x22; 20]),
+                indexed: vec![DecodedArg {
+                    name: "from".to_owned(),
+                    value: TypedValue::Address {
+                        value: Address::from([0x22; 20]),
+                    },
                 }],
-                body: vec![TypedValue::Uint {
-                    value: U256::from(1),
-                    bits: 256,
+                body: vec![DecodedArg {
+                    name: "value".to_owned(),
+                    value: TypedValue::Uint {
+                        value: U256::from(1),
+                        bits: 256,
+                    },
                 }],
                 block_number: 5,
                 block_hash: hash(5),
+                block_timestamp: 1_700_000_000,
             })),
             Event::Reorg(Reorg {
                 height: 1,

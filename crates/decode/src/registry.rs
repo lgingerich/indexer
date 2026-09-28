@@ -27,8 +27,7 @@ use std::collections::BTreeMap;
 use alloy_dyn_abi::{DynSolValue, EventExt as _};
 use alloy_json_abi::{Event, JsonAbi};
 use alloy_primitives::{Address, B256, TxHash};
-use wire::envelope::{ChainId, Decoded};
-use wire::typed::TypedValue;
+use wire::envelope::{ChainId, Decoded, DecodedArg};
 
 use crate::convert::{self, ConversionError};
 
@@ -55,6 +54,8 @@ pub struct RawLog<'a> {
     pub block_number: u64,
     /// Hash of the block containing the log.
     pub block_hash: B256,
+    /// Timestamp of the block containing the log.
+    pub block_timestamp: u64,
 }
 
 /// One loaded contract ABI, able to decode a log against its events.
@@ -131,15 +132,22 @@ impl Abi {
                 detail: error.to_string(),
             })?;
 
+        // `decode_log_parts` splits the event's inputs into indexed and non-indexed
+        // exactly as the ABI declares them, so the names come from the same split.
+        let (indexed_params, body_params): (Vec<_>, Vec<_>) =
+            event.inputs.iter().partition(|param| param.indexed);
+
         Ok(Some(Decoded {
             name: event.name.clone(),
             address: log.address,
             selector: *selector,
+            signature: event.signature(),
             source: source_key(&log),
-            indexed: typed_args(&decoded.indexed)?,
-            body: typed_args(&decoded.body)?,
+            indexed: typed_args(&indexed_params, &decoded.indexed)?,
+            body: typed_args(&body_params, &decoded.body)?,
             block_number: log.block_number,
             block_hash: log.block_hash,
+            block_timestamp: log.block_timestamp,
         }))
     }
 }
@@ -154,11 +162,32 @@ fn source_key(log: &RawLog<'_>) -> String {
     )
 }
 
-/// Converts a decoded argument list, keeping the conversion error's context.
-fn typed_args(values: &[DynSolValue]) -> Result<Vec<TypedValue>, RegistryError> {
-    values
+/// Converts decoded values to named arguments, pairing each with its ABI parameter.
+///
+/// The decoder returns values in ABI order with no names, so the names come from the
+/// event's own input list — the same split the decoder used. A length mismatch would
+/// mean the decoder disagreed with the ABI about its own shape, which is a bug rather
+/// than bad input, so it is an error rather than a truncation.
+fn typed_args(
+    params: &[&alloy_json_abi::EventParam],
+    values: &[DynSolValue],
+) -> Result<Vec<DecodedArg>, RegistryError> {
+    if params.len() != values.len() {
+        return Err(RegistryError::Shape {
+            decoded: values.len(),
+            declared: params.len(),
+        });
+    }
+
+    params
         .iter()
-        .map(convert::value)
+        .zip(values)
+        .map(|(param, value)| {
+            Ok(DecodedArg {
+                name: param.name.clone(),
+                value: convert::value(value)?,
+            })
+        })
         .collect::<Result<Vec<_>, ConversionError>>()
         .map_err(RegistryError::Conversion)
 }
@@ -193,6 +222,14 @@ pub enum RegistryError {
         /// The decoder's own explanation.
         detail: String,
     },
+    /// The decoder returned a different number of values than the ABI declares.
+    #[error("ABI declares {declared} arguments but {decoded} were decoded")]
+    Shape {
+        /// How many values the decoder produced.
+        decoded: usize,
+        /// How many the ABI declares.
+        declared: usize,
+    },
     /// A decoded value could not be published.
     #[error(transparent)]
     Conversion(#[from] ConversionError),
@@ -206,10 +243,10 @@ pub enum RegistryError {
 mod tests {
     use std::sync::LazyLock;
 
-    use alloy_primitives::{Address, B256, TxHash, U256};
+    use alloy_primitives::{Address, B256, I256, TxHash, U256};
 
     use super::{Abi, AbiRegistry, RawLog, RegistryError};
-    use wire::envelope::ChainId;
+    use wire::envelope::{ChainId, DecodedArg};
     use wire::typed::TypedValue;
 
     /// One chain for every fixture; a registry keyed by chain is tested below.
@@ -263,6 +300,7 @@ mod tests {
             log_index: 3,
             block_number: 100,
             block_hash: B256::from([0x02; 32]),
+            block_timestamp: 1_700_000_000,
         }
     }
 
@@ -280,24 +318,36 @@ mod tests {
         assert_eq!(decoded.name, "Transfer");
         assert_eq!(decoded.address, address(0xaa));
         assert_eq!(decoded.selector, transfer_selector());
+        assert_eq!(decoded.signature, "Transfer(address,address,uint256)");
         assert_eq!(decoded.indexed.len(), 2);
         assert_eq!(decoded.body.len(), 1);
+        // Each argument carries the ABI's own name, so a store can address it rather
+        // than count positions.
         assert_eq!(
             decoded.indexed,
             vec![
-                TypedValue::Address {
-                    value: address(0x11)
+                DecodedArg {
+                    name: "from".to_owned(),
+                    value: TypedValue::Address {
+                        value: address(0x11)
+                    },
                 },
-                TypedValue::Address {
-                    value: address(0x22)
+                DecodedArg {
+                    name: "to".to_owned(),
+                    value: TypedValue::Address {
+                        value: address(0x22)
+                    },
                 },
             ]
         );
         assert_eq!(
             decoded.body,
-            vec![TypedValue::Uint {
-                value: U256::from(1_000_000_000_000_000_000u64),
-                bits: 256,
+            vec![DecodedArg {
+                name: "value".to_owned(),
+                value: TypedValue::Uint {
+                    value: U256::from(1_000_000_000_000_000_000u64),
+                    bits: 256,
+                },
             }]
         );
         // The source is the raw log's natural key, so a store can join back to it.
@@ -306,6 +356,7 @@ mod tests {
             format!("100:{}:3", TxHash::from([0x01; 32]))
         );
         assert_eq!(decoded.block_number, 100);
+        assert_eq!(decoded.block_timestamp, 1_700_000_000);
     }
 
     /// A log whose selector the ABI does not declare is a miss, not an error: the
@@ -355,6 +406,117 @@ mod tests {
             Abi::from_json("not an abi"),
             Err(RegistryError::Abi { .. })
         ));
+    }
+
+    /// A regression test against a real Uniswap V3 `Swap` log captured from Base.
+    ///
+    /// Every other test here builds its own bytes, so they would all still pass if
+    /// the decoder agreed with itself about a layout the chain does not use. This one
+    /// pins the layout to the chain: the `int256` amounts are signed, the pool's
+    /// `uint160` price is read at 160 bits, and the trailing `int24` tick is not
+    /// silently widened.
+    #[test]
+    fn a_real_uniswap_v3_swap_log_decodes_with_signed_amounts() {
+        let abi = Abi::from_json(include_str!("../abi/uniswap_v3_pool.json"))
+            .expect("the pool ABI loads");
+
+        let topic0: B256 = "0xc42079f94a6350d7e6235f29174924f928cc2ac818eb64fed8004e115fbcca67"
+            .parse()
+            .expect("selector parses");
+        let topic1: B256 = "0x0000000000000000000000006ff5693b99212da76ad316178a184ab56d299b43"
+            .parse()
+            .expect("topic parses");
+        let data = hex_bytes(
+            "fffffffffffffffffffffffffffffffffffffffffffffffffff4b34627fb9302\
+             0000000000000000000000000000000000000000000000000000000000830544\
+             00000000000000000000000000000000000000000003678007a6bbf505d858fa\
+             00000000000000000000000000000000000000000000000012fb062ae6731f9d\
+             fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffcfd3b",
+        );
+        let log_topics = vec![topic0, topic1, topic1];
+
+        let decoded = abi
+            .decode_log(RawLog {
+                chain: &ChainId::new("base"),
+                address: address(0xd0),
+                topics: &log_topics,
+                data: &data,
+                transaction_hash: TxHash::from([0x2a; 32]),
+                log_index: 767,
+                block_number: 51_913_794,
+                block_hash: B256::from([0xd4; 32]),
+                block_timestamp: 1_700_000_000,
+            })
+            .expect("the log decodes")
+            .expect("the ABI declares Swap");
+
+        assert_eq!(decoded.name, "Swap");
+        assert_eq!(
+            decoded.signature,
+            "Swap(address,address,int256,int256,uint160,uint128,int24)"
+        );
+        // Every argument is named from the ABI, which is what lets a store map
+        // `amount0` to a column instead of counting positions.
+        let names: Vec<&str> = decoded
+            .indexed
+            .iter()
+            .chain(&decoded.body)
+            .map(|arg| arg.name.as_str())
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "sender",
+                "recipient",
+                "amount0",
+                "amount1",
+                "sqrtPriceX96",
+                "liquidity",
+                "tick"
+            ]
+        );
+
+        // `amount0` is negative: this swap sold token0, and reading the two's
+        // complement word as unsigned would produce 1.15e77 instead.
+        assert_eq!(
+            decoded.body.first().map(|arg| &arg.value),
+            Some(&TypedValue::Int {
+                value: I256::try_from(-3_180_585_820_646_654_i64).expect("fits"),
+                bits: 256,
+            })
+        );
+        assert_eq!(
+            decoded.body.get(1).map(|arg| &arg.value),
+            Some(&TypedValue::Int {
+                value: I256::try_from(8_586_564_i64).expect("fits"),
+                bits: 256,
+            })
+        );
+        // `sqrtPriceX96` is `uint160`, not `uint256`.
+        assert_eq!(
+            decoded.body.get(2).and_then(rebuild_type),
+            Some(alloy_dyn_abi::DynSolType::Uint(160))
+        );
+        assert_eq!(
+            decoded.body.get(4).and_then(rebuild_type),
+            Some(alloy_dyn_abi::DynSolType::Int(24))
+        );
+        // The link back to the raw log is its natural key.
+        assert_eq!(
+            decoded.source,
+            format!("51913794:{}:767", TxHash::from([0x2a; 32]))
+        );
+    }
+
+    /// The Solidity type a published argument declares, for asserting a width.
+    fn rebuild_type(arg: &DecodedArg) -> Option<alloy_dyn_abi::DynSolType> {
+        crate::convert::dyn_type(&arg.value).ok()
+    }
+
+    /// Decodes a hex string with whitespace, so a long fixture stays readable.
+    fn hex_bytes(hex: &str) -> Vec<u8> {
+        let compact: String = hex.chars().filter(|c| !c.is_whitespace()).collect();
+        alloy_primitives::hex::decode(compact).expect("fixture is valid hex")
     }
 
     /// The registry is keyed by chain as well as address, so the same address on two

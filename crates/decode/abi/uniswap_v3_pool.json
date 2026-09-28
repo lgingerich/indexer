@@ -1,0 +1,61 @@
+[{
+  "type": "event",
+  "name": "Swap",
+  "anonymous": false,
+  "inputs": [
+    {"name": "sender", "type": "address", "indexed": true},
+    {"name": "recipient", "type": "address", "indexed": true},
+    {"name": "amount0", "type": "int256", "indexed": false},
+    {"name": "amount1", "type": "int256", "indexed": false},
+    {"name": "sqrtPriceX96", "type": "uint160", "indexed": false},
+    {"name": "liquidity", "type": "uint128", "indexed": false},
+    {"name": "tick", "type": "int24", "indexed": false}
+  ]
+},
+{
+  "type": "event",
+  "name": "Mint",
+  "anonymous": false,
+  "inputs": [
+    {"name": "sender", "type": "address", "indexed": false},
+    {"name": "owner", "type": "address", "indexed": true},
+    {"name": "tickLower", "type": "int24", "indexed": true},
+    {"name": "tickUpper", "type": "int24", "indexed": true},
+    {"name": "amount", "type": "uint128", "indexed": false},
+    {"name": "amount0", "type": "uint256", "indexed": false},
+    {"name": "amount1", "type": "uint256", "indexed": false}
+  ]
+},
+{
+  "type": "event",
+  "name": "Burn",
+  "anonymous": false,
+  "inputs": [
+    {"name": "owner", "type": "address", "indexed": true},
+    {"name": "tickLower", "type": "int24", "indexed": true},
+    {"name": "tickUpper", "type": "int24", "indexed": true},
+    {"name": "amount", "type": "uint128", "indexed": false},
+    {"name": "amount0", "type": "uint256", "indexed": false},
+    {"name": "amount1", "type": "uint256", "indexed": false}
+  ]
+},
+{
+  "type": "event",
+  "name": "Transfer",
+  "anonymous": false,
+  "inputs": [
+    {"name": "from", "type": "address", "indexed": true},
+    {"name": "to", "type": "address", "indexed": true},
+    {"name": "value", "type": "uint256", "indexed": false}
+  ]
+},
+{
+  "type": "event",
+  "name": "Approval",
+  "anonymous": false,
+  "inputs": [
+    {"name": "owner", "type": "address", "indexed": true},
+    {"name": "spender", "type": "address", "indexed": true},
+    {"name": "value", "type": "uint256", "indexed": false}
+  ]
+}]
