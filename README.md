@@ -142,7 +142,7 @@ the field:
 | `kafka.batch_ms` | `1000` | Time bound on a batch |
 | `storage.database` | `indexer.duckdb` | Path to the store |
 | `storage.drain_secs` | unset | Stop a topic after this idle. **Omit for a live indexer** |
-| `storage.abi_dir` | `abis` | Directory ABIs are discovered in |
+| `storage.protocol` | `[]` | Registered contracts: name, dataset, ABI, deployments |
 
 Omit `[ingest]` entirely to run decode and storage against a topic filled elsewhere.
 `RUST_LOG` is still read from the environment, because a log filter is not deployment
@@ -151,26 +151,54 @@ configuration.
 An unknown key is a startup error naming the line and the key, so a misspelling is
 caught rather than silently leaving a setting at its default.
 
-### ABIs
+### Registered contracts
 
-Drop a file in `abis/` named for what it decodes:
+The ABI says what a contract's events look like. It cannot say what the contract *is*,
+or where its rows belong — so both are written down, once per protocol:
 
+```toml
+[[storage.protocol]]
+name = "uniswap_v3"        # what it is, stamped on every decoded record
+dataset = "dex.trades"     # where its rows belong
+abi = "abis/uniswap_v3_pool.json"
+
+[[storage.protocol.deployment]]
+chain = "base"
+address = "0xd0b53D9277642d899DF5C87A3966A349A798F224"
 ```
-abis/base.0xd0b53D9277642d899DF5C87A3966A349A798F224.json
-     └ chain  └ contract address
-```
 
-No list to keep in step with the directory — adding a contract is adding a file. The
-contents are the ABI as `cast interface --json` or Etherscan produces it, byte for byte;
-the tag lives in the name because an ABI does not say which contract it belongs to.
+Every decoded record then carries `protocol` and `dataset`, so a consumer routes a row
+without knowing any address.
 
-A file that does not match the name, or holds something that is not an ABI, is an error
-at startup rather than a log quietly not decoding. That matters because a *wrong* ABI
-decodes into plausible values, which is worse than failing.
+**Why a list rather than tagging ABI filenames.** Uniswap V3 has thousands of pools
+sharing one ABI, so a file per address would repeat the same file thousands of times.
+Here the ABI is referenced once and the addresses are lines, and adding a pool is one
+`deployment` block.
+
+Two entries claiming one address is a startup error rather than last-wins, because which
+ABI decoded a log would otherwise depend on file order.
+
+ABI paths resolve relative to the settings file, not the working directory.
 
 One ABI per address applies at every height. A proxy that upgrades changes its ABI at a
 height, which this cannot express — the `AbiRegistry` seam is what a table-backed
 registry keyed by `(chain, address, block_range)` replaces.
+
+### Dataset mappers
+
+The registry says *which dataset* a record belongs to. A mapper says *with what columns*
+— that a `Swap`'s `amount0` is a token amount, and a negative one means the pool sent
+that token out. That is per-protocol knowledge, so it is code rather than configuration:
+
+```rust
+impl DatasetMapper for UniswapV3 {
+    fn dataset(&self) -> &str { "dex.trades" }
+    fn map(&self, decoded: &Decoded) -> Option<Row> { /* the projection */ }
+}
+```
+
+`src/decode/uniswap_v3.rs` is one. A new protocol feeding an existing dataset adds no
+mapper; a new dataset adds one.
 
 ### Other client settings
 

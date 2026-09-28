@@ -25,14 +25,14 @@ use tracing::{info, warn};
 use crate::config::{BatchConfig, KafkaConfig};
 use crate::connectors::{EnvelopeSource as _, EventSink as _, KafkaSink, KafkaSource};
 use crate::decode::Transform;
-use crate::decode::registry::FileRegistry;
+use crate::decode::contracts::ContractRegistry;
 
 /// Builds and runs the decode stage.
 #[derive(Debug)]
 pub struct Decode {
     kafka: KafkaConfig,
     batch: BatchConfig,
-    registry: FileRegistry,
+    registry: ContractRegistry,
     /// The runtime's librdkafka properties, applied to every client this stage builds.
     client: ClientConfig,
 }
@@ -135,7 +135,7 @@ impl Decode {
 pub struct DecodeBuilder {
     kafka: KafkaConfig,
     batch: BatchConfig,
-    abi_dir: std::path::PathBuf,
+    registry: ContractRegistry,
     client: ClientConfig,
 }
 
@@ -148,7 +148,7 @@ impl DecodeBuilder {
         Self {
             kafka,
             batch: BatchConfig::default(),
-            abi_dir: std::path::PathBuf::from(crate::config::DEFAULT_ABI_DIR),
+            registry: ContractRegistry::default(),
             client,
         }
     }
@@ -170,14 +170,10 @@ impl DecodeBuilder {
         self
     }
 
-    /// Sets the directory ABIs are discovered in.
-    ///
-    /// Every `{chain}.{address}.json` file in it is loaded, so adding a contract to the
-    /// decoder is dropping a file in — there is no list to keep in step with the
-    /// directory.
+    /// Sets the contract registry this stage decodes with.
     #[must_use]
-    pub fn abi_dir(mut self, directory: impl Into<std::path::PathBuf>) -> Self {
-        self.abi_dir = directory.into();
+    pub fn registry(mut self, registry: ContractRegistry) -> Self {
+        self.registry = registry;
         self
     }
 
@@ -189,18 +185,10 @@ impl DecodeBuilder {
     /// when its address does not parse, or when its contents are not an ABI, and when
     /// the Kafka configuration has no output topic.
     pub fn build(self) -> Result<Decode> {
-        let registry = FileRegistry::from_dir(&self.abi_dir)?;
-        if registry.is_empty() {
-            warn!(
-                directory = %self.abi_dir.display(),
-                "no ABIs found; every log will pass through undecoded"
-            );
+        if self.registry.is_empty() {
+            warn!("no contracts registered; every log will pass through undecoded");
         } else {
-            info!(
-                directory = %self.abi_dir.display(),
-                abis = registry.len(),
-                "discovered ABIs"
-            );
+            info!(addresses = self.registry.len(), "loaded contract registry");
         }
         if self.kafka.output_topic.is_none() {
             anyhow::bail!("decode kafka output_topic is required");
@@ -208,7 +196,7 @@ impl DecodeBuilder {
         Ok(Decode {
             kafka: self.kafka,
             batch: self.batch,
-            registry,
+            registry: self.registry,
             client: self.client,
         })
     }

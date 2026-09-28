@@ -29,8 +29,23 @@ brokers = "localhost:9092"
 # Set to stop a topic once it has been idle this long. Omit for a live indexer, which
 # must never stop on a quiet block.
 # drain_secs = 5
-# ABIs are discovered here, one `{chain}.{address}.json` per contract.
-# abi_dir = "abis"
+
+# A registered contract. The ABI says what the events look like; it cannot say what the
+# contract *is* or where its rows belong, so both are written here and stamped onto every
+# decoded record.
+#
+# One entry per protocol, with its deployments listed under it: a protocol like Uniswap
+# V3 has thousands of pools sharing one ABI, so naming an ABI file per address would
+# repeat the same file thousands of times.
+#
+# [[storage.protocol]]
+# name = "uniswap_v3"        # what it is, onto every decoded record
+# dataset = "dex.trades"     # where its rows belong
+# abi = "abis/uniswap_v3_pool.json"   # relative to this file
+#
+# [[storage.protocol.deployment]]
+# chain = "base"
+# address = "0xd0b53D9277642d899DF5C87A3966A349A798F224"
 
 # Any other DuckDB setting, passed straight through and validated by the engine.
 # [storage.duckdb]

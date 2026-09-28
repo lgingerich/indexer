@@ -13,11 +13,14 @@
 //! Nothing enforces that now that these are modules rather than crates, so it is on a
 //! reviewer.
 
+pub mod contracts;
 pub mod convert;
+pub mod dataset;
 pub mod registry;
 #[cfg(feature = "kafka")]
 pub mod stage;
 pub mod transform;
+pub mod uniswap_v3;
 
 pub use convert::ConversionError;
 pub use registry::{Abi, AbiRegistry, FileRegistry, RawLog, RegistryError};

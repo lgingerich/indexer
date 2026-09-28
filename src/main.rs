@@ -31,6 +31,7 @@ use tracing_subscriber::EnvFilter;
 use indexer::config::{KafkaConfig, Settings};
 use indexer::connectors::{KafkaSink, StdoutJsonSink, Storage};
 use indexer::decode::Decode;
+use indexer::decode::contracts::ContractRegistry;
 use indexer::ingest::Ingest;
 
 /// The settings file used when none is named on the command line.
@@ -78,6 +79,9 @@ async fn run() -> Result<()> {
         })
         .transpose()?;
 
+    // ABI paths in the settings file read as relative to it, not to the process's
+    // working directory, so the file stays portable.
+    let registry = ContractRegistry::load(&settings.storage.protocol, settings_dir(&path))?;
     let decode = Decode::builder(
         KafkaConfig::builder(&settings.kafka.brokers)
             .group(format!("{}-decode", settings.kafka.group_prefix))
@@ -85,7 +89,7 @@ async fn run() -> Result<()> {
             .output_topic(decoded_topic.clone())
             .build()?,
     )
-    .abi_dir(settings.storage.abi_dir.clone())
+    .registry(registry)
     .batch(batch)
     .client(settings.client_config())
     .build()?;
@@ -143,4 +147,17 @@ async fn run() -> Result<()> {
         result = storage.run() => result.context("storage stopped")?,
     }
     Ok(())
+}
+
+/// The directory a settings file lives in, which its relative paths resolve against.
+///
+/// A bare filename has no parent, so the working directory stands in for it.
+fn settings_dir(path: &str) -> std::path::PathBuf {
+    std::path::Path::new(path)
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .map_or_else(
+            || std::path::PathBuf::from("."),
+            std::path::Path::to_path_buf,
+        )
 }

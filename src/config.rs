@@ -143,14 +143,13 @@ pub struct StorageSettings {
     /// run — a backfill, a test — not for a live indexer.
     #[serde(default)]
     pub drain_secs: Option<u64>,
-    /// The directory ABIs are discovered in.
+    /// The registered contracts, each with its ABI and its deployments.
     ///
-    /// Every `{chain}.{address}.json` file in it is loaded, so adding a contract is
-    /// dropping a file in rather than editing this one. Absent means the default, and a
-    /// directory that does not exist means nothing is decoded — which is said at startup
-    /// rather than being silent.
-    #[serde(default = "default_abi_dir")]
-    pub abi_dir: PathBuf,
+    /// Absent means nothing is decoded, which is a legitimate way to run and is said at
+    /// startup rather than being silent. See [`crate::decode::contracts`] for the shape
+    /// and why a list beats encoding the tag in a filename.
+    #[serde(default)]
+    pub protocol: Vec<crate::decode::contracts::ProtocolEntry>,
     /// Any other `DuckDB` setting, passed straight through.
     ///
     /// `DuckDB` accepts dozens of settings and this file does not restate them. Anything
@@ -173,7 +172,7 @@ impl Default for StorageSettings {
         Self {
             database: default_database(),
             drain_secs: None,
-            abi_dir: default_abi_dir(),
+            protocol: Vec::new(),
             duckdb: std::collections::BTreeMap::new(),
         }
     }
@@ -248,9 +247,6 @@ pub const DEFAULT_DECODED_TOPIC: &str = "decoded.chain";
 /// The default `DuckDB` path.
 pub const DEFAULT_DATABASE: &str = "indexer.duckdb";
 
-/// Where ABIs are discovered by default.
-pub const DEFAULT_ABI_DIR: &str = "abis";
-
 fn default_raw_topic() -> String {
     DEFAULT_RAW_TOPIC.to_owned()
 }
@@ -273,10 +269,6 @@ const fn default_batch_ms() -> u64 {
 
 fn default_database() -> PathBuf {
     PathBuf::from(DEFAULT_DATABASE)
-}
-
-fn default_abi_dir() -> PathBuf {
-    PathBuf::from(DEFAULT_ABI_DIR)
 }
 
 /// Where a Kafka-protocol client connects, and which topics it uses.
@@ -445,10 +437,7 @@ brokers = "localhost:9092"
             settings.storage.database,
             std::path::PathBuf::from(DEFAULT_DATABASE)
         );
-        assert_eq!(
-            settings.storage.abi_dir,
-            std::path::PathBuf::from(super::DEFAULT_ABI_DIR)
-        );
+        assert!(settings.storage.protocol.is_empty());
         assert_eq!(
             settings.drain(),
             None,
@@ -546,7 +535,6 @@ batch_ms = 250
 [storage]
 database = "/tmp/custom.duckdb"
 drain_secs = 3
-abi_dir = "custom-abis"
 "#,
         )
         .expect("settings parse");
@@ -563,9 +551,5 @@ abi_dir = "custom-abis"
             std::path::PathBuf::from("/tmp/custom.duckdb")
         );
         assert_eq!(settings.drain(), Some(Duration::from_secs(3)));
-        assert_eq!(
-            settings.storage.abi_dir,
-            std::path::PathBuf::from("custom-abis")
-        );
     }
 }

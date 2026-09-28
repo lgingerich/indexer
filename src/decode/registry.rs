@@ -120,6 +120,24 @@ impl Abi {
     /// mismatch usually means the ABI is the wrong version for this height, and
     /// silently dropping the log would hide exactly that.
     pub fn decode_log(&self, log: RawLog<'_>) -> Result<Option<Decoded>, RegistryError> {
+        self.decode_log_as(log, "", "")
+    }
+
+    /// Decodes a log, stamping the protocol and dataset it belongs to.
+    ///
+    /// The caller knows these because it found the ABI through a registry entry that
+    /// carries them; an [`Abi`] alone does not, which is why they are parameters rather
+    /// than a lookup here.
+    ///
+    /// # Errors
+    ///
+    /// As [`Abi::decode_log`].
+    pub fn decode_log_as(
+        &self,
+        log: RawLog<'_>,
+        protocol: &str,
+        dataset: &str,
+    ) -> Result<Option<Decoded>, RegistryError> {
         let Some(selector) = log.topics.first() else {
             return Ok(None);
         };
@@ -142,6 +160,8 @@ impl Abi {
         Ok(Some(Decoded {
             name: event.name.clone(),
             address: log.address,
+            protocol: protocol.to_owned(),
+            dataset: dataset.to_owned(),
             selector: *selector,
             signature: event.signature(),
             anonymous: event.anonymous,
@@ -198,6 +218,15 @@ pub trait AbiRegistry {
     /// Must not do I/O on the hot path: a miss returns `None`, and the caller
     /// forwards the log undecoded rather than stalling the pipeline behind a lookup.
     fn abi(&self, chain: &ChainId, address: Address, block: u64) -> Option<&Abi>;
+
+    /// What the registry knows about `address`: its protocol and its dataset.
+    ///
+    /// Defaults to nothing, so a registry that only answers ABIs — a test double, or a
+    /// minimal implementation — stays valid. A record decoded through such a registry
+    /// carries empty strings, which is honest: nothing knows what the contract is.
+    fn describe(&self, _chain: &ChainId, _address: Address) -> Option<(&str, &str)> {
+        None
+    }
 }
 
 /// Why a log could not be decoded.
@@ -248,6 +277,14 @@ pub enum RegistryError {
     AbiName {
         /// The offending file name.
         name: String,
+    },
+    /// Two registry entries claim one `(chain, address)`.
+    #[error("both {chain}.{address} are registered; one address decodes with one ABI")]
+    Duplicate {
+        /// The chain, as written.
+        chain: String,
+        /// The address, as written.
+        address: String,
     },
     /// The ABI directory could not be read.
     #[error("cannot read ABI directory {path}: {detail}")]
@@ -588,10 +625,8 @@ mod tests {
     /// silently widened.
     #[test]
     fn a_real_uniswap_v3_swap_log_decodes_with_signed_amounts() {
-        let abi = Abi::from_json(include_str!(
-            "../../abis/base.0xd0b53D9277642d899DF5C87A3966A349A798F224.json"
-        ))
-        .expect("the pool ABI loads");
+        let abi = Abi::from_json(include_str!("../../abis/uniswap_v3_pool.json"))
+            .expect("the pool ABI loads");
         let topic0: B256 = "0xc42079f94a6350d7e6235f29174924f928cc2ac818eb64fed8004e115fbcca67"
             .parse()
             .expect("selector parses");

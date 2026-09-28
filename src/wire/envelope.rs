@@ -71,7 +71,10 @@ pub use crate::wire::typed::TypedValue;
 ///   `transaction_index`, `log_index`) rather than a formatted `source` string, and
 ///   an explicit `anonymous` flag. Breaking: a v2 consumer reading `source` finds no
 ///   such field, and can rebuild it with [`Decoded::source_key`].
-pub const SCHEMA_VERSION: u16 = 3;
+/// - **4** — [`Decoded`] carries `protocol` and `dataset` from the registry. Additive
+///   in shape but required on the wire, so a v3 consumer deserializing a v4 record
+///   without them fails; bumping says so rather than surprising one.
+pub const SCHEMA_VERSION: u16 = 4;
 
 /// Identifies the chain an event came from, for example `ethereum` or `solana`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -156,6 +159,20 @@ pub struct Decoded {
     pub name: String,
     /// The contract that emitted the log.
     pub address: Address,
+    /// What the contract is, from the registry, for example `uniswap_v3`.
+    ///
+    /// Not derivable from the ABI: an ABI is a list of signatures and says nothing
+    /// about which protocol an address implements. It comes from the registry entry
+    /// that matched, so a consumer can route a record — `uniswap_v3` rows go to
+    /// `dex.trades` — without knowing anything about addresses.
+    pub protocol: String,
+    /// The dataset this event's rows belong to, from the registry, for example
+    /// `dex.trades`.
+    ///
+    /// On the record rather than looked up downstream, because the registry that
+    /// knows it is here. A consumer that has to re-derive it needs the same
+    /// address-to-protocol mapping this stage already has.
+    pub dataset: String,
     /// The event selector, `keccak256` of its signature.
     ///
     /// [`B256::ZERO`] for an anonymous event, which has no selector in `topic0`. A
@@ -527,6 +544,8 @@ mod tests {
             Event::Decoded(Box::new(Decoded {
                 name: "Transfer".to_owned(),
                 address: Address::from([0x22; 20]),
+                protocol: "erc20".to_owned(),
+                dataset: "assets.erc20_transfers".to_owned(),
                 selector: hash(0x07),
                 signature: "Transfer(address,address,uint256)".to_owned(),
                 anonymous: false,
