@@ -263,6 +263,28 @@ mod tests {
         assert_eq!(value["chain"], "ethereum");
     }
 
+    /// The wire object carries exactly the envelope's keys (`chain`, `sequence`)
+    /// plus the event's (`type` and its fields) — nothing else rides along.
+    /// Pinned on `Finalized`, whose two fields make the count exact.
+    #[test]
+    fn the_wire_object_carries_only_the_envelope_and_event_fields() {
+        let envelope = Envelope::new(
+            chain(),
+            7,
+            Event::Finalized(Finalized {
+                height: 42,
+                hash: hash(0x11),
+            }),
+        );
+        let value = serde_json::to_value(&envelope).expect("envelope serializes");
+        assert_eq!(value["type"], "finalized");
+        assert_eq!(value["height"], "0x2a");
+        assert_eq!(value["hash"], format!("0x{}", "11".repeat(32)));
+        assert_eq!(value["sequence"], 7);
+        assert_eq!(value["chain"], "ethereum");
+        assert_eq!(value.as_object().expect("object").len(), 5);
+    }
+
     /// Integer fields render as the node's own "quantity" form, not as JSON
     /// numbers. A live `eth_getBlockByNumber` returns `number`, `gas`, `nonce`,
     /// `gasPrice`, `maxFeePerGas`, `chainId`, `gasUsed`, `logIndex` — every

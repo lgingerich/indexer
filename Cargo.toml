@@ -9,8 +9,21 @@ readme = "README.md"
 repository = "TODO"
 license = "MIT OR Apache-2.0"
 
+[features]
+default = []
+# Kafka-protocol egress (`sink::kafka`) on bundled librdkafka. Off by default so
+# the C build dependency stays out of a plain `cargo build`.
+kafka = ["dep:rdkafka"]
+# Local `DuckDB` store (`sink::duckdb`). Off by default so the one-time C++
+# engine build stays out of a plain `cargo build`.
+duckdb = ["dep:duckdb"]
+
 [dependencies]
 alloy-consensus = { version = "1.8.3", default-features = false, features = ["serde", "std"] }
+# The JSON-RPC envelope and error types (`Response`/`ResponsePacket`/`ErrorPayload`).
+# alloy-network already pulls this in, but its `Response`/`ErrorPayload` are what
+# model a batch and let the source branch on an error's code instead of its text.
+alloy-json-rpc = "1.8.3"
 # `any` types (`AnyRpcBlock`/`AnyRpcTransaction`) are alloy's catch-all for networks
 # whose transaction types fall outside Ethereum's 0-4: an OP-stack deposit (`0x7e`)
 # or Arbitrum retry (`0x6a`) otherwise fails the whole block. See `source::evm`.
@@ -23,9 +36,16 @@ alloy-rpc-types-eth = { version = "1.8.3", default-features = false, features = 
 # `u128` (see `crate::envelope::Envelope`).
 alloy-serde = { version = "1.8.3", default-features = false, features = ["std"] }
 anyhow = "1.0.104"
+# Bundled DuckDB compiles the C++ engine once via duckdb-sys; it is an embedded,
+# single-writer store, used only by the local DuckDB sink (`duckdb` feature).
+duckdb = { version = "1.10505.0", default-features = false, features = ["bundled"], optional = true }
 futures-util = "0.3.34"
+# rdkafka wraps C librdkafka, which `rdkafka-sys` compiles with `cc` (no cmake
+# needed; the version is vendored). It carries the crate's one C build dependency,
+# so it is optional behind the `kafka` feature — see `sink::kafka`.
+rdkafka = { version = "0.39.0", optional = true }
 # native-tls keeps TLS on the platform (Security.framework on macOS, OpenSSL on
-# Linux) so the build needs no C toolchain beyond a system TLS library.
+# Linux) so TLS adds no bundled C toolchain of its own.
 reqwest = { version = "0.13.5", default-features = false, features = ["json", "http2", "native-tls"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = { version = "1.0.151", features = ["raw_value"] }
