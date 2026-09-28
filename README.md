@@ -9,9 +9,15 @@ rewrites.
 
 ## What works today
 
-- **EVM ingestion.** Live heads over WebSocket (`eth_subscribe`/`newHeads`) and
-  full blocks with receipts over JSON-RPC, fetched as one batched request per
-  block. See `src/source/evm.rs`.
+- **EVM ingestion.** Live heads over WebSocket (`eth_subscribe`/`newHeads`), and
+  each block fetched over JSON-RPC with full transactions, receipts, and logs in
+  one batched request. Nothing the node returns is dropped. See
+  `src/source/evm.rs`.
+- **One event per thing.** A `block` marker, then for each transaction a
+  `transaction` event (raw transaction plus raw receipt) followed by its `log`
+  events. Each field is published exactly once: the block's `raw` omits its
+  `transactions` array and a receipt omits its `logs`, since those are their own
+  events.
 - **Ordered events.** Every event gets a per-chain monotonic `sequence` and a
   stable `dedupe_key`. See `src/envelope.rs`.
 - **Finality watermark.** A `finalized` event says a block and everything below
@@ -54,13 +60,13 @@ Logs go to stderr; events go to stdout, so the two streams never interleave.
 ## Event shape
 
 ```json
-{"chain":"base","sequence":18174,"schema_version":2,
+{"chain":"base","sequence":18174,"schema_version":3,
  "type":"log","height":51883702,"block_hash":"0x…","tx_id":"0x…","tx_index":3,
- "item_index":0,"raw":{"address":"0x…","topics":["0x…"],"data":"0x…"}}
+ "item_index":0,"raw":"{\"address\":\"0x…\",\"topics\":[\"0x…\"],\"data\":\"0x…\"}"}
 ```
 
-`raw` is the chain's payload verbatim, so a consumer decodes with whatever ABI it
-trusts. Attaching `schema_version` means a shape change is detectable rather than
+`raw` (and `receipt` on transactions) is the chain's payload as a JSON-encoded
+string, so a consumer decodes with whatever ABI it trusts. Attaching `schema_version` means a shape change is detectable rather than
 silent. Consumers deduplicate on `dedupe_key`, not `sequence`: a sequence can be
 reused after a reorg or a restart.
 
@@ -77,8 +83,8 @@ boundary, rather than a shared type widened to fit both.
 cargo bench
 ```
 
-`benches/hot_path.rs` measures the CPU work between socket and sink — block
-decoding and envelope serialisation — since end-to-end latency is dominated by the
+`benches/hot_path.rs` measures the CPU work between socket and sink — decoding
+the node's batch response and serialising envelopes — since end-to-end latency is dominated by the
 network and is not reproducible off-line. It is hand-rolled and dependency-free so
 it can report percentiles rather than means, and it calls `std::hint::black_box`
 explicitly because that is the only way to stop `lto` and `codegen-units = 1` from
@@ -86,20 +92,19 @@ deleting the work being measured.
 
 Measured on an Apple Silicon laptop, release profile, ~1,000 samples each:
 
-| Workload | events | decode p50 | decode p99 | serialise p50 |
-| --- | --- | --- | --- | --- |
-| 100 txs × 2 logs | 201 | 336µs | 455µs | 207µs |
-| 500 txs × 4 logs | 2,001 | 3.22ms | 3.64ms | 2.08ms |
-| 2,000 txs × 5 logs | 10,001 | 16.4ms | 18.1ms | 10.5ms |
+| Workload | response | events | decode p50 | decode p99 | serialise p50 |
+| --- | --- | --- | --- | --- | --- |
+| 100 txs × 2 logs | 275 KiB | 301 | 652µs | 824µs | 370µs |
+| 500 txs × 4 logs | 1.8 MiB | 2,501 | 4.67ms | 5.86ms | 2.74ms |
+| 2,000 txs × 5 logs | 8.3 MiB | 12,001 | 21.4ms | 25.0ms | 12.4ms |
 
-Both are linear in event count at ~1.6µs/event decode and ~1.0µs/event
-serialisation, so the numbers scale rather than falling off a cliff. Decode is the
-expensive side because `serde_json` visits the receipts tree twice.
+Decode is linear in response size at roughly 2.5µs per KiB. Payloads are never
+parsed, only scanned and copied, so the cost is mostly memory traffic.
 
-The first thing to verify against a real budget: a real chain tip block is a few
-hundred events, so the CPU path is sub-millisecond there. The 2,000-transaction row
-is the honest edge case — a Solana-scale block would touch tens of milliseconds,
-which is where a sub-100ms budget actually starts to bind.
+Against the budget: an average Base block in a live run had about 260
+transactions and 880 logs, which falls between the first two rows, so decode
+plus serialise is a few milliseconds of CPU per block. The larger cost is the
+network: the indexer publishes about 1.7 MB per Base block, roughly 0.8 MB/s.
 
 ## Checks
 

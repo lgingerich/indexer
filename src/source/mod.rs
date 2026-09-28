@@ -4,14 +4,14 @@
 //! separates the two roles a data source plays, because they have different
 //! latency and trust profiles:
 //!
-//! - [`BlockSource::subscribe_heads`] is the *live* path. Rarity here is the point:
-//!   it must be push-based to meet a sub-100ms budget.
-//! - [`BlockSource::block_at`] is the *pull* path. It fetches a full block and its
-//!   receipts on demand, which is what backfill and reorg reconciliation need.
+//! - [`BlockSource::subscribe_heads`] is the *live* path. It must be push-based to
+//!   meet a sub-100ms budget.
+//! - [`BlockSource::fetch_block`] is the *pull* path. It fetches one block with
+//!   everything in it, which is what backfill and reorg reconciliation need.
 //!
-//! A source also owns two things the generic pipeline must not hardcode: what
-//! finality means for this chain, reported as [`RawBlock::finalized`], and how to
-//! turn a raw block into [`Event`]s. Adding Solana, Reth `ExEx`, or a Bitcoin source means
+//! A source also owns two things the generic pipeline must not hardcode: how to
+//! turn a chain's block into [`Event`]s, and what finality means for this chain,
+//! reported as [`FetchedBlock::finalized`]. Adding Solana, Reth `ExEx`, or a Bitcoin source means
 //! implementing this trait, not touching the pipeline.
 
 use std::future::Future;
@@ -47,16 +47,14 @@ pub struct BlockId {
     pub hash: B256,
 }
 
-/// A block and its transaction receipts, exactly as the source returned them.
-///
-/// The payloads stay unparsed here so a [`BlockSource`] can hand them to
-/// [`BlockSource::encode_block`] without this layer knowing the chain's shape.
+/// One block, already turned into events, plus the chain's finality at the time.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RawBlock {
-    /// Verbatim block payload.
-    pub raw_block: String,
-    /// Verbatim receipts payload for the block's transactions.
-    pub raw_receipts: String,
+pub struct FetchedBlock {
+    /// The block's events in publish order.
+    ///
+    /// Either empty, or led by [`Event::Block`]. The pipeline reads parent linkage
+    /// from that marker to detect reorgs, so implementations must preserve it.
+    pub events: Vec<Event>,
     /// The chain's newest finalized block when this block was fetched.
     ///
     /// Each chain defines finality its own way, so the source reports it rather
@@ -91,17 +89,14 @@ pub trait BlockSource: Send + Sync {
     /// Opens the live head subscription.
     fn subscribe_heads(&self) -> impl Future<Output = Result<HeadStream, SourceError>> + Send;
 
-    /// Fetches a block, its receipts, and the chain's current finalized block.
-    fn block_at(&self, height: u64) -> impl Future<Output = Result<RawBlock, SourceError>> + Send;
-
-    /// Turns a raw block into its ordered events, starting with the block marker.
-    ///
-    /// The returned `Vec` is empty, or its first element is
-    /// [`Event::Block`]. The pipeline relies on that to read parent linkage for
-    /// reorg detection, so implementations must preserve it.
+    /// Fetches the block at `height` with everything in it, as events.
     ///
     /// # Errors
     ///
-    /// Returns [`SourceError::Malformed`] when the payload is not decodable.
-    fn encode_block(&self, raw: &RawBlock) -> Result<Vec<Event>, SourceError>;
+    /// Returns [`SourceError::Transport`] when the request fails, and
+    /// [`SourceError::Malformed`] when the response cannot be decoded.
+    fn fetch_block(
+        &self,
+        height: u64,
+    ) -> impl Future<Output = Result<FetchedBlock, SourceError>> + Send;
 }

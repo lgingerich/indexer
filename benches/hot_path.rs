@@ -1,8 +1,8 @@
 //! Microbenchmarks for the hot path: block decode and event serialisation.
 //!
 //! End-to-end latency is dominated by the network and is not reproducible in a
-//! benchmark, but the CPU work between the socket and the sink is: parsing a block
-//! and its receipts into events, and rendering each event to JSON. Those are the
+//! benchmark, but the CPU work between the socket and the sink is: decoding the
+//! node's response into events, and rendering each event to JSON. Those are the
 //! two things that scale with chain activity, so they are what this measures.
 //!
 //! Run with `cargo bench`. The harness is hand-rolled and dependency-free so it
@@ -14,10 +14,8 @@
 use std::hint::black_box;
 use std::time::{Duration, Instant};
 
-use alloy_primitives::B256;
 use indexer::envelope::{ChainId, Envelope};
-use indexer::source::EvmSource;
-use indexer::source::{BlockId, BlockSource as _, RawBlock};
+use indexer::source::evm::decode_batch;
 use serde_json::json;
 
 /// Timed samples collected per benchmark.
@@ -54,15 +52,32 @@ fn report(label: &str, samples: &mut [Duration], unit: &str) {
     }
 }
 
-/// Builds a block and receipts payload shaped like a real `eth_getBlockByNumber`
-/// and `eth_getBlockReceipts` response.
+/// Builds a batch body shaped like the node's response to [`EvmSource`]'s
+/// request: a block with full transactions, its receipts, and the finalized block.
 ///
 /// Synthetic rather than captured so the benchmark can scale the input, and so the
-/// repository does not carry a multi-megabyte fixture. The field names and types
-/// match what a node returns, which is what the decoder cares about.
-fn synthetic_block(tx_count: usize, logs_per_tx: usize) -> RawBlock {
+/// repository does not carry a multi-megabyte fixture. The field names and value
+/// shapes match what a node returns, including a typical EIP-1559 transaction.
+///
+/// [`EvmSource`]: indexer::source::EvmSource
+fn synthetic_batch(tx_count: usize, logs_per_tx: usize) -> Vec<u8> {
+    let block_hash = format!("0x{:064x}", 0xabc);
     let tx_hash = |i: usize| format!("0x{i:064x}");
-    let transactions: Vec<String> = (0..tx_count).map(tx_hash).collect();
+    let transactions: Vec<serde_json::Value> = (0..tx_count)
+        .map(|i| {
+            json!({
+                "type": "0x2", "chainId": "0x2105", "nonce": format!("0x{i:x}"),
+                "hash": tx_hash(i), "blockHash": block_hash, "blockNumber": "0x112a880",
+                "transactionIndex": format!("0x{i:x}"),
+                "from": format!("0x{:040x}", i), "to": format!("0x{:040x}", i + 1),
+                "value": "0x0", "gas": "0x5208", "gasPrice": "0x4c4b40",
+                "maxFeePerGas": "0x989680", "maxPriorityFeePerGas": "0x0",
+                "input": format!("0xa9059cbb{:064x}{:064x}", i, 1),
+                "accessList": [], "v": "0x1", "yParity": "0x1",
+                "r": format!("0x{:064x}", i), "s": format!("0x{:064x}", i + 1),
+            })
+        })
+        .collect();
     let receipts: Vec<serde_json::Value> = (0..tx_count)
         .map(|i| {
             let logs: Vec<serde_json::Value> = (0..logs_per_tx)
@@ -72,45 +87,52 @@ fn synthetic_block(tx_count: usize, logs_per_tx: usize) -> RawBlock {
                         "topics": [format!("0x{:064x}", i), format!("0x{:064x}", j)],
                         "data": "0x0000000000000000000000000000000000000000000000000000000000000001",
                         "blockNumber": "0x112a880",
+                        "blockHash": block_hash,
                         "transactionHash": tx_hash(i),
                         "logIndex": format!("0x{:x}", i * logs_per_tx + j),
+                        "removed": false,
                     })
                 })
                 .collect();
             json!({
-                "transactionHash": tx_hash(i),
-                "transactionIndex": format!("0x{i:x}"),
+                "blockHash": block_hash, "blockNumber": "0x112a880",
+                "transactionHash": tx_hash(i), "transactionIndex": format!("0x{i:x}"),
+                "from": format!("0x{:040x}", i), "to": format!("0x{:040x}", i + 1),
+                "status": "0x1", "gasUsed": "0x5208", "cumulativeGasUsed": "0x5208",
+                "effectiveGasPrice": "0x4c4b40", "type": "0x2", "contractAddress": null,
+                "logsBloom": format!("0x{}", "0".repeat(512)),
                 "logs": logs,
             })
         })
         .collect();
-    let block = json!({
-        "number": "0x112a880",
-        "hash": format!("0x{:064x}", 0xabc),
-        "parentHash": format!("0x{:064x}", 0xdef),
-        "timestamp": "0x6530a1b0",
-        "transactions": transactions,
-    });
-
-    RawBlock {
-        raw_block: block.to_string(),
-        raw_receipts: serde_json::Value::Array(receipts).to_string(),
-        finalized: BlockId {
-            height: 0,
-            hash: B256::ZERO,
-        },
-    }
+    json!([
+        {"jsonrpc": "2.0", "id": 1, "result": {
+            "number": "0x112a880",
+            "hash": block_hash,
+            "parentHash": format!("0x{:064x}", 0xdef),
+            "timestamp": "0x6530a1b0",
+            "miner": "0x4200000000000000000000000000000000000011",
+            "logsBloom": format!("0x{}", "0".repeat(512)),
+            "transactions": transactions,
+        }},
+        {"jsonrpc": "2.0", "id": 2, "result": receipts},
+        {"jsonrpc": "2.0", "id": 3, "result": {
+            "number": "0x112a840",
+            "hash": format!("0x{:064x}", 0xf0),
+            "parentHash": format!("0x{:064x}", 0xef),
+        }},
+    ])
+    .to_string()
+    .into_bytes()
 }
 
 fn main() {
-    let source = EvmSource::new("ethereum", "http://localhost:8545", "ws://localhost:8546");
-
     for (tx_count, logs_per_tx) in [(100_usize, 2_usize), (500, 4), (2000, 5)] {
-        let raw = synthetic_block(tx_count, logs_per_tx);
-        let expected = 1 + tx_count * logs_per_tx;
-        let events = source
-            .encode_block(&raw)
-            .expect("benchmark fixture decodes");
+        let body = synthetic_batch(tx_count, logs_per_tx);
+        let expected = 1 + tx_count + tx_count * logs_per_tx;
+        let events = decode_batch(&body)
+            .expect("benchmark fixture decodes")
+            .events;
         assert_eq!(
             events.len(),
             expected,
@@ -120,14 +142,15 @@ fn main() {
         let mut samples = Vec::with_capacity(SAMPLES);
         for _ in 0..SAMPLES {
             let start = Instant::now();
-            let decoded = source
-                .encode_block(black_box(&raw))
-                .expect("benchmark fixture decodes");
+            let decoded = decode_batch(black_box(&body)).expect("benchmark fixture decodes");
             samples.push(start.elapsed());
             black_box(&decoded);
         }
         report(
-            &format!("decode_block  txs={tx_count} logs/tx={logs_per_tx} events={expected}"),
+            &format!(
+                "decode_batch  txs={tx_count} logs/tx={logs_per_tx} events={expected} body={}KiB",
+                body.len() / 1024
+            ),
             &mut samples,
             "block",
         );
@@ -152,12 +175,14 @@ fn main() {
             }
             samples.push(start.elapsed());
         }
-        let marker = envelopes.first().expect("block has a marker");
-        let log = envelopes.get(1).unwrap_or(marker);
+        let [marker, transaction, log, ..] = envelopes.as_slice() else {
+            panic!("every benchmark block has a marker, a transaction, and a log");
+        };
         report(
             &format!(
-                "serialise    {expected} envelopes (p50 block marker {:.1?}, per log {:.1?})",
+                "serialise     {expected} envelopes (p50 block {:.1?}, transaction {:.1?}, log {:.1?})",
                 median_serialise(marker),
+                median_serialise(transaction),
                 median_serialise(log),
             ),
             &mut samples,
@@ -168,9 +193,8 @@ fn main() {
 
 /// Measures one envelope's serialisation cost at the median.
 ///
-/// Reported separately for the block marker and for a log, because the marker
-/// embeds the whole block payload while a log does not, so a single "per event"
-/// figure would be misleading.
+/// Reported separately per event kind, because their payloads differ by an order
+/// of magnitude, so a single "per event" figure would be misleading.
 fn median_serialise(envelope: &Envelope) -> Duration {
     let mut samples = Vec::with_capacity(SAMPLES);
     for _ in 0..SAMPLES {

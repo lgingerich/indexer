@@ -25,7 +25,7 @@ use serde::{Deserialize, Serialize};
 ///
 /// Bump this whenever the envelope's shape changes so consumers can detect the
 /// change rather than silently misreading events.
-pub const SCHEMA_VERSION: u16 = 2;
+pub const SCHEMA_VERSION: u16 = 3;
 
 /// Identifies the chain an event came from, for example `ethereum` or `solana`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -80,8 +80,25 @@ pub enum Event {
         timestamp: u64,
         /// Number of transactions in the block.
         tx_count: u64,
-        /// Verbatim block payload as the source returned it.
+        /// The block payload as the source returned it, minus its transactions,
+        /// which are published as [`Event::Transaction`]s.
         raw: String,
+    },
+    /// One transaction and its receipt.
+    Transaction {
+        /// Height of the block containing this transaction.
+        height: u64,
+        /// Hash of the block containing this transaction.
+        block_hash: B256,
+        /// Identity of this transaction.
+        tx_id: TxHash,
+        /// Position of this transaction within its block.
+        tx_index: u64,
+        /// Verbatim transaction payload as the source returned it.
+        raw: String,
+        /// The receipt payload as the source returned it, minus its logs, which
+        /// are published as [`Event::Log`]s.
+        receipt: String,
     },
     /// One log or event within a block.
     Log {
@@ -127,6 +144,7 @@ impl Event {
     pub const fn kind(&self) -> &'static str {
         match self {
             Self::Block { .. } => "block",
+            Self::Transaction { .. } => "transaction",
             Self::Log { .. } => "log",
             Self::Reorg { .. } => "reorg",
             Self::Finalized { .. } => "finalized",
@@ -171,6 +189,9 @@ impl Envelope {
         match &self.event {
             Event::Block { height, hash, .. } => {
                 format!("{}:{height}:{hash}:block", self.chain)
+            }
+            Event::Transaction { height, tx_id, .. } => {
+                format!("{}:{height}:{tx_id}:tx", self.chain)
             }
             Event::Log {
                 height,
@@ -291,7 +312,7 @@ mod tests {
         assert_eq!(value["type"], "block");
         assert_eq!(value["sequence"], 4);
         assert_eq!(value["height"], 5);
-        assert_eq!(value["schema_version"], 2);
+        assert_eq!(value["schema_version"], 3);
         assert_eq!(value["hash"], format!("0x{}", "09".repeat(32)));
     }
 }

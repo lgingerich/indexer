@@ -32,7 +32,7 @@ use tracing::{error, info, warn};
 
 use crate::envelope::{Envelope, Event};
 use crate::sink::EventSink;
-use crate::source::{BlockId, BlockSource, RawBlock};
+use crate::source::{BlockId, BlockSource, FetchedBlock};
 
 /// The most published blocks the undo ring remembers by default.
 ///
@@ -107,8 +107,8 @@ impl<S: BlockSource, K: EventSink> Pipeline<S, K> {
         while let Some(head) = heads.next().await {
             let head = head?;
             last_height = head.height;
-            let raw = self.source.block_at(head.height).await?;
-            self.process_block(raw).await?;
+            let block = self.source.fetch_block(head.height).await?;
+            self.process_block(block).await?;
         }
         bail!("head subscription closed after height {last_height}")
     }
@@ -121,11 +121,10 @@ impl<S: BlockSource, K: EventSink> Pipeline<S, K> {
     ///
     /// # Errors
     ///
-    /// Returns an error when the source cannot encode the block or the sink cannot
-    /// deliver an event. Both are fatal: skipping an event would create a gap that
-    /// violates the delivery contract.
-    pub async fn process_block(&mut self, raw: RawBlock) -> anyhow::Result<u64> {
-        let events = self.source.encode_block(&raw)?;
+    /// Returns an error when the sink cannot deliver an event. That is fatal:
+    /// skipping an event would create a gap that violates the delivery contract.
+    pub async fn process_block(&mut self, block: FetchedBlock) -> anyhow::Result<u64> {
+        let FetchedBlock { events, finalized } = block;
         let Some((first, _)) = events.split_first() else {
             return Ok(0);
         };
@@ -140,7 +139,7 @@ impl<S: BlockSource, K: EventSink> Pipeline<S, K> {
             error!(
                 chain = %self.source.chain(),
                 first_kind = first.kind(),
-                "encode_block must lead with a block marker; skipping block"
+                "fetched block must lead with a block marker; skipping block"
             );
             return Ok(0);
         };
@@ -169,7 +168,7 @@ impl<S: BlockSource, K: EventSink> Pipeline<S, K> {
             event_count,
         });
         self.trim_unless_recent(height);
-        self.advance_finality(raw.finalized).await?;
+        self.advance_finality(finalized).await?;
 
         info!(
             chain = %self.source.chain(),
@@ -287,17 +286,15 @@ impl<S: BlockSource, K: EventSink> Pipeline<S, K> {
 // means the fixture or setup is wrong.
 #[expect(clippy::expect_used)]
 mod tests {
-    use std::collections::VecDeque;
     use std::sync::Mutex;
 
+    use alloy_primitives::{B256, TxHash};
     use futures_util::stream;
 
     use super::Pipeline;
-    use alloy_primitives::{B256, TxHash};
-
     use crate::envelope::{ChainId, Envelope, Event};
     use crate::sink::EventSink;
-    use crate::source::{BlockId, BlockSource, HeadStream, RawBlock, SourceError};
+    use crate::source::{BlockId, BlockSource, FetchedBlock, HeadStream, SourceError};
 
     fn hash(byte: u8) -> B256 {
         B256::from([byte; 32])
@@ -325,19 +322,9 @@ mod tests {
         }
     }
 
-    /// Pops pre-scripted blocks so tests control linkage and depth directly.
+    /// Tests hand blocks straight to the pipeline, so the source only names a chain.
     struct FakeSource {
         chain: ChainId,
-        blocks: Mutex<VecDeque<Vec<Event>>>,
-    }
-
-    impl FakeSource {
-        fn new(blocks: Vec<Vec<Event>>) -> Self {
-            Self {
-                chain: ChainId::new("ethereum"),
-                blocks: Mutex::new(blocks.into()),
-            }
-        }
     }
 
     impl BlockSource for FakeSource {
@@ -349,16 +336,10 @@ mod tests {
             Ok(Box::pin(stream::empty()))
         }
 
-        async fn block_at(&self, _height: u64) -> Result<RawBlock, SourceError> {
-            Err(SourceError::Transport("not scripted".to_owned()))
-        }
-
-        fn encode_block(&self, _raw: &RawBlock) -> Result<Vec<Event>, SourceError> {
-            self.blocks
-                .lock()
-                .expect("script lock")
-                .pop_front()
-                .ok_or_else(|| SourceError::Transport("no scripted block".to_owned()))
+        async fn fetch_block(&self, _height: u64) -> Result<FetchedBlock, SourceError> {
+            Err(SourceError::Transport(
+                "tests pass blocks directly".to_owned(),
+            ))
         }
     }
 
@@ -409,39 +390,51 @@ mod tests {
         }
     }
 
-    /// A raw block whose payload is ignored; `FakeSource` scripts the events.
-    fn raw_finalized_at(height: u64) -> RawBlock {
-        RawBlock {
-            raw_block: "{}".to_owned(),
-            raw_receipts: "[]".to_owned(),
+    fn pipeline(undo_depth: usize) -> Pipeline<FakeSource, CollectSink> {
+        let source = FakeSource {
+            chain: ChainId::new("ethereum"),
+        };
+        Pipeline::with_undo_depth(source, CollectSink::default(), undo_depth)
+    }
+
+    fn fetched_at(events: Vec<Event>, finalized_height: u64) -> FetchedBlock {
+        FetchedBlock {
+            events,
             finalized: BlockId {
-                height,
+                height: finalized_height,
                 hash: hash(0xf0),
             },
         }
     }
 
     /// Genesis is trivially final, so reporting it publishes no watermark.
-    fn raw() -> RawBlock {
-        raw_finalized_at(0)
+    fn fetched(events: Vec<Event>) -> FetchedBlock {
+        fetched_at(events, 0)
+    }
+
+    async fn process_all(
+        pipeline: &mut Pipeline<FakeSource, CollectSink>,
+        blocks: Vec<Vec<Event>>,
+    ) {
+        for events in blocks {
+            pipeline
+                .process_block(fetched(events))
+                .await
+                .expect("block publishes");
+        }
     }
 
     #[tokio::test]
     async fn publishes_a_linear_chain_with_contiguous_sequences() {
-        let source = FakeSource::new(vec![
-            vec![block_event(1, hash(1), hash(0)), log_event(1, hash(1), 0)],
-            vec![block_event(2, hash(2), hash(1)), log_event(2, hash(2), 0)],
-        ]);
-        let mut pipeline = Pipeline::new(source, CollectSink::default());
-
-        pipeline
-            .process_block(raw())
-            .await
-            .expect("block 1 publishes");
-        pipeline
-            .process_block(raw())
-            .await
-            .expect("block 2 publishes");
+        let mut pipeline = pipeline(128);
+        process_all(
+            &mut pipeline,
+            vec![
+                vec![block_event(1, hash(1), hash(0)), log_event(1, hash(1), 0)],
+                vec![block_event(2, hash(2), hash(1)), log_event(2, hash(2), 0)],
+            ],
+        )
+        .await;
 
         assert_eq!(pipeline.sink.kinds(), ["block", "log", "block", "log"]);
         assert_eq!(pipeline.sink.sequences(), [0, 1, 2, 3]);
@@ -450,20 +443,17 @@ mod tests {
 
     #[tokio::test]
     async fn depth_one_reorg_retracts_and_reuses_the_reclaimed_sequence() {
-        let source = FakeSource::new(vec![
-            vec![block_event(1, hash(1), hash(0)), log_event(1, hash(1), 0)],
-            vec![block_event(2, hash(2), hash(1)), log_event(2, hash(2), 0)],
-            // Same height, different hash: block 2 was replaced.
-            vec![block_event(2, hash(20), hash(1)), log_event(2, hash(20), 0)],
-        ]);
-        let mut pipeline = Pipeline::new(source, CollectSink::default());
-
-        for _ in 0..3 {
-            pipeline
-                .process_block(raw())
-                .await
-                .expect("block publishes");
-        }
+        let mut pipeline = pipeline(128);
+        process_all(
+            &mut pipeline,
+            vec![
+                vec![block_event(1, hash(1), hash(0)), log_event(1, hash(1), 0)],
+                vec![block_event(2, hash(2), hash(1)), log_event(2, hash(2), 0)],
+                // Same height, different hash: block 2 was replaced.
+                vec![block_event(2, hash(20), hash(1)), log_event(2, hash(20), 0)],
+            ],
+        )
+        .await;
 
         assert_eq!(
             pipeline.sink.kinds(),
@@ -475,25 +465,22 @@ mod tests {
 
     #[tokio::test]
     async fn deep_reorg_retracts_every_block_and_reclaims_their_sequences() {
-        let source = FakeSource::new(vec![
-            vec![block_event(1, hash(1), hash(0)), log_event(1, hash(1), 0)],
-            vec![block_event(2, hash(2), hash(1)), log_event(2, hash(2), 0)],
-            vec![block_event(3, hash(3), hash(2)), log_event(3, hash(3), 0)],
-            // New chain forks at height 2 and already extends to height 3.
+        let mut pipeline = pipeline(128);
+        process_all(
+            &mut pipeline,
             vec![
-                block_event(2, hash(20), hash(1)),
-                log_event(2, hash(20), 0),
-                log_event(2, hash(20), 1),
+                vec![block_event(1, hash(1), hash(0)), log_event(1, hash(1), 0)],
+                vec![block_event(2, hash(2), hash(1)), log_event(2, hash(2), 0)],
+                vec![block_event(3, hash(3), hash(2)), log_event(3, hash(3), 0)],
+                // New chain forks at height 2.
+                vec![
+                    block_event(2, hash(20), hash(1)),
+                    log_event(2, hash(20), 0),
+                    log_event(2, hash(20), 1),
+                ],
             ],
-        ]);
-        let mut pipeline = Pipeline::new(source, CollectSink::default());
-
-        for _ in 0..4 {
-            pipeline
-                .process_block(raw())
-                .await
-                .expect("block publishes");
-        }
+        )
+        .await;
 
         // Both old blocks 2 and 3 are retracted, newest first.
         assert_eq!(pipeline.sink.reorg_orphans(), vec![vec![hash(3), hash(2)]]);
@@ -503,12 +490,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn empty_encode_publishes_nothing_and_holds_the_sequence() {
-        let source = FakeSource::new(vec![Vec::new()]);
-        let mut pipeline = Pipeline::new(source, CollectSink::default());
-
+    async fn empty_block_publishes_nothing_and_holds_the_sequence() {
+        let mut pipeline = pipeline(128);
         let reorgs = pipeline
-            .process_block(raw())
+            .process_block(fetched(Vec::new()))
             .await
             .expect("empty block is not an error");
 
@@ -519,24 +504,16 @@ mod tests {
 
     #[tokio::test]
     async fn undo_ring_stays_bounded_across_many_blocks() {
+        let mut pipeline = pipeline(2);
         let blocks = (1..=10u8)
             .map(|height| {
-                let parent = height - 1;
                 vec![
-                    block_event(u64::from(height), hash(height), hash(parent)),
+                    block_event(u64::from(height), hash(height), hash(height - 1)),
                     log_event(u64::from(height), hash(height), 0),
                 ]
             })
             .collect();
-        let source = FakeSource::new(blocks);
-        let mut pipeline = Pipeline::with_undo_depth(source, CollectSink::default(), 2);
-
-        for _ in 0..10 {
-            pipeline
-                .process_block(raw())
-                .await
-                .expect("block publishes");
-        }
+        process_all(&mut pipeline, blocks).await;
 
         assert_eq!(pipeline.history.len(), 2);
         assert_eq!(pipeline.next_sequence(), 20);
@@ -544,20 +521,15 @@ mod tests {
 
     #[tokio::test]
     async fn finality_watermark_publishes_once_per_advance_and_trims_the_ring() {
-        let blocks = (1..=4u8)
-            .map(|height| {
-                vec![block_event(
-                    u64::from(height),
-                    hash(height),
-                    hash(height - 1),
-                )]
-            })
-            .collect();
-        let mut pipeline = Pipeline::new(FakeSource::new(blocks), CollectSink::default());
-
-        for finalized in [0, 2, 2, 3] {
+        let mut pipeline = pipeline(128);
+        for (height, finalized) in (1..=4u8).zip([0, 2, 2, 3]) {
+            let events = vec![block_event(
+                u64::from(height),
+                hash(height),
+                hash(height - 1),
+            )];
             pipeline
-                .process_block(raw_finalized_at(finalized))
+                .process_block(fetched_at(events, finalized))
                 .await
                 .expect("block publishes");
         }
