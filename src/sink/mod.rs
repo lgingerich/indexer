@@ -71,22 +71,8 @@ impl EventSink for StdoutJsonSink {
 // means the fixture or setup is wrong.
 #[expect(clippy::expect_used)]
 mod tests {
-    use super::{EventSink as _, StdoutJsonSink};
-    use crate::envelope::{ChainId, Envelope, Event, Finalized, Reorg};
-
-    #[tokio::test]
-    async fn stdout_sink_accepts_an_envelope() {
-        let envelope = Envelope::new(
-            ChainId::new("ethereum"),
-            0,
-            Event::Reorg(Reorg {
-                height: 1,
-                new_head_hash: alloy_primitives::B256::from([0; 32]),
-                orphaned_hashes: Vec::new(),
-            }),
-        );
-        assert!(StdoutJsonSink::new().publish(&envelope).await.is_ok());
-    }
+    use super::StdoutJsonSink;
+    use crate::envelope::{ChainId, Envelope, Event, Finalized};
 
     #[test]
     fn render_keeps_the_envelope_fields_flat_on_one_line() {

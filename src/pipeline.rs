@@ -12,9 +12,9 @@
 //! Its state is a machine: [`Mode`] names what it is doing, and the linkage rules
 //! in [`Pipeline::process_block`] decide the transition. A head that links to the
 //! published tip advances the chain; one that does not is a fork, which retracts to
-//! the fork point and is published as an [`Event::Reorg`]. A head that would leave
-//! a height gap, a first head above genesis, and a fork deeper than the undo ring
-//! all fail loudly rather than publishing across a hole.
+//! the fork point in the same call and is published as an [`Event::Reorg`]. A head
+//! that would leave a height gap, a first head above genesis, and a fork deeper
+//! than the undo ring all fail loudly rather than publishing across a hole.
 //!
 //! Turning events into the stream means three things: assigning every envelope a
 //! per-chain monotonic sequence number, checking parent-hash linkage so a reorg
@@ -65,13 +65,6 @@ pub enum Mode {
     /// starts mid-chain at whatever head arrives next. It also cannot be skipped
     /// out of — a head that would leave a gap is an error, not a silent hole.
     Backfilling,
-    /// Retracting a reorg and re-publishing the replacement branch.
-    ///
-    /// Entered when a head's parent does not match the published tip and left once
-    /// the replacement branch's block is published. Resolution is synchronous
-    /// today, so it is entered and left inside one [`Pipeline::process_block`];
-    /// when the re-fetch range is wired it becomes state that spans several.
-    Reorging,
 }
 
 /// One block's slice of the published stream.
@@ -285,11 +278,13 @@ impl<S: BlockSource, K: EventSink> Pipeline<S, K> {
         new_head_hash: B256,
         actual_parent: B256,
     ) -> anyhow::Result<()> {
-        let previous_mode = self.mode;
-        self.mode = Mode::Reorging;
         let expected_parent = self.history.back().map(|block| block.hash);
         let (orphaned_hashes, reclaimed_from) = self.rewind_to(fork);
-        debug_assert!(
+        // `find_fork` locates `fork` inside the ring, so the rewind must orphan
+        // something. Checked on the release path, not with `debug_assert`, because
+        // an empty marker here would tell a consumer to retract nothing while the
+        // chain has already forked.
+        anyhow::ensure!(
             !orphaned_hashes.is_empty(),
             "a reorg must orphan at least the block at {fork}"
         );
@@ -315,7 +310,6 @@ impl<S: BlockSource, K: EventSink> Pipeline<S, K> {
         );
         self.sink.publish(&reorg).await?;
         self.sequence += 1;
-        self.mode = previous_mode;
         Ok(())
     }
 
@@ -618,22 +612,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn following_is_the_mode_until_a_fork_is_detected() {
-        let mut pipeline = pipeline(128);
-        assert_eq!(pipeline.mode(), Mode::Following);
-
-        process_all(
-            &mut pipeline,
-            vec![
-                vec![block_event(1, hash(1), hash(0))],
-                vec![block_event(2, hash(2), hash(1))],
-            ],
-        )
-        .await;
-        assert_eq!(pipeline.mode(), Mode::Following);
-    }
-
-    #[tokio::test]
     async fn a_reannounced_tip_is_not_a_reorg() {
         let mut pipeline = pipeline(128);
         process_all(
@@ -719,7 +697,6 @@ mod tests {
 
         assert_eq!(pipeline.sink.reorg_orphans(), vec![vec![hash(3), hash(2)]]);
         assert_eq!(pipeline.sink.reorg_heights(), [2]);
-        assert_eq!(pipeline.mode(), Mode::Following);
     }
 
     #[tokio::test]

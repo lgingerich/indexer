@@ -375,7 +375,7 @@ fn decode_events(
                 position as u64,
                 number,
                 hash,
-            ))));
+            )?)));
         }
     }
     Ok(events)
@@ -488,13 +488,31 @@ fn decode_receipt(
     }
 }
 
-/// Flattens one RPC log into the log dataset, defaulting absent position fields to
-/// `fallback_index`.
-fn log_record(log: &RpcLog, fallback_index: u64, block_number: u64, block_hash: B256) -> Log {
+/// Flattens one RPC log into the log dataset.
+///
+/// A log's identity is its transaction hash and its index in the block; both are
+/// required for the dataset's `dedupe_key` to mean anything, so a log missing
+/// either is rejected rather than defaulted to zero (which would collide on
+/// dedupe). alloy models them optional only because `eth_getLogs` filters can
+/// omit them; a log nested in a receipt always has them.
+///
+/// # Errors
+///
+/// Returns [`SourceError::Malformed`] when the log has no transaction hash.
+fn log_record(
+    log: &RpcLog,
+    fallback_index: u64,
+    block_number: u64,
+    block_hash: B256,
+) -> Result<Log, SourceError> {
+    const CONTEXT: &str = "eth_getBlockReceipts";
+    let transaction_hash = log
+        .transaction_hash
+        .ok_or_else(|| malformed(CONTEXT, "log has no transactionHash"))?;
     let topics = log.topics();
-    Log {
+    Ok(Log {
         log_index: log.log_index.unwrap_or(fallback_index),
-        transaction_hash: log.transaction_hash.unwrap_or_default(),
+        transaction_hash,
         transaction_index: log.transaction_index.unwrap_or(fallback_index),
         address: log.address(),
         topic0: topics.first().copied(),
@@ -505,7 +523,7 @@ fn log_record(log: &RpcLog, fallback_index: u64, block_number: u64, block_hash: 
         removed: log.removed,
         block_number,
         block_hash,
-    }
+    })
 }
 
 impl BlockSource for EvmSource {
@@ -796,10 +814,17 @@ mod tests {
 
     #[test]
     fn decodes_hex_quantities() {
-        assert_eq!(decode_u64("0x0"), Ok(0));
+        // The only logic here is stripping `0x` and rejecting overflow; bare
+        // `x`/`x` would just re-test `from_str_radix`.
         assert_eq!(decode_u64("0x10"), Ok(16));
-        assert_eq!(decode_u64("ff"), Ok(255));
+        assert_eq!(decode_u64("ff"), Ok(255), "a bare hex string is accepted");
+        assert!(decode_u64("").is_err(), "empty input is not zero");
+        assert!(decode_u64("0x").is_err(), "a lone prefix is not zero");
         assert!(decode_u64("0xzz").is_err());
+        assert!(
+            decode_u64("0x10000000000000000").is_err(),
+            "a value above u64::MAX must error, not wrap"
+        );
     }
 
     #[test]
@@ -985,11 +1010,12 @@ mod tests {
         assert!(error.to_string().contains("header not found"), "{error}");
     }
 
-    /// A node without `eth_getBlockReceipts` answers `-32601`; the batch must parse
-    /// with receipts absent so `fetch_block` can fall back to per-transaction
-    /// fetches, rather than failing the block.
+    /// A node without `eth_getBlockReceipts` answers `-32601`. The batch must still
+    /// carry the block and its transaction hashes — the exact input the
+    /// per-transaction fallback needs — and the rest of the batch must survive, so
+    /// one unsupported method does not poison finalized.
     #[test]
-    fn unsupported_receipts_method_leaves_receipts_absent() {
+    fn unsupported_receipts_method_leaves_the_rest_of_the_batch_usable() {
         let body = json!([
             {"jsonrpc": "2.0", "id": 1, "result": block()},
             {"jsonrpc": "2.0", "id": 2, "error": {"code": -32601, "message": "method not found"}},
@@ -998,6 +1024,25 @@ mod tests {
         .to_string();
         let batch = parse_batch(body.as_bytes()).expect("batch parses without receipts");
         assert!(batch.receipts.is_none());
+        // The fallback reads these hashes to fetch each receipt by transaction.
+        let hashes: Vec<B256> = batch
+            .block
+            .0
+            .inner
+            .transactions
+            .as_transactions()
+            .expect("full transactions")
+            .iter()
+            .map(alloy_network::TransactionResponse::tx_hash)
+            .collect();
+        assert_eq!(
+            hashes,
+            vec![
+                hash(0x11).parse::<B256>().expect("hash"),
+                hash(0x22).parse::<B256>().expect("hash"),
+            ]
+        );
+        assert_eq!(batch.finalized.height, 16, "finalized must still parse");
     }
 
     /// A `null` result (rather than an error) also means the caller must fall back.
@@ -1011,6 +1056,40 @@ mod tests {
         .to_string();
         let batch = parse_batch(body.as_bytes()).expect("batch parses without receipts");
         assert!(batch.receipts.is_none());
+        assert_eq!(batch.finalized.height, 16);
+    }
+
+    /// Only `-32601` means "method unsupported". Any other receipts error is a real
+    /// transport failure and must not be silently downgraded to the fallback.
+    #[test]
+    fn other_receipts_errors_are_not_treated_as_unsupported() {
+        let body = json!([
+            {"jsonrpc": "2.0", "id": 1, "result": block()},
+            {"jsonrpc": "2.0", "id": 2, "error": {"code": -32000, "message": "internal error"}},
+            {"jsonrpc": "2.0", "id": 3, "result": {"number": "0x10", "hash": hash(0xf0)}},
+        ])
+        .to_string();
+        let error = parse_batch(body.as_bytes()).expect_err("a real error must propagate");
+        assert!(error.to_string().contains("internal error"), "{error}");
+    }
+
+    /// The decode boundary requires receipts: a caller that forgets the fallback
+    /// gets a clear error rather than a block of transaction events with no receipts.
+    #[test]
+    fn decode_block_requires_receipts() {
+        let batch = super::RpcBatch {
+            block: serde_json::from_value(block()).expect("block parses"),
+            receipts: None,
+            finalized: crate::source::BlockId {
+                height: 0,
+                hash: B256::ZERO,
+            },
+        };
+        let error = decode_block(batch).expect_err("missing receipts must fail");
+        assert!(
+            error.to_string().contains("receipts were not fetched"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -1037,9 +1116,14 @@ mod tests {
     }
 
     /// An OP-stack block carrying a deposit transaction (`type: 0x7e`), which
-    /// Ethereum-only types reject outright. This is the regression that matters
-    /// most: the deposit type is outside 0-4, so the whole block used to fail to
-    /// decode. The fixture is trimmed from a real Base block.
+    /// Ethereum-only types reject outright. The deposit type is outside 0-4, so
+    /// the whole block used to fail to decode; the fixture is trimmed from a real
+    /// Base block.
+    ///
+    /// The load-bearing assertion is that the decode succeeds at all: a typed
+    /// envelope cannot represent `0x7e`, so this fails unless the catch-all
+    /// (`AnyTxEnvelope::Unknown`) path handles it. The field checks confirm the
+    /// common fields are still projected for the unknown type.
     #[test]
     fn non_ethereum_transaction_type_decodes_and_keeps_its_type() {
         let deposit = json!({
@@ -1068,15 +1152,35 @@ mod tests {
             panic!("second event must be a transaction");
         };
         assert_eq!(transaction.transaction_type, 0x7e);
-        assert_eq!(
-            transaction.to,
-            Some(address(0xf1).parse().expect("to parses"))
-        );
+        assert_eq!(transaction.gas_price, Some(0));
+        assert_eq!(transaction.input.len(), 4);
         assert_eq!(transaction.nonce, 1);
 
         let Event::Receipt(receipt) = &fetched.events[2] else {
             panic!("third event must be a receipt");
         };
         assert_eq!(receipt.transaction_type, 0x7e);
+    }
+
+    /// A log's transaction hash is part of its identity; defaulting it would make
+    /// unrelated logs dedupe together, so it is rejected instead.
+    #[test]
+    fn a_log_without_a_transaction_hash_is_rejected() {
+        let mut receipts = receipts();
+        for log in receipts[0]["logs"]
+            .as_array_mut()
+            .expect("logs are an array")
+        {
+            log.as_object_mut()
+                .expect("log is an object")
+                .remove("transactionHash");
+        }
+        let error = decode_batch(&batch(&block(), &receipts))
+            .expect_err("a log without an identity must fail");
+        let message = error.to_string();
+        assert!(
+            message.contains("eth_getBlockReceipts") && message.contains("transactionHash"),
+            "{message}"
+        );
     }
 }

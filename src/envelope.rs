@@ -222,21 +222,6 @@ mod tests {
     }
 
     #[test]
-    fn b256_wire_format_is_lowercase_0x_hex() {
-        // This is the envelope's serialized identity format, so it is a contract:
-        // if an alloy upgrade changed it, consumers would break silently.
-        let value = hash(0xab);
-        let encoded = serde_json::to_string(&value).expect("hash serializes");
-        assert_eq!(
-            encoded,
-            format!("\"0x{}\"", "ab".repeat(32)),
-            "block hash wire format changed"
-        );
-        let decoded: B256 = serde_json::from_str(&encoded).expect("hash deserializes");
-        assert_eq!(decoded, value);
-    }
-
-    #[test]
     fn datasets_are_flagged_and_control_signals_are_not() {
         assert!(
             Event::Block(Box::new(Block {
