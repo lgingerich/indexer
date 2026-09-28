@@ -1,26 +1,33 @@
-//! The egress boundary: where events go.
+//! The broker boundary: where events go, and where they come from.
 //!
-//! [`EventSink`] is the seam between publishing and the rest of the system.
+//! [`EventSink`] is the seam between publishing and the rest of the system, and
+//! [`EnvelopeSource`] is its mirror for a consumer. Both sit on the same bus, so a
+//! process that decodes is a consumer of one topic and a producer of another.
 //!
-//! The sink is a dumb serializing boundary: it renders the [`Envelope`] as-is and
-//! knows nothing about chains. The schema version is a field on the envelope, not a
-//! property of a sink's framing — see [`wire::envelope::SCHEMA_VERSION`] for why it
-//! is not a broker header.
+//! A sink is a dumb serializing boundary: it renders the [`Envelope`] as-is and knows
+//! nothing about chains. The schema version is a field on the envelope, not a property
+//! of a sink's framing — see [`wire::envelope::SCHEMA_VERSION`] for why it is not a
+//! broker header.
 //!
-//! Sinks do not own their transport. A runtime builds and tunes the engine client
-//! (a `librdkafka` producer, a `DuckDB` connection) and injects it, so the crate
-//! stays a library and the runtime owns connection pools, timeouts, and callbacks.
+//! Sinks and sources do not own their transport. A runtime builds and tunes the engine
+//! client (a `librdkafka` producer or consumer, a `DuckDB` connection) and injects it,
+//! so the crate stays a library and the runtime owns connection pools, group ids,
+//! timeouts, and callbacks.
 
 #[cfg(feature = "duckdb")]
 pub mod duckdb;
 #[cfg(feature = "kafka")]
 pub mod kafka;
+#[cfg(feature = "kafka")]
+pub mod kafka_source;
 pub mod stdout;
 
 #[cfg(feature = "duckdb")]
 pub use duckdb::DuckDbSink;
 #[cfg(feature = "kafka")]
 pub use kafka::KafkaSink;
+#[cfg(feature = "kafka")]
+pub use kafka_source::KafkaSource;
 pub use stdout::StdoutJsonSink;
 
 use wire::envelope::Envelope;
@@ -56,4 +63,32 @@ pub trait EventSink: Send {
     fn flush(&mut self) -> impl Future<Output = anyhow::Result<()>> + Send {
         async { Ok(()) }
     }
+}
+
+/// Receives events in per-chain sequence order.
+///
+/// The consumer side of the bus, and the mirror of [`EventSink`]. A stage that
+/// transforms the stream — decode today, stream processing next — is a source on one
+/// topic and a sink on another, which is why both seams live at this boundary rather
+/// than one here and one in each stage.
+///
+/// Returning an owned [`Envelope`] rather than a borrowed one is deliberate: the item
+/// outlives the broker's buffer, so a compiler-enforced copy keeps a transform from
+/// holding a view into a consumer's fetch queue across an await.
+///
+/// # Checkpointing
+///
+/// Offsets are the checkpoint, and committing them is deliberately *not* part of this
+/// trait. A consumer's correct commit point is a property of how it delivers — after a
+/// flush, after a batch, never — so a stage owning its runtime owns that decision.
+/// A source that committed per record would make at-least-once delivery unachievable.
+pub trait EnvelopeSource: Send {
+    /// The next envelope, or `None` when the stream has ended.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the payload cannot be read: a broker failure, or bytes
+    /// that are not an envelope. The caller stops rather than skipping, since skipping
+    /// a record the source has already advanced past is data loss.
+    fn next(&mut self) -> impl Future<Output = anyhow::Result<Option<Envelope>>> + Send;
 }

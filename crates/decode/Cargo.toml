@@ -7,13 +7,20 @@ description = "Decodes raw indexer events with a contract ABI, as a stateless tr
 license = "MIT OR Apache-2.0"
 publish = false
 
+[[bin]]
+name = "decode"
+path = "src/main.rs"
+required-features = ["kafka"]
+
+[features]
+default = []
+# The broker source and sink the `decode` binary drives. Off by default so a plain
+# `cargo build` does not compile C `librdkafka`; the library and its tests need no
+# broker at all.
+kafka = ["dep:rdkafka", "sink/kafka"]
+
 [lints]
 workspace = true
-
-# No `[[bin]]` yet: the transform is built and tested, but the broker source and
-# sink that would drive it are not, so a binary here would have nothing to do. It
-# lands with that stage. `examples/decode_logs.rs` runs the transform over a JSON
-# file of raw envelopes instead, which is enough to see real decoded output.
 
 [dependencies]
 # The dynamic decoder. Static `sol!` decoding cannot cover an open-ended set of
@@ -22,8 +29,14 @@ alloy-dyn-abi = { version = "1.7.3", default-features = false }
 # `JsonAbi` and its `Event`, the registry's unit of lookup.
 alloy-json-abi = { version = "1.7.3", default-features = false }
 alloy-primitives = { workspace = true }
+anyhow = { workspace = true }
+rdkafka = { workspace = true, optional = true }
 serde_json = { workspace = true }
+sink = { path = "../sink" }
 thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
 wire = { path = "../wire" }
 
 [dev-dependencies]

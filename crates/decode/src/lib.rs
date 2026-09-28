@@ -20,8 +20,8 @@
 //! orphaned rows or compact below a finality watermark; dropping either would make
 //! the decoded stream quietly wrong rather than incomplete.
 //!
-//! Not built yet: the broker source and sink that drive the transform, and a
-//! proxy-aware registry backed by a store rather than an in-process map.
+//! Not built yet: a proxy-aware registry backed by a store rather than a file, and
+//! the stream-processing layer.
 
 pub mod convert;
 pub mod registry;

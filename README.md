@@ -19,7 +19,7 @@ crates/
 ├── wire/         the wire contract: envelope, events, dataset records. Pure data.
 ├── sink/         egress: the EventSink trait and the concrete sinks.
 ├── indexer/      ingestion: block sources, the reorg-aware pipeline, bin `ingest`.
-├── decode/       the stateless ABI decode transform.
+├── decode/       the stateless ABI decode transform, bin `decode`.
 └── materialize/  decoded events into typed tables, in two layers.
 ```
 
@@ -46,13 +46,15 @@ apart is what lets decode stay stateless and replayable.
 - **Ordered events.** Every event gets a per-chain monotonic `sequence`; every
   dataset exposes a `dedupe_key` derived from its natural key. See
   `crates/wire/src/envelope.rs`.
-- **A decode stage.** `crates/decode` is a stateless transform over an ABI registry.
-  It decodes a log against the ABI registered for its `(chain, address, block)`,
-  emits the decoded record *alongside* the raw log so the decoded stream is a
-  lossless superset, and forwards everything else — including reorgs and finality
-  watermarks, which must survive for a store to retract and compact. It reimplements
-  no ordering or reorg logic, so replaying a record is safe. The broker source and
-  sink that would drive it are not built yet.
+- **A decode stage.** `crates/decode` is a stateless transform over an ABI registry,
+  and it runs as a process: `cargo run -p decode --bin decode --features kafka`
+  consumes `raw.chain`, decodes each log against the ABI registered for its
+  `(chain, address)`, and produces to `decoded.chain`. It emits the decoded record
+  *alongside* the raw log, so the decoded stream is a lossless superset, and forwards
+  everything else — including reorgs and finality watermarks, which must survive for a
+  store to retract and compact. It reimplements no ordering or reorg logic, so
+  replaying a record is safe. Offsets are committed only after the producer's flush,
+  so a crash replays a batch rather than losing one.
 - **Typed tables from decoded events.** `crates/materialize` turns a decoded record
   into table rows in two layers: one faithful row per event with every argument under
   its ABI name, and one semantic row in the shape Allium calls `dex.trades`. An ABI
@@ -103,6 +105,29 @@ cargo run -p indexer --bin ingest --release > events.ndjson
 
 Logs go to stderr; events go to stdout, so the two streams never interleave. The
 features above are on by default for the binary.
+
+### Run the decode stage
+
+```bash
+KAFKA_BROKERS=127.0.0.1:9092 \
+DECODE_ABIS="base:0xd0b53D9277642d899DF5C87A3966A349A798F224:crates/decode/abi/uniswap_v3_pool.json" \
+cargo run -p decode --bin decode --features kafka
+```
+
+| Variable | Required | Default | Meaning |
+| --- | --- | --- | --- |
+| `KAFKA_BROKERS` | yes | — | Bootstrap servers |
+| `DECODE_ABIS` | no | — | `chain:address:abi.json`, comma-separated, repeatable |
+| `DECODE_GROUP` | no | `indexer-decode` | Consumer group |
+| `DECODE_INPUT_TOPIC` | no | `raw.chain` | Topic to consume |
+| `DECODE_OUTPUT_TOPIC` | no | `decoded.chain` | Topic to produce |
+| `DECODE_BATCH` | no | `500` | Records per flush |
+| `DECODE_BATCH_MS` | no | `1000` | Time bound on a batch |
+
+A batch is `DECODE_BATCH` records or `DECODE_BATCH_MS` milliseconds, whichever comes
+first. `DECODE_ABIS` applies one ABI per address at every height, which is the honest
+limitation of a file-backed registry: a proxy that upgrades changes its ABI at a
+height, and that needs a table-backed registry behind the same seam.
 
 ## Event shape
 
