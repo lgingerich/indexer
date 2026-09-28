@@ -59,12 +59,33 @@ pub struct FetchedBlock {
 /// A stream of live head notifications. Ends when the connection does.
 pub type HeadStream = Pin<Box<dyn Stream<Item = Result<BlockId, SourceError>> + Send>>;
 
+/// The JSON-RPC code for a method the node does not serve.
+///
+/// Nodes differ on methods outside the Ethereum spec: some L2s and pre-Cancun
+/// Ethereum answer `eth_getBlockReceipts` with this code, and some answer `null`.
+pub const METHOD_NOT_FOUND: i64 = -32601;
+
 /// Failure while talking to a chain data source.
 #[derive(Debug, Error)]
 pub enum SourceError {
     /// The connection, socket, or HTTP request failed.
     #[error("transport failure: {0}")]
     Transport(String),
+    /// The node received the request but answered with a JSON-RPC error object.
+    ///
+    /// The code is kept typed rather than folded into the message, so a caller can
+    /// branch on it (an unsupported method is [`METHOD_NOT_FOUND`]).
+    ///
+    /// [`METHOD_NOT_FOUND`]: crate::source::METHOD_NOT_FOUND
+    #[error("{method} returned error {code}: {message}")]
+    Rpc {
+        /// The method the node rejected.
+        method: String,
+        /// The node's JSON-RPC error code.
+        code: i64,
+        /// The node's error message.
+        message: String,
+    },
     /// The source responded, but the payload was not usable.
     #[error("malformed data from {context}: {detail}")]
     Malformed {
@@ -87,7 +108,8 @@ pub trait BlockSource: Send + Sync {
     ///
     /// # Errors
     ///
-    /// Returns [`SourceError::Transport`] when the request fails, and
+    /// Returns [`SourceError::Transport`] when the request fails,
+    /// [`SourceError::Rpc`] when a call in it was rejected, and
     /// [`SourceError::Malformed`] when the response cannot be decoded.
     fn fetch_block(
         &self,

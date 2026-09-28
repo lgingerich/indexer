@@ -7,9 +7,9 @@
 //!
 //! - Blocks are requested with full transaction objects, and receipts come from
 //!   `eth_getBlockReceipts`, so nothing the node returns is dropped. Some nodes
-//!   lack that method (some L2s, pre-Cancun Ethereum); it is answered with `-32601`
-//!   or null, and the source then fetches each receipt with
-//!   `eth_getTransactionReceipt` in batches of [`RECEIPT_BATCH_LIMIT`].
+//!   lack that method (some L2s, pre-Cancun Ethereum); it is answered with
+//!   `-32601` or null, and the source then fetches each receipt with
+//!   `eth_getTransactionReceipt` in batches of `RECEIPT_BATCH_LIMIT`.
 //! - Finality comes from the node's `finalized` block tag, so each chain's own
 //!   rules apply: about two epochs on Ethereum, L1 finality of the batch on an L2.
 //! - All three calls are sent as one batch, so a block costs one round trip. They
@@ -26,6 +26,7 @@
 use std::fmt;
 
 use alloy_consensus::Transaction as ConsensusTransaction;
+use alloy_json_rpc::{BorrowedResponse, BorrowedResponsePacket, Id, ResponsePayload};
 use alloy_network::TransactionResponse;
 use alloy_network::any::{AnyRpcBlock, AnyRpcTransaction, AnyTransactionReceipt};
 use alloy_network::eip2718::Typed2718 as _;
@@ -37,7 +38,7 @@ use serde_json::json;
 use serde_json::value::RawValue;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
-use super::{BlockId, BlockSource, FetchedBlock, HeadStream, SourceError};
+use super::{BlockId, BlockSource, FetchedBlock, HeadStream, METHOD_NOT_FOUND, SourceError};
 use crate::datasets::evm::{Block, Log, Receipt, Transaction};
 use crate::envelope::{ChainId, Event};
 
@@ -85,16 +86,19 @@ impl EvmSource {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct RpcBlockId {
-    number: String,
-    hash: String,
+    // A quantity on the wire; alloy's `quantity` handles the `0x` hex form and
+    // rejects anything else. `B256`'s own `Deserialize` parses the hash.
+    #[serde(with = "alloy_serde::quantity")]
+    number: u64,
+    hash: B256,
 }
 
 impl RpcBlockId {
-    fn into_block_id(self) -> Result<BlockId, String> {
-        Ok(BlockId {
-            height: decode_u64(&self.number)?,
-            hash: decode_hash(&self.hash)?,
-        })
+    fn into_block_id(self) -> BlockId {
+        BlockId {
+            height: self.number,
+            hash: self.hash,
+        }
     }
 }
 
@@ -113,22 +117,6 @@ struct SubscriptionParams {
     result: Option<RpcBlockId>,
 }
 
-/// One JSON-RPC response inside a batch, borrowing its result from the body.
-#[derive(Debug, Deserialize)]
-struct RpcResponse<'a> {
-    id: u64,
-    #[serde(borrow, default)]
-    result: Option<&'a RawValue>,
-    #[serde(default)]
-    error: Option<RpcErrorObject>,
-}
-
-#[derive(Debug, Deserialize)]
-struct RpcErrorObject {
-    code: i64,
-    message: String,
-}
-
 fn malformed(context: &str, detail: impl fmt::Display) -> SourceError {
     SourceError::Malformed {
         context: context.to_owned(),
@@ -136,16 +124,12 @@ fn malformed(context: &str, detail: impl fmt::Display) -> SourceError {
     }
 }
 
-/// Parses a `0x`-prefixed hex quantity, or a bare hex string.
-fn decode_u64(text: &str) -> Result<u64, String> {
-    let digits = text.strip_prefix("0x").unwrap_or(text);
-    u64::from_str_radix(digits, 16).map_err(|error| format!("invalid quantity {text:?}: {error}"))
-}
-
-/// Parses a 32-byte hash render, rejecting anything alloy would not round-trip.
-fn decode_hash(text: &str) -> Result<B256, String> {
-    text.parse()
-        .map_err(|error| format!("invalid 32-byte hash {text:?}: {error}"))
+/// Parses a response body as one response or a batch, borrowing each payload.
+fn parse_envelope<'a>(
+    context: &str,
+    body: &'a [u8],
+) -> Result<BorrowedResponsePacket<'a>, SourceError> {
+    serde_json::from_slice(body).map_err(|error| malformed(context, error))
 }
 
 /// Pulls one id's result out of a batch response.
@@ -157,23 +141,30 @@ fn decode_hash(text: &str) -> Result<B256, String> {
 /// # Errors
 ///
 /// Returns [`SourceError::Malformed`] when the batch has no entry for `id`, and
-/// [`SourceError::Transport`] when the node answered that call with an error.
+/// [`SourceError::Rpc`] when the node answered that call with an error.
 fn take_result<'a>(
-    responses: &[RpcResponse<'a>],
+    responses: &[BorrowedResponse<'a>],
     id: u64,
     method: &str,
 ) -> Result<Option<&'a RawValue>, SourceError> {
     let response = responses
         .iter()
-        .find(|response| response.id == id)
+        .find(|response| response.id == Id::Number(id))
         .ok_or_else(|| malformed(method, format!("batch response had no entry with id {id}")))?;
-    if let Some(error) = &response.error {
-        return Err(SourceError::Transport(format!(
-            "{method} returned error {}: {}",
-            error.code, error.message
-        )));
+    match &response.payload {
+        ResponsePayload::Success(raw) => {
+            // `null` (and alloy's `"0x"` sentinel for it) means "no result" for
+            // methods like `eth_getBlockReceipts` on nodes that do not serve it,
+            // so the caller decides whether an absent result is fatal.
+            let absent = raw.get().trim() == "null" || raw.get().trim_matches('"') == "0x";
+            Ok((!absent).then_some(*raw))
+        }
+        ResponsePayload::Failure(error) => Err(SourceError::Rpc {
+            method: method.to_owned(),
+            code: error.code,
+            message: error.message.to_string(),
+        }),
     }
-    Ok(response.result)
 }
 
 /// Reads the height and hash out of a block header.
@@ -181,9 +172,7 @@ fn decode_block_id(header: &RawValue) -> Result<BlockId, SourceError> {
     const CONTEXT: &str = "finalized block";
     let block: RpcBlockId =
         serde_json::from_str(header.get()).map_err(|error| malformed(CONTEXT, error))?;
-    block
-        .into_block_id()
-        .map_err(|detail| malformed(CONTEXT, detail))
+    Ok(block.into_block_id())
 }
 
 /// Decodes one WebSocket frame into a head, when the frame is a head notification.
@@ -197,10 +186,7 @@ fn decode_head_frame(text: &str) -> Option<Result<BlockId, SourceError>> {
         return None;
     }
     let head = message.params.and_then(|params| params.result)?;
-    Some(
-        head.into_block_id()
-            .map_err(|detail| malformed("newHeads", detail)),
-    )
+    Some(Ok(head.into_block_id()))
 }
 
 /// The three results one batched block request carries, still in alloy's RPC types
@@ -219,8 +205,8 @@ pub struct RpcBatch {
     ///
     /// `None` when the node does not serve that method; the caller then has to
     /// fetch each receipt by transaction hash. Some nodes answer the method with
-    /// a `-32601` error and others with a `null` result, so both are treated the
-    /// same way.
+    /// a [`METHOD_NOT_FOUND`] error and others with a `null` result, so both are
+    /// treated the same way.
     pub receipts: Option<Vec<AnyTransactionReceipt>>,
     /// The chain's newest finalized block at request time.
     pub finalized: BlockId,
@@ -233,32 +219,34 @@ pub struct RpcBatch {
 ///
 /// # Errors
 ///
-/// Returns [`SourceError::Transport`] when the node answered a call with an
-/// error, and [`SourceError::Malformed`] when the body is not a usable batch.
+/// Returns [`SourceError::Rpc`] when the node answered a call with an error, and
+/// [`SourceError::Malformed`] when the body is not a usable batch.
 pub fn parse_batch(body: &[u8]) -> Result<RpcBatch, SourceError> {
     const BLOCK: &str = "eth_getBlockByNumber";
     const RECEIPTS: &str = "eth_getBlockReceipts";
 
-    let responses: Vec<RpcResponse<'_>> =
-        serde_json::from_slice(body).map_err(|error| malformed("rpc batch", error))?;
+    let packet = parse_envelope("rpc batch", body)?;
+    let responses = packet.responses();
+
     let block_result =
-        take_result(&responses, 1, BLOCK)?.ok_or_else(|| malformed(BLOCK, "result was null"))?;
+        take_result(responses, 1, BLOCK)?.ok_or_else(|| malformed(BLOCK, "result was null"))?;
     let block: AnyRpcBlock =
         serde_json::from_str(block_result.get()).map_err(|error| malformed(BLOCK, error))?;
 
-    let receipts = match take_result(&responses, 2, RECEIPTS) {
+    let receipts = match take_result(responses, 2, RECEIPTS) {
         Ok(Some(result)) => {
             Some(serde_json::from_str(result.get()).map_err(|error| malformed(RECEIPTS, error))?)
         }
-        // An unsupported method is reported as `-32601`, and some nodes answer
-        // with a null result instead; both mean the caller fetches per transaction.
-        Err(error) if is_method_not_found(&error) => None,
+        // An unsupported method is reported as `METHOD_NOT_FOUND`, and some nodes
+        // answer with a null result instead; both mean the caller fetches per
+        // transaction.
+        Err(SourceError::Rpc { code, .. }) if code == METHOD_NOT_FOUND => None,
         Ok(None) => None,
         Err(error) => return Err(error),
     };
 
     let finalized = decode_block_id(
-        take_result(&responses, 3, "finalized block")?
+        take_result(responses, 3, "finalized block")?
             .ok_or_else(|| malformed("finalized block", "result was null"))?,
     )?;
     Ok(RpcBatch {
@@ -266,11 +254,6 @@ pub fn parse_batch(body: &[u8]) -> Result<RpcBatch, SourceError> {
         receipts,
         finalized,
     })
-}
-
-/// Whether a transport error is the node saying it does not have `eth_getBlockReceipts`.
-fn is_method_not_found(error: &SourceError) -> bool {
-    matches!(error, SourceError::Transport(message) if message.contains("-32601"))
 }
 
 /// Turns a parsed batch into ordered dataset events and the finality watermark.
@@ -561,8 +544,8 @@ impl BlockSource for EvmSource {
         let body = self.post_batch(height).await?;
         let mut batch = parse_batch(&body)?;
         // Nodes that do not serve `eth_getBlockReceipts` (some L2s, and pre-Cancun
-        // Ethereum) answer it with `-32601` or null. Fetch the receipts by
-        // transaction hash instead, so the block still becomes events.
+        // Ethereum) answer it with `METHOD_NOT_FOUND` or null. Fetch the receipts
+        // by transaction hash instead, so the block still becomes events.
         if batch.receipts.is_none() {
             batch.receipts = Some(self.fetch_receipts(&batch.block).await?);
         }
@@ -624,11 +607,10 @@ impl EvmSource {
                 })
                 .collect();
             let body = self.post(&serde_json::Value::Array(requests)).await?;
-            let responses: Vec<RpcResponse<'_>> =
-                serde_json::from_slice(&body).map_err(|error| malformed(RECEIPT, error))?;
+            let packet = parse_envelope(RECEIPT, &body)?;
             // Match by id so order is the block's, whatever order the node replies in.
             for index in 0..chunk.len() {
-                let result = take_result(&responses, index as u64 + 1, RECEIPT)?
+                let result = take_result(packet.responses(), index as u64 + 1, RECEIPT)?
                     .ok_or_else(|| malformed(RECEIPT, "result was null"))?;
                 receipts.push(
                     serde_json::from_str(result.get())
@@ -689,7 +671,7 @@ mod tests {
     use alloy_primitives::{Address, B256};
     use serde_json::{Value, json};
 
-    use super::{decode_block, decode_head_frame, decode_u64, parse_batch};
+    use super::{decode_block, decode_head_frame, parse_batch};
     use crate::envelope::Event;
 
     /// Runs the full parse-and-project path, as production does.
@@ -813,18 +795,17 @@ mod tests {
     }
 
     #[test]
-    fn decodes_hex_quantities() {
-        // The only logic here is stripping `0x` and rejecting overflow; bare
-        // `x`/`x` would just re-test `from_str_radix`.
-        assert_eq!(decode_u64("0x10"), Ok(16));
-        assert_eq!(decode_u64("ff"), Ok(255), "a bare hex string is accepted");
-        assert!(decode_u64("").is_err(), "empty input is not zero");
-        assert!(decode_u64("0x").is_err(), "a lone prefix is not zero");
-        assert!(decode_u64("0xzz").is_err());
-        assert!(
-            decode_u64("0x10000000000000000").is_err(),
-            "a value above u64::MAX must error, not wrap"
-        );
+    fn finalized_number_must_be_a_quantity() {
+        // The `finalized` header's number is a JSON-RPC quantity. Alloy's decoder
+        // rejects anything that is not `0x` hex, including bare hex and overflow.
+        let body = json!([
+            {"jsonrpc": "2.0", "id": 1, "result": block()},
+            {"jsonrpc": "2.0", "id": 2, "result": receipts()},
+            {"jsonrpc": "2.0", "id": 3, "result": {"number": "ff", "hash": hash(0xf0)}},
+        ])
+        .to_string();
+        let error = parse_batch(body.as_bytes()).expect_err("bare hex must fail");
+        assert!(error.to_string().contains("finalized block"), "{error}");
     }
 
     #[test]
@@ -1001,12 +982,21 @@ mod tests {
     }
 
     #[test]
-    fn node_error_in_the_batch_is_a_transport_failure() {
+    fn node_error_in_the_batch_is_an_rpc_error() {
         let body = json!([
             {"jsonrpc": "2.0", "id": 1, "error": {"code": -32000, "message": "header not found"}},
         ])
         .to_string();
         let error = decode_batch(body.as_bytes()).expect_err("node error must fail");
+        // The code and method are carried structurally, not folded into the message.
+        assert!(
+            matches!(
+                &error,
+                crate::source::SourceError::Rpc { code: -32000, method, .. }
+                    if method == "eth_getBlockByNumber"
+            ),
+            "{error}"
+        );
         assert!(error.to_string().contains("header not found"), "{error}");
     }
 
