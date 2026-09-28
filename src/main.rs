@@ -47,7 +47,10 @@ async fn main() -> ExitCode {
     match run().await {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
-            error!(%error, "indexer stopped");
+            // `{error:?}` prints the whole `anyhow` chain, where `{error}` prints only
+            // the outermost context. A stage failure is wrapped in "decode stopped", so
+            // the Display form loses the cause — which is the only part worth having.
+            error!(error = ?error, "indexer stopped");
             ExitCode::FAILURE
         }
     }
@@ -82,8 +85,9 @@ async fn run() -> Result<()> {
             .output_topic(decoded_topic.clone())
             .build()?,
     )
-    .abis(settings.storage.abis.clone())?
+    .abi_dir(settings.storage.abi_dir.clone())
     .batch(batch)
+    .client(settings.client_config())
     .build()?;
 
     let mut storage = Storage::builder(
@@ -94,7 +98,9 @@ async fn run() -> Result<()> {
     )
     .topics([raw_topic.clone(), decoded_topic.clone()])
     .database(settings.storage.database.clone())
-    .batch(batch);
+    .batch(batch)
+    .client(settings.client_config())
+    .duckdb(settings.storage.duckdb.clone());
     if let Some(drain) = settings.drain() {
         storage = storage.drain(drain);
     }
@@ -110,7 +116,7 @@ async fn run() -> Result<()> {
 
     // Ingest publishes through whichever sink the settings chose; the other two run on
     // the bus it feeds.
-    let brokers = settings.kafka.brokers.clone();
+    let client = settings.client_config();
     let stdout = settings.ingest.as_ref().is_some_and(|ingest| ingest.stdout);
     let ingest_run = async {
         let Some(ingest) = ingest else {
@@ -120,10 +126,8 @@ async fn run() -> Result<()> {
         if stdout {
             ingest.run(StdoutJsonSink::new()).await
         } else {
-            let producer: rdkafka::producer::BaseProducer = rdkafka::ClientConfig::new()
-                .set("bootstrap.servers", &brokers)
-                .create()
-                .context("create ingest producer")?;
+            let producer: rdkafka::producer::BaseProducer =
+                client.create().context("create ingest producer")?;
             ingest
                 .run(KafkaSink::new(producer, raw_topic.clone()))
                 .await
@@ -131,10 +135,12 @@ async fn run() -> Result<()> {
     };
 
     // Whichever stage stops first ends the process: a stream missing a stage looks
-    // alive while quietly falling behind.
+    // alive while quietly falling behind. The stage's own error is carried with it,
+    // because "decode stopped" says nothing about why.
     tokio::select! {
-        result = ingest_run => result.context("ingest stopped"),
-        result = decode.run() => result.context("decode stopped"),
-        result = storage.run() => result.context("storage stopped"),
+        result = ingest_run => result.context("ingest stopped")?,
+        result = decode.run() => result.context("decode stopped")?,
+        result = storage.run() => result.context("storage stopped")?,
     }
+    Ok(())
 }

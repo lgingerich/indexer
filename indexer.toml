@@ -17,12 +17,22 @@ brokers = "localhost:9092"
 # batch_records = 500
 # batch_ms = 1000
 
+# Any other librdkafka property, passed straight through. Quote the keys, because most
+# of them contain dots and TOML reads a bare dotted key as a nested table.
+# [kafka.properties]
+# "compression.codec" = "gzip"
+# "security.protocol" = "SASL_SSL"
+# "sasl.mechanism" = "PLAIN"
+
 [storage]
 # database = "indexer.duckdb"
-# An ABI per `chain:address:path`. Omit to pass every log through undecoded.
-# abis = [
-#   "base:0xd0b53D9277642d899DF5C87A3966A349A798F224:src/decode/abi/uniswap_v3_pool.json",
-# ]
 # Set to stop a topic once it has been idle this long. Omit for a live indexer, which
 # must never stop on a quiet block.
 # drain_secs = 5
+# ABIs are discovered here, one `{chain}.{address}.json` per contract.
+# abi_dir = "abis"
+
+# Any other DuckDB setting, passed straight through and validated by the engine.
+# [storage.duckdb]
+# threads = "4"
+# max_memory = "1GB"

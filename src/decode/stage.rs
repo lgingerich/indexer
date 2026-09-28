@@ -33,6 +33,8 @@ pub struct Decode {
     kafka: KafkaConfig,
     batch: BatchConfig,
     registry: FileRegistry,
+    /// The runtime's librdkafka properties, applied to every client this stage builds.
+    client: ClientConfig,
 }
 
 impl Decode {
@@ -61,24 +63,22 @@ impl Decode {
 
         let transform = Transform::new(self.registry);
 
-        let consumer: StreamConsumer = ClientConfig::new()
-            .set("bootstrap.servers", &self.kafka.brokers)
+        // The runtime's properties first, then the stage's own, so a passthrough can
+        // still be overridden by the setting it would otherwise conflict with.
+        let mut client = self.client.clone();
+        client
             .set("group.id", &self.kafka.group)
             // A fresh group starts at the beginning rather than skipping the history it
             // was created to read.
             .set("auto.offset.reset", "earliest")
             // The commit point is this stage's decision, after a flush.
-            .set("enable.auto.commit", "false")
-            .create()
-            .context("create consumer")?;
+            .set("enable.auto.commit", "false");
+        let consumer: StreamConsumer = client.create().context("create consumer")?;
         consumer
             .subscribe(&[&self.kafka.input_topic])
             .context("subscribe to input topic")?;
 
-        let producer: BaseProducer = ClientConfig::new()
-            .set("bootstrap.servers", &self.kafka.brokers)
-            .create()
-            .context("create producer")?;
+        let producer: BaseProducer = self.client.create().context("create producer")?;
 
         let mut source = KafkaSource::new(consumer);
         let mut sink = KafkaSink::new(producer, output_topic.clone());
@@ -135,17 +135,21 @@ impl Decode {
 pub struct DecodeBuilder {
     kafka: KafkaConfig,
     batch: BatchConfig,
-    registrations: Vec<String>,
+    abi_dir: std::path::PathBuf,
+    client: ClientConfig,
 }
 
 impl DecodeBuilder {
     /// Starts a build against `kafka`.
     #[must_use]
     pub fn new(kafka: KafkaConfig) -> Self {
+        let mut client = ClientConfig::new();
+        client.set("bootstrap.servers", &kafka.brokers);
         Self {
             kafka,
             batch: BatchConfig::default(),
-            registrations: Vec::new(),
+            abi_dir: std::path::PathBuf::from(crate::config::DEFAULT_ABI_DIR),
+            client,
         }
     }
 
@@ -156,42 +160,47 @@ impl DecodeBuilder {
         self
     }
 
-    /// Registers one ABI, as `chain:address:abi.json`.
+    /// Sets the librdkafka properties every client this stage builds inherits.
     ///
-    /// # Errors
-    ///
-    /// Returns an error if the entry is malformed or the file cannot be loaded. A
-    /// silently skipped ABI would look exactly like a contract that emits no events.
-    pub fn abi(mut self, registration: impl Into<String>) -> Result<Self> {
-        self.registrations.push(registration.into());
-        Ok(self)
+    /// The runtime's passthrough lands here, so a property set once reaches both the
+    /// producer and the consumer.
+    #[must_use]
+    pub fn client(mut self, client: ClientConfig) -> Self {
+        self.client = client;
+        self
     }
 
-    /// Registers several ABIs, as `chain:address:abi.json` entries.
+    /// Sets the directory ABIs are discovered in.
     ///
-    /// # Errors
-    ///
-    /// As [`DecodeBuilder::abi`].
-    pub fn abis<I, S>(mut self, registrations: I) -> Result<Self>
-    where
-        I: IntoIterator<Item = S>,
-        S: Into<String>,
-    {
-        self.registrations
-            .extend(registrations.into_iter().map(Into::into));
-        Ok(self)
+    /// Every `{chain}.{address}.json` file in it is loaded, so adding a contract to the
+    /// decoder is dropping a file in — there is no list to keep in step with the
+    /// directory.
+    #[must_use]
+    pub fn abi_dir(mut self, directory: impl Into<std::path::PathBuf>) -> Self {
+        self.abi_dir = directory.into();
+        self
     }
 
-    /// Finishes the build, loading every registered ABI.
+    /// Finishes the build, discovering every ABI in the directory.
     ///
     /// # Errors
     ///
-    /// Returns an error if a registration is malformed or an ABI cannot be loaded, and
-    /// when the Kafka configuration has no output topic.
+    /// Returns an error when a file in the directory is not `{chain}.{address}.json`,
+    /// when its address does not parse, or when its contents are not an ABI, and when
+    /// the Kafka configuration has no output topic.
     pub fn build(self) -> Result<Decode> {
-        let registry = FileRegistry::load(&self.registrations)?;
+        let registry = FileRegistry::from_dir(&self.abi_dir)?;
         if registry.is_empty() {
-            warn!("no ABIs registered; every log will pass through undecoded");
+            warn!(
+                directory = %self.abi_dir.display(),
+                "no ABIs found; every log will pass through undecoded"
+            );
+        } else {
+            info!(
+                directory = %self.abi_dir.display(),
+                abis = registry.len(),
+                "discovered ABIs"
+            );
         }
         if self.kafka.output_topic.is_none() {
             anyhow::bail!("decode kafka output_topic is required");
@@ -200,6 +209,7 @@ impl DecodeBuilder {
             kafka: self.kafka,
             batch: self.batch,
             registry,
+            client: self.client,
         })
     }
 }

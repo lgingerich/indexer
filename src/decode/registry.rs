@@ -240,57 +240,125 @@ pub enum RegistryError {
         /// The entry as written.
         entry: String,
     },
+    /// An ABI file's name did not say what it decodes.
+    #[error(
+        "ABI file {name:?} is not {{chain}}.{{address}}.json, so nothing says which \
+         contract it applies to"
+    )]
+    AbiName {
+        /// The offending file name.
+        name: String,
+    },
+    /// The ABI directory could not be read.
+    #[error("cannot read ABI directory {path}: {detail}")]
+    AbiDirectory {
+        /// The directory.
+        path: String,
+        /// The underlying error.
+        detail: String,
+    },
 }
 
-/// A registry built from `chain:address:abi.json` entries on disk.
+/// A registry built from every ABI in a directory.
 ///
-/// One ABI per `(chain, address)`, applying at every height. That is the honest
-/// limitation of a file-backed registry and it is stated rather than hidden: a proxy
-/// that upgrades changes its ABI at a height, and this cannot express that. The
-/// [`AbiRegistry`] seam is what a table-backed registry replaces, without the decoder
-/// changing.
+/// An ABI file is named for what it decodes: `{chain}.{address}.json`. So
+/// `base.0xd0b53d9277642d899df5c87a3966a349a798f224.json` is the Base ABI for that
+/// contract. The directory is scanned at startup and no list is configured, which is
+/// what makes adding a contract a matter of dropping a file in.
 ///
-/// The key is the typed [`Address`], not its rendering. An address has several
-/// spellings — lowercase, checksummed — and comparing strings would silently miss a
-/// lookup when one side happened to be checksummed and the other not. That is not
-/// hypothetical: it made every log pass through undecoded until it was fixed, because
-/// the config held a lowercase address and the wire carried a checksummed one.
+/// # Why the name carries the tag
+///
+/// An ABI does not say which chain or contract it belongs to — the file is just the JSON
+/// `cast interface --json` or Etherscan produces, byte for byte. The tag has to live
+/// somewhere, and the name is the one place that needs no wrapper, so an ABI is never
+/// edited to be registered.
+///
+/// It also means a mis-tagged ABI is a *startup* error rather than a runtime surprise. A
+/// wrong ABI decodes a log into plausible values, which is worse than failing, so the
+/// filename is parsed strictly and a file that does not match is refused.
+///
+/// # Known limitation
+///
+/// One ABI per `(chain, address)`, applying at every height. A proxy that upgrades
+/// changes its ABI at a height, and this cannot express that. The [`AbiRegistry`] seam is
+/// what a table-backed registry — keyed by `(chain, address, block_range)` — replaces
+/// without the decoder changing.
+///
+/// # Address spelling
+///
+/// The key is the typed [`Address`], not its rendering, so the checksummed
+/// capitalization in a filename does not matter: an address has several spellings, and
+/// comparing strings silently missed every lookup until this was a typed key.
 #[derive(Debug, Default)]
 pub struct FileRegistry {
     entries: HashMap<(ChainId, Address), Abi>,
 }
 
 impl FileRegistry {
-    /// Loads every registration, failing on a malformed one rather than skipping it.
+    /// Scans `directory` for `{chain}.{address}.json` ABIs.
     ///
-    /// A silently skipped ABI would mean logs quietly not decoding, which looks
-    /// identical to a contract having no events.
+    /// A missing directory yields an empty registry rather than an error, because
+    /// running without decoding is legitimate: the logs pass through undecoded, and the
+    /// caller says so at startup.
     ///
     /// # Errors
     ///
-    /// Returns an error when an entry is not `chain:address:path`, when its address does
-    /// not parse, or when its ABI cannot be read or loaded.
-    pub fn load(registrations: &[String]) -> Result<Self, RegistryError> {
-        let mut entries = HashMap::new();
-        for entry in registrations {
-            let mut parts = entry.splitn(3, ':');
-            let (Some(chain), Some(address), Some(path)) =
-                (parts.next(), parts.next(), parts.next())
-            else {
-                return Err(RegistryError::Registration {
-                    entry: entry.clone(),
+    /// Returns an error when a file's name is not `{chain}.{address}.json`, when its
+    /// address does not parse, or when its contents are not an ABI. None of those are
+    /// skipped: a file in the ABI directory that cannot be used is a mistake worth
+    /// reporting, not a log worth quietly not decoding.
+    pub fn from_dir(directory: impl AsRef<std::path::Path>) -> Result<Self, RegistryError> {
+        let directory = directory.as_ref();
+        let entries = match std::fs::read_dir(directory) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(Self::default());
+            }
+            Err(error) => {
+                return Err(RegistryError::AbiDirectory {
+                    path: directory.display().to_string(),
+                    detail: error.to_string(),
                 });
-            };
-            let address: Address = address.parse().map_err(|_| RegistryError::Address {
-                entry: entry.clone(),
-            })?;
-            let json = std::fs::read_to_string(path).map_err(|error| RegistryError::Abi {
-                detail: format!("read {path}: {error}"),
-            })?;
-            let abi = Abi::from_json(&json)?;
-            entries.insert((ChainId::new(chain), address), abi);
+            }
+        };
+
+        let mut registry = Self::default();
+        for entry in entries {
+            let path = entry
+                .map_err(|error| RegistryError::AbiDirectory {
+                    path: directory.display().to_string(),
+                    detail: error.to_string(),
+                })?
+                .path();
+            // Only `.json`, so a README or an editor's backup in the directory is not
+            // mistaken for a misnamed ABI.
+            if path.extension().is_none_or(|ext| ext != "json") {
+                continue;
+            }
+            registry.load_one(&path)?;
         }
-        Ok(Self { entries })
+        Ok(registry)
+    }
+
+    /// Loads one ABI from its path, taking the chain and address from the filename.
+    fn load_one(&mut self, path: &std::path::Path) -> Result<(), RegistryError> {
+        let named = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default()
+            .to_owned();
+        let (chain, address) = parse_abi_name(&named).ok_or_else(|| RegistryError::AbiName {
+            name: named.clone(),
+        })?;
+        let address: Address = address.parse().map_err(|_| RegistryError::Address {
+            entry: named.clone(),
+        })?;
+        let json = std::fs::read_to_string(path).map_err(|error| RegistryError::Abi {
+            detail: format!("read {}: {error}", path.display()),
+        })?;
+        let abi = Abi::from_json(&json)?;
+        self.entries.insert((ChainId::new(chain), address), abi);
+        Ok(())
     }
 
     /// Whether any ABI is registered.
@@ -298,6 +366,37 @@ impl FileRegistry {
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
+
+    /// How many ABIs are registered, for logging what was picked up.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// The `(chain, address)` pairs this registry answers for.
+    pub fn entries(&self) -> impl Iterator<Item = (&ChainId, Address)> {
+        self.entries
+            .keys()
+            .map(|(chain, address)| (chain, *address))
+    }
+}
+
+/// Splits a `{chain}.{address}.json` filename into its chain and address.
+///
+/// Returns `None` for anything else. The address must contain a `0x` prefix, which is
+/// what keeps a chain name containing a dot — and there are such chains — from being
+/// split in the wrong place.
+fn parse_abi_name(name: &str) -> Option<(&str, &str)> {
+    let stem = name.strip_suffix(".json")?;
+    // The address is the part from the last `0x`; the chain is everything before the dot
+    // that precedes it.
+    let address_at = stem.rfind("0x")?;
+    let (chain, address) = stem.split_at(address_at);
+    let chain = chain.strip_suffix('.')?;
+    if chain.is_empty() || !address.starts_with("0x") {
+        return None;
+    }
+    Some((chain, address))
 }
 
 impl AbiRegistry for FileRegistry {
@@ -316,7 +415,7 @@ mod tests {
 
     use alloy_primitives::{Address, B256, I256, TxHash, U256};
 
-    use super::{Abi, AbiRegistry, RawLog, RegistryError};
+    use super::{Abi, AbiRegistry, FileRegistry, RawLog, RegistryError, parse_abi_name};
     use crate::wire::envelope::{ChainId, DecodedArg};
     use crate::wire::typed::TypedValue;
 
@@ -489,9 +588,10 @@ mod tests {
     /// silently widened.
     #[test]
     fn a_real_uniswap_v3_swap_log_decodes_with_signed_amounts() {
-        let abi =
-            Abi::from_json(include_str!("abi/uniswap_v3_pool.json")).expect("the pool ABI loads");
-
+        let abi = Abi::from_json(include_str!(
+            "../../abis/base.0xd0b53D9277642d899DF5C87A3966A349A798F224.json"
+        ))
+        .expect("the pool ABI loads");
         let topic0: B256 = "0xc42079f94a6350d7e6235f29174924f928cc2ac818eb64fed8004e115fbcca67"
             .parse()
             .expect("selector parses");
@@ -615,5 +715,85 @@ mod tests {
         assert!(registry.abi(&base, address(0xaa), 100).is_some());
         assert!(registry.abi(&base, address(0xbb), 100).is_none());
         assert!(registry.abi(&other, address(0xaa), 100).is_none());
+    }
+
+    /// An ABI file is named for what it decodes, and a chain name containing a dot must
+    /// not be split at the wrong one.
+    #[test]
+    fn an_abi_filename_yields_its_chain_and_address() {
+        assert_eq!(
+            parse_abi_name("base.0xd0b53d9277642d899df5c87a3966a349a798f224.json"),
+            Some(("base", "0xd0b53d9277642d899df5c87a3966a349a798f224"))
+        );
+        // A dotted chain name still splits at the address, which is why the parse looks
+        // for the last `0x` rather than the first dot.
+        assert_eq!(
+            parse_abi_name("arbitrum.nova.0x1111111111111111111111111111111111111111.json"),
+            Some((
+                "arbitrum.nova",
+                "0x1111111111111111111111111111111111111111"
+            ))
+        );
+    }
+
+    /// A file in the ABI directory that does not say what it decodes is refused rather
+    /// than skipped. A wrong ABI produces plausible values, which is worse than not
+    /// decoding, so a misnamed file must be a startup error.
+    #[test]
+    fn a_misnamed_abi_file_is_refused() {
+        assert_eq!(parse_abi_name("uniswap_v3_pool.json"), None);
+        assert_eq!(parse_abi_name("base.json"), None);
+        assert_eq!(
+            parse_abi_name("base.0xnothex.json"),
+            Some(("base", "0xnothex"))
+        );
+        assert_eq!(parse_abi_name("base.0xabc.txt"), None);
+        assert_eq!(parse_abi_name(".0xabc.json"), None);
+        assert_eq!(parse_abi_name("base.abc.json"), None);
+    }
+
+    /// Discovery loads every tagged ABI in a directory, so adding a contract is dropping
+    /// a file in rather than editing a list.
+    #[test]
+    fn a_directory_is_discovered_without_a_list() {
+        let dir = std::env::temp_dir().join(format!("abi-dir-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        // Two ABIs for one contract on two chains, plus a non-JSON file that must be
+        // ignored rather than treated as a misnamed ABI.
+        std::fs::write(
+            dir.join("base.0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.json"),
+            ERC20,
+        )
+        .expect("write base ABI");
+        std::fs::write(
+            dir.join("ethereum.0xAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA.json"),
+            ERC20,
+        )
+        .expect("write ethereum ABI");
+        std::fs::write(dir.join("README.md"), "not an abi").expect("write readme");
+
+        let registry = FileRegistry::from_dir(&dir).expect("the directory is discovered");
+        assert_eq!(registry.len(), 2);
+        // The checksummed spelling in the second filename resolves to the same address
+        // as the lowercase one, because the key is the typed address.
+        assert!(
+            registry
+                .abi(&ChainId::new("base"), address(0xaa), 1)
+                .is_some()
+        );
+        assert!(
+            registry
+                .abi(&ChainId::new("ethereum"), address(0xaa), 1)
+                .is_some()
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A missing directory is an empty registry, not an error: running without decoding
+    /// is legitimate, and the caller says so at startup.
+    #[test]
+    fn a_missing_directory_is_an_empty_registry() {
+        let registry = FileRegistry::from_dir("/nonexistent/abi/dir").expect("missing is empty");
+        assert!(registry.is_empty());
     }
 }

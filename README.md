@@ -142,7 +142,7 @@ the field:
 | `kafka.batch_ms` | `1000` | Time bound on a batch |
 | `storage.database` | `indexer.duckdb` | Path to the store |
 | `storage.drain_secs` | unset | Stop a topic after this idle. **Omit for a live indexer** |
-| `storage.abis` | `[]` | `chain:address:path`, one ABI each |
+| `storage.abi_dir` | `abis` | Directory ABIs are discovered in |
 
 Omit `[ingest]` entirely to run decode and storage against a topic filled elsewhere.
 `RUST_LOG` is still read from the environment, because a log filter is not deployment
@@ -151,9 +151,46 @@ configuration.
 An unknown key is a startup error naming the line and the key, so a misspelling is
 caught rather than silently leaving a setting at its default.
 
-`storage.abis` applies one ABI per address at every height, which is the honest
-limitation of a file-backed registry: a proxy that upgrades changes its ABI at a
-height, and that needs a table-backed registry behind the same seam.
+### ABIs
+
+Drop a file in `abis/` named for what it decodes:
+
+```
+abis/base.0xd0b53D9277642d899DF5C87A3966A349A798F224.json
+     └ chain  └ contract address
+```
+
+No list to keep in step with the directory — adding a contract is adding a file. The
+contents are the ABI as `cast interface --json` or Etherscan produces it, byte for byte;
+the tag lives in the name because an ABI does not say which contract it belongs to.
+
+A file that does not match the name, or holds something that is not an ABI, is an error
+at startup rather than a log quietly not decoding. That matters because a *wrong* ABI
+decodes into plausible values, which is worse than failing.
+
+One ABI per address applies at every height. A proxy that upgrades changes its ABI at a
+height, which this cannot express — the `AbiRegistry` seam is what a table-backed
+registry keyed by `(chain, address, block_range)` replaces.
+
+### Other client settings
+
+Both clients take settings this file does not restate, passed straight through and
+validated by the engine:
+
+```toml
+[kafka.properties]
+"compression.codec" = "gzip"   # quote keys: most contain dots
+"fetch.max.bytes" = "1048576"
+
+[storage.duckdb]
+threads = "4"
+max_memory = "1GB"
+```
+
+Anything unrecognized is an error from librdkafka or DuckDB naming the property, so a
+typo is caught at startup rather than silently ignored. `kafka.properties` applies to
+every client the process builds, so a property that means different things to a producer
+and a consumer — `auto.offset.reset` is the usual one — is better left out.
 
 Storage uses one consumer group per topic, named `<group>-<topic>`, because an offset
 is per group: one group spanning two topics would commit a single position across both.

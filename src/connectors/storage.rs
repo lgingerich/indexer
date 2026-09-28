@@ -12,12 +12,13 @@
 //! orders it, `decode` reads ABI-encoded logs — and this holds none: it wires a
 //! [`KafkaSource`] to a [`DuckDbSink`], both defined here, and drains.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 use tokio::time::error::Elapsed;
 
 use anyhow::{Context as _, Result};
-use duckdb::Connection;
+use duckdb::{Config, Connection};
 use rdkafka::ClientConfig;
 use rdkafka::consumer::{Consumer as _, StreamConsumer};
 use tracing::info;
@@ -85,6 +86,10 @@ pub struct Storage {
     topics: Vec<String>,
     database: PathBuf,
     drain: Option<Duration>,
+    /// The runtime's librdkafka properties, applied to every consumer built here.
+    client: ClientConfig,
+    /// Extra `DuckDB` settings, passed straight to `Config::with`.
+    duckdb: BTreeMap<String, String>,
 }
 
 impl Storage {
@@ -105,7 +110,16 @@ impl Storage {
     /// or a row cannot be written. An idle topic is not an error, and is not confused
     /// with a failed one: see the loop below.
     pub async fn run(self) -> Result<()> {
-        let connection = Connection::open(&self.database)
+        // Any `[storage.duckdb]` setting reaches the engine, which validates it: an
+        // unknown key is an error naming the setting rather than a silent no-op. The
+        // path is set last, since it is not a setting the operator should override here.
+        let mut config = Config::default();
+        for (key, value) in &self.duckdb {
+            config = config
+                .with(key, value)
+                .with_context(|| format!("duckdb setting {key:?} was rejected"))?;
+        }
+        let connection = Connection::open_with_flags(&self.database, config)
             .with_context(|| format!("open store at {}", self.database.display()))?;
         let mut sink = DuckDbSink::new(connection)?;
 
@@ -119,14 +133,14 @@ impl Storage {
         let mut stored = 0_u64;
         for topic in &self.topics {
             // Named for the topic, so committing one topic's position cannot move
-            // another's.
-            let consumer: StreamConsumer = ClientConfig::new()
-                .set("bootstrap.servers", &self.kafka.brokers)
+            // another's. The runtime's properties come first and the stage's own after,
+            // so a passthrough cannot override a setting the stage depends on.
+            let mut client = self.client.clone();
+            client
                 .set("group.id", format!("{}-{topic}", self.kafka.group))
                 .set("auto.offset.reset", "earliest")
-                .set("enable.auto.commit", "false")
-                .create()
-                .context("create consumer")?;
+                .set("enable.auto.commit", "false");
+            let consumer: StreamConsumer = client.create().context("create consumer")?;
             consumer
                 .subscribe(&[topic])
                 .with_context(|| format!("subscribe to {topic}"))?;
@@ -193,21 +207,29 @@ pub struct StorageBuilder {
     topics: Vec<String>,
     database: PathBuf,
     drain: Option<Duration>,
+    /// The runtime's librdkafka properties, applied to every consumer built here.
+    client: ClientConfig,
+    /// Extra `DuckDB` settings, passed straight to `Config::with`.
+    duckdb: BTreeMap<String, String>,
 }
 
 impl StorageBuilder {
     /// Starts a build against `kafka`.
     #[must_use]
     pub fn new(kafka: KafkaConfig) -> Self {
+        let mut client = ClientConfig::new();
+        client.set("bootstrap.servers", &kafka.brokers);
         Self {
             kafka,
             batch: BatchConfig::default(),
             topics: Vec::new(),
-            database: PathBuf::from("indexer.duckdb"),
+            database: PathBuf::from(crate::config::DEFAULT_DATABASE),
             // No drain bound by default, because the default must suit a live stream:
             // a stage that stops whenever a topic goes quiet for a few seconds would
             // take the process down with it. A bounded run opts in explicitly.
             drain: None,
+            client,
+            duckdb: BTreeMap::new(),
         }
     }
 
@@ -226,6 +248,20 @@ impl StorageBuilder {
         S: Into<String>,
     {
         self.topics.extend(topics.into_iter().map(Into::into));
+        self
+    }
+
+    /// Sets the librdkafka properties every consumer this stage builds inherits.
+    #[must_use]
+    pub fn client(mut self, client: ClientConfig) -> Self {
+        self.client = client;
+        self
+    }
+
+    /// Sets extra `DuckDB` settings, passed to the engine as written.
+    #[must_use]
+    pub fn duckdb(mut self, settings: BTreeMap<String, String>) -> Self {
+        self.duckdb = settings;
         self
     }
 
@@ -269,6 +305,8 @@ impl StorageBuilder {
             topics: self.topics,
             database: self.database,
             drain: self.drain,
+            client: self.client,
+            duckdb: self.duckdb,
         })
     }
 }

@@ -104,6 +104,25 @@ pub struct KafkaSettings {
     /// How long to wait before flushing a partial batch, in milliseconds.
     #[serde(default = "default_batch_ms")]
     pub batch_ms: u64,
+    /// Any other librdkafka property, passed straight through.
+    ///
+    /// librdkafka has well over a hundred properties — `security.protocol`, `sasl.*`,
+    /// `compression.type`, `message.timeout.ms`, `enable.idempotence` — and restating
+    /// them here would be a second, stale copy of its documentation. Anything set here
+    /// reaches [`rdkafka::ClientConfig::set`] on both the producer and the consumer, and
+    /// an unrecognized key is an error from librdkafka naming the property.
+    ///
+    /// These apply to every Kafka client the process builds, so a property that means
+    /// different things to a producer and a consumer — `auto.offset.reset` is the usual
+    /// one — is better left unset here than set globally.
+    ///
+    /// ```toml
+    /// [kafka.properties]
+    /// security.protocol = "SASL_SSL"
+    /// compression.type = "zstd"
+    /// ```
+    #[serde(default)]
+    pub properties: std::collections::BTreeMap<String, String>,
 }
 
 /// Where decoded records are stored, and what the decode stage decodes.
@@ -124,12 +143,27 @@ pub struct StorageSettings {
     /// run — a backfill, a test — not for a live indexer.
     #[serde(default)]
     pub drain_secs: Option<u64>,
-    /// ABIs to decode with, as `chain:address:abi.json`.
+    /// The directory ABIs are discovered in.
     ///
-    /// Empty means every log passes through undecoded, which is a legitimate way to run
-    /// and is said out loud at startup rather than being silent.
+    /// Every `{chain}.{address}.json` file in it is loaded, so adding a contract is
+    /// dropping a file in rather than editing this one. Absent means the default, and a
+    /// directory that does not exist means nothing is decoded — which is said at startup
+    /// rather than being silent.
+    #[serde(default = "default_abi_dir")]
+    pub abi_dir: PathBuf,
+    /// Any other `DuckDB` setting, passed straight through.
+    ///
+    /// `DuckDB` accepts dozens of settings and this file does not restate them. Anything
+    /// here reaches [`duckdb::Config::with`], which validates it, so a misspelled key is
+    /// an error from the engine naming the setting rather than a silent no-op.
+    ///
+    /// ```toml
+    /// [storage.duckdb]
+    /// threads = "4"
+    /// max_memory = "1GB"
+    /// ```
     #[serde(default)]
-    pub abis: Vec<String>,
+    pub duckdb: std::collections::BTreeMap<String, String>,
 }
 
 impl Default for StorageSettings {
@@ -139,7 +173,8 @@ impl Default for StorageSettings {
         Self {
             database: default_database(),
             drain_secs: None,
-            abis: Vec::new(),
+            abi_dir: default_abi_dir(),
+            duckdb: std::collections::BTreeMap::new(),
         }
     }
 }
@@ -187,6 +222,21 @@ impl Settings {
             .as_ref()
             .map_or(DEFAULT_RAW_TOPIC, |ingest| ingest.raw_topic.as_str())
     }
+
+    /// A librdkafka client config with the broker address and any passthrough applied.
+    ///
+    /// Both the producer and the consumer come from here, so a property set once in
+    /// `[kafka.properties]` reaches every client rather than being duplicated per stage.
+    #[cfg(feature = "kafka")]
+    #[must_use]
+    pub fn client_config(&self) -> rdkafka::ClientConfig {
+        let mut config = rdkafka::ClientConfig::new();
+        config.set("bootstrap.servers", &self.kafka.brokers);
+        for (key, value) in &self.kafka.properties {
+            config.set(key, value);
+        }
+        config
+    }
 }
 
 /// The default topic ingest publishes to, and decode consumes.
@@ -197,6 +247,9 @@ pub const DEFAULT_DECODED_TOPIC: &str = "decoded.chain";
 
 /// The default `DuckDB` path.
 pub const DEFAULT_DATABASE: &str = "indexer.duckdb";
+
+/// Where ABIs are discovered by default.
+pub const DEFAULT_ABI_DIR: &str = "abis";
 
 fn default_raw_topic() -> String {
     DEFAULT_RAW_TOPIC.to_owned()
@@ -220,6 +273,10 @@ const fn default_batch_ms() -> u64 {
 
 fn default_database() -> PathBuf {
     PathBuf::from(DEFAULT_DATABASE)
+}
+
+fn default_abi_dir() -> PathBuf {
+    PathBuf::from(DEFAULT_ABI_DIR)
 }
 
 /// Where a Kafka-protocol client connects, and which topics it uses.
@@ -388,7 +445,10 @@ brokers = "localhost:9092"
             settings.storage.database,
             std::path::PathBuf::from(DEFAULT_DATABASE)
         );
-        assert!(settings.storage.abis.is_empty());
+        assert_eq!(
+            settings.storage.abi_dir,
+            std::path::PathBuf::from(super::DEFAULT_ABI_DIR)
+        );
         assert_eq!(
             settings.drain(),
             None,
@@ -486,7 +546,7 @@ batch_ms = 250
 [storage]
 database = "/tmp/custom.duckdb"
 drain_secs = 3
-abis = ["base:0xd0b53D9277642d899DF5C87A3966A349A798F224:abi.json"]
+abi_dir = "custom-abis"
 "#,
         )
         .expect("settings parse");
@@ -503,6 +563,9 @@ abis = ["base:0xd0b53D9277642d899DF5C87A3966A349A798F224:abi.json"]
             std::path::PathBuf::from("/tmp/custom.duckdb")
         );
         assert_eq!(settings.drain(), Some(Duration::from_secs(3)));
-        assert_eq!(settings.storage.abis.len(), 1);
+        assert_eq!(
+            settings.storage.abi_dir,
+            std::path::PathBuf::from("custom-abis")
+        );
     }
 }

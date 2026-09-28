@@ -77,8 +77,10 @@ impl AbiRegistry for FixedRegistry {
 
 fn main() -> ExitCode {
     let address: Address = POOL.parse().expect("the pool address parses");
-    let abi = Abi::from_json(include_str!("../src/decode/abi/uniswap_v3_pool.json"))
-        .expect("the pool ABI loads");
+    let abi = Abi::from_json(include_str!(
+        "../abis/base.0xd0b53D9277642d899DF5C87A3966A349A798F224.json"
+    ))
+    .expect("the pool ABI loads");
     let transform = Transform::new(FixedRegistry {
         chain: ChainId::new(CHAIN),
         address,
