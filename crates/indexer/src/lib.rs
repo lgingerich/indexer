@@ -2,7 +2,7 @@
 //!
 //! The crate ingests blocks from the live chain tip and publishes ordered,
 //! finality-tagged events. Chain-specific knowledge is isolated behind
-//! [`source::BlockSource`], and egress is isolated behind [`sink::EventSink`], so
+//! [`source::BlockSource`], and egress is isolated behind [`connectors::EventSink`], so
 //! new chains and new brokers are additions rather than rewrites.
 //!
 //! The published shape lives in the [`wire`] crate rather than here: it is the
@@ -19,10 +19,10 @@
 //!   over JSON-RPC (see [`source::EvmSource`]).
 //! - Per-chain sequence numbering, finality tagging, and reorg retraction with a
 //!   bounded undo ring (see [`pipeline::Pipeline`]).
-//! - Newline-delimited JSON to standard output (see [`sink::StdoutJsonSink`]).
+//! - Newline-delimited JSON to standard output (see [`connectors::StdoutJsonSink`]).
 //! - A Kafka-protocol egress sink on `librdkafka`, behind the `kafka` feature
-//!   (`sink::kafka`).
-//! - A local `DuckDB` store, behind the `duckdb` feature (`sink::duckdb`).
+//!   (`connectors::kafka`).
+//! - A local `DuckDB` store, behind the `duckdb` feature (`connectors::duckdb`).
 //!
 //! Both optional sinks are off by default so a plain `cargo build` neither
 //! compiles C `librdkafka` nor the `DuckDB` C++ engine. Enable them with

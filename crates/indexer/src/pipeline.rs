@@ -38,7 +38,7 @@ use anyhow::bail;
 use futures_util::StreamExt as _;
 use tracing::{error, info, warn};
 
-use sink::EventSink;
+use connectors::EventSink;
 use wire::envelope::{Envelope, Event, Finalized, Reorg};
 
 use crate::source::{BlockId, BlockSource, FetchedBlock};
@@ -381,7 +381,7 @@ mod tests {
     use super::{Mode, Pipeline};
     use wire::envelope::{Block, ChainId, Envelope, Event, Log};
 
-    use sink::EventSink;
+    use connectors::EventSink;
 
     use crate::source::{BlockId, BlockSource, FetchedBlock, HeadStream, SourceError};
 

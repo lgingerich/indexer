@@ -1,10 +1,10 @@
 [workspace]
 resolver = "3"
 members = [
+    "crates/connectors",
     "crates/decode",
     "crates/indexer",
     "crates/materialize",
-    "crates/sink",
     "crates/wire",
 ]
 
@@ -33,7 +33,7 @@ duckdb = { version = "1.10505.0", default-features = false, features = ["bundled
 futures-util = "0.3.34"
 # rdkafka wraps C librdkafka, which `rdkafka-sys` compiles with `cc` (no cmake
 # needed; the version is vendored). It carries the workspace's one C build
-# dependency, so it is optional behind the `kafka` feature — see `sink::kafka`.
+# dependency, so it is optional behind the `kafka` feature — see `connectors::kafka`.
 rdkafka = "0.39.0"
 # native-tls keeps TLS on the platform (Security.framework on macOS, OpenSSL on
 # Linux) so TLS adds no bundled C toolchain of its own.

@@ -1187,6 +1187,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "connectors"
+version = "0.1.0"
+dependencies = [
+ "alloy-primitives",
+ "anyhow",
+ "duckdb",
+ "rdkafka",
+ "serde_json",
+ "tokio",
+ "wire",
+]
+
+[[package]]
 name = "const-hex"
 version = "1.19.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1460,9 +1473,9 @@ dependencies = [
  "alloy-json-abi",
  "alloy-primitives",
  "anyhow",
+ "connectors",
  "rdkafka",
  "serde_json",
- "sink",
  "thiserror",
  "tokio",
  "tracing",
@@ -2397,11 +2410,11 @@ dependencies = [
  "alloy-rpc-types-eth",
  "alloy-serde",
  "anyhow",
+ "connectors",
  "futures-util",
  "reqwest",
  "serde",
  "serde_json",
- "sink",
  "thiserror",
  "tokio",
  "tokio-tungstenite",
@@ -3867,19 +3880,6 @@ name = "simd-adler32"
 version = "0.3.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3a219298ac11a56ea9a6d2120044824d6f01aeb034955e7af7bc16858527deea"
-
-[[package]]
-name = "sink"
-version = "0.1.0"
-dependencies = [
- "alloy-primitives",
- "anyhow",
- "duckdb",
- "rdkafka",
- "serde_json",
- "tokio",
- "wire",
-]
 
 [[package]]
 name = "slab"

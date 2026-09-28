@@ -28,12 +28,12 @@ use std::time::{Duration, Instant};
 
 use alloy_primitives::Address;
 use anyhow::{Context as _, Result};
+use connectors::{EnvelopeSource as _, EventSink as _, KafkaSink, KafkaSource};
 use decode::Transform;
 use decode::registry::{Abi, AbiRegistry};
 use rdkafka::ClientConfig;
 use rdkafka::consumer::{Consumer as _, StreamConsumer};
 use rdkafka::producer::BaseProducer;
-use sink::{EnvelopeSource as _, EventSink as _, KafkaSink, KafkaSource};
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 use wire::envelope::ChainId;

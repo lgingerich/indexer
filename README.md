@@ -17,7 +17,7 @@ rather than by convention.
 ```
 crates/
 ├── wire/         the wire contract: envelope, events, dataset records. Pure data.
-├── sink/         egress: the EventSink trait and the concrete sinks.
+├── connectors/   the bus boundary: EventSink, EnvelopeSource, and the connectors.
 ├── indexer/      ingestion: block sources, the reorg-aware pipeline, bin `ingest`.
 ├── decode/       the stateless ABI decode transform, bin `decode`.
 └── materialize/  decoded events into typed tables, in two layers.
@@ -69,20 +69,21 @@ apart is what lets decode stay stateless and replayable.
   reclaims the sequence numbers those blocks had used. The undo window is bounded
   (128 blocks by default, and finalized blocks are dropped first). See
   `crates/indexer/src/pipeline.rs`.
-- **NDJSON to stdout.** See `crates/sink/src/stdout.rs`.
-- **A Kafka-protocol broker sink**, behind the `kafka` feature, keyed by chain so a
-  chain's stream keeps its `sequence` order on one partition.
+- **NDJSON to stdout.** See `crates/connectors/src/stdout.rs`.
+- **Kafka-protocol connectors** both ways, behind the `kafka` feature: a sink keyed by
+  chain so a chain's stream keeps its `sequence` order on one partition, and a source
+  that yields the same envelopes back.
 - **A local `DuckDB` store**, behind the `duckdb` feature. Embedded and
   single-writer, so it is an archive/analytics endpoint, not the fan-out.
 
-Both optional sinks are off by default so a plain `cargo build` compiles neither C
+Both optional connectors are off by default so a plain `cargo build` compiles neither C
 `librdkafka` nor the `DuckDB` C++ engine; enable them with `--features kafka,duckdb`.
 
 ## Not built yet
 
 Backfill-to-live handoff, checkpoint resume, mempool, filtered
-subscriptions, derived state (balances/nonces), the broker source and sink that
-drive the decode stage, and the Parquet/GCS archiver. The
+subscriptions, derived state (balances/nonces), the stream-processing layer, and the
+Parquet/GCS archiver. The
 crate is a walking skeleton: it indexes forward from
 whatever the chain does next and does not fill gaps that predate startup.
 
@@ -168,8 +169,8 @@ is pinned by tests in `crates/wire/src/envelope.rs`: `every_variant_round_trips_
 covers every event kind, `the_wire_object_carries_only_the_envelope_and_event_fields`
 pins the exact key set, and
 `the_schema_version_is_stamped_and_old_lines_still_parse` pins both the `v` stamp and
-backward compatibility with a line written before the field existed. Every sink
-renders through one encoder, `sink::encode`, so stdout, the broker, and the local
+backward compatibility with a line written before the field existed. Every connector
+renders through the same encoding, so stdout, the broker, and the local
 store cannot drift apart. A chain whose
 identity does not fit that shape — Solana's base58 blockhash and 64-byte signature
 are the expected case — gets its own module beside `src/datasets/evm.rs` plus a

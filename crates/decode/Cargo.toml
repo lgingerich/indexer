@@ -17,7 +17,7 @@ default = []
 # The broker source and sink the `decode` binary drives. Off by default so a plain
 # `cargo build` does not compile C `librdkafka`; the library and its tests need no
 # broker at all.
-kafka = ["dep:rdkafka", "sink/kafka"]
+kafka = ["dep:rdkafka", "connectors/kafka"]
 
 [lints]
 workspace = true
@@ -32,7 +32,7 @@ alloy-primitives = { workspace = true }
 anyhow = { workspace = true }
 rdkafka = { workspace = true, optional = true }
 serde_json = { workspace = true }
-sink = { path = "../sink" }
+connectors = { path = "../connectors" }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }

@@ -13,8 +13,8 @@ path = "src/main.rs"
 
 [features]
 default = ["kafka", "duckdb"]
-kafka = ["sink/kafka"]
-duckdb = ["sink/duckdb"]
+kafka = ["connectors/kafka"]
+duckdb = ["connectors/duckdb"]
 
 [lints]
 workspace = true
@@ -31,7 +31,7 @@ futures-util = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-sink = { path = "../sink" }
+connectors = { path = "../connectors" }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tokio-tungstenite = { workspace = true }

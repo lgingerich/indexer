@@ -1,9 +1,9 @@
 [package]
-name = "sink"
+name = "connectors"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.95.0"
-description = "The indexer's egress boundary: the sink trait and the concrete sinks."
+description = "The indexer's bus boundary: the sink and source traits, and the concrete connectors."
 license = "MIT OR Apache-2.0"
 publish = false
 
@@ -12,7 +12,7 @@ workspace = true
 
 [features]
 default = []
-# Kafka-protocol egress (`kafka`) on bundled librdkafka. Off by default so the C
+# Kafka-protocol connectors (`kafka`) on bundled librdkafka. Off by default so the C
 # build dependency stays out of a plain `cargo build`.
 kafka = ["dep:rdkafka"]
 # Local `DuckDB` store (`duckdb`). Off by default so the one-time C++ engine build

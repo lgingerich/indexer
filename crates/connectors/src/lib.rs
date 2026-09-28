@@ -18,16 +18,12 @@
 pub mod duckdb;
 #[cfg(feature = "kafka")]
 pub mod kafka;
-#[cfg(feature = "kafka")]
-pub mod kafka_source;
 pub mod stdout;
 
 #[cfg(feature = "duckdb")]
 pub use duckdb::DuckDbSink;
 #[cfg(feature = "kafka")]
-pub use kafka::KafkaSink;
-#[cfg(feature = "kafka")]
-pub use kafka_source::KafkaSource;
+pub use kafka::{KafkaSink, KafkaSource};
 pub use stdout::StdoutJsonSink;
 
 use wire::envelope::Envelope;

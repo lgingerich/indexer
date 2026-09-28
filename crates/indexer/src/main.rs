@@ -7,9 +7,9 @@
 use std::process::ExitCode;
 
 use anyhow::{Context as _, Result};
+use connectors::StdoutJsonSink;
 use indexer::pipeline::Pipeline;
 use indexer::source::EvmSource;
-use sink::StdoutJsonSink;
 use tracing::error;
 use tracing_subscriber::EnvFilter;
 
