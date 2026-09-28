@@ -2,8 +2,8 @@
 //!
 //! One crate, one binary, four layers, each a module: the chain data goes in through
 //! [`ingest`], out to a bus through [`connectors`], is decoded against a contract ABI
-//! by [`decode`], and is persisted by [`storage`]. [`wire`] is the published shape all
-//! of them agree on.
+//! by [`decode`], and is persisted through [`connectors`]. [`wire`] is the published
+//! shape all of them agree on.
 //!
 //! # Why modules rather than crates
 //!
@@ -42,5 +42,4 @@ pub mod config;
 pub mod connectors;
 pub mod decode;
 pub mod ingest;
-pub mod storage;
 pub mod wire;

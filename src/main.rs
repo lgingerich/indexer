@@ -38,9 +38,9 @@ use tracing_subscriber::EnvFilter;
 
 use indexer::config::{BatchConfig, KafkaConfig};
 use indexer::connectors::StdoutJsonSink;
+use indexer::connectors::Storage;
 use indexer::decode::Decode;
 use indexer::ingest::Ingest;
-use indexer::storage::Storage;
 
 #[tokio::main]
 async fn main() -> ExitCode {

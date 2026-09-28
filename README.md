@@ -19,15 +19,19 @@ src/
 ├── main.rs         builds every stage from the environment and runs them together
 ├── config.rs       typed builders — stage configuration, not string lookups
 ├── wire/           the wire contract: envelope, events, dataset records. Pure data.
-├── connectors/     the bus and storage boundary: traits and concrete connectors.
+├── connectors/     the traits, the concrete connectors, and the storage runtime.
 ├── ingest/         block sources and the reorg-aware pipeline.
-├── decode/         the stateless ABI decode transform and its registry.
-└── storage/        draining topics into the local store.
+└── decode/         the stateless ABI decode transform and its registry.
 ```
 
 `wire` depends on `alloy` and `serde` and on nothing else in the tree. `decode`
 knows nothing about `ingest`, so it cannot reach into the pipeline's ordering and reorg
 state machine.
+
+`connectors` holds no domain logic: it is the traits, the transports, and the stages
+whose whole job is wiring — the storage drain lives there rather than in a module of its
+own, because it is the sink and the process that drives it, and it would be the only
+stage module with nothing of its own in it.
 
 The layers were separate crates, which enforced that direction with the compiler. They
 are modules now, so it is a convention a reviewer checks. The trade: breaking the
@@ -35,7 +39,7 @@ are modules now, so it is a convention a reviewer checks. The trade: breaking th
 bus into another — four manifests, feature forwarding between them, and a compiler
 guarantee worth about one edge. At this size, one owner reads all of it.
 
-The pipeline is `ingest` → `raw.chain` → `decode` → `decoded.chain` → `storage`.
+The pipeline is `ingest` → `raw.chain` → `decode` → `decoded.chain` → storage.
 Aggregation and windowing are not built.
 
 ## What works today

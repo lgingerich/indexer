@@ -15,10 +15,12 @@
 
 pub mod convert;
 pub mod registry;
+#[cfg(feature = "kafka")]
 pub mod stage;
 pub mod transform;
 
 pub use convert::ConversionError;
 pub use registry::{Abi, AbiRegistry, FileRegistry, RawLog, RegistryError};
+#[cfg(feature = "kafka")]
 pub use stage::Decode;
 pub use transform::Transform;

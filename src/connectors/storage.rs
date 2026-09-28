@@ -3,6 +3,11 @@
 //! One consumer group per topic, because an offset is per group: one group spanning two
 //! topics would commit a single position across both. An idle bound makes a bounded run
 //! terminate rather than block forever on a broker that has nothing more to give.
+//!
+//! This lives beside the sink it drives rather than in a module of its own. A stage
+//! module elsewhere in the tree holds domain logic — `ingest` decodes chain data and
+//! orders it, `decode` reads ABI-encoded logs — and this holds none: it wires a
+//! [`KafkaSource`] to a [`DuckDbSink`], both defined here, and drains.
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant};

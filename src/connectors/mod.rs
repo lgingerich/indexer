@@ -1,11 +1,12 @@
-//! The bus boundary: where events go, and where they come from.
+//! The bus and storage boundary: the traits, the connectors, and their runtimes.
 //!
 //! [`EventSink`] is the seam between publishing and the rest of the system, and
 //! [`EnvelopeSource`] is its mirror for a consumer. Both sit on the same bus, so a
 //! process that decodes is a consumer of one topic and a producer of another.
 //!
-//! Both speak [`Envelope`]. This crate also owns the store's runtime, because the sink
-//! and the process that drives it only make sense together.
+//! Both speak [`Envelope`]. This module also owns the store's runtime — [`Storage`] —
+//! because the sink and the process that drives it only make sense together, and the
+//! stage is nothing but wiring of connectors that live here.
 //!
 //! A sink is a dumb serializing boundary: it renders the [`Envelope`] as-is and knows
 //! nothing about chains. The schema version is a field on the envelope, not a property
@@ -14,7 +15,7 @@
 //!
 //! Sinks and sources do not own their transport. A runtime builds and tunes the engine
 //! client (a `librdkafka` producer or consumer, a `DuckDB` connection) and injects it,
-//! so the crate stays a library and the runtime owns connection pools, group ids,
+//! so the module stays a library and the runtime owns connection pools, group ids,
 //! timeouts, and callbacks.
 
 #[cfg(feature = "duckdb")]
@@ -22,12 +23,16 @@ pub mod duckdb;
 #[cfg(feature = "kafka")]
 pub mod kafka;
 pub mod stdout;
+#[cfg(all(feature = "kafka", feature = "duckdb"))]
+pub mod storage;
 
 #[cfg(feature = "duckdb")]
 pub use duckdb::DuckDbSink;
 #[cfg(feature = "kafka")]
 pub use kafka::{KafkaSink, KafkaSource};
 pub use stdout::StdoutJsonSink;
+#[cfg(all(feature = "kafka", feature = "duckdb"))]
+pub use storage::Storage;
 
 use crate::wire::envelope::Envelope;
 

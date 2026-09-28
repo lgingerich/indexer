@@ -8,13 +8,15 @@
 //! # Dependency direction
 //!
 //! This module may depend on [`crate::connectors`] and [`crate::wire`], and nothing
-//! else. In particular it knows nothing about [`crate::decode`] or [`crate::storage`]:
+//! else. In particular it knows nothing about [`crate::decode`]:
 //! what happens to an envelope after it is published is not ingestion's business.
 
 pub mod pipeline;
 pub mod source;
+#[cfg(feature = "kafka")]
 pub mod stage;
 
 pub use pipeline::Pipeline;
 pub use source::{BlockSource, EvmSource};
+#[cfg(feature = "kafka")]
 pub use stage::Ingest;

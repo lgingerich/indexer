@@ -12,6 +12,11 @@ license = "MIT OR Apache-2.0"
 [[bin]]
 name = "indexer"
 path = "src/main.rs"
+# The binary wires all three stages together, and two of them need a broker or a store.
+# Without the features there is nothing for it to run, so it is skipped rather than
+# failing the build — the same reason the stages were separate bins with
+# `required-features` before they were one.
+required-features = ["kafka", "duckdb"]
 
 [features]
 default = []
