@@ -6,11 +6,15 @@
 //!
 //! The client is [`rdkafka`](https://docs.rs/rdkafka), the maintained Rust binding
 //! to `librdkafka`. It is the production-grade choice: `librdkafka` owns the
-//! accumulator, batching, compression, retries, and idempotence, so the sink
-//! hands it one record and gets a delivery report. The cost is a C build
-//! dependency — `rdkafka-sys` compiles `librdkafka` with `cc` — which the crate
-//! otherwise avoids (see the `native-tls` note in `Cargo.toml`); the pure-Rust
-//! `rskafka` was rejected for a thinner producer.
+//! accumulator, batching, compression, retries, and idempotence.
+//!
+//! The sink takes a ready [`BaseProducer`] rather than building one, because the
+//! producer's settings *are* the runtime's policy — broker addresses, acks,
+//! compression, linger, SASL/TLS, the delivery callback. A library cannot guess
+//! them; the runtime creates the producer with whatever it needs and hands it in.
+//! The cost of that choice is the C build dependency (`rdkafka-sys` compiles
+//! `librdkafka` with `cc`), which the crate otherwise avoids (see the `native-tls`
+//! note in `Cargo.toml`).
 //!
 //! Two contracts are settled here, shared with the other sinks:
 //!
@@ -27,45 +31,36 @@
 //!   chain therefore lands on one partition, so a single chain's write throughput
 //!   is capped by that partition; shard by chain *and* height, or move to a log
 //!   with a total order, if that ceiling is ever hit.
+//!
+//! `publish` only enqueues — `BaseProducer::send` returns as soon as the record is
+//! in `librdkafka`'s accumulator, so the caller is never blocked on a delivery
+//! report. [`flush`](EventSink::flush) is the durability point and the drain.
+//! `ponytail:` delivery failures between flushes are reported by `librdkafka`'s
+//! own callback, not surfaced as a `Result` here; a delivery report carried back
+//! through [`EventSink`] is the upgrade path if a lost record must fail the
+//! pipeline.
 
 use std::time::Duration;
 
 use anyhow::Context as _;
-use rdkafka::ClientConfig;
-use rdkafka::producer::{FutureProducer, FutureRecord};
-use rdkafka::util::Timeout;
+use rdkafka::producer::{BaseProducer, BaseRecord, Producer as _};
 
 use crate::envelope::Envelope;
 use crate::sink::EventSink;
 
-/// How long to retry while the producer's queue is full before giving up.
+/// How long [`flush`](EventSink::flush) waits for the accumulator to drain.
 ///
-/// Only the enqueue phase: `message.timeout.ms` bounds the delivery itself.
-const QUEUE_TIMEOUT: Duration = Duration::from_secs(5);
+/// Not a config knob: a runtime that wants a different drain can call
+/// `Producer::flush` on its own producer after the pipeline stops.
+const FLUSH_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Where to reach the broker and what topic to produce to.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct KafkaConfig {
-    /// Comma-separated `host:port` bootstrap servers.
-    pub brokers: String,
-    /// The topic every chain's events are produced to.
-    pub topic: String,
-}
-
-impl KafkaConfig {
-    /// Builds a config from bootstrap servers and a topic.
-    #[must_use]
-    pub fn new(brokers: impl Into<String>, topic: impl Into<String>) -> Self {
-        Self {
-            brokers: brokers.into(),
-            topic: topic.into(),
-        }
-    }
-}
+/// How long to spend serving delivery callbacks per `publish`, and the enqueue
+/// timeout once the producer queue is full.
+const POLL_INTERVAL: Duration = Duration::from_millis(0);
 
 /// Produces envelopes to a Kafka-protocol topic.
 pub struct KafkaSink {
-    producer: FutureProducer,
+    producer: BaseProducer,
     topic: String,
 }
 
@@ -78,28 +73,17 @@ impl std::fmt::Debug for KafkaSink {
 }
 
 impl KafkaSink {
-    /// Creates the producer for `config`'s broker.
+    /// Wraps a producer the runtime already built and tuned.
     ///
-    /// `librdkafka` connects lazily and maintains the metadata, so this does not
-    /// round-trip to the broker; the first [`publish`](EventSink::publish)
-    /// surfaces an unreachable broker as an error.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the producer cannot be created, for example when a
-    /// config value is not one `librdkafka` accepts.
-    pub fn connect(config: &KafkaConfig) -> anyhow::Result<Self> {
-        let producer = ClientConfig::new()
-            .set("bootstrap.servers", &config.brokers)
-            // Bound delivery so a stuck broker fails the pipeline instead of
-            // buffering events without bound; this is the durability ceiling.
-            .set("message.timeout.ms", "30000")
-            .create()
-            .context("create producer")?;
-        Ok(Self {
+    /// The runtime owns the producer's settings: `bootstrap.servers`,
+    /// `message.timeout.ms`, compression, idempotence, SASL/TLS, and the delivery
+    /// callback all come from how it was created here.
+    #[must_use]
+    pub fn new(producer: BaseProducer, topic: impl Into<String>) -> Self {
+        Self {
             producer,
-            topic: config.topic.clone(),
-        })
+            topic: topic.into(),
+        }
     }
 
     /// The partition key for an envelope: its chain.
@@ -118,24 +102,30 @@ impl KafkaSink {
 }
 
 impl EventSink for KafkaSink {
-    async fn publish(&self, envelope: &Envelope) -> anyhow::Result<()> {
+    async fn publish(&mut self, envelope: &Envelope) -> anyhow::Result<()> {
+        // Serve any delivery callbacks that are ready first, so a stuck broker
+        // does not accumulate unpolled reports; `POLL_INTERVAL` of zero makes this
+        // a non-blocking poll.
+        self.producer.poll(POLL_INTERVAL);
         let payload = serde_json::to_string(envelope)?;
-        let record = FutureRecord::to(&self.topic)
+        let record = BaseRecord::to(&self.topic)
             .payload(payload.as_bytes())
             .key(Self::partition_key(envelope));
         self.producer
-            .send(record, Timeout::After(QUEUE_TIMEOUT))
-            .await
+            .send(record)
             .map_err(|(error, _message)| error)
-            .context("produce to broker")?;
-        Ok(())
+            .context("enqueue to broker")
+    }
+
+    async fn flush(&mut self) -> anyhow::Result<()> {
+        self.producer.flush(FLUSH_TIMEOUT).context("drain producer")
     }
 }
 
 #[cfg(test)]
 mod tests {
     use crate::envelope::{ChainId, Envelope, Event, Finalized};
-    use crate::sink::kafka::{KafkaConfig, KafkaSink};
+    use crate::sink::kafka::KafkaSink;
 
     fn envelope(chain: &str) -> Envelope {
         Envelope::new(
@@ -154,12 +144,5 @@ mod tests {
     fn partition_key_is_the_chain() {
         assert_eq!(KafkaSink::partition_key(&envelope("base")), "base");
         assert_eq!(KafkaSink::partition_key(&envelope("ethereum")), "ethereum");
-    }
-
-    #[test]
-    fn config_borrows_what_it_was_built_with() {
-        let config = KafkaConfig::new("redpanda:9092", "indexer.events");
-        assert_eq!(config.brokers, "redpanda:9092");
-        assert_eq!(config.topic, "indexer.events");
     }
 }

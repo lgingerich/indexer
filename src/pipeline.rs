@@ -5,7 +5,8 @@
 //! - A **source** knows one chain: how to hear about new heads, fetch a block, and
 //!   turn it into [`Event`]s. It holds no state about what was published.
 //! - A **sink** knows one destination: how to deliver an [`Envelope`] to a given
-//!   chain's stream. It knows nothing about ordering.
+//!   chain's stream. It knows nothing about ordering, and it buffers until
+//!   [`flush`](EventSink::flush), which the pipeline calls once per block.
 //! - The **pipeline** is the only stateful part. It drives the source, turns its
 //!   events into a single ordered stream, and hands each envelope to the sink.
 //!
@@ -232,6 +233,11 @@ impl<S: BlockSource, K: EventSink> Pipeline<S, K> {
         });
         self.trim_unless_recent(height);
         self.advance_finality(finalized).await?;
+        // One flush per block is the batch boundary: every event published above —
+        // a reorg marker, the block's events, and a finality watermark — becomes
+        // durable together, so a buffering sink opens its engine once per block
+        // instead of once per event.
+        self.sink.flush().await?;
         self.mode = Mode::Following;
 
         info!(
@@ -368,8 +374,6 @@ impl<S: BlockSource, K: EventSink> Pipeline<S, K> {
 // means the fixture or setup is wrong.
 #[expect(clippy::expect_used)]
 mod tests {
-    use std::sync::Mutex;
-
     use alloy_primitives::{B256, TxHash};
     use futures_util::stream;
 
@@ -426,34 +430,25 @@ mod tests {
     }
 
     /// Collects published envelopes so tests can assert on order and sequence.
+    ///
+    /// A plain `Vec` and not a mutex: the trait drives the sink through `&mut self`,
+    /// so the sink owns its own batch state.
     #[derive(Default)]
     struct CollectSink {
-        seen: Mutex<Vec<Envelope>>,
+        seen: Vec<Envelope>,
     }
 
     impl CollectSink {
         fn kinds(&self) -> Vec<&'static str> {
-            self.seen
-                .lock()
-                .expect("sink lock")
-                .iter()
-                .map(Envelope::kind)
-                .collect()
+            self.seen.iter().map(Envelope::kind).collect()
         }
 
         fn sequences(&self) -> Vec<u64> {
-            self.seen
-                .lock()
-                .expect("sink lock")
-                .iter()
-                .map(|envelope| envelope.sequence)
-                .collect()
+            self.seen.iter().map(|envelope| envelope.sequence).collect()
         }
 
         fn reorg_orphans(&self) -> Vec<Vec<B256>> {
             self.seen
-                .lock()
-                .expect("sink lock")
                 .iter()
                 .filter_map(|envelope| match &envelope.event {
                     Event::Reorg(reorg) => Some(reorg.orphaned_hashes.clone()),
@@ -464,8 +459,6 @@ mod tests {
 
         fn reorg_heights(&self) -> Vec<u64> {
             self.seen
-                .lock()
-                .expect("sink lock")
                 .iter()
                 .filter_map(|envelope| match &envelope.event {
                     Event::Reorg(reorg) => Some(reorg.height),
@@ -476,8 +469,8 @@ mod tests {
     }
 
     impl EventSink for CollectSink {
-        async fn publish(&self, envelope: &Envelope) -> anyhow::Result<()> {
-            self.seen.lock().expect("sink lock").push(envelope.clone());
+        async fn publish(&mut self, envelope: &Envelope) -> anyhow::Result<()> {
+            self.seen.push(envelope.clone());
             Ok(())
         }
     }

@@ -1,9 +1,15 @@
 //! Newline-delimited JSON to standard output.
 
+use tokio::io::AsyncWriteExt as _;
+
 use crate::envelope::Envelope;
 use crate::sink::EventSink;
 
 /// Writes newline-delimited JSON to standard output.
+///
+/// Unlike the buffering sinks, each line is written and flushed as it arrives:
+/// stdout is the human/pipe view of the live stream, so its value is liveness,
+/// not throughput. Use a broker sink when batching matters.
 #[derive(Debug, Default, Clone)]
 pub struct StdoutJsonSink;
 
@@ -16,14 +22,12 @@ impl StdoutJsonSink {
 }
 
 impl EventSink for StdoutJsonSink {
-    async fn publish(&self, envelope: &Envelope) -> anyhow::Result<()> {
+    async fn publish(&mut self, envelope: &Envelope) -> anyhow::Result<()> {
         let mut line = serde_json::to_string(envelope)?;
-        // serialises writers behind one lock. Fine for one process and
-        // one stdout; move to a buffered channel when brokers are added.
         line.push('\n');
         let mut stdout = tokio::io::stdout();
-        tokio::io::AsyncWriteExt::write_all(&mut stdout, line.as_bytes()).await?;
-        tokio::io::AsyncWriteExt::flush(&mut stdout).await?;
+        stdout.write_all(line.as_bytes()).await?;
+        stdout.flush().await?;
         Ok(())
     }
 }
