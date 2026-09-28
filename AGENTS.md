@@ -29,6 +29,25 @@ Guidance for AI coding agents working in this repository.
 - Prefer clear public APIs, useful documentation, and focused tests.
 - Do not weaken lint levels, release profiles, or CI checks without calling it out first.
 
+## Data Modeling
+
+Model datasets on Allium's published schemas before inventing a shape. They cover
+many chains (EVM, Solana, and others) and many dataset types (raw, decoded, assets,
+DEX, NFTs, metrics), so a matching table is almost always already designed:
+
+- Index of everything: <https://docs.allium.so/llms.txt>
+- EVM raw tables: <https://docs.allium.so/historical-data/supported-blockchains/evm/ethereum/raw>
+- EVM decoded tables: <https://docs.allium.so/historical-data/supported-blockchains/evm/ethereum/decoded>
+- Solana tables: <https://docs.allium.so/_llms/data-catalog/solana.md>
+- Core schemas shared across chains: <https://docs.allium.so/_llms/data-catalog/evm/core-schemas.md>
+
+Before adding a dataset or a field, search Allium for the table that already covers
+it (chain name + dataset name, e.g. "ethereum raw logs") and copy its column set,
+natural key, and normalization. Follow the same conventions this repo already takes
+from them (`src/datasets/evm.rs`): one normalized table per dataset, a documented
+natural key that becomes the `dedupe_key`, children referenced by scalar key rather
+than embedded, and no opaque `raw` blobs — every field present and typed.
+
 ## Verification
 
 After code changes, run the relevant checks:

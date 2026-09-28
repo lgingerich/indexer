@@ -15,8 +15,17 @@ use std::hint::black_box;
 use std::time::{Duration, Instant};
 
 use indexer::envelope::{ChainId, Envelope};
-use indexer::source::evm::decode_batch;
+use indexer::source::FetchedBlock;
+use indexer::source::evm::{decode_block, parse_batch};
 use serde_json::json;
+
+/// The full production decode path: parse the batch, then project it to records.
+///
+/// Mirrors `EvmSource::fetch_block` minus the network, so the benchmark measures
+/// the same work a live block costs between socket and sink.
+fn decode(body: &[u8]) -> Result<FetchedBlock, indexer::source::SourceError> {
+    decode_block(parse_batch(body)?)
+}
 
 /// Timed samples collected per benchmark.
 const SAMPLES: usize = 1_000;
@@ -89,6 +98,7 @@ fn synthetic_batch(tx_count: usize, logs_per_tx: usize) -> Vec<u8> {
                         "blockNumber": "0x112a880",
                         "blockHash": block_hash,
                         "transactionHash": tx_hash(i),
+                        "transactionIndex": format!("0x{i:x}"),
                         "logIndex": format!("0x{:x}", i * logs_per_tx + j),
                         "removed": false,
                     })
@@ -102,8 +112,7 @@ fn synthetic_batch(tx_count: usize, logs_per_tx: usize) -> Vec<u8> {
                 "effectiveGasPrice": "0x4c4b40", "type": "0x2", "contractAddress": null,
                 "logsBloom": format!("0x{}", "0".repeat(512)),
                 "logs": logs,
-            })
-        })
+            })        })
         .collect();
     json!([
         {"jsonrpc": "2.0", "id": 1, "result": {
@@ -112,6 +121,17 @@ fn synthetic_batch(tx_count: usize, logs_per_tx: usize) -> Vec<u8> {
             "parentHash": format!("0x{:064x}", 0xdef),
             "timestamp": "0x6530a1b0",
             "miner": "0x4200000000000000000000000000000000000011",
+            "nonce": "0x0000000000000042",
+            "sha3Uncles": format!("0x{:064x}", 0),
+            "transactionsRoot": format!("0x{:064x}", 1),
+            "stateRoot": format!("0x{:064x}", 2),
+            "receiptsRoot": format!("0x{:064x}", 3),
+            "mixHash": format!("0x{:064x}", 0),
+            "difficulty": "0x0",
+            "extraData": "0x",
+            "gasLimit": "0x1c9c380",
+            "gasUsed": "0x5208",
+            "baseFeePerGas": "0x4c4b40",
             "logsBloom": format!("0x{}", "0".repeat(512)),
             "transactions": transactions,
         }},
@@ -129,8 +149,10 @@ fn synthetic_batch(tx_count: usize, logs_per_tx: usize) -> Vec<u8> {
 fn main() {
     for (tx_count, logs_per_tx) in [(100_usize, 2_usize), (500, 4), (2000, 5)] {
         let body = synthetic_batch(tx_count, logs_per_tx);
-        let expected = 1 + tx_count + tx_count * logs_per_tx;
-        let events = decode_batch(&body)
+        // One event per thing: the block, then each transaction, its receipt, and
+        // its logs.
+        let expected = 1 + tx_count * (2 + logs_per_tx);
+        let events = decode(black_box(&body))
             .expect("benchmark fixture decodes")
             .events;
         assert_eq!(
@@ -138,11 +160,10 @@ fn main() {
             expected,
             "fixture shape changed; the benchmark would measure the wrong work"
         );
-
         let mut samples = Vec::with_capacity(SAMPLES);
         for _ in 0..SAMPLES {
             let start = Instant::now();
-            let decoded = decode_batch(black_box(&body)).expect("benchmark fixture decodes");
+            let decoded = decode(black_box(&body)).expect("benchmark fixture decodes");
             samples.push(start.elapsed());
             black_box(&decoded);
         }

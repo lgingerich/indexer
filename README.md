@@ -13,13 +13,14 @@ rewrites.
   each block fetched over JSON-RPC with full transactions, receipts, and logs in
   one batched request. Nothing the node returns is dropped. See
   `src/source/evm.rs`.
-- **One event per thing.** A `block` marker, then for each transaction a
-  `transaction` event (raw transaction plus raw receipt) followed by its `log`
-  events. Each field is published exactly once: the block's `raw` omits its
-  `transactions` array and a receipt omits its `logs`, since those are their own
-  events.
-- **Ordered events.** Every event gets a per-chain monotonic `sequence` and a
-  stable `dedupe_key`. See `src/envelope.rs`.
+- **One event per dataset.** A `block` event, then for each transaction a
+  `transaction` event, its `receipt` event, and its `log` events. Each dataset is a
+  normalized table — a block references its transactions by hash, a receipt carries
+  only the count of its logs — so no field is published twice and a row maps to a
+  persistence row. See `src/datasets/evm.rs`.
+- **Ordered events.** Every event gets a per-chain monotonic `sequence`; every
+  dataset exposes a `dedupe_key` derived from its natural key. See `src/envelope.rs`
+  and `src/datasets/evm.rs`.
 - **Finality watermark.** A `finalized` event says a block and everything below
   it are permanent. Its height comes from the node's own `finalized` tag, so each
   chain's rules apply with no confirmation count to tune; on Base it trails the
@@ -60,22 +61,34 @@ Logs go to stderr; events go to stdout, so the two streams never interleave.
 ## Event shape
 
 ```json
-{"chain":"base","sequence":18174,"schema_version":3,
- "type":"log","height":51883702,"block_hash":"0x…","tx_id":"0x…","tx_index":3,
- "item_index":0,"raw":"{\"address\":\"0x…\",\"topics\":[\"0x…\"],\"data\":\"0x…\"}"}
+{"chain":"base","sequence":18174,
+ "type":"log","log_index":0,"transaction_hash":"0x…","transaction_index":3,
+ "address":"0x…","topic0":"0x…","topic1":null,"topic2":null,"topic3":null,
+ "data":"0x…","removed":false,"block_number":51883702,"block_hash":"0x…"}
 ```
 
-`raw` (and `receipt` on transactions) is the chain's payload as a JSON-encoded
-string, so a consumer decodes with whatever ABI it trusts. Attaching `schema_version` means a shape change is detectable rather than
-silent. Consumers deduplicate on `dedupe_key`, not `sequence`: a sequence can be
-reused after a reorg or a restart.
+Events fall into two kinds. **Datasets** — `block`, `transaction`, `receipt`, `log`
+— are durable on-chain records, defined per chain in `src/datasets/evm.rs`. Each
+is a normalized table with a natural key and fully deconstructed fields, the same
+decomposition of the chain's datasets, so a row maps straight to a
+persistence row; children are referenced by scalar key, never embedded. **Control
+signals** — `reorg`, `finalized` — drive a consumer's state machine and carry no
+payload; `Event::is_dataset` tells them apart. The line is one flat object: `chain`,
+`sequence`, and the event's fields under its `type` tag. Consumers deduplicate on
+each event's `dedupe_key`, not `sequence`: a sequence can be reused after a reorg or
+a restart, and the key is scoped to the stream. Each dataset's key comes from its
+natural key, so a transaction and its receipt (both keyed by the transaction hash)
+stay distinct.
 
-Block and transaction identity use `alloy_primitives::B256` and `TxHash`, encoded as
-lowercase `0x` hex. Two tests pin that as a contract, since it is what consumers
-parse: `b256_wire_format_is_lowercase_0x_hex` in `src/envelope.rs`. A chain whose
+Identity uses `alloy_primitives::{B256, BlockHash, TxHash}`, encoded as lowercase
+`0x` hex, and quantity fields encode as `0x` hex via `alloy-serde`. Two tests pin
+the hash format as a contract, since it is what consumers parse:
+`b256_wire_format_is_lowercase_0x_hex` in `src/envelope.rs`. The line the sink
+writes is pinned by `render_keeps_the_envelope_fields_flat_on_one_line` in
+`src/sink/mod.rs`. A chain whose
 identity does not fit that shape — Solana's base58 blockhash and 64-byte signature
-are the expected case — gets its own type plus a tagged union at the envelope
-boundary, rather than a shared type widened to fit both.
+are the expected case — gets its own module beside `src/datasets/evm.rs` plus a
+variant in `Event`, rather than a shared type widened to fit both.
 
 ## Benchmarks
 
@@ -94,17 +107,20 @@ Measured on an Apple Silicon laptop, release profile, ~1,000 samples each:
 
 | Workload | response | events | decode p50 | decode p99 | serialise p50 |
 | --- | --- | --- | --- | --- | --- |
-| 100 txs × 2 logs | 275 KiB | 301 | 652µs | 824µs | 370µs |
-| 500 txs × 4 logs | 1.8 MiB | 2,501 | 4.67ms | 5.86ms | 2.74ms |
-| 2,000 txs × 5 logs | 8.3 MiB | 12,001 | 21.4ms | 25.0ms | 12.4ms |
+| 100 txs × 2 logs | 281 KiB | 401 | 725µs | 921µs | 572µs |
+| 500 txs × 4 logs | 1.9 MiB | 3,001 | 4.76ms | 5.48ms | 4.71ms |
+| 2,000 txs × 5 logs | 8.6 MiB | 14,001 | 21.6ms | 25.3ms | 23.0ms |
 
-Decode is linear in response size at roughly 2.5µs per KiB. Payloads are never
-parsed, only scanned and copied, so the cost is mostly memory traffic.
+Decode is linear in response size at roughly 2.5µs per KiB. Payloads are still
+never *decoded* into ABI values — the node's JSON is deserialized into alloy's RPC
+types and then projected field by field — so the cost remains mostly memory traffic
+and per-event allocation.
 
 Against the budget: an average Base block in a live run had about 260
 transactions and 880 logs, which falls between the first two rows, so decode
 plus serialise is a few milliseconds of CPU per block. The larger cost is the
-network: the indexer publishes about 1.7 MB per Base block, roughly 0.8 MB/s.
+network: the indexer publishes several MB per Base block, since every dataset is
+now published with its fields spelled out rather than as one opaque `raw` string.
 
 ## Checks
 

@@ -4,8 +4,8 @@
 //!
 //! - A **source** knows one chain: how to hear about new heads, fetch a block, and
 //!   turn it into [`Event`]s. It holds no state about what was published.
-//! - A **sink** knows one destination: how to deliver an [`Envelope`]. It knows
-//!   nothing about chains or ordering.
+//! - A **sink** knows one destination: how to deliver an [`Envelope`] to a given
+//!   chain's stream. It knows nothing about ordering.
 //! - The **pipeline** is the only stateful part. It drives the source, turns its
 //!   events into a single ordered stream, and hands each envelope to the sink.
 //!
@@ -30,7 +30,7 @@ use anyhow::bail;
 use futures_util::StreamExt as _;
 use tracing::{error, info, warn};
 
-use crate::envelope::{Envelope, Event};
+use crate::envelope::{Envelope, Event, Finalized, Reorg};
 use crate::sink::EventSink;
 use crate::source::{BlockId, BlockSource, FetchedBlock};
 
@@ -129,13 +129,7 @@ impl<S: BlockSource, K: EventSink> Pipeline<S, K> {
             return Ok(0);
         };
 
-        let Event::Block {
-            height,
-            hash,
-            parent_hash,
-            ..
-        } = first
-        else {
+        let Event::Block(block) = first else {
             error!(
                 chain = %self.source.chain(),
                 first_kind = first.kind(),
@@ -143,7 +137,7 @@ impl<S: BlockSource, K: EventSink> Pipeline<S, K> {
             );
             return Ok(0);
         };
-        let (height, hash, parent_hash) = (*height, *hash, *parent_hash);
+        let (height, hash, parent_hash) = (block.number, block.hash, block.parent_hash);
 
         let mut reorgs = 0;
         if let Some(previous) = self.history.back()
@@ -193,10 +187,10 @@ impl<S: BlockSource, K: EventSink> Pipeline<S, K> {
         let marker = Envelope::new(
             self.source.chain().clone(),
             self.sequence,
-            Event::Finalized {
+            Event::Finalized(Finalized {
                 height: finalized.height,
                 hash: finalized.hash,
-            },
+            }),
         );
         self.sink.publish(&marker).await?;
         self.sequence += 1;
@@ -226,11 +220,11 @@ impl<S: BlockSource, K: EventSink> Pipeline<S, K> {
         let reorg = Envelope::new(
             self.source.chain().clone(),
             self.sequence,
-            Event::Reorg {
+            Event::Reorg(Reorg {
                 height,
                 new_head_hash,
                 orphaned_hashes,
-            },
+            }),
         );
         self.sink.publish(&reorg).await?;
         self.sequence += 1;
@@ -292,7 +286,7 @@ mod tests {
     use futures_util::stream;
 
     use super::Pipeline;
-    use crate::envelope::{ChainId, Envelope, Event};
+    use crate::envelope::{Block, ChainId, Envelope, Event, Log};
     use crate::sink::EventSink;
     use crate::source::{BlockId, BlockSource, FetchedBlock, HeadStream, SourceError};
 
@@ -300,26 +294,26 @@ mod tests {
         B256::from([byte; 32])
     }
 
-    fn block_event(height: u64, hash: B256, parent_hash: B256) -> Event {
-        Event::Block {
-            height,
+    // Test fixtures use `..Default::default()` so adding a field to a dataset does
+    // not churn every test that only cares about identity.
+    fn block_event(number: u64, hash: B256, parent_hash: B256) -> Event {
+        Event::Block(Box::new(Block {
+            number,
             hash,
             parent_hash,
-            timestamp: 1_700_000_000 + height,
-            tx_count: 1,
-            raw: "{}".to_owned(),
-        }
+            timestamp: 1_700_000_000 + number,
+            ..Block::default()
+        }))
     }
 
-    fn log_event(height: u64, block_hash: B256, item_index: u64) -> Event {
-        Event::Log {
-            height,
+    fn log_event(number: u64, block_hash: B256, log_index: u64) -> Event {
+        Event::Log(Box::new(Log {
+            log_index,
             block_hash,
-            tx_id: TxHash::from([0x01; 32]),
-            tx_index: 0,
-            item_index,
-            raw: "{}".to_owned(),
-        }
+            block_number: number,
+            transaction_hash: TxHash::from([0x01; 32]),
+            ..Log::default()
+        }))
     }
 
     /// Tests hand blocks straight to the pipeline, so the source only names a chain.
@@ -374,9 +368,7 @@ mod tests {
                 .expect("sink lock")
                 .iter()
                 .filter_map(|envelope| match &envelope.event {
-                    Event::Reorg {
-                        orphaned_hashes, ..
-                    } => Some(orphaned_hashes.clone()),
+                    Event::Reorg(reorg) => Some(reorg.orphaned_hashes.clone()),
                     _ => None,
                 })
                 .collect()
