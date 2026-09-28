@@ -189,6 +189,26 @@ identity does not fit that shape — Solana's base58 blockhash and 64-byte signa
 are the expected case — gets its own module beside `src/datasets/evm.rs` plus a
 variant in `Event`, rather than a shared type widened to fit both.
 
+## Examples
+
+```bash
+cargo run --example decode_logs
+```
+
+Decodes two real Uniswap V3 swap logs captured from a Base pool, using the same
+`Transform` the decode stage runs. No arguments and no broker: the capture and the ABI
+are embedded, and each input is printed followed by its decoded record — which is what
+the stage publishes, since the decoded stream keeps the raw log rather than replacing it.
+
+Worth reading the output for two things: `amount0` is negative, because the amount is an
+`int256` and the sign says which way the pool sent that token; and `sqrtPriceX96` carries
+`bits: 160` while `tick` carries `bits: 24`, because a store needs the declared width to
+pick a column and a width is not recoverable from a number.
+
+To point it at other contracts, capture real input with `STDOUT=1 cargo run --release`,
+which prints what the indexer would publish instead of sending it to a broker, and change
+the address, chain, ABI, and fixture the example names.
+
 ## Benchmarks
 
 ```bash

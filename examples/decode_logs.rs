@@ -1,15 +1,35 @@
-//! Runs the decode transform over a file of raw envelopes and prints NDJSON.
+//! Decodes real Uniswap V3 swap logs, with no arguments and no broker.
 //!
-//! This is a way to *see* decoded output without a broker. It reads envelopes in the
-//! shape the indexer publishes, decodes each, and writes the transform's own output —
-//! the raw envelope followed by its decoded record — to stdout.
+//! ```bash
+//! cargo run --example decode_logs
+//! ```
 //!
-//! # Getting the input
+//! It reads two real `Swap` logs captured from a Uniswap V3 pool on Base, embeds the
+//! pool's ABI, and runs the same [`Transform`] the decode stage runs in production. For
+//! each input it prints the raw envelope followed by the decoded record, which is what
+//! the stage publishes: the decoded stream is a lossless superset, so nothing is
+//! replaced.
 //!
-//! The input is NDJSON, one published envelope per line. There is no fixture in the
-//! repository, so produce one from the chain first: run the indexer with `STDOUT=1`,
-//! which prints what it would publish instead of sending it to a broker, and keep a
-//! slice.
+//! # What to look for
+//!
+//! - `amount0` is **negative** in the first swap. The amount is an `int256`, and the
+//!   sign says which way the pool sent that token. Reading the two's-complement word as
+//!   unsigned would give ~1.15e77 instead.
+//! - `sqrtPriceX96` carries `bits: 160` and `tick` carries `bits: 24`. The declared
+//!   width travels with the value, because a width is not recoverable from a number and
+//!   a store needs it to pick a column.
+//! - Every argument carries the ABI's own name. That is what lets a consumer address
+//!   `amount0` rather than count positions, which breaks silently when an ABI revision
+//!   reorders a parameter.
+//!
+//! # Decoding other contracts
+//!
+//! This example is self-contained on purpose: it takes no arguments and needs no broker,
+//! because a demo that has to be configured is a demo that gets skipped. To decode a
+//! different contract, change `POOL`, `CHAIN`, and the two `include_str!` files above.
+//!
+//! To capture real input for it, run the indexer with `STDOUT=1`, which prints what it
+//! would publish instead of sending it to a broker:
 //!
 //! ```bash
 //! EVM_CHAIN=base \
@@ -19,17 +39,8 @@
 //! cargo run --release 2>/dev/null | head -200 > envelopes.ndjson
 //! ```
 //!
-//! Then decode that file. `--address` is the contract whose ABI applies to every line
-//! in it, so the capture is worth filtering to one contract's logs; a real registry is
-//! keyed by `(chain, address, block)` and answers per log, and this stands in for it.
-//!
-//! ```bash
-//! cargo run --example decode_logs -- \
-//!   --abi src/decode/abi/uniswap_v3_pool.json \
-//!   --address 0xd0b53D9277642d899DF5C87A3966A349A798F224 \
-//!   --chain base \
-//!   envelopes.ndjson
-//! ```
+//! A real registry is keyed by `(chain, address, block)` and answers per log; the fixed
+//! registry here stands in for it so the example needs no configuration.
 
 // A runnable tool rather than a library, so printing is the whole job.
 #![expect(clippy::print_stdout, clippy::print_stderr, clippy::expect_used)]
@@ -41,6 +52,19 @@ use indexer::decode::Transform;
 use indexer::decode::registry::{Abi, AbiRegistry};
 use indexer::wire::envelope::ChainId;
 use indexer::wire::envelope::Envelope;
+
+/// The pool these logs came from, and the address its ABI is registered against.
+const POOL: &str = "0xd0b53D9277642d899DF5C87A3966A349A798F224";
+
+/// The chain the captured logs are from.
+const CHAIN: &str = "base";
+
+/// Two real `Swap` logs from the pool above, one per line.
+///
+/// Captured from Base rather than synthesized, so the example proves the decoder against
+/// bytes the chain produced. It is small enough to embed because one log is under a
+/// kilobyte, and a fixture that needs fetching would make this unrunnable.
+const SWAPS: &str = include_str!("fixtures/uniswap_v3_swaps.ndjson");
 
 /// One ABI for every address on one chain, which is all a demo needs.
 struct FixedRegistry {
@@ -56,98 +80,37 @@ impl AbiRegistry for FixedRegistry {
 }
 
 fn main() -> ExitCode {
-    let mut abi_path = None;
-    let mut address = None;
-    let mut chain = "base".to_owned();
-    let mut input = None;
-
-    let mut args = std::env::args().skip(1);
-    while let Some(arg) = args.next() {
-        if !arg.starts_with("--") {
-            input = Some(arg);
-            continue;
-        }
-        let Some(value) = args.next() else {
-            eprintln!("{arg} needs a value");
-            return ExitCode::FAILURE;
-        };
-        match arg.as_str() {
-            "--abi" => abi_path = Some(value),
-            "--address" => address = Some(value),
-            "--chain" => chain = value,
-            other => {
-                eprintln!("unknown flag {other}");
-                return ExitCode::FAILURE;
-            }
-        }
-    }
-
-    let (Some(abi_path), Some(address), Some(input)) = (abi_path, address, input) else {
-        eprintln!(
-            "usage: decode_logs --abi <abi.json> --address <contract> [--chain <id>] <envelopes.ndjson>"
-        );
-        return ExitCode::FAILURE;
-    };
-
-    let address: Address = address.parse().expect("address parses");
-    let abi = Abi::from_json(&std::fs::read_to_string(&abi_path).expect("ABI file reads"))
-        .expect("ABI loads");
-    let registry = FixedRegistry {
-        chain: ChainId::new(chain),
+    let address: Address = POOL.parse().expect("the pool address parses");
+    let abi = Abi::from_json(include_str!("../src/decode/abi/uniswap_v3_pool.json"))
+        .expect("the pool ABI loads");
+    let transform = Transform::new(FixedRegistry {
+        chain: ChainId::new(CHAIN),
         address,
         abi,
-    };
-    let transform = Transform::new(registry);
+    });
 
-    let contents = match std::fs::read_to_string(&input) {
-        Ok(contents) => contents,
-        Err(error) => {
-            // A missing input is the most likely way to get here, and the raw `Os` error
-            // does not say where the file was supposed to come from. See the module docs.
-            eprintln!("cannot read {input}: {error}");
-            eprintln!(
-                "the input is NDJSON of published envelopes; see the module docs for \
-                 how to capture one with STDOUT=1"
-            );
-            return ExitCode::FAILURE;
-        }
-    };
-    let (mut lines, mut decoded_count, mut failed) = (0_usize, 0_usize, 0_usize);
-    for (number, line) in contents.lines().enumerate() {
+    let mut decoded_count = 0_usize;
+    for (number, line) in SWAPS.lines().enumerate() {
         if line.trim().is_empty() {
             continue;
         }
-        let envelope: Envelope = match serde_json::from_str(line) {
-            Ok(envelope) => envelope,
-            Err(error) => {
-                // Named so a bad line in a 200-line capture is findable.
-                eprintln!("line {}: not an envelope: {error}", number + 1);
-                failed += 1;
-                continue;
+        let envelope: Envelope =
+            serde_json::from_str(line).expect("the fixture is a published envelope");
+        for out in transform.apply(envelope).expect("the log decodes") {
+            if matches!(out.event, indexer::wire::envelope::Event::Decoded(_)) {
+                decoded_count += 1;
             }
-        };
-        lines += 1;
-        match transform.apply(envelope) {
-            Ok(output) => {
-                for out in output {
-                    if matches!(out.event, indexer::wire::envelope::Event::Decoded(_)) {
-                        decoded_count += 1;
-                    }
-                    println!(
-                        "{}",
-                        serde_json::to_string(&out).expect("envelope serializes")
-                    );
-                }
-            }
-            Err(error) => {
-                failed += 1;
-                eprintln!("line {}: decode failed: {error}", number + 1);
-            }
+            println!(
+                "{}",
+                serde_json::to_string(&out).expect("envelope serializes")
+            );
         }
+        eprintln!("line {}: decoded", number + 1);
     }
 
-    eprintln!("{lines} envelopes in, {decoded_count} decoded, {failed} failed");
-    if failed > 0 {
+    eprintln!("{decoded_count} swaps decoded, each printed after its source log");
+    if decoded_count == 0 {
+        eprintln!("nothing decoded, which means the fixture or the ABI changed");
         return ExitCode::FAILURE;
     }
     ExitCode::SUCCESS
