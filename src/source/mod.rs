@@ -27,18 +27,12 @@ pub use evm::EvmSource;
 
 use crate::envelope::{ChainId, Event};
 
-/// A live head notification: the block the chain is currently building on.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Head {
-    /// Height of the new head, or slot on slot-based chains.
-    pub height: u64,
-    /// Hash of the new head.
-    pub hash: B256,
-    /// Hash of the block the new head builds on.
-    pub parent_hash: B256,
-}
-
 /// A block's height and hash, without the rest of its contents.
+///
+/// Used for both a live head notification and the finalized-block watermark: in
+/// each case the pipeline needs only where the block is, not what is in it. The
+/// head's parent hash is not carried because linkage is checked on the fetched
+/// block's marker, not on the notification that prompted the fetch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BlockId {
     /// Block height, or slot on slot-based chains.
@@ -63,7 +57,7 @@ pub struct FetchedBlock {
 }
 
 /// A stream of live head notifications. Ends when the connection does.
-pub type HeadStream = Pin<Box<dyn Stream<Item = Result<Head, SourceError>> + Send>>;
+pub type HeadStream = Pin<Box<dyn Stream<Item = Result<BlockId, SourceError>> + Send>>;
 
 /// Failure while talking to a chain data source.
 #[derive(Debug, Error)]

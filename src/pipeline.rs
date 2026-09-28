@@ -9,6 +9,13 @@
 //! - The **pipeline** is the only stateful part. It drives the source, turns its
 //!   events into a single ordered stream, and hands each envelope to the sink.
 //!
+//! Its state is a machine: [`Mode`] names what it is doing, and the linkage rules
+//! in [`Pipeline::process_block`] decide the transition. A head that links to the
+//! published tip advances the chain; one that does not is a fork, which retracts to
+//! the fork point and is published as an [`Event::Reorg`]. A head that would leave
+//! a height gap, a first head above genesis, and a fork deeper than the undo ring
+//! all fail loudly rather than publishing across a hole.
+//!
 //! Turning events into the stream means three things: assigning every envelope a
 //! per-chain monotonic sequence number, checking parent-hash linkage so a reorg
 //! surfaces as an [`Event::Reorg`] rather than as silently wrong data, and
@@ -34,7 +41,8 @@ use crate::envelope::{Envelope, Event, Finalized, Reorg};
 use crate::sink::EventSink;
 use crate::source::{BlockId, BlockSource, FetchedBlock};
 
-/// The most published blocks the undo ring remembers by default.
+/// The most published blocks the undo ring remembers by default, and therefore the
+/// deepest reorg it can retract.
 ///
 /// Blocks at or below the finalized height are dropped first, since no reorg can
 /// reach them, so on Ethereum the ring rarely holds more than about 64. This cap
@@ -42,13 +50,37 @@ use crate::source::{BlockId, BlockSource, FetchedBlock};
 /// on L1, where it is the ceiling on how deep a reorg can be retracted.
 pub const DEFAULT_UNDO_DEPTH: usize = 128;
 
+/// What the pipeline is doing when it is driven forward.
+///
+/// The pipeline is a state machine whose state is `(sequence, history, finalized)`;
+/// this names the mode that state is in, so the driver's next step is explicit
+/// rather than implied by a stack of conditionals.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mode {
+    /// Subscribed to live heads and publishing each one as it arrives.
+    Following,
+    /// Filling a contiguous height range up to the live tip before trusting heads.
+    ///
+    /// Not entered yet: backfill-to-live handoff is not built, so a fresh pipeline
+    /// starts mid-chain at whatever head arrives next. It also cannot be skipped
+    /// out of — a head that would leave a gap is an error, not a silent hole.
+    Backfilling,
+    /// Retracting a reorg and re-publishing the replacement branch.
+    ///
+    /// Entered when a head's parent does not match the published tip and left once
+    /// the replacement branch's block is published. Resolution is synchronous
+    /// today, so it is entered and left inside one [`Pipeline::process_block`];
+    /// when the re-fetch range is wired it becomes state that spans several.
+    Reorging,
+}
+
 /// One block's slice of the published stream.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct PublishedBlock {
     height: u64,
     hash: B256,
+    /// Sequence of the block's first published event; where a rewind resumes.
     first_sequence: u64,
-    event_count: u64,
 }
 
 /// Drives one source into one sink as an ordered, reorg-aware stream.
@@ -60,6 +92,7 @@ pub struct Pipeline<S, K> {
     undo_depth: usize,
     sequence: u64,
     finalized_height: u64,
+    mode: Mode,
 }
 
 impl<S: BlockSource, K: EventSink> Pipeline<S, K> {
@@ -69,7 +102,11 @@ impl<S: BlockSource, K: EventSink> Pipeline<S, K> {
         Self::with_undo_depth(source, sink, DEFAULT_UNDO_DEPTH)
     }
 
-    /// Builds a pipeline that can retract reorgs up to `undo_depth` blocks deep.
+    /// Builds a pipeline that retracts up to `undo_depth` published blocks.
+    ///
+    /// The undo ring holds at most `undo_depth` blocks, so a fork at the ring's
+    /// oldest remembered block retracts exactly `undo_depth` of them. A deeper fork
+    /// is refused rather than partially retracted.
     ///
     /// A depth of zero disables reorg retraction: linkage is still checked, but no
     /// sequence numbers can be reclaimed.
@@ -78,10 +115,11 @@ impl<S: BlockSource, K: EventSink> Pipeline<S, K> {
         Self {
             source,
             sink,
-            history: VecDeque::new(),
+            history: VecDeque::with_capacity(undo_depth.min(256)),
             undo_depth,
             sequence: 0,
             finalized_height: 0,
+            mode: Mode::Following,
         }
     }
 
@@ -89,6 +127,12 @@ impl<S: BlockSource, K: EventSink> Pipeline<S, K> {
     #[must_use]
     pub const fn next_sequence(&self) -> u64 {
         self.sequence
+    }
+
+    /// The mode the pipeline is currently in.
+    #[must_use]
+    pub const fn mode(&self) -> Mode {
+        self.mode
     }
 
     /// Follows the live chain tip until the head subscription ends.
@@ -121,8 +165,11 @@ impl<S: BlockSource, K: EventSink> Pipeline<S, K> {
     ///
     /// # Errors
     ///
-    /// Returns an error when the sink cannot deliver an event. That is fatal:
-    /// skipping an event would create a gap that violates the delivery contract.
+    /// Returns an error when the sink cannot deliver an event — that is fatal,
+    /// since skipping an event would leave a sequence gap — and when linkage
+    /// cannot be resolved locally: a height gap, a first head above genesis with no
+    /// remembered history, or a fork deeper than the undo ring. Those are coverage
+    /// breaks rather than reorgs, and neither can be published honestly from here.
     pub async fn process_block(&mut self, block: FetchedBlock) -> anyhow::Result<u64> {
         let FetchedBlock { events, finalized } = block;
         let Some((first, _)) = events.split_first() else {
@@ -138,17 +185,47 @@ impl<S: BlockSource, K: EventSink> Pipeline<S, K> {
             return Ok(0);
         };
         let (height, hash, parent_hash) = (block.number, block.hash, block.parent_hash);
-
         let mut reorgs = 0;
-        if let Some(previous) = self.history.back()
-            && parent_hash != previous.hash
-        {
-            self.publish_reorg(height, hash, parent_hash).await?;
-            reorgs = 1;
+
+        if let Some(previous) = self.history.back() {
+            let latest = previous.height;
+            if height == latest && hash == previous.hash {
+                // The tip was already published and re-announced. Not a fork.
+                return Ok(0);
+            }
+            if parent_hash == previous.hash {
+                // Links to the published tip. With no gap this is the next height;
+                // a gap means a head was missed, which is a coverage hole rather
+                // than a fork, and publishing across it would leave a silent hole.
+                if height != latest + 1 {
+                    self.mode = Mode::Backfilling;
+                    bail!(
+                        "height gap: published tip {latest} -> head {height}; \
+                         backfill catches this up, but backfill-to-live handoff is not built yet"
+                    );
+                }
+            } else if let Some(fork) = self.find_fork(parent_hash) {
+                // A genuine fork: retract to the fork point, not to the head.
+                self.publish_reorg(fork, hash, parent_hash).await?;
+                reorgs = 1;
+            } else {
+                return Err(anyhow::anyhow!(
+                    "no fork point for head {height} (parent {parent_hash}); the reorg is \
+                     deeper than the {} remembered blocks",
+                    self.undo_depth
+                ));
+            }
+        } else if height > 1 {
+            // A first block above genesis with nothing remembered means history was
+            // skipped; publishing it would present a chain with no prior block.
+            self.mode = Mode::Backfilling;
+            bail!(
+                "first head is {height}, above genesis, with no remembered history; \
+                 backfill-to-live handoff is not built yet"
+            );
         }
 
         let first_sequence = self.sequence;
-        let event_count = events.len() as u64;
         for event in events {
             let envelope = Envelope::new(self.source.chain().clone(), self.sequence, event);
             self.sink.publish(&envelope).await?;
@@ -159,10 +236,10 @@ impl<S: BlockSource, K: EventSink> Pipeline<S, K> {
             height,
             hash,
             first_sequence,
-            event_count,
         });
         self.trim_unless_recent(height);
         self.advance_finality(finalized).await?;
+        self.mode = Mode::Following;
 
         info!(
             chain = %self.source.chain(),
@@ -197,38 +274,62 @@ impl<S: BlockSource, K: EventSink> Pipeline<S, K> {
         Ok(())
     }
 
-    /// Retracts the chain from `height` onward and emits the reorg marker.
+    /// Retracts the chain to `fork` (the first orphaned height) and emits the reorg marker.
+    ///
+    /// The fork is the new branch's first block: the first published block that did
+    /// not build on `actual_parent`. The marker names that height, so a consumer can
+    /// retract every hash at or above it and re-request from there.
     async fn publish_reorg(
         &mut self,
-        height: u64,
+        fork: u64,
         new_head_hash: B256,
         actual_parent: B256,
     ) -> anyhow::Result<()> {
+        let previous_mode = self.mode;
+        self.mode = Mode::Reorging;
         let expected_parent = self.history.back().map(|block| block.hash);
-        let (orphaned_hashes, reclaimed_from) = self.rewind_to(height);
+        let (orphaned_hashes, reclaimed_from) = self.rewind_to(fork);
+        debug_assert!(
+            !orphaned_hashes.is_empty(),
+            "a reorg must orphan at least the block at {fork}"
+        );
         self.sequence = reclaimed_from.unwrap_or(self.sequence);
         warn!(
             chain = %self.source.chain(),
-            height,
-            ?expected_parent,
+            expected = ?expected_parent,
             %actual_parent,
+            fork,
             orphaned = orphaned_hashes.len(),
             sequence = self.sequence,
-            "parent hash mismatch; retracting chain and publishing reorg"
+            "parent hash mismatch; retracted to the fork point and publishing reorg"
         );
 
         let reorg = Envelope::new(
             self.source.chain().clone(),
             self.sequence,
             Event::Reorg(Reorg {
-                height,
+                height: fork,
                 new_head_hash,
                 orphaned_hashes,
             }),
         );
         self.sink.publish(&reorg).await?;
         self.sequence += 1;
+        self.mode = previous_mode;
         Ok(())
+    }
+
+    /// The first height at or above which blocks are orphaned by a fork at `parent`.
+    ///
+    /// `parent` is the new head's parent; the fork point is the first block that did
+    /// not build on it, which is the block one above the ring entry whose hash is
+    /// `parent`. Returns `None` when the fork is older than the ring.
+    fn find_fork(&self, parent: B256) -> Option<u64> {
+        self.history
+            .iter()
+            .rev()
+            .find(|block| block.hash == parent)
+            .map(|block| block.height + 1)
     }
 
     /// Drops remembered blocks at or above `height`.
@@ -245,13 +346,6 @@ impl<S: BlockSource, K: EventSink> Pipeline<S, K> {
             }
             orphaned.push(block.hash);
             reclaimed_from = Some(block.first_sequence);
-        }
-        if orphaned.len() == self.undo_depth && self.undo_depth > 0 {
-            error!(
-                height,
-                undo_depth = self.undo_depth,
-                "reorg may be deeper than the undo ring; retraction is incomplete"
-            );
         }
         (orphaned, reclaimed_from)
     }
@@ -285,7 +379,7 @@ mod tests {
     use alloy_primitives::{B256, TxHash};
     use futures_util::stream;
 
-    use super::Pipeline;
+    use super::{Mode, Pipeline};
     use crate::envelope::{Block, ChainId, Envelope, Event, Log};
     use crate::sink::EventSink;
     use crate::source::{BlockId, BlockSource, FetchedBlock, HeadStream, SourceError};
@@ -369,6 +463,18 @@ mod tests {
                 .iter()
                 .filter_map(|envelope| match &envelope.event {
                     Event::Reorg(reorg) => Some(reorg.orphaned_hashes.clone()),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        fn reorg_heights(&self) -> Vec<u64> {
+            self.seen
+                .lock()
+                .expect("sink lock")
+                .iter()
+                .filter_map(|envelope| match &envelope.event {
+                    Event::Reorg(reorg) => Some(reorg.height),
                     _ => None,
                 })
                 .collect()
@@ -509,6 +615,111 @@ mod tests {
 
         assert_eq!(pipeline.history.len(), 2);
         assert_eq!(pipeline.next_sequence(), 20);
+    }
+
+    #[tokio::test]
+    async fn following_is_the_mode_until_a_fork_is_detected() {
+        let mut pipeline = pipeline(128);
+        assert_eq!(pipeline.mode(), Mode::Following);
+
+        process_all(
+            &mut pipeline,
+            vec![
+                vec![block_event(1, hash(1), hash(0))],
+                vec![block_event(2, hash(2), hash(1))],
+            ],
+        )
+        .await;
+        assert_eq!(pipeline.mode(), Mode::Following);
+    }
+
+    #[tokio::test]
+    async fn a_reannounced_tip_is_not_a_reorg() {
+        let mut pipeline = pipeline(128);
+        process_all(
+            &mut pipeline,
+            vec![
+                vec![block_event(1, hash(1), hash(0)), log_event(1, hash(1), 0)],
+                vec![block_event(2, hash(2), hash(1)), log_event(2, hash(2), 0)],
+                // The node resends the current head: same height, same hash.
+                vec![block_event(2, hash(2), hash(1)), log_event(2, hash(2), 0)],
+            ],
+        )
+        .await;
+
+        assert_eq!(pipeline.sink.kinds(), ["block", "log", "block", "log"]);
+        assert_eq!(pipeline.next_sequence(), 4);
+        assert!(pipeline.sink.reorg_orphans().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_height_gap_is_a_coverage_error_not_a_silent_hole() {
+        let mut pipeline = pipeline(128);
+        process_all(&mut pipeline, vec![vec![block_event(1, hash(1), hash(0))]]).await;
+
+        // Head 3 chains from the published block 1, so it links to the tip but skips
+        // height 2.
+        let error = pipeline
+            .process_block(fetched(vec![block_event(3, hash(3), hash(1))]))
+            .await
+            .expect_err("a gap must fail");
+        assert!(error.to_string().contains("height gap"), "{error}");
+        assert_eq!(pipeline.mode(), Mode::Backfilling);
+    }
+
+    #[tokio::test]
+    async fn a_first_head_above_genesis_is_a_coverage_error() {
+        let mut pipeline = pipeline(128);
+        let error = pipeline
+            .process_block(fetched(vec![block_event(5, hash(5), hash(4))]))
+            .await
+            .expect_err("a fresh pipeline cannot start mid-chain");
+        assert!(error.to_string().contains("first head"), "{error}");
+        assert_eq!(pipeline.mode(), Mode::Backfilling);
+    }
+
+    #[tokio::test]
+    async fn a_reorg_deeper_than_the_ring_is_an_error_not_an_empty_marker() {
+        // The ring holds only the last two blocks, so a fork below them cannot be
+        // located and retracted.
+        let mut pipeline = pipeline(2);
+        process_all(
+            &mut pipeline,
+            vec![
+                vec![block_event(1, hash(1), hash(0))],
+                vec![block_event(2, hash(2), hash(1))],
+                vec![block_event(3, hash(3), hash(2))],
+            ],
+        )
+        .await;
+
+        // A new head building on block 1 forks below the remembered range.
+        let error = pipeline
+            .process_block(fetched(vec![block_event(2, hash(20), hash(1))]))
+            .await
+            .expect_err("a fork older than the ring must fail");
+        assert!(error.to_string().contains("no fork point"), "{error}");
+        assert!(pipeline.sink.reorg_orphans().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_reorg_names_the_fork_point_as_its_height() {
+        let mut pipeline = pipeline(128);
+        process_all(
+            &mut pipeline,
+            vec![
+                vec![block_event(1, hash(1), hash(0))],
+                vec![block_event(2, hash(2), hash(1)), log_event(2, hash(2), 0)],
+                vec![block_event(3, hash(3), hash(2)), log_event(3, hash(3), 0)],
+                // A new branch forked at height 2; its head is the first new block.
+                vec![block_event(2, hash(20), hash(1)), log_event(2, hash(20), 0)],
+            ],
+        )
+        .await;
+
+        assert_eq!(pipeline.sink.reorg_orphans(), vec![vec![hash(3), hash(2)]]);
+        assert_eq!(pipeline.sink.reorg_heights(), [2]);
+        assert_eq!(pipeline.mode(), Mode::Following);
     }
 
     #[tokio::test]

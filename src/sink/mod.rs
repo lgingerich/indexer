@@ -1,8 +1,6 @@
 //! The egress boundary: where events go.
 //!
-//! [`EventSink`] is the seam between publishing and the rest of the system. v1
-//! ships an NDJSON sink to standard output, which keeps the ingestion loop
-//! testable without a broker. The production sink is Redpanda.
+//! [`EventSink`] is the seam between publishing and the rest of the system.
 //!
 //! The sink is a dumb serializing boundary: it renders the [`Envelope`] as-is and
 //! knows nothing about chains. A message-format version would belong here once a

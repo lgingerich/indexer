@@ -30,7 +30,7 @@ use serde_json::json;
 use serde_json::value::RawValue;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
-use super::{BlockId, BlockSource, FetchedBlock, Head, HeadStream, SourceError};
+use super::{BlockId, BlockSource, FetchedBlock, HeadStream, SourceError};
 use crate::datasets::evm::{Block, Log, Receipt, Transaction};
 use crate::envelope::{ChainId, Event};
 
@@ -55,27 +55,31 @@ impl EvmSource {
             chain: chain.into(),
             http_url: http_url.into(),
             ws_url: ws_url.into(),
-            client: reqwest::Client::new(),
+            // A bounded timeout keeps a node that accepts the connection and then
+            // stalls from hanging a fetch forever. `build` only fails on TLS
+            // backend init, in which case the default client is still usable.
+            client: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(10))
+                .build()
+                .unwrap_or_default(),
         }
     }
 }
 
-/// A block header's identity fields: a `newHeads` notification, or the finalized
-/// block, whose other fields are ignored.
+/// A block's identity fields, enough for a `newHeads` notification or the
+/// finalized block; every other header field is ignored.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct RpcHead {
+struct RpcBlockId {
     number: String,
     hash: String,
-    parent_hash: String,
 }
 
-impl RpcHead {
-    fn into_head(self) -> Result<Head, String> {
-        Ok(Head {
+impl RpcBlockId {
+    fn into_block_id(self) -> Result<BlockId, String> {
+        Ok(BlockId {
             height: decode_u64(&self.number)?,
             hash: decode_hash(&self.hash)?,
-            parent_hash: decode_hash(&self.parent_hash)?,
         })
     }
 }
@@ -92,7 +96,7 @@ struct SubscriptionMessage {
 #[derive(Debug, Deserialize)]
 struct SubscriptionParams {
     #[serde(default)]
-    result: Option<RpcHead>,
+    result: Option<RpcBlockId>,
 }
 
 /// One JSON-RPC response inside a batch, borrowing its result from the body.
@@ -154,19 +158,15 @@ fn take_result<'a>(
 /// Reads the height and hash out of a block header.
 fn decode_block_id(header: &RawValue) -> Result<BlockId, SourceError> {
     const CONTEXT: &str = "finalized block";
-    let head: RpcHead =
+    let block: RpcBlockId =
         serde_json::from_str(header.get()).map_err(|error| malformed(CONTEXT, error))?;
-    let head = head
-        .into_head()
-        .map_err(|detail| malformed(CONTEXT, detail))?;
-    Ok(BlockId {
-        height: head.height,
-        hash: head.hash,
-    })
+    block
+        .into_block_id()
+        .map_err(|detail| malformed(CONTEXT, detail))
 }
 
 /// Decodes one WebSocket frame into a head, when the frame is a head notification.
-fn decode_head_frame(text: &str) -> Option<Result<Head, SourceError>> {
+fn decode_head_frame(text: &str) -> Option<Result<BlockId, SourceError>> {
     let message: SubscriptionMessage = match serde_json::from_str(text) {
         Ok(message) => message,
         Err(error) => return Some(Err(malformed("websocket frame", error))),
@@ -177,7 +177,7 @@ fn decode_head_frame(text: &str) -> Option<Result<Head, SourceError>> {
     }
     let head = message.params.and_then(|params| params.result)?;
     Some(
-        head.into_head()
+        head.into_block_id()
             .map_err(|detail| malformed("newHeads", detail)),
     )
 }
@@ -272,7 +272,9 @@ fn decode_events(
     let number = block.header.inner.number;
     let hash = block.header.hash;
 
-    let mut events = Vec::with_capacity(1 + transactions.len() * 3);
+    // One block, a transaction and receipt per transaction, and every log.
+    let log_count: usize = receipts.iter().map(|receipt| receipt.logs().len()).sum();
+    let mut events = Vec::with_capacity(1 + transactions.len() * 2 + log_count);
     events.push(Event::Block(Box::new(decode_header(block, transactions))));
 
     for (position, (transaction, receipt)) in transactions.iter().zip(receipts).enumerate() {
@@ -859,15 +861,18 @@ mod tests {
 
     #[test]
     fn head_notification_decodes() {
+        // A real `newHeads` notification carries far more than identity; the extra
+        // fields are ignored.
         let frame = r#"{"jsonrpc":"2.0","method":"eth_subscription","params":{"result":{
             "number":"0x10",
             "hash":"0x0000000000000000000000000000000000000000000000000000000000000001",
-            "parentHash":"0x0000000000000000000000000000000000000000000000000000000000000002"
+            "parentHash":"0x0000000000000000000000000000000000000000000000000000000000000002",
+            "timestamp":"0x6530a1b0"
         }}}"#;
         let head = decode_head_frame(frame)
             .expect("frame is a head")
             .expect("head decodes");
         assert_eq!(head.height, 16);
-        assert_eq!(head.parent_hash, B256::with_last_byte(2));
+        assert_eq!(head.hash, B256::with_last_byte(1));
     }
 }
