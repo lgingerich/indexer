@@ -103,11 +103,12 @@ mod tests {
             .expect("envelope renders");
         let value: serde_json::Value = serde_json::from_str(&rendered).expect("renders as JSON");
         // The consumer-facing wire contract: one flat object carrying chain, the
-        // sequence, and the event's fields under its `type` tag.
+        // sequence, and the event's fields under its `type` tag. Heights are `0x`
+        // quantities, like the node's own encoding.
         assert_eq!(value["chain"], "base");
         assert_eq!(value["sequence"], 7);
         assert_eq!(value["type"], "finalized");
-        assert_eq!(value["height"], 42);
+        assert_eq!(value["height"], "0x2a");
         assert_eq!(value["hash"], format!("0x{}", "11".repeat(32)));
         // Exactly the envelope's keys plus the event's: chain, sequence, type, and
         // the two `finalized` fields — nothing else rides along.

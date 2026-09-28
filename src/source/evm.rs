@@ -6,8 +6,10 @@
 //! stating because they are easy to get wrong:
 //!
 //! - Blocks are requested with full transaction objects, and receipts come from
-//!   `eth_getBlockReceipts`, so nothing the node returns is dropped. Some
-//!   non-Ethereum nodes lack `eth_getBlockReceipts`.
+//!   `eth_getBlockReceipts`, so nothing the node returns is dropped. Some nodes
+//!   lack that method (some L2s, pre-Cancun Ethereum); it is answered with `-32601`
+//!   or null, and the source then fetches each receipt with
+//!   `eth_getTransactionReceipt` in batches of [`RECEIPT_BATCH_LIMIT`].
 //! - Finality comes from the node's `finalized` block tag, so each chain's own
 //!   rules apply: about two epochs on Ethereum, L1 finality of the batch on an L2.
 //! - All three calls are sent as one batch, so a block costs one round trip. They
@@ -15,15 +17,20 @@
 //!   block with another fork's receipts; every receipt's `blockHash` is checked.
 //! - The batch is parsed into alloy's RPC types, then projected field by field into
 //!   the [`crate::datasets`] records; nothing is kept as opaque JSON.
+//! - Parsing uses alloy's *catch-all* (`any`) types, so a chain's non-Ethereum
+//!   transaction types — an OP-stack deposit (`0x7e`), an Arbitrum retry (`0x6a`) —
+//!   decode instead of failing the block, and chain-specific extras are captured.
+//!   Everything read from them goes through the standard `Transaction` accessors,
+//!   except the transaction type, which is kept as its raw `u8`.
 
 use std::fmt;
 
-use alloy_consensus::TxReceipt as _;
+use alloy_consensus::Transaction as ConsensusTransaction;
+use alloy_network::TransactionResponse;
+use alloy_network::any::{AnyRpcBlock, AnyRpcTransaction, AnyTransactionReceipt};
+use alloy_network::eip2718::Typed2718 as _;
 use alloy_primitives::B256;
-use alloy_rpc_types_eth::{
-    Block as RpcBlock, Log as RpcLog, Transaction as RpcTransaction, TransactionReceipt,
-    TransactionTrait as _,
-};
+use alloy_rpc_types_eth::Log as RpcLog;
 use futures_util::{SinkExt as _, StreamExt};
 use serde::Deserialize;
 use serde_json::json;
@@ -33,6 +40,13 @@ use tokio_tungstenite::{connect_async, tungstenite::Message};
 use super::{BlockId, BlockSource, FetchedBlock, HeadStream, SourceError};
 use crate::datasets::evm::{Block, Log, Receipt, Transaction};
 use crate::envelope::{ChainId, Event};
+
+/// How many `eth_getTransactionReceipt` calls to put in one JSON-RPC batch.
+///
+/// Public nodes cap a batch — Base and Optimism reject anything above ten calls
+/// with `-32014` — so the per-transaction receipt fallback requests hashes in
+/// chunks this size. Ten is the smallest observed cap, so it is safe everywhere.
+const RECEIPT_BATCH_LIMIT: usize = 10;
 
 /// A source that talks to one EVM chain over HTTP JSON-RPC and WebSocket.
 #[derive(Debug, Clone)]
@@ -135,11 +149,20 @@ fn decode_hash(text: &str) -> Result<B256, String> {
 }
 
 /// Pulls one id's result out of a batch response.
+///
+/// A null result is returned as `Ok(None)` rather than an error, because null has
+/// meaning for some methods: `eth_getBlockReceipts` answers null on nodes and
+/// forks that do not support it, so the caller decides whether that is fatal.
+///
+/// # Errors
+///
+/// Returns [`SourceError::Malformed`] when the batch has no entry for `id`, and
+/// [`SourceError::Transport`] when the node answered that call with an error.
 fn take_result<'a>(
     responses: &[RpcResponse<'a>],
     id: u64,
     method: &str,
-) -> Result<&'a RawValue, SourceError> {
+) -> Result<Option<&'a RawValue>, SourceError> {
     let response = responses
         .iter()
         .find(|response| response.id == id)
@@ -150,9 +173,7 @@ fn take_result<'a>(
             error.code, error.message
         )));
     }
-    response
-        .result
-        .ok_or_else(|| malformed(method, "result was null"))
+    Ok(response.result)
 }
 
 /// Reads the height and hash out of a block header.
@@ -184,12 +205,23 @@ fn decode_head_frame(text: &str) -> Option<Result<BlockId, SourceError>> {
 
 /// The three results one batched block request carries, still in alloy's RPC types
 /// and not yet projected into [`crate::datasets`] records.
+///
+/// The block and receipts use alloy's *catch-all* (`any`) types, so a chain's
+/// non-Ethereum transaction types — an OP-stack deposit (`0x7e`), an Arbitrum
+/// retry (`0x6a`) — decode instead of failing the whole block. Everything this
+/// source reads is reachable through the standard `Transaction`/`BlockHeader`
+/// accessors; only the transaction type falls back to a raw `u8`.
 #[derive(Debug)]
 pub struct RpcBatch {
     /// The block, from `eth_getBlockByNumber` with full transactions.
-    pub block: RpcBlock<RpcTransaction>,
+    pub block: AnyRpcBlock,
     /// The block's receipts, from `eth_getBlockReceipts`.
-    pub receipts: Vec<TransactionReceipt>,
+    ///
+    /// `None` when the node does not serve that method; the caller then has to
+    /// fetch each receipt by transaction hash. Some nodes answer the method with
+    /// a `-32601` error and others with a `null` result, so both are treated the
+    /// same way.
+    pub receipts: Option<Vec<AnyTransactionReceipt>>,
     /// The chain's newest finalized block at request time.
     pub finalized: BlockId,
 }
@@ -209,18 +241,36 @@ pub fn parse_batch(body: &[u8]) -> Result<RpcBatch, SourceError> {
 
     let responses: Vec<RpcResponse<'_>> =
         serde_json::from_slice(body).map_err(|error| malformed("rpc batch", error))?;
-    let block: RpcBlock<RpcTransaction> =
-        serde_json::from_str(take_result(&responses, 1, BLOCK)?.get())
-            .map_err(|error| malformed(BLOCK, error))?;
-    let receipts: Vec<TransactionReceipt> =
-        serde_json::from_str(take_result(&responses, 2, RECEIPTS)?.get())
-            .map_err(|error| malformed(RECEIPTS, error))?;
-    let finalized = decode_block_id(take_result(&responses, 3, "finalized block")?)?;
+    let block_result =
+        take_result(&responses, 1, BLOCK)?.ok_or_else(|| malformed(BLOCK, "result was null"))?;
+    let block: AnyRpcBlock =
+        serde_json::from_str(block_result.get()).map_err(|error| malformed(BLOCK, error))?;
+
+    let receipts = match take_result(&responses, 2, RECEIPTS) {
+        Ok(Some(result)) => {
+            Some(serde_json::from_str(result.get()).map_err(|error| malformed(RECEIPTS, error))?)
+        }
+        // An unsupported method is reported as `-32601`, and some nodes answer
+        // with a null result instead; both mean the caller fetches per transaction.
+        Err(error) if is_method_not_found(&error) => None,
+        Ok(None) => None,
+        Err(error) => return Err(error),
+    };
+
+    let finalized = decode_block_id(
+        take_result(&responses, 3, "finalized block")?
+            .ok_or_else(|| malformed("finalized block", "result was null"))?,
+    )?;
     Ok(RpcBatch {
         block,
         receipts,
         finalized,
     })
+}
+
+/// Whether a transport error is the node saying it does not have `eth_getBlockReceipts`.
+fn is_method_not_found(error: &SourceError) -> bool {
+    matches!(error, SourceError::Transport(message) if message.contains("-32601"))
 }
 
 /// Turns a parsed batch into ordered dataset events and the finality watermark.
@@ -239,6 +289,10 @@ pub fn decode_block(batch: RpcBatch) -> Result<FetchedBlock, SourceError> {
         receipts,
         finalized,
     } = batch;
+    // The batched method is the only way receipts reach a pure decode; when a node
+    // lacks it, `fetch_block` fills them in per transaction before calling here.
+    let receipts =
+        receipts.ok_or_else(|| malformed("eth_getBlockReceipts", "receipts were not fetched"))?;
     Ok(FetchedBlock {
         events: decode_events(&block, &receipts)?,
         finalized,
@@ -247,17 +301,22 @@ pub fn decode_block(batch: RpcBatch) -> Result<FetchedBlock, SourceError> {
 
 /// Projects a block and its receipts into dataset events.
 fn decode_events(
-    block: &RpcBlock<RpcTransaction>,
-    receipts: &[TransactionReceipt],
+    block: &AnyRpcBlock,
+    receipts: &[AnyTransactionReceipt],
 ) -> Result<Vec<Event>, SourceError> {
     const RECEIPTS: &str = "eth_getBlockReceipts";
 
-    let transactions = block.transactions.as_transactions().ok_or_else(|| {
-        malformed(
-            "eth_getBlockByNumber",
-            "block returned transaction hashes only",
-        )
-    })?;
+    let transactions = block
+        .0
+        .inner
+        .transactions
+        .as_transactions()
+        .ok_or_else(|| {
+            malformed(
+                "eth_getBlockByNumber",
+                "block returned transaction hashes only",
+            )
+        })?;
     if receipts.len() != transactions.len() {
         return Err(malformed(
             RECEIPTS,
@@ -269,8 +328,8 @@ fn decode_events(
         ));
     }
 
-    let number = block.header.inner.number;
-    let hash = block.header.hash;
+    let number = block.0.inner.header.inner.number;
+    let hash = block.0.inner.header.hash;
 
     // One block, a transaction and receipt per transaction, and every log.
     let log_count: usize = receipts.iter().map(|receipt| receipt.logs().len()).sum();
@@ -278,7 +337,7 @@ fn decode_events(
     events.push(Event::Block(Box::new(decode_header(block, transactions))));
 
     for (position, (transaction, receipt)) in transactions.iter().zip(receipts).enumerate() {
-        let tx_hash = *transaction.inner.tx_hash();
+        let tx_hash = transaction.tx_hash();
         let tx_index = position as u64;
 
         let receipt_block = receipt.block_hash.unwrap_or_default();
@@ -304,7 +363,7 @@ fn decode_events(
             transaction,
             tx_index,
             number,
-            block.header.inner.timestamp,
+            block.0.inner.header.inner.timestamp,
             hash,
         ))));
         events.push(Event::Receipt(Box::new(decode_receipt(
@@ -323,69 +382,78 @@ fn decode_events(
 }
 
 /// Flattens a block header and its transaction hashes into the block dataset.
-fn decode_header(block: &RpcBlock<RpcTransaction>, transactions: &[RpcTransaction]) -> Block {
-    let header = &block.header.inner;
+fn decode_header(block: &AnyRpcBlock, transactions: &[AnyRpcTransaction]) -> Block {
+    let header = &block.0.inner.header;
     Block {
         number: header.number,
-        hash: block.header.hash,
-        parent_hash: header.parent_hash,
-        timestamp: header.timestamp,
-        nonce: header.nonce,
-        ommers_hash: header.ommers_hash,
-        transactions_root: header.transactions_root,
-        state_root: header.state_root,
-        receipts_root: header.receipts_root,
-        withdrawals_root: header.withdrawals_root,
-        logs_bloom: header.logs_bloom,
-        miner: header.beneficiary,
-        difficulty: header.difficulty,
-        total_difficulty: block.header.total_difficulty,
-        size: block.header.size,
-        extra_data: header.extra_data.clone(),
-        gas_limit: header.gas_limit,
-        gas_used: header.gas_used,
+        hash: header.hash,
+        parent_hash: header.inner.parent_hash,
+        timestamp: header.inner.timestamp,
+        nonce: header.inner.nonce.unwrap_or_default(),
+        ommers_hash: header.inner.ommers_hash,
+        transactions_root: header.inner.transactions_root,
+        state_root: header.inner.state_root,
+        receipts_root: header.inner.receipts_root,
+        withdrawals_root: header.inner.withdrawals_root,
+        logs_bloom: header.inner.logs_bloom,
+        miner: header.inner.beneficiary,
+        difficulty: header.inner.difficulty,
+        total_difficulty: header.total_difficulty,
+        size: header.size,
+        extra_data: header.inner.extra_data.clone(),
+        gas_limit: header.inner.gas_limit,
+        gas_used: header.inner.gas_used,
         transaction_count: transactions.len() as u64,
-        base_fee_per_gas: header.base_fee_per_gas,
-        blob_gas_used: header.blob_gas_used,
-        excess_blob_gas: header.excess_blob_gas,
-        parent_beacon_block_root: header.parent_beacon_block_root,
-        ommers: block.uncles.clone(),
+        base_fee_per_gas: header.inner.base_fee_per_gas,
+        blob_gas_used: header.inner.blob_gas_used,
+        excess_blob_gas: header.inner.excess_blob_gas,
+        parent_beacon_block_root: header.inner.parent_beacon_block_root,
+        ommers: block.0.inner.uncles.clone(),
         transaction_hashes: transactions
             .iter()
-            .map(|transaction| *transaction.inner.tx_hash())
+            .map(AnyRpcTransaction::tx_hash)
             .collect(),
     }
 }
 
 /// Flattens one RPC transaction into the transaction dataset.
+///
+/// Every field comes from the standard `alloy_consensus::Transaction` accessors,
+/// which work for Ethereum and non-Ethereum types alike (an OP deposit reads its
+/// `gasPrice` from the unknown transaction's captured fields). The type is kept as
+/// the raw `u8` so a non-Ethereum type — `0x7e`, `0x6a` — survives.
 fn decode_transaction(
-    transaction: &RpcTransaction,
+    transaction: &AnyRpcTransaction,
     tx_index: u64,
     block_number: u64,
     block_timestamp: u64,
     block_hash: B256,
 ) -> Transaction {
     Transaction {
-        hash: *transaction.inner.tx_hash(),
-        nonce: transaction.nonce(),
+        hash: transaction.tx_hash(),
+        nonce: ConsensusTransaction::nonce(transaction),
         transaction_index: tx_index,
-        from: transaction.inner.signer(),
-        to: transaction.inner.to(),
-        value: transaction.inner.value(),
-        gas: transaction.inner.gas_limit(),
-        gas_price: transaction.inner.gas_price(),
-        max_fee_per_gas: transaction.inner.max_fee_per_gas(),
-        max_priority_fee_per_gas: transaction.inner.max_priority_fee_per_gas(),
-        max_fee_per_blob_gas: transaction.inner.max_fee_per_blob_gas(),
-        input: transaction.inner.input().clone(),
-        transaction_type: transaction.inner.tx_type(),
-        chain_id: transaction.inner.chain_id(),
-        access_list: transaction.inner.access_list().cloned(),
-        blob_versioned_hashes: transaction
-            .inner
-            .blob_versioned_hashes()
+        from: transaction.from(),
+        to: ConsensusTransaction::to(transaction),
+        value: ConsensusTransaction::value(transaction),
+        gas: ConsensusTransaction::gas_limit(transaction),
+        // `gas_price`/`max_fee_per_gas` exist on both `Transaction` and
+        // `TransactionResponse` for an RPC transaction; the RPC one is correct.
+        // `max_fee_per_gas` is `Some` for dynamic-fee types and `None` for legacy,
+        // where the consensus accessor saturates to the gas price instead.
+        gas_price: TransactionResponse::gas_price(transaction),
+        max_fee_per_gas: TransactionResponse::max_fee_per_gas(transaction)
+            .unwrap_or_else(|| ConsensusTransaction::max_fee_per_gas(transaction)),
+        max_priority_fee_per_gas: ConsensusTransaction::max_priority_fee_per_gas(transaction),
+        max_fee_per_blob_gas: ConsensusTransaction::max_fee_per_blob_gas(transaction),
+        input: ConsensusTransaction::input(transaction).clone(),
+        transaction_type: transaction.ty(),
+        chain_id: ConsensusTransaction::chain_id(transaction),
+        access_list: ConsensusTransaction::access_list(transaction).cloned(),
+        blob_versioned_hashes: ConsensusTransaction::blob_versioned_hashes(transaction)
             .map(<[B256]>::to_vec),
-        authorization_list: transaction.inner.authorization_list().map(<[_]>::to_vec),
+        authorization_list: ConsensusTransaction::authorization_list(transaction)
+            .map(<[_]>::to_vec),
         block_timestamp,
         block_number,
         block_hash,
@@ -394,7 +462,7 @@ fn decode_transaction(
 
 /// Flattens one RPC receipt into the receipt dataset, without its logs.
 fn decode_receipt(
-    receipt: &TransactionReceipt,
+    receipt: &AnyTransactionReceipt,
     transaction_hash: B256,
     tx_index: u64,
     block_number: u64,
@@ -405,13 +473,13 @@ fn decode_receipt(
         transaction_index: tx_index,
         from: receipt.from,
         to: receipt.to,
-        status: receipt.status(),
-        transaction_type: receipt.transaction_type(),
+        status: receipt.inner.inner.status(),
+        transaction_type: receipt.inner.inner.r#type,
         gas_used: receipt.gas_used,
-        cumulative_gas_used: receipt.inner.cumulative_gas_used(),
+        cumulative_gas_used: receipt.inner.inner.cumulative_gas_used(),
         effective_gas_price: receipt.effective_gas_price,
         contract_address: receipt.contract_address,
-        logs_bloom: receipt.inner.bloom(),
+        logs_bloom: receipt.inner.inner.bloom(),
         blob_gas_used: receipt.blob_gas_used,
         blob_gas_price: receipt.blob_gas_price,
         log_count: receipt.logs().len() as u64,
@@ -473,11 +541,86 @@ impl BlockSource for EvmSource {
 
     async fn fetch_block(&self, height: u64) -> Result<FetchedBlock, SourceError> {
         let body = self.post_batch(height).await?;
-        decode_block(parse_batch(&body)?)
+        let mut batch = parse_batch(&body)?;
+        // Nodes that do not serve `eth_getBlockReceipts` (some L2s, and pre-Cancun
+        // Ethereum) answer it with `-32601` or null. Fetch the receipts by
+        // transaction hash instead, so the block still becomes events.
+        if batch.receipts.is_none() {
+            batch.receipts = Some(self.fetch_receipts(&batch.block).await?);
+        }
+        decode_block(batch)
     }
 }
 
 impl EvmSource {
+    /// POSTs one JSON-RPC request body and returns the response bytes.
+    async fn post(&self, body: &serde_json::Value) -> Result<Vec<u8>, SourceError> {
+        let transport = |error: reqwest::Error| SourceError::Transport(error.to_string());
+        self.client
+            .post(self.http_url.as_str())
+            .json(body)
+            .send()
+            .await
+            .and_then(reqwest::Response::error_for_status)
+            .map_err(transport)?
+            .bytes()
+            .await
+            .map_err(transport)
+            .map(|bytes| bytes.to_vec())
+    }
+
+    /// Fetches the block's receipts one transaction at a time, in index order.
+    ///
+    /// The fallback for nodes without `eth_getBlockReceipts`. Many public nodes cap
+    /// a JSON-RPC batch at [`RECEIPT_BATCH_LIMIT`] calls — Base and Optimism answer
+    /// `-32014` above it — so the hashes are requested in chunks of that size.
+    async fn fetch_receipts(
+        &self,
+        block: &AnyRpcBlock,
+    ) -> Result<Vec<AnyTransactionReceipt>, SourceError> {
+        const RECEIPT: &str = "eth_getTransactionReceipt";
+        let transactions = block
+            .0
+            .inner
+            .transactions
+            .as_transactions()
+            .ok_or_else(|| {
+                malformed(
+                    "eth_getBlockByNumber",
+                    "block returned transaction hashes only",
+                )
+            })?;
+
+        let mut receipts = Vec::with_capacity(transactions.len());
+        for chunk in transactions.chunks(RECEIPT_BATCH_LIMIT) {
+            let requests: Vec<serde_json::Value> = chunk
+                .iter()
+                .enumerate()
+                .map(|(index, transaction)| {
+                    json!({
+                        "jsonrpc": "2.0",
+                        "id": index + 1,
+                        "method": RECEIPT,
+                        "params": [transaction.tx_hash()],
+                    })
+                })
+                .collect();
+            let body = self.post(&serde_json::Value::Array(requests)).await?;
+            let responses: Vec<RpcResponse<'_>> =
+                serde_json::from_slice(&body).map_err(|error| malformed(RECEIPT, error))?;
+            // Match by id so order is the block's, whatever order the node replies in.
+            for index in 0..chunk.len() {
+                let result = take_result(&responses, index as u64 + 1, RECEIPT)?
+                    .ok_or_else(|| malformed(RECEIPT, "result was null"))?;
+                receipts.push(
+                    serde_json::from_str(result.get())
+                        .map_err(|error| malformed(RECEIPT, error))?,
+                );
+            }
+        }
+        Ok(receipts)
+    }
+
     /// Sends the batched block request and returns the raw response body.
     ///
     /// This is the only I/O in a block fetch; parsing and projection are pure and
@@ -507,18 +650,7 @@ impl EvmSource {
                 "params": ["finalized", false],
             },
         ]);
-        let transport = |error: reqwest::Error| SourceError::Transport(error.to_string());
-        self.client
-            .post(self.http_url.as_str())
-            .json(&batch)
-            .send()
-            .await
-            .and_then(reqwest::Response::error_for_status)
-            .map_err(transport)?
-            .bytes()
-            .await
-            .map_err(transport)
-            .map(|bytes| bytes.to_vec())
+        self.post(&batch).await
     }
 }
 
@@ -734,7 +866,7 @@ mod tests {
             Some(address(0xf1).parse().expect("to parses"))
         );
         assert_eq!(transaction.input.len(), 4);
-        assert_eq!(transaction.transaction_type, TxType::Eip1559);
+        assert_eq!(transaction.transaction_type, TxType::Eip1559 as u8);
         assert_eq!(transaction.block_number, 18_000_000);
 
         let Event::Receipt(receipt) = &fetched.events[2] else {
@@ -746,7 +878,7 @@ mod tests {
         assert_eq!(receipt.cumulative_gas_used, 21_000);
         // Logs are their own dataset; the receipt carries only their count.
         assert_eq!(receipt.log_count, 2);
-        assert_eq!(receipt.transaction_type, TxType::Eip1559);
+        assert_eq!(receipt.transaction_type, TxType::Eip1559 as u8);
 
         let Event::Log(log) = &fetched.events[4] else {
             panic!("fifth event must be a log");
@@ -853,6 +985,34 @@ mod tests {
         assert!(error.to_string().contains("header not found"), "{error}");
     }
 
+    /// A node without `eth_getBlockReceipts` answers `-32601`; the batch must parse
+    /// with receipts absent so `fetch_block` can fall back to per-transaction
+    /// fetches, rather than failing the block.
+    #[test]
+    fn unsupported_receipts_method_leaves_receipts_absent() {
+        let body = json!([
+            {"jsonrpc": "2.0", "id": 1, "result": block()},
+            {"jsonrpc": "2.0", "id": 2, "error": {"code": -32601, "message": "method not found"}},
+            {"jsonrpc": "2.0", "id": 3, "result": {"number": "0x10", "hash": hash(0xf0)}},
+        ])
+        .to_string();
+        let batch = parse_batch(body.as_bytes()).expect("batch parses without receipts");
+        assert!(batch.receipts.is_none());
+    }
+
+    /// A `null` result (rather than an error) also means the caller must fall back.
+    #[test]
+    fn null_receipts_result_leaves_receipts_absent() {
+        let body = json!([
+            {"jsonrpc": "2.0", "id": 1, "result": block()},
+            {"jsonrpc": "2.0", "id": 2, "result": null},
+            {"jsonrpc": "2.0", "id": 3, "result": {"number": "0x10", "hash": hash(0xf0)}},
+        ])
+        .to_string();
+        let batch = parse_batch(body.as_bytes()).expect("batch parses without receipts");
+        assert!(batch.receipts.is_none());
+    }
+
     #[test]
     fn subscription_confirmation_is_not_a_head() {
         let confirmation = r#"{"jsonrpc":"2.0","id":1,"result":"0xsub"}"#;
@@ -874,5 +1034,49 @@ mod tests {
             .expect("head decodes");
         assert_eq!(head.height, 16);
         assert_eq!(head.hash, B256::with_last_byte(1));
+    }
+
+    /// An OP-stack block carrying a deposit transaction (`type: 0x7e`), which
+    /// Ethereum-only types reject outright. This is the regression that matters
+    /// most: the deposit type is outside 0-4, so the whole block used to fail to
+    /// decode. The fixture is trimmed from a real Base block.
+    #[test]
+    fn non_ethereum_transaction_type_decodes_and_keeps_its_type() {
+        let deposit = json!({
+            "hash": hash(0x11), "blockHash": hash(0xab), "blockNumber": "0x112a880",
+            "transactionIndex": "0x0", "from": address(0xf0), "to": address(0xf1),
+            "value": "0x0", "gas": "0x5208", "gasPrice": "0x0",
+            "input": "0xdeadbeef", "nonce": "0x1", "type": "0x7e",
+            // Fields alloy captures for the unknown type and does not model.
+            "sourceHash": hash(0x42), "mint": "0x0", "depositReceiptVersion": "0x1",
+            "v": "0x0", "r": hash(0x00), "s": hash(0x00), "yParity": "0x0",
+        });
+        let mut block = block();
+        block["transactions"] = json!([deposit]);
+        // The deposit receipt carries no blob fields; keep the block/receipt
+        // hashes aligned with the block fixture.
+        let mut receipts = receipts();
+        receipts.as_array_mut().expect("array").truncate(1);
+        receipts[0]["transactionHash"] = json!(hash(0x11));
+        receipts[0]["type"] = json!("0x7e");
+        receipts[0]["logs"] = json!([]);
+
+        let fetched = decode_batch(&batch(&block, &receipts)).expect("OP deposit block decodes");
+        assert_eq!(fetched.events.len(), 3, "block, transaction, receipt");
+
+        let Event::Transaction(transaction) = &fetched.events[1] else {
+            panic!("second event must be a transaction");
+        };
+        assert_eq!(transaction.transaction_type, 0x7e);
+        assert_eq!(
+            transaction.to,
+            Some(address(0xf1).parse().expect("to parses"))
+        );
+        assert_eq!(transaction.nonce, 1);
+
+        let Event::Receipt(receipt) = &fetched.events[2] else {
+            panic!("third event must be a receipt");
+        };
+        assert_eq!(receipt.transaction_type, 0x7e);
     }
 }

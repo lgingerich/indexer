@@ -79,6 +79,7 @@ impl From<String> for ChainId {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Reorg {
     /// Height of the new head at which the discontinuity was detected.
+    #[serde(with = "alloy_serde::quantity")]
     pub height: u64,
     /// Hash of the new head.
     pub new_head_hash: B256,
@@ -94,6 +95,7 @@ pub struct Reorg {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Finalized {
     /// Height of the newest finalized block.
+    #[serde(with = "alloy_serde::quantity")]
     pub height: u64,
     /// Hash of the newest finalized block.
     pub hash: B256,
@@ -207,11 +209,9 @@ impl Envelope {
 // means the fixture or setup is wrong.
 #[expect(clippy::expect_used)]
 mod tests {
-    use std::str::FromStr as _;
+    use alloy_primitives::{Address, B256, TxHash};
 
-    use alloy_primitives::B256;
-
-    use super::{Block, ChainId, Envelope, Event, Finalized};
+    use super::{Block, ChainId, Envelope, Event, Finalized, Log, Receipt, Reorg, Transaction};
 
     fn chain() -> ChainId {
         ChainId::new("ethereum")
@@ -234,12 +234,6 @@ mod tests {
         );
         let decoded: B256 = serde_json::from_str(&encoded).expect("hash deserializes");
         assert_eq!(decoded, value);
-    }
-
-    #[test]
-    fn b256_rejects_wrong_length_hex() {
-        assert!(B256::from_str("0xdeadbeef").is_err());
-        assert!(B256::from_str("not hex").is_err());
     }
 
     #[test]
@@ -279,8 +273,98 @@ mod tests {
         let value = serde_json::to_value(&envelope).expect("envelope serializes");
         assert_eq!(value["type"], "block");
         assert_eq!(value["sequence"], 4);
-        assert_eq!(value["number"], 5);
+        assert_eq!(value["number"], "0x5");
         assert_eq!(value["hash"], format!("0x{}", "09".repeat(32)));
         assert_eq!(value["chain"], "ethereum");
+    }
+
+    /// Integer fields render as the node's own "quantity" form, not as JSON
+    /// numbers. A live `eth_getBlockByNumber` returns `number`, `gas`, `nonce`,
+    /// `gasPrice`, `maxFeePerGas`, `chainId`, `gasUsed`, `logIndex` — every
+    /// integer — as `0x` hex, so matching that is what keeps a consumer from
+    /// having to special-case our encoding against the node's.
+    #[test]
+    fn integers_render_as_quantities_not_json_numbers() {
+        let envelope = Envelope::new(
+            chain(),
+            120,
+            Event::Transaction(Box::new(Transaction {
+                hash: TxHash::from([0x11; 32]),
+                nonce: 130_000,
+                gas: 454_000,
+                gas_price: Some(7),
+                max_fee_per_gas: 8,
+                chain_id: Some(1),
+                block_number: 26_000_000,
+                ..Transaction::default()
+            })),
+        );
+        let value = serde_json::to_value(&envelope).expect("envelope serializes");
+        assert_eq!(value["nonce"], "0x1fbd0");
+        assert_eq!(value["gas"], "0x6ed70");
+        assert_eq!(value["gas_price"], "0x7");
+        assert_eq!(value["max_fee_per_gas"], "0x8");
+        assert_eq!(value["chain_id"], "0x1");
+        assert_eq!(value["block_number"], "0x18cba80");
+        // The envelope's own sequence is a plain JSON number, not a chain quantity.
+        assert_eq!(value["sequence"], 120);
+    }
+
+    /// Every variant must survive the round trip an envelope takes: serialised by
+    /// the sink, then read back by a consumer. `Transaction` and `Receipt` carry
+    /// `u128` fee fields, which serde's `flatten` buffering cannot deserialize
+    /// unless those fields use the quantity encoding — this test is what pins that.
+    #[test]
+    fn every_variant_round_trips_through_json() {
+        let variants = [
+            Event::Block(Box::new(Block {
+                number: 5,
+                hash: hash(9),
+                parent_hash: hash(8),
+                timestamp: 1_700_000_000,
+                ..Block::default()
+            })),
+            Event::Transaction(Box::new(Transaction {
+                hash: TxHash::from([0x11; 32]),
+                from: Address::from([0x22; 20]),
+                gas_price: Some(u128::MAX),
+                max_fee_per_gas: u128::MAX,
+                max_priority_fee_per_gas: Some(u128::MAX),
+                max_fee_per_blob_gas: Some(u128::MAX),
+                block_number: 5,
+                ..Transaction::default()
+            })),
+            Event::Receipt(Box::new(Receipt {
+                transaction_hash: TxHash::from([0x11; 32]),
+                effective_gas_price: u128::MAX,
+                blob_gas_price: Some(u128::MAX),
+                block_number: 5,
+                ..Receipt::default()
+            })),
+            Event::Log(Box::new(Log {
+                log_index: 1,
+                transaction_hash: TxHash::from([0x11; 32]),
+                block_number: 5,
+                topic0: Some(hash(0x07)),
+                ..Log::default()
+            })),
+            Event::Reorg(Reorg {
+                height: 1,
+                new_head_hash: hash(3),
+                orphaned_hashes: vec![hash(2)],
+            }),
+            Event::Finalized(Finalized {
+                height: 1,
+                hash: hash(3),
+            }),
+        ];
+        for event in variants {
+            let kind = event.kind();
+            let envelope = Envelope::new(chain(), 0, event);
+            let encoded = serde_json::to_string(&envelope).expect("envelope serializes");
+            let decoded: Envelope = serde_json::from_str(&encoded)
+                .unwrap_or_else(|error| panic!("{kind} does not round-trip: {error}\n{encoded}"));
+            assert_eq!(decoded, envelope, "{kind} changed across the round trip");
+        }
     }
 }

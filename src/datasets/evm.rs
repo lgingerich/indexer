@@ -17,11 +17,12 @@
 //! Every field is present and typed; nothing is kept as opaque JSON, so a consumer
 //! can persist a row without decoding. Field types come from `alloy-primitives`
 //! ([`Address`], [`B256`], [`U256`], `Bytes`) and `alloy-rpc-types-eth`
-//! ([`AccessList`], [`TxType`]), which serialize to the canonical Ethereum JSON
-//! forms — lowercase `0x` hex for bytes, `0x` quantity for numbers — pinned by a
-//! test in `crate::envelope`.
+//! ([`AccessList`], `SignedAuthorization`). Integer fields carry `#[serde(with =
+//! "alloy_serde::quantity")]` so they render as the Ethereum JSON-RPC "quantity"
+//! form (`0x` hex) the node itself uses, not as bare JSON numbers; `U256` and the
+//! byte/address types already serialize to their canonical `0x` forms. The whole
+//! envelope is pinned by round-trip and wire-format tests in `crate::envelope`.
 
-use alloy_consensus::TxType;
 use alloy_primitives::{Address, B64, B256, BlockHash, Bloom, Bytes, TxHash, U256};
 use alloy_rpc_types_eth::{AccessList, SignedAuthorization};
 use serde::{Deserialize, Serialize};
@@ -35,12 +36,14 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct Block {
     /// Height of the chain, in blocks.
+    #[serde(with = "alloy_serde::quantity")]
     pub number: u64,
     /// Unique identifier of this block.
     pub hash: BlockHash,
     /// Identifier of the parent block.
     pub parent_hash: BlockHash,
     /// Timestamp for when the block was collated.
+    #[serde(with = "alloy_serde::quantity")]
     pub timestamp: u64,
     /// Hash of the generated proof-of-work; `B64::ZERO` post-merge.
     pub nonce: B64,
@@ -67,16 +70,34 @@ pub struct Block {
     /// Arbitrary data relevant to this block.
     pub extra_data: Bytes,
     /// Gas limit of this block.
+    #[serde(with = "alloy_serde::quantity")]
     pub gas_limit: u64,
     /// Total gas used by this block's transactions.
+    #[serde(with = "alloy_serde::quantity")]
     pub gas_used: u64,
     /// Number of transactions in this block.
+    #[serde(with = "alloy_serde::quantity")]
     pub transaction_count: u64,
     /// Minimum gas price required for inclusion, in wei; `None` before EIP-1559.
+    #[serde(
+        default,
+        with = "alloy_serde::quantity::opt",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub base_fee_per_gas: Option<u64>,
     /// Total blob gas used by this block's blob transactions; EIP-4844.
+    #[serde(
+        default,
+        with = "alloy_serde::quantity::opt",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub blob_gas_used: Option<u64>,
     /// Excess blob gas carried from the parent; EIP-4844.
+    #[serde(
+        default,
+        with = "alloy_serde::quantity::opt",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub excess_blob_gas: Option<u64>,
     /// Root of the parent beacon block; EIP-4788.
     pub parent_beacon_block_root: Option<B256>,
@@ -103,8 +124,10 @@ pub struct Transaction {
     /// Unique identifier of this transaction.
     pub hash: TxHash,
     /// Nonce of the sending account.
+    #[serde(with = "alloy_serde::quantity")]
     pub nonce: u64,
     /// Position of this transaction within its block.
+    #[serde(with = "alloy_serde::quantity")]
     pub transaction_index: u64,
     /// Address of the sending party.
     pub from: Address,
@@ -113,20 +136,47 @@ pub struct Transaction {
     /// Value transferred, in wei.
     pub value: U256,
     /// Gas allocated to this transaction.
+    #[serde(with = "alloy_serde::quantity")]
     pub gas: u64,
     /// Gas price, in wei; `Some` for legacy and EIP-2930 transactions.
+    #[serde(
+        default,
+        with = "alloy_serde::quantity::opt",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub gas_price: Option<u128>,
     /// Maximum fee per gas, in wei; EIP-1559.
+    #[serde(with = "alloy_serde::quantity")]
     pub max_fee_per_gas: u128,
     /// Maximum priority fee per gas, in wei; EIP-1559.
+    #[serde(
+        default,
+        with = "alloy_serde::quantity::opt",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub max_priority_fee_per_gas: Option<u128>,
     /// Maximum fee per blob gas, in wei; EIP-4844.
+    #[serde(
+        default,
+        with = "alloy_serde::quantity::opt",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub max_fee_per_blob_gas: Option<u128>,
     /// Calldata sent with this transaction.
     pub input: Bytes,
     /// Transaction type: 0 legacy, 1 access list, 2 dynamic fee, 3 blob, 4 set-code.
-    pub transaction_type: TxType,
+    ///
+    /// Kept as the raw `u8` rather than a fixed enum, because non-Ethereum EVM
+    /// chains use types outside 0-4 — an OP-stack deposit is `0x7e`, an Arbitrum
+    /// retry `0x6a` — and they must round-trip unmodified.
+    #[serde(with = "alloy_serde::quantity")]
+    pub transaction_type: u8,
     /// Chain this transaction is valid on, from EIP-155.
+    #[serde(
+        default,
+        with = "alloy_serde::quantity::opt",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub chain_id: Option<u64>,
     /// Access list; EIP-2930.
     pub access_list: Option<AccessList>,
@@ -135,8 +185,10 @@ pub struct Transaction {
     /// Authorization list; EIP-7702.
     pub authorization_list: Option<Vec<SignedAuthorization>>,
     /// Block timestamp, denormalized for time-based partitioning.
+    #[serde(with = "alloy_serde::quantity")]
     pub block_timestamp: u64,
     /// Height of the block containing this transaction.
+    #[serde(with = "alloy_serde::quantity")]
     pub block_number: u64,
     /// Hash of the block containing this transaction.
     pub block_hash: BlockHash,
@@ -161,6 +213,7 @@ pub struct Receipt {
     /// Hash of the transaction this receipt belongs to.
     pub transaction_hash: TxHash,
     /// Position of that transaction within its block.
+    #[serde(with = "alloy_serde::quantity")]
     pub transaction_index: u64,
     /// Address of the sending party.
     pub from: Address,
@@ -169,24 +222,43 @@ pub struct Receipt {
     /// Success status of the transaction.
     pub status: bool,
     /// Transaction type, mirrored from the transaction.
-    pub transaction_type: TxType,
+    ///
+    /// The raw `u8`, for the same reason as [`Transaction::transaction_type`]:
+    /// non-Ethereum chains use types outside 0-4.
+    #[serde(with = "alloy_serde::quantity")]
+    pub transaction_type: u8,
     /// Gas used by this transaction alone.
+    #[serde(with = "alloy_serde::quantity")]
     pub gas_used: u64,
     /// Total gas used in the block when this transaction was executed.
+    #[serde(with = "alloy_serde::quantity")]
     pub cumulative_gas_used: u64,
     /// Effective gas price paid, in wei.
+    #[serde(with = "alloy_serde::quantity")]
     pub effective_gas_price: u128,
     /// Address of the created contract, if this was a deployment.
     pub contract_address: Option<Address>,
     /// Bloom filter for this receipt's logs.
     pub logs_bloom: Bloom,
     /// Blob gas used; EIP-4844.
+    #[serde(
+        default,
+        with = "alloy_serde::quantity::opt",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub blob_gas_used: Option<u64>,
     /// Blob gas price; EIP-4844.
+    #[serde(
+        default,
+        with = "alloy_serde::quantity::opt",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub blob_gas_price: Option<u128>,
     /// Number of logs emitted by this transaction.
+    #[serde(with = "alloy_serde::quantity")]
     pub log_count: u64,
     /// Height of the block containing this receipt's transaction.
+    #[serde(with = "alloy_serde::quantity")]
     pub block_number: u64,
     /// Hash of the block containing this receipt's transaction.
     pub block_hash: BlockHash,
@@ -207,10 +279,12 @@ impl Receipt {
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct Log {
     /// Position of this log within its block.
+    #[serde(with = "alloy_serde::quantity")]
     pub log_index: u64,
     /// Hash of the transaction that emitted this log.
     pub transaction_hash: TxHash,
     /// Position of the emitting transaction within its block.
+    #[serde(with = "alloy_serde::quantity")]
     pub transaction_index: u64,
     /// Address of the contract that emitted this log.
     pub address: Address,
@@ -228,6 +302,7 @@ pub struct Log {
     /// separately, so this is carried as the source returned it.
     pub removed: bool,
     /// Height of the block containing this log.
+    #[serde(with = "alloy_serde::quantity")]
     pub block_number: u64,
     /// Hash of the block containing this log.
     pub block_hash: BlockHash,
