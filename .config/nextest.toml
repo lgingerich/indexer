@@ -1,0 +1,9 @@
+# nextest configuration.
+#
+# The repository's verification command is `cargo nextest run --all-targets
+# --all-features`, which does not filter out benchmark targets. `benches/hot_path.rs`
+# is a `harness = false` benchmark whose `main` runs a ~40-second measurement, so
+# without this filter `--all-targets` appears to hang. `cargo bench` is unaffected
+# and still runs it.
+[profile.default]
+default-filter = "not binary(hot_path)"
