@@ -14,10 +14,10 @@
 use std::hint::black_box;
 use std::time::{Duration, Instant};
 
-use indexer::envelope::{ChainId, Envelope};
 use indexer::source::FetchedBlock;
 use indexer::source::evm::{decode_block, parse_batch};
 use serde_json::json;
+use wire::envelope::{ChainId, Envelope};
 
 /// The full production decode path: parse the batch, then project it to records.
 ///

@@ -38,8 +38,9 @@ use anyhow::bail;
 use futures_util::StreamExt as _;
 use tracing::{error, info, warn};
 
-use crate::envelope::{Envelope, Event, Finalized, Reorg};
-use crate::sink::EventSink;
+use sink::EventSink;
+use wire::envelope::{Envelope, Event, Finalized, Reorg};
+
 use crate::source::{BlockId, BlockSource, FetchedBlock};
 
 /// The most published blocks the undo ring remembers by default, and therefore the
@@ -378,8 +379,10 @@ mod tests {
     use futures_util::stream;
 
     use super::{Mode, Pipeline};
-    use crate::envelope::{Block, ChainId, Envelope, Event, Log};
-    use crate::sink::EventSink;
+    use wire::envelope::{Block, ChainId, Envelope, Event, Log};
+
+    use sink::EventSink;
+
     use crate::source::{BlockId, BlockSource, FetchedBlock, HeadStream, SourceError};
 
     fn hash(byte: u8) -> B256 {

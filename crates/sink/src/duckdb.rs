@@ -1,21 +1,22 @@
 //! The `DuckDB` sink: envelopes into a local, queryable database.
 //!
-//! Where [`StdoutJsonSink`](crate::sink::StdoutJsonSink) is fire-and-forward, this
+//! Where [`StdoutJsonSink`](crate::StdoutJsonSink) is fire-and-forward, this
 //! one is a *store*: it appends each envelope as a row so a later process can
 //! query the history locally with SQL. That split matters — `DuckDB` is an
 //! embedded, single-writer engine, so it is an archive/analytics endpoint, not a
 //! horizontally-scaled egress. Keep it for a local replica or an analytical
 //! sidecar, not as the fan-out for many consumers.
 //!
-//! One flat row per event, no `raw` blob:
+//! One flat row per event; the envelope rides along as `JSON` rather than as a
+//! second copy of its fields:
 //!
-//! | column       | source                                                |
-//! |--------------|-------------------------------------------------------|
-//! | `sequence`   | [`Envelope::sequence`]                                |
-//! | `chain`      | [`Envelope::chain`]                                   |
-//! | `event_type` | [`Envelope::kind`] (`block`, `log`, `reorg`, …)       |
-//! | `dedupe_key` | [`Event::dedupe_key`](crate::envelope::Event::dedupe_key) |
-//! | `envelope`   | the whole envelope as `DuckDB` `JSON`                   |
+//! | column       | source                                                  |
+//! |--------------|---------------------------------------------------------|
+//! | `sequence`   | [`Envelope::sequence`]                                  |
+//! | `chain`      | [`Envelope::chain`]                                     |
+//! | `event_type` | [`Envelope::kind`] (`block`, `log`, `reorg`, …)         |
+//! | `dedupe_key` | [`Event::dedupe_key`](wire::envelope::Event::dedupe_key) |
+//! | `envelope`   | `serde_json::to_string(envelope)`                       |
 //!
 //! `sequence`/`chain` are lifted into columns because they are the columns you
 //! filter and order on; the full envelope still rides along as `JSON` so nothing
@@ -37,9 +38,9 @@
 
 use anyhow::Context as _;
 use duckdb::{Connection, params};
+use wire::envelope::Envelope;
 
-use crate::envelope::Envelope;
-use crate::sink::EventSink;
+use crate::EventSink;
 
 /// DDL for the append-only event table.
 ///
@@ -156,10 +157,10 @@ impl Row {
 #[expect(clippy::expect_used)]
 mod tests {
     use duckdb::Connection;
+    use wire::envelope::{ChainId, Envelope, Event, Finalized};
 
-    use crate::envelope::{ChainId, Envelope, Event, Finalized};
-    use crate::sink::EventSink as _;
-    use crate::sink::duckdb::DuckDbSink;
+    use crate::EventSink as _;
+    use crate::duckdb::DuckDbSink;
 
     fn sink() -> DuckDbSink {
         let connection = Connection::open_in_memory().expect("open in-memory DuckDB");

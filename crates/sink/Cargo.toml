@@ -1,0 +1,31 @@
+[package]
+name = "sink"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95.0"
+description = "The indexer's egress boundary: the sink trait and the concrete sinks."
+license = "MIT OR Apache-2.0"
+publish = false
+
+[lints]
+workspace = true
+
+[features]
+default = []
+# Kafka-protocol egress (`kafka`) on bundled librdkafka. Off by default so the C
+# build dependency stays out of a plain `cargo build`.
+kafka = ["dep:rdkafka"]
+# Local `DuckDB` store (`duckdb`). Off by default so the one-time C++ engine build
+# stays out of a plain `cargo build`.
+duckdb = ["dep:duckdb"]
+
+[dependencies]
+anyhow = { workspace = true }
+duckdb = { workspace = true, optional = true }
+rdkafka = { workspace = true, optional = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+wire = { path = "../wire" }
+
+[dev-dependencies]
+alloy-primitives = { workspace = true }

@@ -1,0 +1,43 @@
+[package]
+name = "indexer"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95.0"
+description = "A low-latency, chain-agnostic blockchain indexer."
+license = "MIT OR Apache-2.0"
+publish = false
+
+[[bin]]
+name = "ingest"
+path = "src/main.rs"
+
+[features]
+default = ["kafka", "duckdb"]
+kafka = ["sink/kafka"]
+duckdb = ["sink/duckdb"]
+
+[lints]
+workspace = true
+
+[dependencies]
+alloy-consensus = { workspace = true }
+alloy-json-rpc = { workspace = true }
+alloy-network = { workspace = true }
+alloy-primitives = { workspace = true }
+alloy-rpc-types-eth = { workspace = true }
+alloy-serde = { workspace = true }
+anyhow = { workspace = true }
+futures-util = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sink = { path = "../sink" }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tokio-tungstenite = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+wire = { path = "../wire" }
+
+[dev-dependencies]
+alloy-primitives = { workspace = true }

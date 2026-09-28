@@ -1,0 +1,18 @@
+[package]
+name = "wire"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95.0"
+description = "The indexer's wire contract: the envelope, event, and dataset records."
+license = "MIT OR Apache-2.0"
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+alloy-primitives = { workspace = true }
+alloy-rpc-types-eth = { workspace = true }
+alloy-serde = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }

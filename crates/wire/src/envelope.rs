@@ -12,13 +12,30 @@
 //!   not records of a chain. They carry no verbatim payload and exist to drive a
 //!   consumer's state machine, so they are defined here.
 //!
-//! Raw chain payloads are carried verbatim in each dataset's `raw` field. Decoding is
-//! deliberately out of scope, so a consumer decodes with whatever ABI or IDL it
-//! trusts.
+//! Decoding is deliberately out of scope here, so a consumer decodes with whatever
+//! ABI or IDL it trusts. Every dataset field is present and typed, though, so a
+//! consumer that only persists does not have to decode anything.
 //!
-//! An [`Envelope`] carries the [`Event`], the `sequence` the pipeline assigned, and
-//! the [`ChainId`] it came from. The schema version is a property of the serialized
-//! form, so the sink that serializes stamps it.
+//! An [`Envelope`] carries the [`Event`], the [`ChainId`] it came from, the
+//! [`Envelope::sequence`] the pipeline assigned, and the [`SCHEMA_VERSION`] the
+//! encoder wrote. The version is a field on the envelope rather than a property of
+//! a sink's framing because one of the sinks is a local database: a broker header
+//! survives no hop into `DuckDB`, a file, or a pipe, so a consumer reading those
+//! could not tell two shapes apart.
+//!
+//! # Compatibility policy
+//!
+//! [`SCHEMA_VERSION`] is bumped only for a **breaking** change: a field's type or
+//! meaning changing, a field or variant being removed, or a required field being
+//! added. **Additive** changes — a new optional field, a new [`Event`] variant —
+//! do not bump it; consumers must skip an unknown `type` and ignore unknown fields,
+//! which is what keeps an additive change safe without a version bump.
+//!
+//! A breaking change needs a coexistence window on the topic, because a consumer
+//! group reading across the change sees both shapes interleaved.
+//!
+//! The line every sink writes is pinned by `every_variant_round_trips_through_json`
+//! and `the_wire_object_carries_only_the_envelope_and_event_fields`.
 //!
 //! # Identity types
 //!
@@ -34,6 +51,13 @@ use alloy_primitives::B256;
 use serde::{Deserialize, Serialize};
 
 pub use crate::datasets::evm::{Block, Log, Receipt, Transaction};
+
+/// The version of the envelope's wire shape.
+///
+/// Stamped on every serialized [`Envelope`] as `v`, so a consumer can tell which
+/// shape it is reading without out-of-band knowledge. Bumped only for a breaking
+/// change; see the compatibility policy in the module docs.
+pub const SCHEMA_VERSION: u16 = 1;
 
 /// Identifies the chain an event came from, for example `ethereum` or `solana`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -179,9 +203,21 @@ pub struct Envelope {
     /// Per-chain monotonic position in the published stream. Consumers order by
     /// this; a reorg rewinds it.
     pub sequence: u64,
+    /// The wire shape's version, written by [`Envelope::new`].
+    ///
+    /// Defaulted on deserialize so an envelope from before the field existed still
+    /// reads as itself, which is the pre-versioning shape.
+    #[serde(default = "schema_version", rename = "v")]
+    pub schema_version: u16,
     /// The event itself.
     #[serde(flatten)]
     pub event: Event,
+}
+
+/// The [`SCHEMA_VERSION`] as a serde default, for envelopes written before the
+/// field existed.
+const fn schema_version() -> u16 {
+    SCHEMA_VERSION
 }
 
 impl Envelope {
@@ -192,6 +228,7 @@ impl Envelope {
         Self {
             chain,
             sequence,
+            schema_version: SCHEMA_VERSION,
             event,
         }
     }
@@ -211,7 +248,10 @@ impl Envelope {
 mod tests {
     use alloy_primitives::{Address, B256, TxHash};
 
-    use super::{Block, ChainId, Envelope, Event, Finalized, Log, Receipt, Reorg, Transaction};
+    use super::{
+        Block, ChainId, Envelope, Event, Finalized, Log, Receipt, Reorg, SCHEMA_VERSION,
+        Transaction,
+    };
 
     fn chain() -> ChainId {
         ChainId::new("ethereum")
@@ -261,6 +301,7 @@ mod tests {
         assert_eq!(value["number"], "0x5");
         assert_eq!(value["hash"], format!("0x{}", "09".repeat(32)));
         assert_eq!(value["chain"], "ethereum");
+        assert_eq!(value["v"], 1);
     }
 
     /// The wire object carries exactly the envelope's keys (`chain`, `sequence`)
@@ -282,7 +323,30 @@ mod tests {
         assert_eq!(value["hash"], format!("0x{}", "11".repeat(32)));
         assert_eq!(value["sequence"], 7);
         assert_eq!(value["chain"], "ethereum");
-        assert_eq!(value.as_object().expect("object").len(), 5);
+        assert_eq!(value["v"], 1);
+        assert_eq!(value.as_object().expect("object").len(), 6);
+    }
+
+    /// The version is stamped on every rendered line, and an envelope written
+    /// before the field existed still reads back as itself rather than failing.
+    #[test]
+    fn the_schema_version_is_stamped_and_old_lines_still_parse() {
+        let envelope = Envelope::new(
+            chain(),
+            7,
+            Event::Finalized(Finalized {
+                height: 42,
+                hash: hash(0x11),
+            }),
+        );
+        let mut value = serde_json::to_value(&envelope).expect("envelope serializes");
+        assert_eq!(value["v"], SCHEMA_VERSION);
+
+        // A line from before versioning: no `v`, everything else as it was.
+        value.as_object_mut().expect("object").remove("v");
+        let decoded: Envelope = serde_json::from_value(value).expect("legacy line parses");
+        assert_eq!(decoded.schema_version, 1);
+        assert_eq!(decoded, envelope);
     }
 
     /// Integer fields render as the node's own "quantity" form, not as JSON

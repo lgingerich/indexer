@@ -1,24 +1,9 @@
-[package]
-name = "indexer"
-version = "0.1.0"
-edition = "2024"
-rust-version = "1.95.0"
-authors = ["TODO"]
-description = "A low-latency, chain-agnostic blockchain indexer."
-readme = "README.md"
-repository = "TODO"
-license = "MIT OR Apache-2.0"
+[workspace]
+resolver = "3"
+members = ["crates/decode", "crates/indexer", "crates/sink", "crates/wire"]
 
-[features]
-default = []
-# Kafka-protocol egress (`sink::kafka`) on bundled librdkafka. Off by default so
-# the C build dependency stays out of a plain `cargo build`.
-kafka = ["dep:rdkafka"]
-# Local `DuckDB` store (`sink::duckdb`). Off by default so the one-time C++
-# engine build stays out of a plain `cargo build`.
-duckdb = ["dep:duckdb"]
-
-[dependencies]
+# Shared dependency versions, so a crate cannot drift onto its own alloy or serde.
+[workspace.dependencies]
 alloy-consensus = { version = "1.8.3", default-features = false, features = ["serde", "std"] }
 # The JSON-RPC envelope and error types (`Response`/`ResponsePacket`/`ErrorPayload`).
 # alloy-network already pulls this in, but its `Response`/`ErrorPayload` are what
@@ -33,17 +18,17 @@ alloy-rpc-types-eth = { version = "1.8.3", default-features = false, features = 
 # alloy's own serde helpers. `quantity` renders integers as the Ethereum JSON-RPC
 # "quantity" format (`0x` hex), which is the canonical wire form for these fields
 # and, unlike serde's native integer encoding, survives `#[serde(flatten)]` for
-# `u128` (see `crate::envelope::Envelope`).
+# `u128` (see `wire::envelope::Envelope`).
 alloy-serde = { version = "1.8.3", default-features = false, features = ["std"] }
 anyhow = "1.0.104"
 # Bundled DuckDB compiles the C++ engine once via duckdb-sys; it is an embedded,
 # single-writer store, used only by the local DuckDB sink (`duckdb` feature).
-duckdb = { version = "1.10505.0", default-features = false, features = ["bundled"], optional = true }
+duckdb = { version = "1.10505.0", default-features = false, features = ["bundled"] }
 futures-util = "0.3.34"
 # rdkafka wraps C librdkafka, which `rdkafka-sys` compiles with `cc` (no cmake
-# needed; the version is vendored). It carries the crate's one C build dependency,
-# so it is optional behind the `kafka` feature — see `sink::kafka`.
-rdkafka = { version = "0.39.0", optional = true }
+# needed; the version is vendored). It carries the workspace's one C build
+# dependency, so it is optional behind the `kafka` feature — see `sink::kafka`.
+rdkafka = "0.39.0"
 # native-tls keeps TLS on the platform (Security.framework on macOS, OpenSSL on
 # Linux) so TLS adds no bundled C toolchain of its own.
 reqwest = { version = "0.13.5", default-features = false, features = ["json", "http2", "native-tls"] }
@@ -55,38 +40,9 @@ tokio-tungstenite = { version = "0.30.0", default-features = false, features = [
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", default-features = false, features = ["env-filter", "fmt", "json"] }
 
-[dev-dependencies]
-
-[[bench]]
-name = "hot_path"
-harness = false
-
-[profile.release]
-codegen-units = 1
-debug = 0
-debug-assertions = false
-incremental = false
-opt-level = 3
-lto = true
-panic = "abort"
-strip = "debuginfo"
-
-[profile.release-profiling]
-inherits = "release"
-debug = "line-tables-only"
-strip = "none"
-
-[profile.dev]
-codegen-units = 256
-debug = 2
-debug-assertions = true
-incremental = true
-opt-level = 0
-lto = false
-panic = "unwind"
-strip = false
-
-[lints.rust]
+# Lints are workspace-wide so every crate in the tree lives under one standard.
+# A crate that opts in with `[lints] workspace = true` cannot quietly relax it.
+[workspace.lints.rust]
 missing_docs                    = "warn"
 unexpected_cfgs                 = "warn"
 unsafe_code                     = "deny"
@@ -102,7 +58,7 @@ unreachable_pub                 = "deny"
 unreachable_code                = "deny"
 unreachable_patterns            = "deny"
 
-[lints.clippy]
+[workspace.lints.clippy]
 pedantic                        = { level = "warn", priority = -2 }
 
 # === Provenance-Safe Pointer Casts ===
@@ -136,7 +92,7 @@ map_clone                       = "deny"
 needless_collect                = "deny"
 needless_pass_by_value          = "deny"
 or_fun_call                     = "deny"
-redundant_clone                 = "deny"
+redundant_clone                  = "deny"
 trivially_copy_pass_by_ref      = "deny"
 unnecessary_lazy_evaluations    = "deny"
 unnecessary_to_owned            = "deny"
@@ -179,3 +135,30 @@ unused_peekable                 = "deny"
 useless_conversion              = "deny"
 used_underscore_binding         = "deny"
 vec_box                         = "deny"
+
+# Profiles are honored only in the workspace root, so they live here and every
+# member inherits them.
+[profile.release]
+codegen-units = 1
+debug = 0
+debug-assertions = false
+incremental = false
+opt-level = 3
+lto = true
+panic = "abort"
+strip = "debuginfo"
+
+[profile.release-profiling]
+inherits = "release"
+debug = "line-tables-only"
+strip = "none"
+
+[profile.dev]
+codegen-units = 256
+debug = 2
+debug-assertions = true
+incremental = true
+opt-level = 0
+lto = false
+panic = "unwind"
+strip = false

@@ -19,13 +19,13 @@
 //! Two contracts are settled here, shared with the other sinks:
 //!
 //! - **Rendering.** Bytes come from `serde_json::to_string(envelope)`, the same
-//!   encoding [`StdoutJsonSink`](crate::sink::StdoutJsonSink) writes, so stdout
-//!   and the broker never drift apart.
+//!   encoding [`StdoutJsonSink`](crate::StdoutJsonSink) writes, so stdout and the
+//!   broker never drift apart.
 //! - **Key.** Each record is keyed by its chain, not by
-//!   [`Event::dedupe_key`](crate::envelope::Event::dedupe_key). `librdkafka`'s
+//!   [`Event::dedupe_key`](wire::envelope::Event::dedupe_key). `librdkafka`'s
 //!   default partitioner places equal keys on one partition, so keying by chain
 //!   keeps that chain's stream together and preserves per-chain
-//!   [`sequence`](crate::envelope::Envelope::sequence) order across whatever
+//!   [`sequence`](wire::envelope::Envelope::sequence) order across whatever
 //!   partition count the topic has. Keying by identity would spread a chain
 //!   across partitions and force consumers to buffer and reorder. `ponytail:` one
 //!   chain therefore lands on one partition, so a single chain's write throughput
@@ -44,9 +44,9 @@ use std::time::Duration;
 
 use anyhow::Context as _;
 use rdkafka::producer::{BaseProducer, BaseRecord, Producer as _};
+use wire::envelope::Envelope;
 
-use crate::envelope::Envelope;
-use crate::sink::EventSink;
+use crate::EventSink;
 
 /// How long [`flush`](EventSink::flush) waits for the accumulator to drain.
 ///
@@ -124,8 +124,9 @@ impl EventSink for KafkaSink {
 
 #[cfg(test)]
 mod tests {
-    use crate::envelope::{ChainId, Envelope, Event, Finalized};
-    use crate::sink::kafka::KafkaSink;
+    use wire::envelope::{ChainId, Envelope, Event, Finalized};
+
+    use crate::kafka::KafkaSink;
 
     fn envelope(chain: &str) -> Envelope {
         Envelope::new(

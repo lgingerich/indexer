@@ -1,9 +1,9 @@
 //! Newline-delimited JSON to standard output.
 
 use tokio::io::AsyncWriteExt as _;
+use wire::envelope::Envelope;
 
-use crate::envelope::Envelope;
-use crate::sink::EventSink;
+use crate::EventSink;
 
 /// Writes newline-delimited JSON to standard output.
 ///
@@ -23,6 +23,8 @@ impl StdoutJsonSink {
 
 impl EventSink for StdoutJsonSink {
     async fn publish(&mut self, envelope: &Envelope) -> anyhow::Result<()> {
+        // The same encoding the other sinks render, so a consumer of the pipe and a
+        // consumer of the broker read the same bytes.
         let mut line = serde_json::to_string(envelope)?;
         line.push('\n');
         let mut stdout = tokio::io::stdout();

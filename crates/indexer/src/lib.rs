@@ -1,10 +1,13 @@
 //! A low-latency, chain-agnostic blockchain indexer.
 //!
-//! The crate is a walking skeleton: it ingests blocks from the live chain tip and
-//! publishes ordered, finality-tagged events. Chain-specific knowledge is isolated
-//! behind [`source::BlockSource`], and egress is isolated behind
-//! [`sink::EventSink`], so new chains and new brokers are additions rather than
-//! rewrites.
+//! The crate ingests blocks from the live chain tip and publishes ordered,
+//! finality-tagged events. Chain-specific knowledge is isolated behind
+//! [`source::BlockSource`], and egress is isolated behind [`sink::EventSink`], so
+//! new chains and new brokers are additions rather than rewrites.
+//!
+//! The published shape lives in the [`wire`] crate rather than here: it is the
+//! contract between this crate and whatever consumes the stream, so it is a
+//! dependency both sides share rather than something an egress path owns.
 //!
 //! The large fixtures in the EVM source tests nest JSON objects deep enough to
 //! exceed the default macro recursion budget.
@@ -30,8 +33,5 @@
 //! Mempool, ABI/IDL decoding, filtered subscriptions, derived state, backfill to
 //! live handoff, checkpoint resume, and the Parquet archiver.
 
-pub mod datasets;
-pub mod envelope;
 pub mod pipeline;
-pub mod sink;
 pub mod source;

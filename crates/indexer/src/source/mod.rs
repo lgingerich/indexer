@@ -25,7 +25,7 @@ pub mod evm;
 
 pub use evm::EvmSource;
 
-use crate::envelope::{ChainId, Event};
+use wire::envelope::{ChainId, Event};
 
 /// A block's height and hash, without the rest of its contents.
 ///

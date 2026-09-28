@@ -1,0 +1,21 @@
+[package]
+name = "decode"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95.0"
+description = "Decodes raw indexer events with a contract ABI, as a stateless transform."
+license = "MIT OR Apache-2.0"
+publish = false
+
+[lints]
+workspace = true
+
+# No `[[bin]]` yet: the transform is built and tested, but the broker source and
+# sink that would drive it are not, so a binary here would have nothing to do. It
+# lands with that stage.
+
+[dependencies]
+wire = { path = "../wire" }
+
+[dev-dependencies]
+alloy-primitives = { workspace = true }

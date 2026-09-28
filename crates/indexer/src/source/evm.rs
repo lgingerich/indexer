@@ -16,7 +16,7 @@
 //!   still execute separately on the node, so a reorg between them can pair a
 //!   block with another fork's receipts; every receipt's `blockHash` is checked.
 //! - The batch is parsed into alloy's RPC types, then projected field by field into
-//!   the [`crate::datasets`] records; nothing is kept as opaque JSON.
+//!   the [`wire::datasets`] records; nothing is kept as opaque JSON.
 //! - Parsing uses alloy's *catch-all* (`any`) types, so a chain's non-Ethereum
 //!   transaction types — an OP-stack deposit (`0x7e`), an Arbitrum retry (`0x6a`) —
 //!   decode instead of failing the block, and chain-specific extras are captured.
@@ -39,8 +39,8 @@ use serde_json::value::RawValue;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
 use super::{BlockId, BlockSource, FetchedBlock, HeadStream, METHOD_NOT_FOUND, SourceError};
-use crate::datasets::evm::{Block, Log, Receipt, Transaction};
-use crate::envelope::{ChainId, Event};
+use wire::datasets::evm::{Block, Log, Receipt, Transaction};
+use wire::envelope::{ChainId, Event};
 
 /// How many `eth_getTransactionReceipt` calls to put in one JSON-RPC batch.
 ///
@@ -190,7 +190,7 @@ fn decode_head_frame(text: &str) -> Option<Result<BlockId, SourceError>> {
 }
 
 /// The three results one batched block request carries, still in alloy's RPC types
-/// and not yet projected into [`crate::datasets`] records.
+/// and not yet projected into [`wire::datasets`] records.
 ///
 /// The block and receipts use alloy's *catch-all* (`any`) types, so a chain's
 /// non-Ethereum transaction types — an OP-stack deposit (`0x7e`), an Arbitrum
@@ -672,7 +672,7 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::{decode_block, decode_head_frame, parse_batch};
-    use crate::envelope::Event;
+    use wire::envelope::Event;
 
     /// Runs the full parse-and-project path, as production does.
     fn decode_batch(body: &[u8]) -> Result<crate::source::FetchedBlock, super::SourceError> {
