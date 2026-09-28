@@ -3,9 +3,16 @@ name = "connectors"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.95.0"
-description = "The indexer's bus boundary: the sink and source traits, and the concrete connectors."
+description = "The indexer's bus and storage boundary: the traits, the connectors, and their runtimes."
 license = "MIT OR Apache-2.0"
 publish = false
+
+# The store's runtime lives beside the store's sink: `DuckDbSink` is the mechanism and
+# this binary drives it, and the two only make sense together.
+[[bin]]
+name = "storage"
+path = "src/bin/storage.rs"
+required-features = ["kafka", "duckdb"]
 
 [lints]
 workspace = true
@@ -25,6 +32,8 @@ duckdb = { workspace = true, optional = true }
 rdkafka = { workspace = true, optional = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
 wire = { path = "../wire" }
 
 [dev-dependencies]

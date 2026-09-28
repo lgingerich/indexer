@@ -4,7 +4,6 @@ members = [
     "crates/connectors",
     "crates/decode",
     "crates/indexer",
-    "crates/materialize",
     "crates/wire",
 ]
 

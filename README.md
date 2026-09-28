@@ -17,10 +17,9 @@ rather than by convention.
 ```
 crates/
 ├── wire/         the wire contract: envelope, events, dataset records. Pure data.
-├── connectors/   the bus boundary: EventSink, EnvelopeSource, and the connectors.
+├── connectors/   the bus and storage boundary: traits, connectors, bin `storage`.
 ├── indexer/      ingestion: block sources, the reorg-aware pipeline, bin `ingest`.
-├── decode/       the stateless ABI decode transform, bin `decode`.
-└── materialize/  decoded events into typed tables, bin `materialize`.
+└── decode/       the stateless ABI decode transform, bin `decode`.
 ```
 
 `wire` depends on `alloy` and `serde` and on nothing else in the tree. `decode`
@@ -28,9 +27,8 @@ depends on `wire` and **not** on `indexer`, so the decode stage structurally can
 reach into the pipeline's ordering and reorg state machine. That missing edge is the
 whole point of the split.
 
-`materialize` is separate from `decode` for the same reason one level down: a new ABI
-is a decode concern, and a new protocol's meaning is a modeling concern. Keeping them
-apart is what lets decode stay stateless and replayable.
+The pipeline today is `ingest` → `raw.chain` → `decode` → `decoded.chain` → `storage`.
+Aggregation and windowing are not built.
 
 ## What works today
 
@@ -55,11 +53,9 @@ apart is what lets decode stay stateless and replayable.
   store to retract and compact. It reimplements no ordering or reorg logic, so
   replaying a record is safe. Offsets are committed only after the producer's flush,
   so a crash replays a batch rather than losing one.
-- **Typed tables from decoded events.** `crates/materialize` turns a decoded record
-  into table rows in two layers: one faithful row per event with every argument under
-  its ABI name, and one semantic row in the shape Allium calls `dex.trades`. An ABI
-  integer that fits an `i64` becomes one; anything wider — a `uint160` price, a
-  `uint256` wei amount — becomes exact decimal text rather than a rounded float.
+- **A storage stage.** `cargo run -p connectors --bin storage --features kafka,duckdb`
+  drains `raw.chain` and `decoded.chain` into a local DuckDB database, one consumer
+  group per topic and one append-only `events` table.
 - **Finality watermark.** A `finalized` event says a block and everything below
   it are permanent. Its height comes from the node's own `finalized` tag, so each
   chain's rules apply with no confirmation count to tune; on Base it trails the
@@ -82,7 +78,7 @@ Both optional connectors are off by default so a plain `cargo build` compiles ne
 ## Not built yet
 
 Backfill-to-live handoff, checkpoint resume, mempool, filtered
-subscriptions, derived state (balances/nonces), the stream-processing layer, and the
+subscriptions, derived state (balances/nonces), the aggregation layer, and the
 Parquet/GCS archiver. The
 crate is a walking skeleton: it indexes forward from
 whatever the chain does next and does not fill gaps that predate startup.
@@ -130,27 +126,28 @@ first. `DECODE_ABIS` applies one ABI per address at every height, which is the h
 limitation of a file-backed registry: a proxy that upgrades changes its ABI at a
 height, and that needs a table-backed registry behind the same seam.
 
-### Run the materialize stage
+### Run the storage stage
 
 ```bash
 KAFKA_BROKERS=127.0.0.1:9092 \
-MATERIALIZE_OUTPUT_DIR=tables \
-cargo run -p materialize --bin materialize --features kafka
+STORAGE_DATABASE=indexer.duckdb \
+cargo run -p connectors --bin storage --features kafka,duckdb
 ```
 
 | Variable | Required | Default | Meaning |
 | --- | --- | --- | --- |
 | `KAFKA_BROKERS` | yes | — | Bootstrap servers |
-| `MATERIALIZE_INPUT_TOPIC` | no | `decoded.chain` | Topic to consume |
-| `MATERIALIZE_OUTPUT_DIR` | no | `tables` | Directory for one NDJSON file per table |
-| `MATERIALIZE_GROUP` | no | `indexer-materialize` | Consumer group |
-| `MATERIALIZE_BATCH` | no | `500` | Rows per flush |
-| `MATERIALIZE_BATCH_MS` | no | `1000` | Time bound on a batch |
+| `STORAGE_TOPICS` | no | `raw.chain,decoded.chain` | Topics to consume |
+| `STORAGE_DATABASE` | no | `indexer.duckdb` | Path to the store |
+| `STORAGE_GROUP` | no | `indexer-storage` | Consumer group prefix |
+| `STORAGE_BATCH` | no | `500` | Records per flush |
+| `STORAGE_BATCH_MS` | no | `1000` | Time bound on a batch |
+| `STORAGE_DRAIN_SECS` | no | `5` | Idle time before a topic is treated as drained |
 
-Output is one file per table — `Swap.ndjson`, `dex.trades.ndjson` — each line a row
-with its identity columns first, so the two layers are joinable. The JSON-lines sink
-appends and does not deduplicate, so it is for inspecting output; a real store upserts
-on the identity columns instead.
+One consumer group per topic, named `<STORAGE_GROUP>-<topic>`, because an offset is per
+group: one group spanning two topics would commit a single position across both. Every
+envelope lands in an append-only `events` table with the envelope as JSON beside the
+columns a query filters on.
 
 ## Event shape
 
