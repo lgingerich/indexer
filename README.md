@@ -20,7 +20,7 @@ crates/
 ├── connectors/   the bus boundary: EventSink, EnvelopeSource, and the connectors.
 ├── indexer/      ingestion: block sources, the reorg-aware pipeline, bin `ingest`.
 ├── decode/       the stateless ABI decode transform, bin `decode`.
-└── materialize/  decoded events into typed tables, in two layers.
+└── materialize/  decoded events into typed tables, bin `materialize`.
 ```
 
 `wire` depends on `alloy` and `serde` and on nothing else in the tree. `decode`
@@ -129,6 +129,28 @@ A batch is `DECODE_BATCH` records or `DECODE_BATCH_MS` milliseconds, whichever c
 first. `DECODE_ABIS` applies one ABI per address at every height, which is the honest
 limitation of a file-backed registry: a proxy that upgrades changes its ABI at a
 height, and that needs a table-backed registry behind the same seam.
+
+### Run the materialize stage
+
+```bash
+KAFKA_BROKERS=127.0.0.1:9092 \
+MATERIALIZE_OUTPUT_DIR=tables \
+cargo run -p materialize --bin materialize --features kafka
+```
+
+| Variable | Required | Default | Meaning |
+| --- | --- | --- | --- |
+| `KAFKA_BROKERS` | yes | — | Bootstrap servers |
+| `MATERIALIZE_INPUT_TOPIC` | no | `decoded.chain` | Topic to consume |
+| `MATERIALIZE_OUTPUT_DIR` | no | `tables` | Directory for one NDJSON file per table |
+| `MATERIALIZE_GROUP` | no | `indexer-materialize` | Consumer group |
+| `MATERIALIZE_BATCH` | no | `500` | Rows per flush |
+| `MATERIALIZE_BATCH_MS` | no | `1000` | Time bound on a batch |
+
+Output is one file per table — `Swap.ndjson`, `dex.trades.ndjson` — each line a row
+with its identity columns first, so the two layers are joinable. The JSON-lines sink
+appends and does not deduplicate, so it is for inspecting output; a real store upserts
+on the identity columns instead.
 
 ## Event shape
 

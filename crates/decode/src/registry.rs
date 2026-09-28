@@ -48,6 +48,8 @@ pub struct RawLog<'a> {
     pub data: &'a [u8],
     /// The transaction that emitted the log.
     pub transaction_hash: TxHash,
+    /// The emitting transaction's position in its block.
+    pub transaction_index: u64,
     /// The log's position within its block.
     pub log_index: u64,
     /// Height of the block containing the log.
@@ -142,7 +144,10 @@ impl Abi {
             address: log.address,
             selector: *selector,
             signature: event.signature(),
-            source: source_key(&log),
+            anonymous: event.anonymous,
+            transaction_hash: log.transaction_hash,
+            transaction_index: log.transaction_index,
+            log_index: log.log_index,
             indexed: typed_args(&indexed_params, &decoded.indexed)?,
             body: typed_args(&body_params, &decoded.body)?,
             block_number: log.block_number,
@@ -150,16 +155,6 @@ impl Abi {
             block_timestamp: log.block_timestamp,
         }))
     }
-}
-
-/// The raw log's natural key, in the same shape
-/// [`Log::dedupe_key`](wire::datasets::evm::Log::dedupe_key) uses, so a decoded
-/// record links back to the exact record it came from.
-fn source_key(log: &RawLog<'_>) -> String {
-    format!(
-        "{}:{}:{}",
-        log.block_number, log.transaction_hash, log.log_index
-    )
 }
 
 /// Converts decoded values to named arguments, pairing each with its ABI parameter.
@@ -297,6 +292,7 @@ mod tests {
             topics,
             data,
             transaction_hash: TxHash::from([0x01; 32]),
+            transaction_index: 1,
             log_index: 3,
             block_number: 100,
             block_hash: B256::from([0x02; 32]),
@@ -352,7 +348,7 @@ mod tests {
         );
         // The source is the raw log's natural key, so a store can join back to it.
         assert_eq!(
-            decoded.source,
+            decoded.source_key(),
             format!("100:{}:3", TxHash::from([0x01; 32]))
         );
         assert_eq!(decoded.block_number, 100);
@@ -442,6 +438,7 @@ mod tests {
                 topics: &log_topics,
                 data: &data,
                 transaction_hash: TxHash::from([0x2a; 32]),
+                transaction_index: 12,
                 log_index: 767,
                 block_number: 51_913_794,
                 block_hash: B256::from([0xd4; 32]),
@@ -503,7 +500,7 @@ mod tests {
         );
         // The link back to the raw log is its natural key.
         assert_eq!(
-            decoded.source,
+            decoded.source_key(),
             format!("51913794:{}:767", TxHash::from([0x2a; 32]))
         );
     }

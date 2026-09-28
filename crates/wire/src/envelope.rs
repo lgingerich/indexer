@@ -42,7 +42,7 @@
 //!
 //! # Identity types
 //!
-//! Dataset identity uses [`B256`] and [`TxHash`](alloy_primitives::TxHash) from
+//! Dataset identity uses [`B256`] and [`TxHash`] from
 //! `alloy-primitives`. They are
 //! not hand-rolled here because alloy already models exactly this: a fixed 32-byte
 //! identity whose JSON form is lowercase `0x` hex. The encoding is a wire contract,
@@ -50,7 +50,7 @@
 
 use std::fmt;
 
-use alloy_primitives::{Address, B256};
+use alloy_primitives::{Address, B256, TxHash};
 use serde::{Deserialize, Serialize};
 
 pub use crate::datasets::evm::{Block, DecodedArg, Log, Receipt, Transaction};
@@ -67,7 +67,11 @@ pub use crate::typed::TypedValue;
 ///   `signature`; `Decoded` and [`Log`] both carry `block_timestamp`. Breaking:
 ///   `Decoded`'s `indexed` and `body` changed from bare values to named ones, so a
 ///   v1 consumer cannot read a v2 record.
-pub const SCHEMA_VERSION: u16 = 2;
+/// - **3** — [`Decoded`] carries its identity as typed fields (`transaction_hash`,
+///   `transaction_index`, `log_index`) rather than a formatted `source` string, and
+///   an explicit `anonymous` flag. Breaking: a v2 consumer reading `source` finds no
+///   such field, and can rebuild it with [`Decoded::source_key`].
+pub const SCHEMA_VERSION: u16 = 3;
 
 /// Identifies the chain an event came from, for example `ethereum` or `solana`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -153,6 +157,10 @@ pub struct Decoded {
     /// The contract that emitted the log.
     pub address: Address,
     /// The event selector, `keccak256` of its signature.
+    ///
+    /// [`B256::ZERO`] for an anonymous event, which has no selector in `topic0`. A
+    /// zero selector is not a valid `keccak256` of a signature, so it cannot collide
+    /// with a real one.
     pub selector: B256,
     /// The event's human-readable signature, for example
     /// `Transfer(address,address,uint256)`.
@@ -160,11 +168,20 @@ pub struct Decoded {
     /// Carried because a selector alone is not a readable name, and a consumer
     /// debugging a decode should not have to compute one back from the selector.
     pub signature: String,
-    /// The [`Log::dedupe_key`] of the raw log this was decoded from.
+    /// Whether the ABI declares this event anonymous.
     ///
-    /// The link back to the source record, so a decoded row can be traced to the log
-    /// that produced it and a re-decode can be recognized as one.
-    pub source: String,
+    /// An anonymous event's `topic0` is its first indexed argument rather than a
+    /// selector, so a consumer that wants to reconstruct the log's topics needs to
+    /// know not to prefix them with [`selector`](Self::selector).
+    pub anonymous: bool,
+    /// The transaction that emitted the log.
+    pub transaction_hash: TxHash,
+    /// The emitting transaction's position in its block.
+    #[serde(with = "alloy_serde::quantity")]
+    pub transaction_index: u64,
+    /// The log's position in its block.
+    #[serde(with = "alloy_serde::quantity")]
+    pub log_index: u64,
     /// The indexed arguments, in ABI order, each carrying its name.
     pub indexed: Vec<DecodedArg>,
     /// The non-indexed arguments, in ABI order, each carrying its name.
@@ -182,13 +199,26 @@ pub struct Decoded {
 impl Decoded {
     /// A key that is stable across redelivery and unique per decoded record.
     ///
-    /// Built from the source log's key plus this event's selector, so a re-decode of
-    /// the same log produces the same key and a store upserts rather than
+    /// Built from the raw log's natural key plus this event's selector, so a re-decode
+    /// of the same log produces the same key and a store upserts rather than
     /// duplicates. It excludes `sequence` for the same reason every other dataset
     /// does: a sequence is reassigned by a reorg or a restart.
     #[must_use]
     pub fn dedupe_key(&self) -> String {
-        format!("{}:{}:decoded", self.source, self.selector)
+        format!("{}:{}:decoded", self.source_key(), self.selector)
+    }
+
+    /// The raw log's natural key, in the same shape
+    /// [`Log::dedupe_key`] produces: `block:transaction:log_index`.
+    ///
+    /// This is the link back to the record the decode read, so a decoded row traces to
+    /// the exact raw log it came from.
+    #[must_use]
+    pub fn source_key(&self) -> String {
+        format!(
+            "{}:{}:{}",
+            self.block_number, self.transaction_hash, self.log_index
+        )
     }
 }
 
@@ -499,8 +529,10 @@ mod tests {
                 address: Address::from([0x22; 20]),
                 selector: hash(0x07),
                 signature: "Transfer(address,address,uint256)".to_owned(),
-                source: "5:0x1111111111111111111111111111111111111111111111111111111111111111:1"
-                    .to_owned(),
+                anonymous: false,
+                transaction_hash: TxHash::from([0x11; 32]),
+                transaction_index: 0,
+                log_index: 1,
                 indexed: vec![DecodedArg {
                     name: "from".to_owned(),
                     value: TypedValue::Address {

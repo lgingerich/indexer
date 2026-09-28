@@ -1,8 +1,12 @@
-//! The broker boundary: where events go, and where they come from.
+//! The bus boundary: where events go, and where they come from.
 //!
 //! [`EventSink`] is the seam between publishing and the rest of the system, and
 //! [`EnvelopeSource`] is its mirror for a consumer. Both sit on the same bus, so a
 //! process that decodes is a consumer of one topic and a producer of another.
+//!
+//! Both speak [`Envelope`]. A materialized table row is not an envelope — it is a
+//! projection with its own table and columns, and it goes to a store rather than a
+//! broker — so its seam lives with the rows themselves, in `materialize`.
 //!
 //! A sink is a dumb serializing boundary: it renders the [`Envelope`] as-is and knows
 //! nothing about chains. The schema version is a field on the envelope, not a property

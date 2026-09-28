@@ -28,13 +28,61 @@
 
 pub mod column;
 pub mod events;
+pub mod jsonl;
 pub mod trades;
 
 pub use column::{Column, Value};
 pub use events::{EventRow, Identity};
-pub use trades::Trade;
+pub use jsonl::JsonLinesRowSink;
+pub use trades::{TRADES_TABLE, Trade};
 
 use wire::envelope::Decoded;
+
+/// A table row a store can write: a table name and columns in a stable order.
+///
+/// The seam between materializing and persisting. It exists separately from the bus's
+/// envelope traits because a row is not an envelope — it is a projection with its own
+/// table, and it goes to a store rather than a broker. It lives here rather than in
+/// `connectors` because it is defined in terms of [`Column`], and a row shape is a
+/// property of the rows, not of the transport.
+pub trait Row: Send + Sync {
+    /// The table this row belongs to.
+    fn table(&self) -> &str;
+
+    /// The row's columns, in a stable order.
+    fn columns(&self) -> &[Column];
+}
+
+/// Where typed rows go.
+///
+/// The mirror of the bus's `EventSink` for tables rather than envelopes. Like it, this
+/// buffers and [`flush`](RowSink::flush) is the batch and durability point, so a store
+/// pays its per-batch cost once rather than per row — which is also why a caller's
+/// offset commit belongs after a flush, not after a write.
+pub trait RowSink: Send {
+    /// Accepts one row, keyed by the table it belongs to.
+    ///
+    /// May buffer; the row is not durable until [`RowSink::flush`] succeeds.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the row cannot be accepted. The caller stops rather than
+    /// skipping, since a skipped row is a hole in a table.
+    fn write(
+        &mut self,
+        table: &str,
+        row: &dyn Row,
+    ) -> impl Future<Output = anyhow::Result<()>> + Send;
+
+    /// Makes everything written since the last flush durable, as one batch.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the buffered rows cannot be delivered.
+    fn flush(&mut self) -> impl Future<Output = anyhow::Result<()>> + Send {
+        async { Ok(()) }
+    }
+}
 
 /// Every table a decoded event produces.
 ///
@@ -80,7 +128,10 @@ mod tests {
             address: Address::from([0xd0; 20]),
             selector: B256::from([0xc4; 32]),
             signature: "Swap(address,address,int256,int256,uint160,uint128,int24)".to_owned(),
-            source: format!("51913794:{}:767", B256::from([0x2a; 32])),
+            anonymous: false,
+            transaction_hash: B256::from([0x2a; 32]),
+            transaction_index: 12,
+            log_index: 767,
             indexed: vec![
                 DecodedArg {
                     name: "sender".to_owned(),

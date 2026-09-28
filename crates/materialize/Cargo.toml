@@ -7,12 +7,30 @@ description = "Turns decoded events into typed, queryable tables."
 license = "MIT OR Apache-2.0"
 publish = false
 
+[[bin]]
+name = "materialize"
+path = "src/main.rs"
+required-features = ["kafka"]
+
+[features]
+default = []
+# The broker source the `materialize` binary drives. Off by default so a plain
+# `cargo build` does not compile C `librdkafka`; the library and its tests need no
+# broker at all.
+kafka = ["dep:rdkafka", "connectors/kafka"]
+
 [lints]
 workspace = true
 
 [dependencies]
 alloy-primitives = { workspace = true }
+anyhow = { workspace = true }
+connectors = { path = "../connectors" }
+rdkafka = { workspace = true, optional = true }
 serde_json = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
 wire = { path = "../wire" }
 
 [dev-dependencies]

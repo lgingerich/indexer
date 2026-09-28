@@ -102,6 +102,7 @@ impl<R: AbiRegistry> Transform<R> {
             topics: &topics,
             data: &log.data,
             transaction_hash: log.transaction_hash,
+            transaction_index: log.transaction_index,
             log_index: log.log_index,
             block_number: log.block_number,
             block_hash: log.block_hash,
@@ -316,7 +317,10 @@ mod tests {
             panic!("the second output must be the decoded record");
         };
         assert_eq!(record.name, "Transfer");
-        assert_eq!(record.source, format!("5:{}:3", TxHash::from([0x01; 32])));
+        assert_eq!(
+            record.source_key(),
+            format!("5:{}:3", TxHash::from([0x01; 32]))
+        );
         assert_eq!(record.indexed.len(), 2);
         assert_eq!(record.body.len(), 1);
     }

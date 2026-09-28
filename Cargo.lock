@@ -2762,7 +2762,13 @@ name = "materialize"
 version = "0.1.0"
 dependencies = [
  "alloy-primitives",
+ "anyhow",
+ "connectors",
+ "rdkafka",
  "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
  "wire",
 ]
 
