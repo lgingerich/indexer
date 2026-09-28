@@ -100,37 +100,58 @@ writes `decoded.chain`, and storage drains both into `DuckDB`. They run concurre
 and stop together — a stage that ends for good stops the process, because continuing
 without it would leave a stream that looks alive but is not.
 
+Settings come from a TOML file, named by the first argument or defaulting to
+`indexer.toml`. `indexer.toml` in the repository is a working example.
+
 ```bash
-EVM_CHAIN=base \
-EVM_HTTP_URL=https://base-rpc.publicnode.com \
-EVM_WS_URL=wss://base-rpc.publicnode.com \
-KAFKA_BROKERS=127.0.0.1:9092 \
-DECODE_ABIS="base:0xd0b53D9277642d899DF5C87A3966A349A798F224:src/decode/abi/uniswap_v3_pool.json" \
-STORAGE_DATABASE=indexer.duckdb \
-RUST_LOG=info \
-cargo run --release --features kafka,duckdb
+RUST_LOG=info cargo run --release --features kafka,duckdb -- indexer.toml
 ```
 
-`STDOUT=1` prints *ingest* to stdout instead of publishing it, which is useful for
-watching the raw stream. The broker is still required: decode and storage both run on it
-and neither is optional.
+```toml
+[ingest]
+chain = "base"
+http_url = "https://base-rpc.publicnode.com"
+ws_url = "wss://base-rpc.publicnode.com"
 
-| Variable | Required | Default | Meaning |
-| --- | --- | --- | --- |
-| `KAFKA_BROKERS` | for decode/storage | — | Bootstrap servers |
-| `EVM_CHAIN` | no | — | Chain id. Unset runs without ingest |
-| `EVM_HTTP_URL` | with `EVM_CHAIN` | — | JSON-RPC endpoint for blocks and receipts |
-| `EVM_WS_URL` | with `EVM_CHAIN` | — | WebSocket endpoint for `newHeads` |
-| `RAW_TOPIC` | no | `raw.chain` | Ingest's output and decode's input |
-| `DECODED_TOPIC` | no | `decoded.chain` | Decode's output |
-| `DECODE_ABIS` | no | — | `chain:address:abi.json`, comma-separated |
-| `STORAGE_DATABASE` | no | `indexer.duckdb` | Path to the store |
-| `STDOUT` | no | — | `1` prints *ingest* to stdout instead of publishing |
-| `RUST_LOG` | no | `info` | Log filter |
+[kafka]
+brokers = "localhost:9092"
 
-Logs go to stderr; events go to stdout, so the two streams never interleave.
+[storage]
+database = "indexer.duckdb"
+```
 
-`DECODE_ABIS` applies one ABI per address at every height, which is the honest
+**Required** — no value could be right by accident, so each errors at startup naming
+the field:
+
+| Key | Meaning |
+| --- | --- |
+| `kafka.brokers` | Bootstrap servers |
+| `ingest.chain` | Chain id stamped on every event |
+| `ingest.http_url` | JSON-RPC endpoint for blocks and receipts |
+| `ingest.ws_url` | WebSocket endpoint for `newHeads` |
+
+**Defaulted** — correct for a standard deployment; override for a non-standard one:
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `ingest.raw_topic` | `raw.chain` | Ingest's output and decode's input |
+| `ingest.stdout` | `false` | Print instead of publishing |
+| `kafka.decoded_topic` | `decoded.chain` | Decode's output |
+| `kafka.group_prefix` | `indexer` | Consumer group prefix, per stage |
+| `kafka.batch_records` | `500` | Records per flush |
+| `kafka.batch_ms` | `1000` | Time bound on a batch |
+| `storage.database` | `indexer.duckdb` | Path to the store |
+| `storage.drain_secs` | unset | Stop a topic after this idle. **Omit for a live indexer** |
+| `storage.abis` | `[]` | `chain:address:path`, one ABI each |
+
+Omit `[ingest]` entirely to run decode and storage against a topic filled elsewhere.
+`RUST_LOG` is still read from the environment, because a log filter is not deployment
+configuration.
+
+An unknown key is a startup error naming the line and the key, so a misspelling is
+caught rather than silently leaving a setting at its default.
+
+`storage.abis` applies one ABI per address at every height, which is the honest
 limitation of a file-backed registry: a proxy that upgrades changes its ABI at a
 height, and that needs a table-backed registry behind the same seam.
 
@@ -205,9 +226,9 @@ Worth reading the output for two things: `amount0` is negative, because the amou
 `bits: 160` while `tick` carries `bits: 24`, because a store needs the declared width to
 pick a column and a width is not recoverable from a number.
 
-To point it at other contracts, capture real input with `STDOUT=1 cargo run --release`,
-which prints what the indexer would publish instead of sending it to a broker, and change
-the address, chain, ABI, and fixture the example names.
+To point it at other contracts, capture real input by setting `stdout = true` in the
+`[ingest]` table, which prints what the indexer would publish instead of sending it to a
+broker, and change the address, chain, ABI, and fixture the example names.
 
 ## Benchmarks
 

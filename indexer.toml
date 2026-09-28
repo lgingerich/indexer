@@ -1,0 +1,28 @@
+# Settings for a standard single-chain deployment.
+#
+# Only `brokers`, and `chain`/`http_url`/`ws_url` when ingesting, have no default. Every
+# other key may be omitted and is documented in `src/config.rs`.
+
+[ingest]
+chain = "base"
+http_url = "https://base-rpc.publicnode.com"
+ws_url = "wss://base-rpc.publicnode.com"
+# raw_topic = "raw.chain"
+# stdout = false
+
+[kafka]
+brokers = "localhost:9092"
+# decoded_topic = "decoded.chain"
+# group_prefix = "indexer"
+# batch_records = 500
+# batch_ms = 1000
+
+[storage]
+# database = "indexer.duckdb"
+# An ABI per `chain:address:path`. Omit to pass every log through undecoded.
+# abis = [
+#   "base:0xd0b53D9277642d899DF5C87A3966A349A798F224:src/decode/abi/uniswap_v3_pool.json",
+# ]
+# Set to stop a topic once it has been idle this long. Omit for a live indexer, which
+# must never stop on a quiet block.
+# drain_secs = 5

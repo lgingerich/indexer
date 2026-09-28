@@ -28,15 +28,11 @@
 //! because a demo that has to be configured is a demo that gets skipped. To decode a
 //! different contract, change `POOL`, `CHAIN`, and the two `include_str!` files above.
 //!
-//! To capture real input for it, run the indexer with `STDOUT=1`, which prints what it
-//! would publish instead of sending it to a broker:
+//! To capture real input for it, run the indexer with `stdout = true` in `[ingest]`,
+//! which prints what it would publish instead of sending it to a broker:
 //!
 //! ```bash
-//! EVM_CHAIN=base \
-//! EVM_HTTP_URL=https://base-rpc.publicnode.com \
-//! EVM_WS_URL=wss://base-rpc.publicnode.com \
-//! STDOUT=1 RUST_LOG=warn \
-//! cargo run --release 2>/dev/null | head -200 > envelopes.ndjson
+//! RUST_LOG=warn cargo run --release 2>/dev/null | head -200 > envelopes.ndjson
 //! ```
 //!
 //! A real registry is keyed by `(chain, address, block)` and answers per log; the fixed

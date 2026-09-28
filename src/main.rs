@@ -1,49 +1,40 @@
-//! The indexer's entry point: builds every stage and runs them together.
+//! The indexer's entry point: reads the settings file, builds every stage, runs them.
 //!
 //! One binary, started as a process. Each stage is built explicitly here rather than
-//! reading the environment for itself, so what runs is visible in one place and the
-//! stages themselves stay constructible in a test.
+//! reading settings for itself, so what runs is visible in one place and the stages stay
+//! constructible in a test.
 //!
 //! # What runs
 //!
-//! Ingest follows a chain's live tip and publishes to `raw.chain`. Decode consumes that
-//! and publishes to `decoded.chain`. Storage drains both into `DuckDB`. They run
+//! Ingest follows a chain's live tip and publishes to the raw topic. Decode consumes that
+//! and publishes to the decoded topic. Storage drains both into `DuckDB`. They run
 //! concurrently and stop together: a stage that ends for good — an ingest subscription
 //! that closes, a decode input that ends — stops the process, because continuing without
 //! it would leave a stream that looks alive but is not.
 //!
-//! # Environment
+//! # Settings
 //!
-//! Read once, here, and turned into builders. Nothing below this file looks at the
-//! environment.
+//! A TOML file, named by the first argument or `indexer.toml`. Every setting and its
+//! default is documented in [`indexer::config`], and the required ones error at startup
+//! naming the field.
 //!
-//! | Variable | Required | Meaning |
-//! | --- | --- | --- |
-//! | `EVM_CHAIN` | for ingest | Chain id stamped on every event |
-//! | `EVM_HTTP_URL` | for ingest | JSON-RPC endpoint for blocks and receipts |
-//! | `EVM_WS_URL` | for ingest | WebSocket endpoint for heads |
-//! | `KAFKA_BROKERS` | yes | Bootstrap servers |
-//! | `RAW_TOPIC` | no | Defaults to `raw.chain` |
-//! | `DECODED_TOPIC` | no | Defaults to `decoded.chain` |
-//! | `DECODE_ABIS` | no | `chain:address:abi.json`, comma-separated |
-//! | `STORAGE_DATABASE` | no | Defaults to `indexer.duckdb` |
-//! | `STDOUT` | no | `1` prints *ingest* to stdout instead of publishing |
-//!
-//! The broker is required even with `STDOUT=1`, because decode and storage both run on
-//! it and neither is optional; `STDOUT` only changes where ingest publishes.
+//! ```bash
+//! cargo run --release -- settings.toml
+//! ```
 
 use std::process::ExitCode;
-use std::time::Duration;
 
 use anyhow::{Context as _, Result};
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 
-use indexer::config::{BatchConfig, KafkaConfig};
-use indexer::connectors::StdoutJsonSink;
-use indexer::connectors::Storage;
+use indexer::config::{KafkaConfig, Settings};
+use indexer::connectors::{KafkaSink, StdoutJsonSink, Storage};
 use indexer::decode::Decode;
 use indexer::ingest::Ingest;
+
+/// The settings file used when none is named on the command line.
+const DEFAULT_SETTINGS: &str = "indexer.toml";
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -62,52 +53,79 @@ async fn main() -> ExitCode {
     }
 }
 
-/// Reads the environment, builds every stage, and runs them until one stops.
+/// Reads the settings file and runs every configured stage until one stops.
 async fn run() -> Result<()> {
-    let broker = Broker::from_env()?;
-    let batch = BatchConfig::new(500, Duration::from_secs(1));
+    let path = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| DEFAULT_SETTINGS.to_owned());
+    let settings = Settings::from_file(&path)?;
 
-    let ingest = build_ingest()?;
+    let batch = settings.batch();
+    let raw_topic = settings.raw_topic().to_owned();
+    let decoded_topic = settings.kafka.decoded_topic.clone();
+
+    let ingest = settings
+        .ingest
+        .as_ref()
+        .map(|ingest| {
+            Ingest::builder(&ingest.chain)
+                .http_url(&ingest.http_url)
+                .ws_url(&ingest.ws_url)
+                .build()
+        })
+        .transpose()?;
+
     let decode = Decode::builder(
-        KafkaConfig::builder(&broker.brokers)
-            .group("indexer-decode")
-            .input_topic(broker.raw_topic.clone())
-            .output_topic(broker.decoded_topic.clone())
+        KafkaConfig::builder(&settings.kafka.brokers)
+            .group(format!("{}-decode", settings.kafka.group_prefix))
+            .input_topic(raw_topic.clone())
+            .output_topic(decoded_topic.clone())
             .build()?,
     )
-    .abis(abi_registrations())?
-    .batch(batch)
-    .build()?;
-    let storage = Storage::builder(
-        KafkaConfig::builder(&broker.brokers)
-            .group("indexer-storage")
-            .input_topic(broker.raw_topic.clone())
-            .build()?,
-    )
-    .topics([broker.raw_topic.clone(), broker.decoded_topic.clone()])
-    .database(std::env::var("STORAGE_DATABASE").unwrap_or_else(|_| "indexer.duckdb".to_owned()))
+    .abis(settings.storage.abis.clone())?
     .batch(batch)
     .build()?;
 
-    info!("starting ingest, decode, and storage");
+    let mut storage = Storage::builder(
+        KafkaConfig::builder(&settings.kafka.brokers)
+            .group(format!("{}-storage", settings.kafka.group_prefix))
+            .input_topic(raw_topic.clone())
+            .build()?,
+    )
+    .topics([raw_topic.clone(), decoded_topic.clone()])
+    .database(settings.storage.database.clone())
+    .batch(batch);
+    if let Some(drain) = settings.drain() {
+        storage = storage.drain(drain);
+    }
+    let storage = storage.build()?;
 
-    // Ingest publishes through whichever sink it was built with; the other two run on
+    info!(
+        settings = %path,
+        raw_topic = %raw_topic,
+        decoded_topic = %decoded_topic,
+        ingest = ingest.is_some(),
+        "starting"
+    );
+
+    // Ingest publishes through whichever sink the settings chose; the other two run on
     // the bus it feeds.
-    let raw_topic = broker.raw_topic.clone();
+    let brokers = settings.kafka.brokers.clone();
+    let stdout = settings.ingest.as_ref().is_some_and(|ingest| ingest.stdout);
     let ingest_run = async {
         let Some(ingest) = ingest else {
             // Ingest is not configured; the other stages run on their own.
             return std::future::pending().await;
         };
-        if std::env::var("STDOUT").is_ok_and(|value| value == "1") {
+        if stdout {
             ingest.run(StdoutJsonSink::new()).await
         } else {
             let producer: rdkafka::producer::BaseProducer = rdkafka::ClientConfig::new()
-                .set("bootstrap.servers", &broker.brokers)
+                .set("bootstrap.servers", &brokers)
                 .create()
                 .context("create ingest producer")?;
             ingest
-                .run(indexer::connectors::KafkaSink::new(producer, raw_topic))
+                .run(KafkaSink::new(producer, raw_topic.clone()))
                 .await
         }
     };
@@ -119,57 +137,4 @@ async fn run() -> Result<()> {
         result = decode.run() => result.context("decode stopped"),
         result = storage.run() => result.context("storage stopped"),
     }
-}
-
-/// The broker every stage connects to, and the topics they share.
-struct Broker {
-    brokers: String,
-    raw_topic: String,
-    decoded_topic: String,
-}
-
-impl Broker {
-    /// Reads the broker settings, requiring only what every stage needs.
-    ///
-    /// The broker is required, because decode and storage both run on it and neither is
-    /// optional. `STDOUT=1` still needs a broker address for the other two stages; it
-    /// only changes where *ingest* publishes.
-    fn from_env() -> Result<Self> {
-        Ok(Self {
-            brokers: std::env::var("KAFKA_BROKERS").context("KAFKA_BROKERS must be set")?,
-            raw_topic: std::env::var("RAW_TOPIC").unwrap_or_else(|_| "raw.chain".to_owned()),
-            decoded_topic: std::env::var("DECODED_TOPIC")
-                .unwrap_or_else(|_| "decoded.chain".to_owned()),
-        })
-    }
-}
-
-/// Builds the ingest stage from the environment, or `None` when it is not configured.
-///
-/// Ingest is optional so the decode and storage stages can be run against a topic that
-/// was filled elsewhere.
-fn build_ingest() -> Result<Option<Ingest>> {
-    let Ok(chain) = std::env::var("EVM_CHAIN") else {
-        info!("EVM_CHAIN unset; running without ingest");
-        return Ok(None);
-    };
-    let http_url = std::env::var("EVM_HTTP_URL").context("EVM_HTTP_URL must be set")?;
-    let ws_url = std::env::var("EVM_WS_URL").context("EVM_WS_URL must be set")?;
-    Ok(Some(
-        Ingest::builder(chain)
-            .http_url(http_url)
-            .ws_url(ws_url)
-            .build()?,
-    ))
-}
-
-/// The ABI registrations from `DECODE_ABIS`, which is a comma-separated list.
-fn abi_registrations() -> Vec<String> {
-    std::env::var("DECODE_ABIS")
-        .unwrap_or_default()
-        .split(',')
-        .map(str::trim)
-        .filter(|entry| !entry.is_empty())
-        .map(str::to_owned)
-        .collect()
 }
