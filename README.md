@@ -11,23 +11,31 @@ rewrites.
 
 A Cargo workspace. The split exists so that the process that produces events and
 any process that consumes them share one definition of the stream without sharing a
-runtime — the dependency graph is the boundary, and it is enforced by the compiler
-rather than by convention.
+One crate, one binary, four layers as modules. Started as a process, every stage built
+explicitly in `main`, so what runs is visible in one place.
 
 ```
-crates/
-├── wire/         the wire contract: envelope, events, dataset records. Pure data.
-├── connectors/   the bus and storage boundary: traits, connectors, bin `storage`.
-├── indexer/      ingestion: block sources, the reorg-aware pipeline, bin `ingest`.
-└── decode/       the stateless ABI decode transform, bin `decode`.
+src/
+├── main.rs         builds every stage from the environment and runs them together
+├── config.rs       typed builders — stage configuration, not string lookups
+├── wire/           the wire contract: envelope, events, dataset records. Pure data.
+├── connectors/     the bus and storage boundary: traits and concrete connectors.
+├── ingest/         block sources and the reorg-aware pipeline.
+├── decode/         the stateless ABI decode transform and its registry.
+└── storage/        draining topics into the local store.
 ```
 
 `wire` depends on `alloy` and `serde` and on nothing else in the tree. `decode`
-depends on `wire` and **not** on `indexer`, so the decode stage structurally cannot
-reach into the pipeline's ordering and reorg state machine. That missing edge is the
-whole point of the split.
+knows nothing about `ingest`, so it cannot reach into the pipeline's ordering and reorg
+state machine.
 
-The pipeline today is `ingest` → `raw.chain` → `decode` → `decoded.chain` → `storage`.
+The layers were separate crates, which enforced that direction with the compiler. They
+are modules now, so it is a convention a reviewer checks. The trade: breaking the
+`decode` → `ingest` cycle was what forced the shared types into their own crate and the
+bus into another — four manifests, feature forwarding between them, and a compiler
+guarantee worth about one edge. At this size, one owner reads all of it.
+
+The pipeline is `ingest` → `raw.chain` → `decode` → `decoded.chain` → `storage`.
 Aggregation and windowing are not built.
 
 ## What works today
@@ -35,27 +43,25 @@ Aggregation and windowing are not built.
 - **EVM ingestion.** Live heads over WebSocket (`eth_subscribe`/`newHeads`), and
   each block fetched over JSON-RPC with full transactions, receipts, and logs in
   one batched request. Nothing the node returns is dropped. See
-  `crates/indexer/src/source/evm.rs`.
+  `src/ingest/source/evm.rs`.
 - **One event per dataset.** A `block` event, then for each transaction a
   `transaction` event, its `receipt` event, and its `log` events. Each dataset is a
   normalized table — a block references its transactions by hash, a receipt carries
   only the count of its logs — so no field is published twice and a row maps to a
-  persistence row. See `crates/wire/src/datasets/evm.rs`.
+  persistence row. See `src/wire/datasets/evm.rs`.
 - **Ordered events.** Every event gets a per-chain monotonic `sequence`; every
   dataset exposes a `dedupe_key` derived from its natural key. See
-  `crates/wire/src/envelope.rs`.
-- **A decode stage.** `crates/decode` is a stateless transform over an ABI registry,
-  and it runs as a process: `cargo run -p decode --bin decode --features kafka`
-  consumes `raw.chain`, decodes each log against the ABI registered for its
+  `src/wire/envelope.rs`.
+- **A decode stage.** `src/decode` is a stateless transform over an ABI registry.
+  It consumes `raw.chain`, decodes each log against the ABI registered for its
   `(chain, address)`, and produces to `decoded.chain`. It emits the decoded record
   *alongside* the raw log, so the decoded stream is a lossless superset, and forwards
   everything else — including reorgs and finality watermarks, which must survive for a
   store to retract and compact. It reimplements no ordering or reorg logic, so
   replaying a record is safe. Offsets are committed only after the producer's flush,
   so a crash replays a batch rather than losing one.
-- **A storage stage.** `cargo run -p connectors --bin storage --features kafka,duckdb`
-  drains `raw.chain` and `decoded.chain` into a local DuckDB database, one consumer
-  group per topic and one append-only `events` table.
+- **A storage stage.** It drains `raw.chain` and `decoded.chain` into a local `DuckDB`
+  database, one consumer group per topic and one append-only `events` table.
 - **Finality watermark.** A `finalized` event says a block and everything below
   it are permanent. Its height comes from the node's own `finalized` tag, so each
   chain's rules apply with no confirmation count to tune; on Base it trails the
@@ -64,8 +70,8 @@ Aggregation and windowing are not built.
   publishes a `reorg` event whose `orphaned_hashes` say what was retracted, and
   reclaims the sequence numbers those blocks had used. The undo window is bounded
   (128 blocks by default, and finalized blocks are dropped first). See
-  `crates/indexer/src/pipeline.rs`.
-- **NDJSON to stdout.** See `crates/connectors/src/stdout.rs`.
+  `src/ingest/pipeline.rs`.
+- **NDJSON to stdout.** See `src/connectors/stdout.rs`.
 - **Kafka-protocol connectors** both ways, behind the `kafka` feature: a sink keyed by
   chain so a chain's stream keeps its `sequence` order on one partition, and a source
   that yields the same envelopes back.
@@ -85,69 +91,52 @@ whatever the chain does next and does not fill gaps that predate startup.
 
 ## Run it
 
+One binary runs every stage: ingest follows the chain, decode reads `raw.chain` and
+writes `decoded.chain`, and storage drains both into `DuckDB`. They run concurrently
+and stop together — a stage that ends for good stops the process, because continuing
+without it would leave a stream that looks alive but is not.
+
 ```bash
 EVM_CHAIN=base \
 EVM_HTTP_URL=https://base-rpc.publicnode.com \
 EVM_WS_URL=wss://base-rpc.publicnode.com \
+KAFKA_BROKERS=127.0.0.1:9092 \
+DECODE_ABIS="base:0xd0b53D9277642d899DF5C87A3966A349A798F224:src/decode/abi/uniswap_v3_pool.json" \
+STORAGE_DATABASE=indexer.duckdb \
 RUST_LOG=info \
-cargo run -p indexer --bin ingest --release > events.ndjson
+cargo run --release --features kafka,duckdb
 ```
+
+To watch the stream without a broker, set `STDOUT=1` and leave `KAFKA_BROKERS` unset —
+ingest prints NDJSON to stdout instead of publishing.
 
 | Variable | Required | Default | Meaning |
 | --- | --- | --- | --- |
-| `EVM_CHAIN` | yes | — | Chain id stamped on every event |
-| `EVM_HTTP_URL` | yes | — | JSON-RPC endpoint for blocks, receipts, and the finalized block |
-| `EVM_WS_URL` | yes | — | WebSocket endpoint for `newHeads` |
+| `KAFKA_BROKERS` | for decode/storage | — | Bootstrap servers |
+| `EVM_CHAIN` | no | — | Chain id. Unset runs without ingest |
+| `EVM_HTTP_URL` | with `EVM_CHAIN` | — | JSON-RPC endpoint for blocks and receipts |
+| `EVM_WS_URL` | with `EVM_CHAIN` | — | WebSocket endpoint for `newHeads` |
+| `RAW_TOPIC` | no | `raw.chain` | Ingest's output and decode's input |
+| `DECODED_TOPIC` | no | `decoded.chain` | Decode's output |
+| `DECODE_ABIS` | no | — | `chain:address:abi.json`, comma-separated |
+| `STORAGE_DATABASE` | no | `indexer.duckdb` | Path to the store |
+| `STDOUT` | no | — | `1` to print ingest to stdout instead of publishing |
 | `RUST_LOG` | no | `info` | Log filter |
 
-Logs go to stderr; events go to stdout, so the two streams never interleave. The
-features above are on by default for the binary.
+Logs go to stderr; events go to stdout, so the two streams never interleave.
 
-### Run the decode stage
-
-```bash
-KAFKA_BROKERS=127.0.0.1:9092 \
-DECODE_ABIS="base:0xd0b53D9277642d899DF5C87A3966A349A798F224:crates/decode/abi/uniswap_v3_pool.json" \
-cargo run -p decode --bin decode --features kafka
-```
-
-| Variable | Required | Default | Meaning |
-| --- | --- | --- | --- |
-| `KAFKA_BROKERS` | yes | — | Bootstrap servers |
-| `DECODE_ABIS` | no | — | `chain:address:abi.json`, comma-separated, repeatable |
-| `DECODE_GROUP` | no | `indexer-decode` | Consumer group |
-| `DECODE_INPUT_TOPIC` | no | `raw.chain` | Topic to consume |
-| `DECODE_OUTPUT_TOPIC` | no | `decoded.chain` | Topic to produce |
-| `DECODE_BATCH` | no | `500` | Records per flush |
-| `DECODE_BATCH_MS` | no | `1000` | Time bound on a batch |
-
-A batch is `DECODE_BATCH` records or `DECODE_BATCH_MS` milliseconds, whichever comes
-first. `DECODE_ABIS` applies one ABI per address at every height, which is the honest
+`DECODE_ABIS` applies one ABI per address at every height, which is the honest
 limitation of a file-backed registry: a proxy that upgrades changes its ABI at a
 height, and that needs a table-backed registry behind the same seam.
 
-### Run the storage stage
+Storage uses one consumer group per topic, named `<group>-<topic>`, because an offset
+is per group: one group spanning two topics would commit a single position across both.
+Every envelope lands in an append-only `events` table with the envelope as JSON beside
+the columns a query filters on. A topic with nothing more to read is drained and the
+run stops.
 
-```bash
-KAFKA_BROKERS=127.0.0.1:9092 \
-STORAGE_DATABASE=indexer.duckdb \
-cargo run -p connectors --bin storage --features kafka,duckdb
-```
-
-| Variable | Required | Default | Meaning |
-| --- | --- | --- | --- |
-| `KAFKA_BROKERS` | yes | — | Bootstrap servers |
-| `STORAGE_TOPICS` | no | `raw.chain,decoded.chain` | Topics to consume |
-| `STORAGE_DATABASE` | no | `indexer.duckdb` | Path to the store |
-| `STORAGE_GROUP` | no | `indexer-storage` | Consumer group prefix |
-| `STORAGE_BATCH` | no | `500` | Records per flush |
-| `STORAGE_BATCH_MS` | no | `1000` | Time bound on a batch |
-| `STORAGE_DRAIN_SECS` | no | `5` | Idle time before a topic is treated as drained |
-
-One consumer group per topic, named `<STORAGE_GROUP>-<topic>`, because an offset is per
-group: one group spanning two topics would commit a single position across both. Every
-envelope lands in an append-only `events` table with the envelope as JSON beside the
-columns a query filters on.
+Configuration is a typed builder in `src/config.rs`, not a string lookup scattered
+through each stage, so a stage can be constructed in a test with no environment at all.
 
 ## Event shape
 
@@ -167,7 +156,7 @@ does not bump it, which is why consumers must skip an unknown `type` and ignore
 unknown fields.
 
 Events fall into three kinds. **Datasets** — `block`, `transaction`, `receipt`, `log`
-— are durable on-chain records, defined per chain in `crates/wire/src/datasets/evm.rs`. Each
+— are durable on-chain records, defined per chain in `src/wire/datasets/evm.rs`. Each
 is a normalized table with a natural key and fully deconstructed fields, the same
 decomposition of the chain's datasets, so a row maps straight to a
 persistence row; children are referenced by scalar key, never embedded. **Derived**
@@ -184,7 +173,7 @@ stay distinct.
 
 Identity uses `alloy_primitives::{B256, BlockHash, TxHash}`, encoded as lowercase
 `0x` hex, and quantity fields encode as `0x` hex via `alloy-serde`. The wire shape
-is pinned by tests in `crates/wire/src/envelope.rs`: `every_variant_round_trips_through_json`
+is pinned by tests in `src/wire/envelope.rs`: `every_variant_round_trips_through_json`
 covers every event kind, `the_wire_object_carries_only_the_envelope_and_event_fields`
 pins the exact key set, and
 `the_schema_version_is_stamped_and_old_lines_still_parse` pins both the `v` stamp and
@@ -201,7 +190,7 @@ variant in `Event`, rather than a shared type widened to fit both.
 cargo bench
 ```
 
-`crates/indexer/benches/hot_path.rs` measures the CPU work between socket and sink — decoding
+`benches/hot_path.rs` measures the CPU work between socket and sink — decoding
 the node's batch response and serialising envelopes — since end-to-end latency is dominated by the
 network and is not reproducible off-line. It is hand-rolled and dependency-free so
 it can report percentiles rather than means, and it calls `std::hint::black_box`
@@ -230,10 +219,10 @@ now published with its fields spelled out rather than as one opaque `raw` string
 ## Checks
 
 ```bash
-cargo fmt --all --check
-cargo clippy --workspace --all-targets --all-features -- -D warnings
-cargo doc --no-deps --workspace --all-features
-cargo test --workspace
+cargo fmt --check
+cargo clippy --all-targets --all-features -- -D warnings
+cargo doc --no-deps --all-features
+cargo test
 ```
 
 ## Compatibility policy

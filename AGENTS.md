@@ -25,8 +25,7 @@ Guidance for AI coding agents working in this repository.
 - Lock the tech stack to Rust, Cargo, rustfmt, Clippy, rustdoc, and cargo-nextest unless the user asks for alternatives.
 - Keep this template library-first unless the user asks for binary-specific structure.
 - Preserve the pinned Rust toolchain in `rust-toolchain.toml` unless asked to change it.
-- Match the existing strict lint style in the workspace `Cargo.toml`
-  (`[workspace.lints]`); every crate opts in with `[lints] workspace = true`.
+- Match the existing strict lint style in `Cargo.toml`.
 - Prefer clear public APIs, useful documentation, and focused tests.
 - Do not weaken lint levels, release profiles, or CI checks without calling it out first.
 
@@ -45,7 +44,7 @@ DEX, NFTs, metrics), so a matching table is almost always already designed:
 Before adding a dataset or a field, search Allium for the table that already covers
 it (chain name + dataset name, e.g. "ethereum raw logs") and copy its column set,
 natural key, and normalization. Follow the same conventions this repo already takes
-from them (`crates/wire/src/datasets/evm.rs`): one normalized table per dataset, a documented
+from them (`src/wire/datasets/evm.rs`): one normalized table per dataset, a documented
 natural key that becomes the `dedupe_key`, children referenced by scalar key rather
 than embedded, and no opaque `raw` blobs — every field present and typed.
 
@@ -54,16 +53,16 @@ than embedded, and no opaque `raw` blobs — every field present and typed.
 After code changes, run the relevant checks:
 
 ```bash
-cargo fmt --all --check
-cargo clippy --workspace --all-targets --all-features -- -D warnings
-cargo doc --no-deps --workspace --all-features
-cargo test --workspace
+cargo fmt --check
+cargo clippy --all-targets --all-features -- -D warnings
+cargo doc --no-deps --all-features
+cargo test
 ```
 
 If `cargo nextest` is installed, also run:
 
 ```bash
-cargo nextest run --workspace --all-targets --all-features
+cargo nextest run --all-targets --all-features
 ```
 
 ## Communication

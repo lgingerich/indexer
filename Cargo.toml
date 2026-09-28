@@ -1,22 +1,37 @@
-[workspace]
-resolver = "3"
-members = [
-    "crates/connectors",
-    "crates/decode",
-    "crates/indexer",
-    "crates/wire",
-]
+[package]
+name = "indexer"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95.0"
+authors = ["TODO"]
+description = "A low-latency, chain-agnostic blockchain indexer."
+readme = "README.md"
+repository = "TODO"
+license = "MIT OR Apache-2.0"
 
-# Shared dependency versions, so a crate cannot drift onto its own alloy or serde.
-[workspace.dependencies]
-alloy-consensus = { version = "1.8.3", default-features = false, features = ["serde", "std"] }
+[[bin]]
+name = "indexer"
+path = "src/main.rs"
+
+[features]
+default = []
+# Kafka-protocol connectors (`connectors::kafka`) on bundled librdkafka, and the
+# `decode` and `storage` stages that drive them. Off by default so the C build
+# dependency stays out of a plain `cargo build`.
+kafka = ["dep:rdkafka"]
+# Local `DuckDB` store (`connectors::duckdb`). Off by default so the one-time C++
+# engine build stays out of a plain `cargo build`.
+duckdb = ["dep:duckdb"]
+
+[dependencies]
+alloy-consensus = "1.8.3"
 # The JSON-RPC envelope and error types (`Response`/`ResponsePacket`/`ErrorPayload`).
 # alloy-network already pulls this in, but its `Response`/`ErrorPayload` are what
 # model a batch and let the source branch on an error's code instead of its text.
 alloy-json-rpc = "1.8.3"
 # `any` types (`AnyRpcBlock`/`AnyRpcTransaction`) are alloy's catch-all for networks
 # whose transaction types fall outside Ethereum's 0-4: an OP-stack deposit (`0x7e`)
-# or Arbitrum retry (`0x6a`) otherwise fails the whole block. See `source::evm`.
+# or Arbitrum retry (`0x6a`) otherwise fails the whole block. See `ingest::source`.
 alloy-network = "1.8.3"
 alloy-primitives = { version = "1.7.3", default-features = false, features = ["serde", "std"] }
 alloy-rpc-types-eth = { version = "1.8.3", default-features = false, features = ["serde", "std"] }
@@ -25,15 +40,20 @@ alloy-rpc-types-eth = { version = "1.8.3", default-features = false, features = 
 # and, unlike serde's native integer encoding, survives `#[serde(flatten)]` for
 # `u128` (see `wire::envelope::Envelope`).
 alloy-serde = { version = "1.8.3", default-features = false, features = ["std"] }
+# The dynamic decoder. Static `sol!` decoding cannot cover an open-ended set of
+# contracts, so the registry path is runtime-typed; see `decode::registry`.
+alloy-dyn-abi = { version = "1.7.3", default-features = false }
+# `JsonAbi` and its `Event`, the registry's unit of lookup.
+alloy-json-abi = { version = "1.7.3", default-features = false }
 anyhow = "1.0.104"
 # Bundled DuckDB compiles the C++ engine once via duckdb-sys; it is an embedded,
 # single-writer store, used only by the local DuckDB sink (`duckdb` feature).
-duckdb = { version = "1.10505.0", default-features = false, features = ["bundled"] }
+duckdb = { version = "1.10505.0", default-features = false, features = ["bundled"], optional = true }
 futures-util = "0.3.34"
 # rdkafka wraps C librdkafka, which `rdkafka-sys` compiles with `cc` (no cmake
-# needed; the version is vendored). It carries the workspace's one C build
-# dependency, so it is optional behind the `kafka` feature — see `connectors::kafka`.
-rdkafka = "0.39.0"
+# needed; the version is vendored). It carries the crate's one C build dependency,
+# so it is optional behind the `kafka` feature — see `connectors::kafka`.
+rdkafka = { version = "0.39.0", optional = true }
 # native-tls keeps TLS on the platform (Security.framework on macOS, OpenSSL on
 # Linux) so TLS adds no bundled C toolchain of its own.
 reqwest = { version = "0.13.5", default-features = false, features = ["json", "http2", "native-tls"] }
@@ -45,9 +65,38 @@ tokio-tungstenite = { version = "0.30.0", default-features = false, features = [
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", default-features = false, features = ["env-filter", "fmt", "json"] }
 
-# Lints are workspace-wide so every crate in the tree lives under one standard.
-# A crate that opts in with `[lints] workspace = true` cannot quietly relax it.
-[workspace.lints.rust]
+[dev-dependencies]
+
+[[bench]]
+name = "hot_path"
+harness = false
+
+[profile.release]
+codegen-units = 1
+debug = 0
+debug-assertions = false
+incremental = false
+opt-level = 3
+lto = true
+panic = "abort"
+strip = "debuginfo"
+
+[profile.release-profiling]
+inherits = "release"
+debug = "line-tables-only"
+strip = "none"
+
+[profile.dev]
+codegen-units = 256
+debug = 2
+debug-assertions = true
+incremental = true
+opt-level = 0
+lto = false
+panic = "unwind"
+strip = false
+
+[lints.rust]
 missing_docs                    = "warn"
 unexpected_cfgs                 = "warn"
 unsafe_code                     = "deny"
@@ -63,7 +112,7 @@ unreachable_pub                 = "deny"
 unreachable_code                = "deny"
 unreachable_patterns            = "deny"
 
-[workspace.lints.clippy]
+[lints.clippy]
 pedantic                        = { level = "warn", priority = -2 }
 
 # === Provenance-Safe Pointer Casts ===
@@ -140,30 +189,3 @@ unused_peekable                 = "deny"
 useless_conversion              = "deny"
 used_underscore_binding         = "deny"
 vec_box                         = "deny"
-
-# Profiles are honored only in the workspace root, so they live here and every
-# member inherits them.
-[profile.release]
-codegen-units = 1
-debug = 0
-debug-assertions = false
-incremental = false
-opt-level = 3
-lto = true
-panic = "abort"
-strip = "debuginfo"
-
-[profile.release-profiling]
-inherits = "release"
-debug = "line-tables-only"
-strip = "none"
-
-[profile.dev]
-codegen-units = 256
-debug = 2
-debug-assertions = true
-incremental = true
-opt-level = 0
-lto = false
-panic = "unwind"
-strip = false
