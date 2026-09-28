@@ -1,9 +1,27 @@
 //! Runs the decode transform over a file of raw envelopes and prints NDJSON.
 //!
-//! This is a way to *see* decoded output before the broker source and sink exist.
-//! It reads envelopes in the shape the indexer publishes, decodes each, and writes
-//! the transform's own output — the raw envelope followed by its decoded record —
-//! to stdout.
+//! This is a way to *see* decoded output without a broker. It reads envelopes in the
+//! shape the indexer publishes, decodes each, and writes the transform's own output —
+//! the raw envelope followed by its decoded record — to stdout.
+//!
+//! # Getting the input
+//!
+//! The input is NDJSON, one published envelope per line. There is no fixture in the
+//! repository, so produce one from the chain first: run the indexer with `STDOUT=1`,
+//! which prints what it would publish instead of sending it to a broker, and keep a
+//! slice.
+//!
+//! ```bash
+//! EVM_CHAIN=base \
+//! EVM_HTTP_URL=https://base-rpc.publicnode.com \
+//! EVM_WS_URL=wss://base-rpc.publicnode.com \
+//! STDOUT=1 RUST_LOG=warn \
+//! cargo run --release 2>/dev/null | head -200 > envelopes.ndjson
+//! ```
+//!
+//! Then decode that file. `--address` is the contract whose ABI applies to every line
+//! in it, so the capture is worth filtering to one contract's logs; a real registry is
+//! keyed by `(chain, address, block)` and answers per log, and this stands in for it.
 //!
 //! ```bash
 //! cargo run --example decode_logs -- \
@@ -12,10 +30,6 @@
 //!   --chain base \
 //!   envelopes.ndjson
 //! ```
-//!
-//! Every envelope in the file goes to the one address; a real registry is keyed by
-//! `(chain, address, block)` and would answer per log. The seam is the same either
-//! way, which is the point.
 
 // A runnable tool rather than a library, so printing is the whole job.
 #![expect(clippy::print_stdout, clippy::print_stderr, clippy::expect_used)]
@@ -85,10 +99,33 @@ fn main() -> ExitCode {
     };
     let transform = Transform::new(registry);
 
-    let contents = std::fs::read_to_string(&input).expect("input file reads");
+    let contents = match std::fs::read_to_string(&input) {
+        Ok(contents) => contents,
+        Err(error) => {
+            // A missing input is the most likely way to get here, and the raw `Os` error
+            // does not say where the file was supposed to come from. See the module docs.
+            eprintln!("cannot read {input}: {error}");
+            eprintln!(
+                "the input is NDJSON of published envelopes; see the module docs for \
+                 how to capture one with STDOUT=1"
+            );
+            return ExitCode::FAILURE;
+        }
+    };
     let (mut lines, mut decoded_count, mut failed) = (0_usize, 0_usize, 0_usize);
-    for line in contents.lines().filter(|line| !line.trim().is_empty()) {
-        let envelope: Envelope = serde_json::from_str(line).expect("envelope parses");
+    for (number, line) in contents.lines().enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let envelope: Envelope = match serde_json::from_str(line) {
+            Ok(envelope) => envelope,
+            Err(error) => {
+                // Named so a bad line in a 200-line capture is findable.
+                eprintln!("line {}: not an envelope: {error}", number + 1);
+                failed += 1;
+                continue;
+            }
+        };
         lines += 1;
         match transform.apply(envelope) {
             Ok(output) => {
@@ -104,7 +141,7 @@ fn main() -> ExitCode {
             }
             Err(error) => {
                 failed += 1;
-                eprintln!("decode failed: {error}");
+                eprintln!("line {}: decode failed: {error}", number + 1);
             }
         }
     }
