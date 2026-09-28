@@ -27,7 +27,10 @@
 //! | `DECODED_TOPIC` | no | Defaults to `decoded.chain` |
 //! | `DECODE_ABIS` | no | `chain:address:abi.json`, comma-separated |
 //! | `STORAGE_DATABASE` | no | Defaults to `indexer.duckdb` |
-//! | `STDOUT` | no | `1` to print ingest to stdout instead of the broker |
+//! | `STDOUT` | no | `1` prints *ingest* to stdout instead of publishing |
+//!
+//! The broker is required even with `STDOUT=1`, because decode and storage both run on
+//! it and neither is optional; `STDOUT` only changes where ingest publishes.
 
 use std::process::ExitCode;
 use std::time::Duration;
@@ -61,31 +64,27 @@ async fn main() -> ExitCode {
 
 /// Reads the environment, builds every stage, and runs them until one stops.
 async fn run() -> Result<()> {
-    let brokers = std::env::var("KAFKA_BROKERS").context("KAFKA_BROKERS must be set")?;
-    let raw_topic = std::env::var("RAW_TOPIC").unwrap_or_else(|_| "raw.chain".to_owned());
-    let decoded_topic =
-        std::env::var("DECODED_TOPIC").unwrap_or_else(|_| "decoded.chain".to_owned());
+    let broker = Broker::from_env()?;
     let batch = BatchConfig::new(500, Duration::from_secs(1));
 
-    let ingest = build_ingest(&raw_topic)?;
+    let ingest = build_ingest()?;
     let decode = Decode::builder(
-        KafkaConfig::builder(brokers.clone())
+        KafkaConfig::builder(&broker.brokers)
             .group("indexer-decode")
-            .input_topic(raw_topic.clone())
-            .output_topic(decoded_topic.clone())
+            .input_topic(broker.raw_topic.clone())
+            .output_topic(broker.decoded_topic.clone())
             .build()?,
     )
-    .abis(abi_registrations())
-    .context("read DECODE_ABIS")?
+    .abis(abi_registrations())?
     .batch(batch)
     .build()?;
     let storage = Storage::builder(
-        KafkaConfig::builder(brokers.clone())
+        KafkaConfig::builder(&broker.brokers)
             .group("indexer-storage")
-            .input_topic(raw_topic.clone())
+            .input_topic(broker.raw_topic.clone())
             .build()?,
     )
-    .topics([raw_topic.clone(), decoded_topic.clone()])
+    .topics([broker.raw_topic.clone(), broker.decoded_topic.clone()])
     .database(std::env::var("STORAGE_DATABASE").unwrap_or_else(|_| "indexer.duckdb".to_owned()))
     .batch(batch)
     .build()?;
@@ -94,23 +93,21 @@ async fn run() -> Result<()> {
 
     // Ingest publishes through whichever sink it was built with; the other two run on
     // the bus it feeds.
+    let raw_topic = broker.raw_topic.clone();
     let ingest_run = async {
         let Some(ingest) = ingest else {
-            // Ingest is not configured; let the other stages run on their own.
+            // Ingest is not configured; the other stages run on their own.
             return std::future::pending().await;
         };
         if std::env::var("STDOUT").is_ok_and(|value| value == "1") {
             ingest.run(StdoutJsonSink::new()).await
         } else {
             let producer: rdkafka::producer::BaseProducer = rdkafka::ClientConfig::new()
-                .set("bootstrap.servers", &brokers)
+                .set("bootstrap.servers", &broker.brokers)
                 .create()
                 .context("create ingest producer")?;
             ingest
-                .run(indexer::connectors::KafkaSink::new(
-                    producer,
-                    raw_topic.clone(),
-                ))
+                .run(indexer::connectors::KafkaSink::new(producer, raw_topic))
                 .await
         }
     };
@@ -124,18 +121,40 @@ async fn run() -> Result<()> {
     }
 }
 
+/// The broker every stage connects to, and the topics they share.
+struct Broker {
+    brokers: String,
+    raw_topic: String,
+    decoded_topic: String,
+}
+
+impl Broker {
+    /// Reads the broker settings, requiring only what every stage needs.
+    ///
+    /// The broker is required, because decode and storage both run on it and neither is
+    /// optional. `STDOUT=1` still needs a broker address for the other two stages; it
+    /// only changes where *ingest* publishes.
+    fn from_env() -> Result<Self> {
+        Ok(Self {
+            brokers: std::env::var("KAFKA_BROKERS").context("KAFKA_BROKERS must be set")?,
+            raw_topic: std::env::var("RAW_TOPIC").unwrap_or_else(|_| "raw.chain".to_owned()),
+            decoded_topic: std::env::var("DECODED_TOPIC")
+                .unwrap_or_else(|_| "decoded.chain".to_owned()),
+        })
+    }
+}
+
 /// Builds the ingest stage from the environment, or `None` when it is not configured.
 ///
 /// Ingest is optional so the decode and storage stages can be run against a topic that
 /// was filled elsewhere.
-fn build_ingest(raw_topic: &str) -> Result<Option<Ingest>> {
+fn build_ingest() -> Result<Option<Ingest>> {
     let Ok(chain) = std::env::var("EVM_CHAIN") else {
         info!("EVM_CHAIN unset; running without ingest");
         return Ok(None);
     };
     let http_url = std::env::var("EVM_HTTP_URL").context("EVM_HTTP_URL must be set")?;
     let ws_url = std::env::var("EVM_WS_URL").context("EVM_WS_URL must be set")?;
-    let _ = raw_topic;
     Ok(Some(
         Ingest::builder(chain)
             .http_url(http_url)

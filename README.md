@@ -111,8 +111,9 @@ RUST_LOG=info \
 cargo run --release --features kafka,duckdb
 ```
 
-To watch the stream without a broker, set `STDOUT=1` and leave `KAFKA_BROKERS` unset —
-ingest prints NDJSON to stdout instead of publishing.
+`STDOUT=1` prints *ingest* to stdout instead of publishing it, which is useful for
+watching the raw stream. The broker is still required: decode and storage both run on it
+and neither is optional.
 
 | Variable | Required | Default | Meaning |
 | --- | --- | --- | --- |
@@ -124,7 +125,7 @@ ingest prints NDJSON to stdout instead of publishing.
 | `DECODED_TOPIC` | no | `decoded.chain` | Decode's output |
 | `DECODE_ABIS` | no | — | `chain:address:abi.json`, comma-separated |
 | `STORAGE_DATABASE` | no | `indexer.duckdb` | Path to the store |
-| `STDOUT` | no | — | `1` to print ingest to stdout instead of publishing |
+| `STDOUT` | no | — | `1` prints *ingest* to stdout instead of publishing |
 | `RUST_LOG` | no | `info` | Log filter |
 
 Logs go to stderr; events go to stdout, so the two streams never interleave.
