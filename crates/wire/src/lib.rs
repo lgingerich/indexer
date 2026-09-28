@@ -9,6 +9,9 @@
 //!   [`envelope::Event`], with the schema version and the per-chain sequence.
 //! - [`datasets`] are the durable records an event may carry, one normalized table
 //!   per dataset.
+//! - [`typed`] is the typed form of a decoded ABI argument, which is what a decoded
+//!   record carries instead of opaque bytes.
 
 pub mod datasets;
 pub mod envelope;
+pub mod typed;

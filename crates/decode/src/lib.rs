@@ -20,8 +20,13 @@
 //! orphaned rows or compact below a finality watermark; dropping either would make
 //! the decoded stream quietly wrong rather than incomplete.
 //!
-//! Not built yet: the ABI registry, the decoder, and the broker source/sink.
+//! Not built yet: the broker source and sink that drive the transform, and a
+//! proxy-aware registry backed by a store rather than an in-process map.
 
+pub mod convert;
+pub mod registry;
 pub mod transform;
 
+pub use convert::ConversionError;
+pub use registry::{Abi, AbiRegistry, RawLog, RegistryError};
 pub use transform::Transform;

@@ -8,6 +8,9 @@
 //!   Each carries its own identity fields and dedupe key. Their shape is per-chain,
 //!   so the EVM records live in [`crate::datasets::evm`]; Solana's would be a sibling
 //!   module and a variant here.
+//! - **Derived** ([`Event::Decoded`]): a record the decode stage produces from a
+//!   dataset, carrying its typed arguments. It is a dataset, not a control signal,
+//!   and it only ever appears on a decoded stream.
 //! - **Control** ([`Reorg`], [`Finalized`]): signals about the indexer's own state,
 //!   not records of a chain. They carry no verbatim payload and exist to drive a
 //!   consumer's state machine, so they are defined here.
@@ -47,10 +50,11 @@
 
 use std::fmt;
 
-use alloy_primitives::B256;
+use alloy_primitives::{Address, B256};
 use serde::{Deserialize, Serialize};
 
 pub use crate::datasets::evm::{Block, Log, Receipt, Transaction};
+pub use crate::typed::TypedValue;
 
 /// The version of the envelope's wire shape.
 ///
@@ -125,6 +129,54 @@ pub struct Finalized {
     pub hash: B256,
 }
 
+/// One log decoded against a contract ABI, as typed arguments.
+///
+/// Produced by the decode stage, not the indexer: nothing in the ingest path knows
+/// an ABI, so this record only ever appears on a decoded stream. It is a *dataset*
+/// rather than a control signal — a durable on-chain record a consumer can store —
+/// and it carries everything needed to identify the row it becomes without a second
+/// lookup.
+///
+/// The raw log it came from is referenced by [`Log::dedupe_key`], not embedded:
+/// the raw stream is the archive, so re-decoding with a later ABI is a replay of
+/// that record rather than a re-fetch from a node.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Decoded {
+    /// The event name from the ABI, for example `Transfer`.
+    pub name: String,
+    /// The contract that emitted the log.
+    pub address: Address,
+    /// The event selector, `keccak256` of its signature.
+    pub selector: B256,
+    /// The [`Log::dedupe_key`] of the raw log this was decoded from.
+    ///
+    /// The link back to the source record, so a decoded row can be traced to the log
+    /// that produced it and a re-decode can be recognized as one.
+    pub source: String,
+    /// The indexed arguments, in ABI order.
+    pub indexed: Vec<TypedValue>,
+    /// The non-indexed arguments, in ABI order.
+    pub body: Vec<TypedValue>,
+    /// Height of the block containing this log.
+    #[serde(with = "alloy_serde::quantity")]
+    pub block_number: u64,
+    /// Hash of the block containing this log.
+    pub block_hash: B256,
+}
+
+impl Decoded {
+    /// A key that is stable across redelivery and unique per decoded record.
+    ///
+    /// Built from the source log's key plus this event's selector, so a re-decode of
+    /// the same log produces the same key and a store upserts rather than
+    /// duplicates. It excludes `sequence` for the same reason every other dataset
+    /// does: a sequence is reassigned by a reorg or a restart.
+    #[must_use]
+    pub fn dedupe_key(&self) -> String {
+        format!("{}:{}:decoded", self.source, self.selector)
+    }
+}
+
 /// Everything the indexer publishes, tagged by `type` on the wire.
 ///
 /// Dataset payloads are boxed: a [`Block`] or [`Receipt`] carries a 256-byte bloom
@@ -141,6 +193,8 @@ pub enum Event {
     Receipt(Box<Receipt>),
     /// A log, from its receipt's `logs` array.
     Log(Box<Log>),
+    /// A log decoded against a contract ABI. Only the decode stage produces this.
+    Decoded(Box<Decoded>),
     /// A discontinuity in the published chain.
     Reorg(Reorg),
     /// A finality watermark.
@@ -156,6 +210,7 @@ impl Event {
             Self::Transaction(_) => "transaction",
             Self::Receipt(_) => "receipt",
             Self::Log(_) => "log",
+            Self::Decoded(_) => "decoded",
             Self::Reorg(_) => "reorg",
             Self::Finalized(_) => "finalized",
         }
@@ -168,7 +223,11 @@ impl Event {
     #[must_use]
     pub const fn is_dataset(&self) -> bool {
         match self {
-            Self::Block(_) | Self::Transaction(_) | Self::Receipt(_) | Self::Log(_) => true,
+            Self::Block(_)
+            | Self::Transaction(_)
+            | Self::Receipt(_)
+            | Self::Log(_)
+            | Self::Decoded(_) => true,
             Self::Reorg(_) | Self::Finalized(_) => false,
         }
     }
@@ -187,6 +246,7 @@ impl Event {
             Self::Transaction(transaction) => transaction.dedupe_key(),
             Self::Receipt(receipt) => receipt.dedupe_key(),
             Self::Log(log) => log.dedupe_key(),
+            Self::Decoded(decoded) => decoded.dedupe_key(),
             Self::Reorg(reorg) => format!("{}:{}:reorg", reorg.height, reorg.new_head_hash),
             Self::Finalized(finalized) => {
                 format!("{}:{}:finalized", finalized.height, finalized.hash)
@@ -246,11 +306,11 @@ impl Envelope {
 // means the fixture or setup is wrong.
 #[expect(clippy::expect_used)]
 mod tests {
-    use alloy_primitives::{Address, B256, TxHash};
+    use alloy_primitives::{Address, B256, TxHash, U256};
 
     use super::{
-        Block, ChainId, Envelope, Event, Finalized, Log, Receipt, Reorg, SCHEMA_VERSION,
-        Transaction,
+        Block, ChainId, Decoded, Envelope, Event, Finalized, Log, Receipt, Reorg, SCHEMA_VERSION,
+        Transaction, TypedValue,
     };
 
     fn chain() -> ChainId {
@@ -418,6 +478,22 @@ mod tests {
                 block_number: 5,
                 topic0: Some(hash(0x07)),
                 ..Log::default()
+            })),
+            Event::Decoded(Box::new(Decoded {
+                name: "Transfer".to_owned(),
+                address: Address::from([0x22; 20]),
+                selector: hash(0x07),
+                source: "5:0x1111111111111111111111111111111111111111111111111111111111111111:1"
+                    .to_owned(),
+                indexed: vec![TypedValue::Address {
+                    value: Address::from([0x22; 20]),
+                }],
+                body: vec![TypedValue::Uint {
+                    value: U256::from(1),
+                    bits: 256,
+                }],
+                block_number: 5,
+                block_hash: hash(5),
             })),
             Event::Reorg(Reorg {
                 height: 1,

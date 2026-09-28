@@ -15,6 +15,14 @@ workspace = true
 # lands with that stage.
 
 [dependencies]
+# The dynamic decoder. Static `sol!` decoding cannot cover an open-ended set of
+# contracts, so the registry path is runtime-typed; see `registry`.
+alloy-dyn-abi = { version = "1.7.3", default-features = false }
+# `JsonAbi` and its `Event`, the registry's unit of lookup.
+alloy-json-abi = { version = "1.7.3", default-features = false }
+alloy-primitives = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
 wire = { path = "../wire" }
 
 [dev-dependencies]

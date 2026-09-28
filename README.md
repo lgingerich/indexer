@@ -41,10 +41,13 @@ whole point of the split.
 - **Ordered events.** Every event gets a per-chain monotonic `sequence`; every
   dataset exposes a `dedupe_key` derived from its natural key. See
   `crates/wire/src/envelope.rs`.
-- **A decode stage.** `crates/decode` is a stateless transform that forwards an
-  envelope unchanged and preserves its identity. It reimplements no ordering or
-  reorg logic, so replaying a record is safe. The ABI registry and the decoding
-  itself are not built yet; the transform's invariants are pinned by tests first.
+- **A decode stage.** `crates/decode` is a stateless transform over an ABI registry.
+  It decodes a log against the ABI registered for its `(chain, address, block)`,
+  emits the decoded record *alongside* the raw log so the decoded stream is a
+  lossless superset, and forwards everything else — including reorgs and finality
+  watermarks, which must survive for a store to retract and compact. It reimplements
+  no ordering or reorg logic, so replaying a record is safe. The broker source and
+  sink that would drive it are not built yet.
 - **Finality watermark.** A `finalized` event says a block and everything below
   it are permanent. Its height comes from the node's own `finalized` tag, so each
   chain's rules apply with no confirmation count to tune; on Base it trails the
@@ -65,8 +68,9 @@ Both optional sinks are off by default so a plain `cargo build` compiles neither
 
 ## Not built yet
 
-Backfill-to-live handoff, checkpoint resume, mempool, ABI/IDL decoding, filtered
-subscriptions, derived state (balances/nonces), and the Parquet/GCS archiver. The
+Backfill-to-live handoff, checkpoint resume, mempool, filtered
+subscriptions, derived state (balances/nonces), the broker source and sink that
+drive the decode stage, and the Parquet/GCS archiver. The
 crate is a walking skeleton: it indexes forward from
 whatever the chain does next and does not fill gaps that predate startup.
 
@@ -107,11 +111,14 @@ or a field or variant being removed. Adding an optional field or a new event var
 does not bump it, which is why consumers must skip an unknown `type` and ignore
 unknown fields.
 
-Events fall into two kinds. **Datasets** — `block`, `transaction`, `receipt`, `log`
-— are durable on-chain records, defined per chain in `src/datasets/evm.rs`. Each
+Events fall into three kinds. **Datasets** — `block`, `transaction`, `receipt`, `log`
+— are durable on-chain records, defined per chain in `crates/wire/src/datasets/evm.rs`. Each
 is a normalized table with a natural key and fully deconstructed fields, the same
 decomposition of the chain's datasets, so a row maps straight to a
-persistence row; children are referenced by scalar key, never embedded. **Control
+persistence row; children are referenced by scalar key, never embedded. **Derived**
+records — `decoded` — are what the decode stage produces from a dataset, carrying
+typed ABI arguments; the type of every argument travels with it, so a consumer can
+rebuild a typed column without reading the ABI. **Control
 signals** — `reorg`, `finalized` — drive a consumer's state machine and carry no
 payload; `Event::is_dataset` tells them apart. The line is one flat object: `chain`,
 `sequence`, and the event's fields under its `type` tag. Consumers deduplicate on
