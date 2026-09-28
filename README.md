@@ -16,16 +16,21 @@ rather than by convention.
 
 ```
 crates/
-├── wire/      the wire contract: envelope, events, dataset records. Pure data.
-├── sink/      egress: the EventSink trait and the concrete sinks.
-├── indexer/   ingestion: block sources, the reorg-aware pipeline, bin `ingest`.
-└── decode/    the stateless ABI decode transform, and (soon) bin `decode`.
+├── wire/         the wire contract: envelope, events, dataset records. Pure data.
+├── sink/         egress: the EventSink trait and the concrete sinks.
+├── indexer/      ingestion: block sources, the reorg-aware pipeline, bin `ingest`.
+├── decode/       the stateless ABI decode transform.
+└── materialize/  decoded events into typed tables, in two layers.
 ```
 
 `wire` depends on `alloy` and `serde` and on nothing else in the tree. `decode`
 depends on `wire` and **not** on `indexer`, so the decode stage structurally cannot
 reach into the pipeline's ordering and reorg state machine. That missing edge is the
 whole point of the split.
+
+`materialize` is separate from `decode` for the same reason one level down: a new ABI
+is a decode concern, and a new protocol's meaning is a modeling concern. Keeping them
+apart is what lets decode stay stateless and replayable.
 
 ## What works today
 
@@ -48,6 +53,11 @@ whole point of the split.
   watermarks, which must survive for a store to retract and compact. It reimplements
   no ordering or reorg logic, so replaying a record is safe. The broker source and
   sink that would drive it are not built yet.
+- **Typed tables from decoded events.** `crates/materialize` turns a decoded record
+  into table rows in two layers: one faithful row per event with every argument under
+  its ABI name, and one semantic row in the shape Allium calls `dex.trades`. An ABI
+  integer that fits an `i64` becomes one; anything wider — a `uint160` price, a
+  `uint256` wei amount — becomes exact decimal text rather than a rounded float.
 - **Finality watermark.** A `finalized` event says a block and everything below
   it are permanent. Its height comes from the node's own `finalized` tag, so each
   chain's rules apply with no confirmation count to tune; on Base it trails the

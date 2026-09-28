@@ -1,6 +1,12 @@
 [workspace]
 resolver = "3"
-members = ["crates/decode", "crates/indexer", "crates/sink", "crates/wire"]
+members = [
+    "crates/decode",
+    "crates/indexer",
+    "crates/materialize",
+    "crates/sink",
+    "crates/wire",
+]
 
 # Shared dependency versions, so a crate cannot drift onto its own alloy or serde.
 [workspace.dependencies]

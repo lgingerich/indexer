@@ -1,0 +1,23 @@
+[package]
+name = "materialize"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95.0"
+description = "Turns decoded events into typed, queryable tables."
+license = "MIT OR Apache-2.0"
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+alloy-primitives = { workspace = true }
+serde_json = { workspace = true }
+wire = { path = "../wire" }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+
+[[example]]
+name = "materialize_tables"
+path = "examples/materialize_tables.rs"
