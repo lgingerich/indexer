@@ -12,19 +12,18 @@ license = "MIT OR Apache-2.0"
 [[bin]]
 name = "indexer"
 path = "src/main.rs"
-# The binary wires all three stages together, and two of them need a broker or a store.
-# Without the features there is nothing for it to run, so it is skipped rather than
-# failing the build.
-required-features = ["kafka", "duckdb"]
+# The pipeline needs a store to write to, so the binary is skipped without one rather
+# than failing the build. Kafka is optional: a `[bus] kind = "memory"` run needs no
+# broker, so `cargo run` works with the default features and no message queue.
+required-features = ["duckdb"]
 
 [features]
-default = []
-# Kafka-protocol connectors (`connectors::kafka`) on bundled librdkafka, and the
-# `decode` and `storage` stages that drive them. Off by default so the C build
-# dependency stays out of a plain `cargo build`.
+default = ["duckdb"]
+# Kafka-protocol connectors (`connectors::kafka`) on bundled librdkafka. Off by default so
+# the C build dependency stays out of a plain `cargo build`; add it to reach a broker.
 kafka = ["dep:rdkafka"]
-# Local `DuckDB` store (`connectors::duckdb`). Off by default so the one-time C++
-# engine build stays out of a plain `cargo build`.
+# Local `DuckDB` store (`connectors::duckdb`). On by default: it is the default store, and
+# the pipeline needs exactly one to run. Remove it only to build without the C++ engine.
 duckdb = ["dep:duckdb"]
 
 [dependencies]

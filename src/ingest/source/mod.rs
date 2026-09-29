@@ -22,8 +22,10 @@ use futures_util::Stream;
 use thiserror::Error;
 
 pub mod evm;
+pub mod merged;
 
 pub use evm::EvmSource;
+pub use merged::Merged;
 
 use crate::wire::envelope::{ChainId, Event};
 

@@ -9,16 +9,19 @@ rewrites.
 
 ## Layout
 
-One crate, one binary, four layers as modules. Every stage is built explicitly in
-`main`, so what runs is visible in one place. The layers share one definition of the
-stream through `wire`, without sharing a process.
+One crate, one binary, four layers as modules. What runs is not hardcoded: the settings
+file states it, and `runtime` assembles the pipeline — ingest iff a chain is configured,
+decode iff a registry has entries, storage always — on whichever bus and store the
+settings chose. `main` is only the process boundary. The layers share one definition of
+the stream through `wire`, without sharing a process.
 
 ```
 src/
-├── main.rs         builds every stage from the settings file and runs them together
-├── config.rs       typed builders — stage configuration, not string lookups
+├── main.rs         the process boundary: logging, the settings path, the exit code
+├── runtime.rs      assembles the pipeline the settings describe, and runs it
+├── config.rs       typed settings — stage configuration, not string lookups
 ├── wire/           the wire contract: envelope, events, dataset records. Pure data.
-├── connectors/     the traits, the concrete connectors, and the shared drain loop.
+├── connectors/     the traits, the transports (kafka, memory, stdout, duckdb), the drain loop.
 ├── ingest/         block sources and the reorg-aware pipeline.
 └── decode/         the stateless ABI decode transform and its registry.
 ```
@@ -74,14 +77,17 @@ Aggregation and windowing are not built.
   (128 blocks by default, and finalized blocks are dropped first). See
   `src/ingest/pipeline.rs`.
 - **NDJSON to stdout.** See `src/connectors/stdout.rs`.
-- **Kafka-protocol connectors** both ways, behind the `kafka` feature: a sink keyed by
-  chain so a chain's stream keeps its `sequence` order on one partition, and a source
-  that yields the same envelopes back.
-- **A local `DuckDB` store**, behind the `duckdb` feature. Embedded and
+- **Two buses, one pipeline.** The stages share a topic bus: a Kafka-protocol transport
+  (behind the `kafka` feature) whose sink is keyed by chain so a chain's stream keeps its
+  `sequence` order on one partition, or an in-process transport (`kind = "memory"`) that
+  runs the whole pipeline with no broker. The stages and the publish → flush → commit
+  order are identical either way; only durability differs.
+- **A local `DuckDB` store**, behind the `duckdb` feature (on by default). Embedded and
   single-writer, so it is an archive/analytics endpoint, not the fan-out.
 
-Both optional connectors are off by default so a plain `cargo build` compiles neither C
-`librdkafka` nor the `DuckDB` C++ engine; enable them with `--features kafka,duckdb`.
+`duckdb` is on by default because the pipeline needs a store to run; `kafka` is off by
+default so a plain `cargo build` does not compile the C `librdkafka`. A memory-bus run
+needs no broker, so `cargo run` alone runs the pipeline.
 
 ## Not built yet
 
@@ -92,10 +98,19 @@ does not fill gaps that predate startup.
 
 ## Run it
 
-One binary runs every stage: ingest follows the chain, decode reads `raw.chain` and
-writes `decoded.chain`, and storage drains both into `DuckDB`. They run concurrently
-and stop together — a stage that ends for good stops the process, because continuing
-without it would leave a stream that looks alive but is not.
+One binary runs the pipeline the settings describe: ingest follows the chain, decode reads
+`raw.chain` and writes `decoded.chain`, and storage drains both into the store. What runs
+is not hardcoded — the settings decide it. Stages run concurrently and stop together: a
+stage that ends for good stops the process, because continuing without it would leave a
+stream that looks alive but is not.
+
+- **Ingest runs iff `[ingest]` is present** — configuring a chain is the statement that it
+  should be followed.
+- **Decode runs iff `[decode] registry` names a registry with entries.** Decode is purely
+  additive: with none it would drop every raw dataset and forward only the control
+  signals, which ingest already publishes to the topic storage reads, so skipping it
+  loses nothing.
+- **Storage always runs**, reading the raw topic and (when decode ran) the decoded topic.
 
 Settings come from a TOML file, named by the first argument or defaulting to
 `indexer.toml`. `indexer.toml` in the repository is a working example. What decode decodes
@@ -103,7 +118,11 @@ lives in a separate registry file, named by `[decode] registry` and defaulting t
 `registry.toml` is a working example; see [The contract registry](#the-contract-registry).
 
 ```bash
-RUST_LOG=info cargo run --release --features kafka,duckdb -- indexer.toml
+# With a broker (the kafka feature compiles librdkafka):
+RUST_LOG=info cargo run --release --features kafka -- indexer.toml
+
+# Or no broker at all: an in-process bus, one process, no message queue.
+RUST_LOG=info cargo run --release -- indexer.toml
 ```
 
 ```toml
@@ -112,19 +131,42 @@ chain = "base"
 http_url = "https://base-rpc.publicnode.com"
 ws_url = "wss://base-rpc.publicnode.com"
 
-[kafka]
+[bus]
+kind = "kafka"          # or "memory" for a single, broker-less process
+
+[bus.kafka]
 brokers = "localhost:9092"
 
+[runtime]
+drain_secs = 5   # omit for a live indexer
+
 [storage]
-database = "indexer.duckdb"
+kind = "duckdb"
+
+[storage.duckdb]
+path = "indexer.duckdb"
+
+[decode]
+registry = "registry.toml"
 ```
+
+Each table names what owns its fields, not where a field was first needed:
+
+- `[bus]` — the transport (`kind`), the topics, and the group prefix. A topic is a bus
+  concept, not a Kafka one, so the same names apply under either transport. The broker's
+  own settings live under `[bus.kafka]`, needed only when `kind = "kafka"`.
+- `[runtime]` — how every stage drains: the batch size and time bound, and the drain
+  bound. Transport-independent, so it is not under `[bus]`.
+- `[storage.<kind>]` — one backend's own settings. `[storage] kind` selects it, so a
+  second backend (ClickHouse, Postgres) is a variant there plus its own table, not
+  another top-level `database` whose owner a reader has to guess.
 
 **Required** — no value could be right by accident, so each errors at startup naming
 the field:
 
 | Key | Meaning |
 | --- | --- |
-| `kafka.brokers` | Bootstrap servers |
+| `bus.kafka.brokers` | Bootstrap servers, when `bus.kind = "kafka"` |
 | `ingest.chain` | Chain id stamped on every event |
 | `ingest.http_url` | JSON-RPC endpoint for blocks and receipts |
 | `ingest.ws_url` | WebSocket endpoint for `newHeads` |
@@ -133,27 +175,32 @@ the field:
 
 | Key | Default | Meaning |
 | --- | --- | --- |
-| `ingest.raw_topic` | `raw.chain` | Ingest's output and decode's input |
+| `bus.kind` | `kafka` | The transport: `kafka` or `memory` |
+| `bus.raw_topic` | `raw.chain` | Ingest's output and decode's input |
+| `bus.decoded_topic` | `decoded.chain` | Decode's output |
+| `bus.group_prefix` | `indexer` | Consumer group prefix, per stage (Kafka only) |
 | `ingest.stdout` | `false` | Print instead of publishing |
-| `kafka.decoded_topic` | `decoded.chain` | Decode's output |
-| `kafka.group_prefix` | `indexer` | Consumer group prefix, per stage |
-| `kafka.batch_records` | `500` | Records per flush |
-| `kafka.batch_ms` | `1000` | Time bound on a batch |
-| `storage.database` | `indexer.duckdb` | Path to the store |
-| `storage.drain_secs` | unset | Stop a topic after this idle; bounds decode's input too. **Omit for a live indexer** |
+| `runtime.batch_records` | `500` | Records per flush |
+| `runtime.batch_ms` | `1000` | Time bound on a batch |
+| `runtime.drain_secs` | unset | Stop a topic after this idle; bounds decode's input too. **Omit for a live indexer** |
+| `storage.kind` | `duckdb` | The store backend |
+| `storage.duckdb.path` | `indexer.duckdb` | Path to the store |
 
-**Optional table:**
+**Optional tables:**
 
 | Key | Meaning |
 | --- | --- |
 | `decode.registry` | Path to the contract registry file, relative to the settings file. Absent means nothing is decoded |
+| `bus.kafka.properties` | Any other librdkafka property, passed straight through |
+| `storage.duckdb.settings` | Any other DuckDB setting, passed straight through |
 
 Omit `[ingest]` entirely to run decode and storage against a topic filled elsewhere.
 `RUST_LOG` is still read from the environment, because a log filter is not deployment
 configuration.
 
 An unknown key is a startup error naming the line and the key, so a misspelling is
-caught rather than silently leaving a setting at its default.
+caught rather than silently leaving a setting at its default. An unknown `storage.kind`
+is likewise an error rather than a silent fallback to the default backend.
 
 ### The contract registry
 
@@ -251,28 +298,30 @@ Both clients take settings this file does not restate, passed straight through a
 validated by the engine:
 
 ```toml
-[kafka.properties]
+[bus.kafka.properties]
 "compression.codec" = "gzip"   # quote keys: most contain dots
 "fetch.max.bytes" = "1048576"
 
-[storage.duckdb]
+[storage.duckdb.settings]
 threads = "4"
 max_memory = "1GB"
 ```
 
 Anything unrecognized is an error from librdkafka or DuckDB naming the property, so a
-typo is caught at startup rather than silently ignored. `kafka.properties` applies to
+typo is caught at startup rather than silently ignored. `bus.kafka.properties` applies to
 every client the process builds, so a property that means different things to a producer
 and a consumer — `auto.offset.reset` is the usual one — is better left out.
 
-The store uses one consumer group per topic, named `<group>-<topic>`, because an offset
-is per group: one group spanning two topics would commit a single position across both.
-Every envelope lands in an append-only `events` table with the envelope as JSON beside
-the columns a query filters on. A topic with nothing more to read is drained and the
-run stops.
+On Kafka, each topic-consumer pair uses its own consumer group, named `<prefix>-<stage>`,
+because an offset is per group: one group spanning two topics would commit a single
+position across both. Every envelope lands in an append-only `events` table with the
+envelope as JSON beside the columns a query filters on. A topic with nothing more to read
+is drained and the run stops.
 
 Configuration is a typed builder in `src/config.rs`, not a string lookup scattered
 through each stage, so a stage can be constructed in a test with no environment at all.
+`src/runtime.rs` turns those settings into the pipeline, so the wiring is testable without
+a broker.
 
 ## Event shape
 

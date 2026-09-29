@@ -1,42 +1,60 @@
 # Settings for a standard single-chain deployment.
 #
-# Only `brokers`, and `chain`/`http_url`/`ws_url` when ingesting, have no default. Every
-# other key may be omitted and is documented in `src/config.rs`.
+# The pipeline is assembled from what is here: `[ingest]` present means ingest runs,
+# `[decode] registry` present means decode runs, and `[storage]` says where it lands. The
+# only choices are the bus and the store; everything else follows. Every key is
+# documented in `src/config.rs`.
 
 [ingest]
 chain = "base"
 http_url = "https://base-rpc.publicnode.com"
 ws_url = "wss://base-rpc.publicnode.com"
-# raw_topic = "raw.chain"
 # stdout = false
 
-[kafka]
-brokers = "localhost:9092"
+# The bus the stages share. `kind = "memory"` runs everything in one process with no
+# broker and no durability — for a single-process run, not a deployment.
+[bus]
+# kind = "kafka"          # or "memory"
+# Both topics live here because every stage agrees on them, not because a broker owns
+# them: ingest publishes the raw topic and decode consumes it, decode publishes the
+# decoded topic and storage consumes it.
+# raw_topic = "raw.chain"
 # decoded_topic = "decoded.chain"
 # group_prefix = "indexer"
-# batch_records = 500
-# batch_ms = 1000
+
+[bus.kafka]
+brokers = "localhost:9092"
 
 # Any other librdkafka property, passed straight through. Quote the keys, because most
 # of them contain dots and TOML reads a bare dotted key as a nested table.
-# [kafka.properties]
+# [bus.kafka.properties]
 # "compression.codec" = "gzip"
 # "security.protocol" = "SASL_SSL"
 # "sasl.mechanism" = "PLAIN"
 
-[storage]
-# database = "indexer.duckdb"
+# How every stage drains. Transport-independent, so it is not under `[bus]`.
+[runtime]
+# batch_records = 500
+# batch_ms = 1000
 # Set to stop a topic once it has been idle this long. Omit for a live indexer, which
 # must never stop on a quiet block.
 # drain_secs = 5
 
-# What the decode stage decodes. Absent means nothing is decoded, which is a legitimate
-# way to run and is said at startup. The registry is its own file — see `registry.toml` —
-# so the contract catalog grows without churning these settings.
-# [decode]
-# registry = "registry.toml"
+[storage]
+# The backend to write. `duckdb` is the only kind today; an unknown one is a startup
+# error rather than a silent fallback.
+# kind = "duckdb"
+
+[storage.duckdb]
+# path = "indexer.duckdb"
 
 # Any other DuckDB setting, passed straight through and validated by the engine.
-# [storage.duckdb]
+# [storage.duckdb.settings]
 # threads = "4"
 # max_memory = "1GB"
+
+# What the decode stage decodes. The registry is its own file — see `registry.toml` —
+# so the contract catalog grows without churning these settings. An absent registry
+# means nothing is decoded, which is a legitimate way to run and is said at startup.
+# [decode]
+# registry = "registry.toml"

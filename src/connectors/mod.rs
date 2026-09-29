@@ -12,12 +12,14 @@
 pub mod duckdb;
 #[cfg(feature = "kafka")]
 pub mod kafka;
+pub mod memory;
 pub mod stdout;
 
 #[cfg(feature = "duckdb")]
 pub use duckdb::DuckDbSink;
 #[cfg(feature = "kafka")]
 pub use kafka::{KafkaSink, KafkaSource};
+pub use memory::{MemoryBus, MemorySink, MemorySource};
 pub use stdout::StdoutJsonSink;
 
 use std::time::{Duration, Instant};

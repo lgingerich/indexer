@@ -37,4 +37,5 @@ pub mod config;
 pub mod connectors;
 pub mod decode;
 pub mod ingest;
+pub mod runtime;
 pub mod wire;
