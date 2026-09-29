@@ -36,8 +36,7 @@
 //!
 //! A breaking change needs a coexistence window on the topic, because a consumer
 //! group reading across the change sees both shapes interleaved. That is the point of
-//! the number: it exists for consumers reading a stream while the shape moves under
-//! them, which is why it starts at 1 and stays there until something is published.
+//! the number: it lets a consumer reading a stream tell which shape it has.
 //!
 //! The line every sink writes is pinned by `every_variant_round_trips_through_json`
 //! and `the_wire_object_carries_only_the_envelope_and_event_fields`.
@@ -64,10 +63,8 @@ pub use crate::wire::typed::TypedValue;
 /// shape it is reading without out-of-band knowledge. Bumped only for a breaking
 /// change; see the compatibility policy in the module docs.
 ///
-/// It sits at 1 because nothing has shipped: the shape has changed several times
-/// during development, and numbering those changes would describe a history no
-/// consumer ever saw. The first number a consumer reads should be the first shape
-/// that existed when they started reading.
+/// It is 1 because no shape has been published yet, so a consumer's first number is
+/// the first shape it can read.
 pub const SCHEMA_VERSION: u16 = 1;
 
 /// Identifies the chain an event came from, for example `ethereum` or `solana`.
@@ -107,7 +104,7 @@ impl From<String> for ChainId {
     }
 }
 
-/// A discontinuity: previously published blocks are no longer canonical.
+/// A discontinuity: published blocks are no longer canonical.
 ///
 /// A control signal rather than a dataset: it describes the indexer's view of the
 /// chain changing, and has no verbatim payload.
@@ -234,7 +231,7 @@ impl Decoded {
 
 /// Everything the indexer publishes, tagged by `type` on the wire.
 ///
-/// Dataset payloads are boxed: a [`Block`] or [`Receipt`] carries a 256-byte bloom
+/// The dataset payloads are boxed: a [`Block`] or [`Receipt`] carries a 256-byte bloom
 /// filter, and without boxing every [`Log`] event — the overwhelming majority on a
 /// busy block — would be padded to that size in memory and on the stack.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -320,8 +317,8 @@ pub struct Envelope {
     pub sequence: u64,
     /// The wire shape's version, written by [`Envelope::new`].
     ///
-    /// Defaulted on deserialize so an envelope from before the field existed still
-    /// reads as itself, which is the pre-versioning shape.
+    /// Defaulted on deserialize, so a line carrying no `v` reads as the current
+    /// shape rather than failing.
     #[serde(default = "schema_version", rename = "v")]
     pub schema_version: u16,
     /// The event itself.
@@ -329,8 +326,7 @@ pub struct Envelope {
     pub event: Event,
 }
 
-/// The [`SCHEMA_VERSION`] as a serde default, for envelopes written before the
-/// field existed.
+/// The [`SCHEMA_VERSION`] as a serde default, for a line carrying no `v` field.
 const fn schema_version() -> u16 {
     SCHEMA_VERSION
 }
@@ -408,27 +404,6 @@ mod tests {
     }
 
     #[test]
-    fn datasets_are_flagged_and_control_signals_are_not() {
-        assert!(
-            Event::Block(Box::new(Block {
-                number: 1,
-                hash: hash(1),
-                parent_hash: hash(0),
-                timestamp: 1,
-                ..Block::default()
-            }))
-            .is_dataset()
-        );
-        assert!(
-            !Event::Finalized(Finalized {
-                height: 1,
-                hash: hash(1),
-            })
-            .is_dataset()
-        );
-    }
-
-    #[test]
     fn envelope_serializes_event_fields_flat_with_a_type_tag() {
         let envelope = Envelope::new(
             chain(),
@@ -473,10 +448,10 @@ mod tests {
         assert_eq!(value.as_object().expect("object").len(), 6);
     }
 
-    /// The version is stamped on every rendered line, and an envelope written
-    /// before the field existed still reads back as itself rather than failing.
+    /// The version is stamped on every rendered line, and a line carrying no `v`
+    /// reads back as the current shape rather than failing.
     #[test]
-    fn the_schema_version_is_stamped_and_old_lines_still_parse() {
+    fn the_schema_version_is_stamped_and_absent_v_parses() {
         let envelope = Envelope::new(
             chain(),
             7,
@@ -488,9 +463,10 @@ mod tests {
         let mut value = serde_json::to_value(&envelope).expect("envelope serializes");
         assert_eq!(value["v"], SCHEMA_VERSION);
 
-        // A line from before versioning: no `v`, everything else as it was.
+        // A line from a producer that predates the `v` field: no `v`, everything else
+        // as it is.
         value.as_object_mut().expect("object").remove("v");
-        let decoded: Envelope = serde_json::from_value(value).expect("legacy line parses");
+        let decoded: Envelope = serde_json::from_value(value).expect("line without `v` parses");
         assert_eq!(decoded.schema_version, SCHEMA_VERSION);
         assert_eq!(decoded, envelope);
     }
@@ -527,10 +503,10 @@ mod tests {
         assert_eq!(value["sequence"], 120);
     }
 
-    /// Every variant must survive the round trip an envelope takes: serialised by
-    /// the sink, then read back by a consumer. `Transaction` and `Receipt` carry
-    /// `u128` fee fields, which serde's `flatten` buffering cannot deserialize
-    /// unless those fields use the quantity encoding — this test is what pins that.
+    /// The round trip an envelope takes through a sink and back. `Transaction` and
+    /// `Receipt` carry `u128` fee fields, which serde's `flatten` buffering cannot
+    /// deserialize unless those fields use the quantity encoding — this test is what
+    /// pins that, and it is the only test here that is not tied to one event shape.
     #[test]
     fn every_variant_round_trips_through_json() {
         let variants = [

@@ -77,13 +77,13 @@
 //!
 //! # Discovery, in one paragraph
 //!
-//! A pool created by a factory did not exist when the registry file was written. A
-//! discovery rule closes that gap: when a factory's creation event decodes, the rule names
-//! the argument holding the new child address and what ABI it decodes with. `run` applies
-//! the registration immediately, in the same sequential pass. That is deterministic — the
-//! child's ABI is already loaded, so no network is involved — and correct because a factory
-//! emits its creation event before the child emits anything, so the child is registered
-//! before its first log is read.
+//! A pool created by a factory is not in the registry file, because it did not exist
+//! when that file was written. A discovery rule closes that gap: when a factory's
+//! creation event decodes, the rule names the argument holding the new child address and
+//! what ABI it decodes with. `run` applies the registration immediately, in the same
+//! sequential pass. That is deterministic — the child's ABI is already loaded, so no
+//! network is involved — and correct because a factory emits its creation event before
+//! the child emits anything, so the child is registered before its first log is read.
 //!
 //! # What this deliberately does not do
 //!
@@ -101,8 +101,7 @@
 //! This module may depend on [`crate::connectors`] and [`crate::wire`]. It deliberately
 //! knows nothing about [`crate::ingest`]: the ordering and reorg state machine lives
 //! there, and a decode that needed it would be a decode that has to reimplement it.
-//! Nothing enforces that now that these are modules rather than crates, so it is on a
-//! reviewer.
+//! The layers are modules, so nothing enforces that direction; it is on a reviewer.
 
 pub mod abi;
 pub mod registry;

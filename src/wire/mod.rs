@@ -1,8 +1,8 @@
 //! The wire contract: what the indexer publishes, and nothing about how.
 //!
 //! Pure data. It does no I/O, holds no async, and depends on no other module in the
-//! crate, so both the code that produces events and any code that consumes them can
-//! share one definition of the stream.
+//! crate, so the code that produces events and the code that consumes them share one
+//! definition of the stream.
 //!
 //! - [`envelope`] is the published shape: an [`envelope::Envelope`] wrapping an
 //!   [`envelope::Event`], with the schema version and the per-chain sequence.

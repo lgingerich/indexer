@@ -487,9 +487,9 @@ fn decode_receipt(
 /// log under the wrong transaction index corrupts a downstream join. `log_index` is
 /// the log's position within the receipt, which is the right fallback for it.
 ///
-/// Both defaults are latent today — alloy models `logIndex` and `transactionIndex`
-/// as required, so a log missing either fails to deserialize before this runs — but
-/// they are the correct values if alloy ever relaxes that.
+/// Both defaults are latent: alloy models `logIndex` and `transactionIndex` as
+/// required, so a log missing either fails to deserialize before this runs. They are
+/// the correct values if alloy ever relaxes that.
 ///
 /// # Errors
 ///
@@ -1017,10 +1017,10 @@ mod tests {
         assert!(error.to_string().contains("header not found"), "{error}");
     }
 
-    /// A node without `eth_getBlockReceipts` answers `-32601`. The batch must still
-    /// carry the block and its transaction hashes — the exact input the
-    /// per-transaction fallback needs — and the rest of the batch must survive, so
-    /// one unsupported method does not poison finalized.
+    /// A node without `eth_getBlockReceipts` answers `-32601`. The batch carries the
+    /// block and its transaction hashes — the exact input the per-transaction fallback
+    /// needs — and the rest of the batch survives, so one unsupported method does not
+    /// poison finalized.
     #[test]
     fn unsupported_receipts_method_leaves_the_rest_of_the_batch_usable() {
         let body = json!([
@@ -1123,14 +1123,13 @@ mod tests {
     }
 
     /// An OP-stack block carrying a deposit transaction (`type: 0x7e`), which
-    /// Ethereum-only types reject outright. The deposit type is outside 0-4, so
-    /// the whole block used to fail to decode; the fixture is trimmed from a real
-    /// Base block.
+    /// Ethereum-only types reject outright; the fixture is trimmed from a real Base
+    /// block.
     ///
     /// The load-bearing assertion is that the decode succeeds at all: a typed
     /// envelope cannot represent `0x7e`, so this fails unless the catch-all
     /// (`AnyTxEnvelope::Unknown`) path handles it. The field checks confirm the
-    /// common fields are still projected for the unknown type.
+    /// common fields are projected for the unknown type.
     #[test]
     fn non_ethereum_transaction_type_decodes_and_keeps_its_type() {
         let deposit = json!({

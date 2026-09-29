@@ -9,14 +9,13 @@ rewrites.
 
 ## Layout
 
-A Cargo workspace. The split exists so that the process that produces events and
-any process that consumes them share one definition of the stream without sharing a
-One crate, one binary, four layers as modules. Started as a process, every stage built
-explicitly in `main`, so what runs is visible in one place.
+One crate, one binary, four layers as modules. Every stage is built explicitly in
+`main`, so what runs is visible in one place. The layers share one definition of the
+stream through `wire`, without sharing a process.
 
 ```
 src/
-├── main.rs         builds every stage from the environment and runs them together
+├── main.rs         builds every stage from the settings file and runs them together
 ├── config.rs       typed builders — stage configuration, not string lookups
 ├── wire/           the wire contract: envelope, events, dataset records. Pure data.
 ├── connectors/     the traits, the concrete connectors, and the shared drain loop.
@@ -33,16 +32,14 @@ drain loop the stages drive (`connectors/mod.rs`). The loop lives there rather t
 module of its own because it is the sink's contract — the publish → flush → commit order
 exists once, so storage and decode cannot drift on it.
 
-The layers were separate crates, which enforced that direction with the compiler. They
-are modules now, so it is a convention a reviewer checks. The trade: breaking the
-`decode` → `ingest` cycle was what forced the shared types into their own crate and the
-bus into another — four manifests, feature forwarding between them, and a compiler
-guarantee worth about one edge. At this size, one owner reads all of it.
+The layers are modules, so their one-way dependency direction is a convention a
+reviewer checks rather than one the compiler enforces. At this size, one owner reads
+all of it, and each module documents the direction it may depend in.
 
 The pipeline is `ingest` → `raw.chain` → `decode` → `decoded.chain` → storage.
 Aggregation and windowing are not built.
 
-## What works today
+## What works
 
 - **EVM ingestion.** Live heads over WebSocket (`eth_subscribe`/`newHeads`), and
   each block fetched over JSON-RPC with full transactions, receipts, and logs in
@@ -88,11 +85,10 @@ Both optional connectors are off by default so a plain `cargo build` compiles ne
 
 ## Not built yet
 
-Backfill-to-live handoff, checkpoint resume, mempool, filtered
-subscriptions, derived state (balances/nonces), the aggregation layer, and the
-Parquet/GCS archiver. The
-crate is a walking skeleton: it indexes forward from
-whatever the chain does next and does not fill gaps that predate startup.
+Backfill-to-live handoff, checkpoint resume, mempool, filtered subscriptions, derived
+state (balances/nonces), the aggregation layer, and the Parquet/GCS archiver. The
+crate is a walking skeleton: it indexes forward from whatever the chain does next and
+does not fill gaps that predate startup.
 
 ## Run it
 
@@ -187,15 +183,15 @@ child = "pool"           # the decoded argument holding the new pool address
 abi = "uniswap_v3_pool"  # what the child decodes with, and its protocol tag
 ```
 
-**Why an ABI is named once.** Uniswap V3 has thousands of pools sharing one ABI. The ABI
-is loaded once and shared; an address is a line.
+**Why an ABI is named once.** A pool protocol like Uniswap V3 has thousands of pools
+sharing one ABI. The ABI is loaded once and shared; an address is a line.
 
-**Discovery.** A pool created at runtime cannot be a `[[contract]]`. A rule closes that:
-when the factory's creation event decodes, the named argument holds the child's address,
-and the child is registered with the named ABI. Registration is deterministic — the
-child's ABI is already loaded, so no network is involved — and a factory emits its
-creation event before the child emits anything, so a sequential pass registers a child
-before its first log.
+**Discovery.** A pool created at runtime is not in the registry file, so it cannot be a
+`[[contract]]`. A rule closes that: when the factory's creation event decodes, the named
+argument holds the child's address, and the child is registered with the named ABI.
+Registration is deterministic — the child's ABI is already loaded, so no network is
+involved — and a factory emits its creation event before the child emits anything, so a
+sequential pass registers a child before its first log.
 
 A protocol that does not put its pools at an address needs no rule: **Uniswap V4's
 `PoolManager` is a single `[[contract]]`**, because a V4 pool is a `bytes32` id (`keccak256`
@@ -316,8 +312,8 @@ Identity uses `alloy_primitives::{B256, BlockHash, TxHash}`, encoded as lowercas
 is pinned by tests in `src/wire/envelope.rs`: `every_variant_round_trips_through_json`
 covers every event kind, `the_wire_object_carries_only_the_envelope_and_event_fields`
 pins the exact key set, and
-`the_schema_version_is_stamped_and_old_lines_still_parse` pins both the `v` stamp and
-backward compatibility with a line written before the field existed. Every connector
+`the_schema_version_is_stamped_and_absent_v_parses` pins both the `v` stamp and
+backward compatibility with a line written without the field. Every connector
 renders through the same encoding, so stdout, the broker, and the local
 store cannot drift apart. A chain whose
 identity does not fit that shape — Solana's base58 blockhash and 64-byte signature
@@ -374,8 +370,8 @@ and per-event allocation.
 Against the budget: an average Base block in a live run had about 260
 transactions and 880 logs, which falls between the first two rows, so decode
 plus serialise is a few milliseconds of CPU per block. The larger cost is the
-network: the indexer publishes several MB per Base block, since every dataset is
-now published with its fields spelled out rather than as one opaque `raw` string.
+network: the indexer publishes several MB per Base block, because every dataset is
+published with its fields spelled out rather than as one opaque `raw` string.
 
 ## Checks
 

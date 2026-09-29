@@ -24,8 +24,10 @@
 //! Sequences are per event, not per block, so reclaiming them after a reorg means
 //! remembering where each block's run began — what the bounded undo ring stores.
 //!
-//! Not yet: it reorgs only against blocks published in this process. Backfill-to-live
-//! handoff, checkpoint resume, and rebuilding the ring from durable history are deferred.
+//! # Coverage
+//!
+//! It reorgs against blocks published in this process. Backfill-to-live handoff,
+//! checkpoint resume, and rebuilding the ring from durable history are not built.
 
 use std::collections::VecDeque;
 
@@ -59,9 +61,9 @@ pub enum Mode {
     Following,
     /// Filling a contiguous height range up to the live tip before trusting heads.
     ///
-    /// Not entered yet: with no backfill-to-live handoff, a fresh pipeline starts
-    /// mid-chain at whatever head arrives next. And it cannot be left — a head that
-    /// would leave a gap is an error, not a silent hole.
+    /// A fresh pipeline starts mid-chain at whatever head arrives next, since there is
+    /// no backfill-to-live handoff, and this mode is entered when a head would leave a
+    /// gap. It is terminal: a gap is an error, not a silent hole.
     Backfilling,
 }
 
@@ -189,7 +191,7 @@ impl<S: BlockSource, K: EnvelopeSink> Pipeline<S, K> {
                     self.mode = Mode::Backfilling;
                     bail!(
                         "height gap: published tip {latest} -> head {height}; \
-                         backfill catches this up, but backfill-to-live handoff is not built yet"
+                         backfill catches this up, but backfill-to-live handoff is not built"
                     );
                 }
             } else if let Some(fork) = self.find_fork(parent_hash) {
@@ -209,7 +211,7 @@ impl<S: BlockSource, K: EnvelopeSink> Pipeline<S, K> {
             self.mode = Mode::Backfilling;
             bail!(
                 "first head is {height}, above genesis, with no remembered history; \
-                 backfill-to-live handoff is not built yet"
+                 backfill-to-live handoff is not built"
             );
         }
 
@@ -244,7 +246,7 @@ impl<S: BlockSource, K: EnvelopeSink> Pipeline<S, K> {
         Ok(reorgs)
     }
 
-    /// Publishes a watermark if `finalized` is newer than the last one, and drops
+    /// Publishes a watermark if `finalized` is newer than the current one, and drops
     /// ring entries below it, which no reorg can reach.
     async fn advance_finality(&mut self, finalized: BlockId) -> anyhow::Result<()> {
         if finalized.height <= self.finalized_height {
@@ -349,8 +351,8 @@ impl<S: BlockSource, K: EnvelopeSink> Pipeline<S, K> {
             return;
         }
         // The newest entry is only evicted when the source jumps backwards, which
-        // is a reorg we cannot retract; swappable in favour of an error once the
-        // ring is rebuilt from durable history.
+        // is a reorg this ring cannot retract; swappable for an error once the ring
+        // is rebuilt from durable history.
         if self
             .history
             .front()
@@ -381,7 +383,7 @@ mod tests {
         B256::from([byte; 32])
     }
 
-    // Test fixtures use `..Default::default()` so adding a field to a dataset does
+    // Test fixtures use `..Default::default()` so a new field on a dataset does
     // not churn every test that only cares about identity.
     fn block_event(number: u64, hash: B256, parent_hash: B256) -> Event {
         Event::Block(Box::new(Block {

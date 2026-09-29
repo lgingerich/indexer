@@ -189,7 +189,7 @@ fn typed_args(
 /// # Errors
 ///
 /// Returns [`DecodeError::Unsupported`] for a value type the wire shape does not carry
-/// (only a Solidity `function` today), and [`DecodeError::Width`] if a declared width or
+/// (only a Solidity `function`), and [`DecodeError::Width`] if a declared width or
 /// size exceeds a `u16`, which no real ABI can produce.
 fn value_to_typed(decoded: &DynSolValue) -> Result<TypedValue, DecodeError> {
     let typed = match decoded {
@@ -273,7 +273,7 @@ pub enum DecodeError {
     },
     /// A decoded value is a type the wire shape does not carry.
     ///
-    /// Only a Solidity `function` type reaches this today.
+    /// Only a Solidity `function` type reaches this.
     #[error("unsupported ABI value: {0}")]
     Unsupported(&'static str),
     /// A declared width or size did not fit the wire field that carries it.

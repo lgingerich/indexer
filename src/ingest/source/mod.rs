@@ -41,7 +41,8 @@ pub struct BlockId {
     pub hash: B256,
 }
 
-/// One block, already turned into events, plus the chain's finality at the time.
+/// One block, already turned into events, plus the chain's finality when it was
+/// fetched.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FetchedBlock {
     /// The block's events in publish order.

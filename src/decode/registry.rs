@@ -29,10 +29,10 @@
 //!
 //! # Discovery
 //!
-//! A pool created by a factory did not exist when the settings were written, so it
-//! cannot be a `[[contract]]`. A `[[discovery]]` rule closes that: when the factory's
-//! creation event decodes, the named argument holds the new child's address, and the
-//! child is registered with the named ABI.
+//! A pool created by a factory is not in the registry file, because it did not exist when
+//! that file was written, so it cannot be a `[[contract]]`. A `[[discovery]]` rule closes
+//! that: when the factory's creation event decodes, the named argument holds the new
+//! child's address, and the child is registered with the named ABI.
 //!
 //! Registration is **deterministic**: the child's ABI is already loaded, so no network
 //! is involved and the registry never has to block. The only ordering fact relied on is
@@ -50,8 +50,8 @@
 //! A contract applies at every height. A proxy that upgrades changes its ABI at a
 //! height, which this cannot express; [`AbiRegistry::contract`] already takes a `block`
 //! so a block-ranged version can replace it without the decoder changing. A rule also
-//! cannot yet resolve a proxy or fetch an unknown ABI — both are additive behind the
-//! same rule shape.
+//! cannot resolve a proxy or fetch an unknown ABI — both are additive behind the same
+//! rule shape.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};

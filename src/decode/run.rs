@@ -145,9 +145,8 @@ impl DecodeBuilder {
     ///
     /// # Errors
     ///
-    /// Never fails today. It returns a `Result` so a future required setting can be
-    /// reported the way the other builders report theirs, rather than changing every
-    /// call site at that point.
+    /// Never fails. It returns a `Result` so a required setting can be reported the way
+    /// the other builders report theirs, rather than changing every call site then.
     pub fn build(self) -> Result<Decode> {
         if self.registry.is_empty() {
             warn!("no contracts registered; every log will be dropped undecoded");
@@ -181,7 +180,7 @@ mod tests {
 
     use super::Decode;
 
-    /// A source over a fixed list, which is the point of the refactor: the stage runs
+    /// A source over a fixed list, which is the point of the split: the stage runs
     /// without a broker, so its wiring is testable.
     #[derive(Default)]
     struct FakeSource {
