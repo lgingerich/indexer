@@ -1,45 +1,21 @@
 # Settings for a standard single-chain deployment.
 #
-# The pipeline is assembled from what is here: `[ingest]` present means ingest runs,
-# `[decode] registry` present means decode runs, and `[storage]` says where it lands. The
-# only choices are the bus and the store; everything else follows. Every key is
-# documented in `src/config.rs`.
+# `[ingest]` names the chain to follow, `[decode] registry` names the contracts to decode,
+# and `[storage]` says where it all lands. Ingest and decode run together in one task;
+# storage runs in another, joined by an in-process channel. Every key is documented in
+# `src/config.rs`.
 
 [ingest]
 chain = "base"
 http_url = "https://base-rpc.publicnode.com"
 ws_url = "wss://base-rpc.publicnode.com"
+# Print the stream to stdout instead of storing it. No store is opened.
 # stdout = false
 
-# The bus the stages share. `kind = "memory"` runs everything in one process with no
-# broker and no durability — for a single-process run, not a deployment.
-[bus]
-kind = "memory"
-# kind = "kafka"          # or "memory"
-# Both topics live here because every stage agrees on them, not because a broker owns
-# them: ingest publishes the raw topic and decode consumes it, decode publishes the
-# decoded topic and storage consumes it.
-raw_topic = "raw.chain"
-decoded_topic = "decoded.chain"
-group_prefix = "indexer"
-
-[bus.kafka]
-brokers = "localhost:9092"
-
-# Any other librdkafka property, passed straight through. Quote the keys, because most
-# of them contain dots and TOML reads a bare dotted key as a nested table.
-# [bus.kafka.properties]
-# "compression.codec" = "gzip"
-# "security.protocol" = "SASL_SSL"
-# "sasl.mechanism" = "PLAIN"
-
-# How every stage drains. Transport-independent, so it is not under `[bus]`.
 [runtime]
+# The most records one store commit may cover. Storage commits each block as it arrives
+# and, when it has fallen behind, folds the waiting blocks into one commit up to this many.
 # batch_records = 500
-batch_ms = 1000
-# Set to stop a topic once it has been idle this long. Omit for a live indexer, which
-# must never stop on a quiet block.
-# drain_secs = 5
 
 [storage]
 # The backend to write. `duckdb` is the only kind today; an unknown one is a startup

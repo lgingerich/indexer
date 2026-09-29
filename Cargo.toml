@@ -13,16 +13,12 @@ license = "MIT OR Apache-2.0"
 name = "indexer"
 path = "src/main.rs"
 # The pipeline needs a store to write to, so the binary is skipped without one rather
-# than failing the build. Kafka is optional: a `[bus] kind = "memory"` run needs no
-# broker, so `cargo run` works with the default features and no message queue.
+# than failing the build.
 required-features = ["duckdb"]
 
 [features]
 default = ["duckdb"]
-# Kafka-protocol connectors (`connectors::kafka`) on bundled librdkafka. Off by default so
-# the C build dependency stays out of a plain `cargo build`; add it to reach a broker.
-kafka = ["dep:rdkafka"]
-# Local `DuckDB` store (`connectors::duckdb`). On by default: it is the default store, and
+# Local `DuckDB` store (`sink::duckdb`). On by default: it is the default store, and
 # the pipeline needs exactly one to run. Remove it only to build without the C++ engine.
 duckdb = ["dep:duckdb"]
 
@@ -53,10 +49,6 @@ anyhow = "1.0.104"
 # single-writer store, used only by the local DuckDB sink (`duckdb` feature).
 duckdb = { version = "1.10505.0", default-features = false, features = ["bundled"], optional = true }
 futures-util = "0.3.34"
-# rdkafka wraps C librdkafka, which `rdkafka-sys` compiles with `cc` (no cmake
-# needed; the version is vendored). It carries the crate's one C build dependency,
-# so it is optional behind the `kafka` feature — see `connectors::kafka`.
-rdkafka = { version = "0.39.0", optional = true }
 # native-tls keeps TLS on the platform (Security.framework on macOS, OpenSSL on
 # Linux) so TLS adds no bundled C toolchain of its own.
 reqwest = { version = "0.13.5", default-features = false, features = ["json", "http2", "native-tls"] }

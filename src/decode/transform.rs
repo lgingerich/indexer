@@ -5,41 +5,33 @@
 //! is passed per call rather than owned, so the caller can register a discovered
 //! contract between records — which is why `apply` takes `&R`.
 //!
-//! # What lands on the decoded topic
+//! # What it produces
 //!
-//! The stage republishes exactly two things and drops everything else:
+//! One thing: a [`Decoded`] record for a log whose address is registered and whose
+//! selector the ABI declares. The raw log is not replaced — it is published as it was,
+//! and [`Decoded::source_key`] joins the record back to it — so the decoded record is an
+//! addition to the stream, not a second copy of it.
 //!
-//! - **Decoded records.** A log whose address is registered and whose selector the ABI
-//!   declares becomes a [`Decoded`] record. The raw log is *not* republished — it is
-//!   already on the raw topic, and [`Decoded::source_key`] joins back to it — so the
-//!   decoded topic is the decode *output*, not a second copy of the raw stream.
-//! - **Control signals.** [`Event::Reorg`] and [`Event::Finalized`] are forwarded
-//!   verbatim, because a store retracts orphaned rows from the reorg's `orphaned_hashes`
-//!   and compacts below the finality watermark.
-//!
-//! A block, transaction, or receipt has no decoded form; a log with no registered ABI,
-//! or one whose data does not decode, has nothing to publish. All of them are dropped,
-//! since the raw topic already carries them.
+//! Everything else has nothing to add: a block, transaction, or receipt has no decoded
+//! form; a log with no registered ABI, or one whose data does not decode, has nothing to
+//! publish; and a [`Reorg`](Event::Reorg) or [`Finalized`](Event::Finalized) marker
+//! already travels in the stream the caller is forwarding, so repeating it would only
+//! duplicate it.
 //!
 //! # The invariants it must preserve
 //!
 //! Whatever decoding is added later, [`Transform::apply`] may never break these:
 //!
-//! 1. **Control signals pass through verbatim.** [`Event::Reorg`] and
-//!    [`Event::Finalized`] come out exactly as they went in, with their `chain` and
-//!    `sequence` intact. Losing either makes the decoded stream quietly wrong.
-//! 2. **A failed decode is reported, not silent.** A log whose data does not decode
+//! 1. **A failed decode is reported, not silent.** A log whose data does not decode
 //!    produces no record, but the failure rides on [`Applied::error`] so a caller logs
 //!    it. A miss — no ABI for the address, or no selector on the ABI — is not a failure:
-//!    the raw log is already upstream, so a later ABI fix is a replay, not a re-fetch.
-//! 3. **Identity is preserved.** Every published envelope carries the input's `chain` and
-//!    `sequence`, and a decoded record's on-chain identity comes from the raw log, so it
-//!    traces to the exact log it came from. `sequence` is never renumbered.
+//!    the raw log is already stored, so a later ABI fix is a re-decode, not a re-fetch.
+//! 2. **Identity is preserved.** A decoded envelope carries the input's `chain` and
+//!    `sequence`, and a record's on-chain identity comes from the raw log, so it traces
+//!    to the exact log it came from. `sequence` is never renumbered.
 //!
 //! [`Decoded`]: crate::wire::envelope::Event::Decoded
 //! [`Decoded::source_key`]: crate::wire::envelope::Decoded::source_key
-//! [`Event::Reorg`]: crate::wire::envelope::Event::Reorg
-//! [`Event::Finalized`]: crate::wire::envelope::Event::Finalized
 
 use crate::decode::abi::DecodeError;
 use crate::decode::registry::{AbiRegistry, Discovery};
@@ -51,8 +43,8 @@ use crate::wire::envelope::{ChainId, Decoded, Envelope, Event, Log};
 /// unregistered.
 #[derive(Debug)]
 pub struct Applied {
-    /// The envelope to republish: the decoded record, or a control signal forwarded
-    /// verbatim. `None` when the input has no decoded form.
+    /// The decoded record, to publish alongside the raw envelope. `None` when the input
+    /// has no decoded form.
     pub output: Option<Envelope>,
     /// The decode failure, if a log matched an ABI but did not decode against it.
     pub error: Option<DecodeError>,
@@ -64,7 +56,7 @@ pub struct Applied {
     pub discovery: Option<Discovery>,
 }
 
-/// Decodes one raw envelope into the envelope to republish, if any.
+/// Decodes one raw envelope into its decoded record, if it has one.
 ///
 /// Stateless by construction: it holds no registry, no undo ring, and assigns no
 /// sequence numbers, so it cannot disagree with the pipeline about ordering, and
@@ -72,43 +64,33 @@ pub struct Applied {
 pub struct Transform;
 
 impl Transform {
-    /// The envelope to republish for one raw input envelope, if any.
+    /// The decoded record for one raw input envelope, if it has one.
     ///
     /// Returns an [`Applied`] rather than a `Result`, because a log that fails to decode
     /// is not an error the pipeline can act on: it produces no record and the failure
     /// rides alongside for a caller to log. A miss and a non-log are silent.
-    pub fn apply<R: AbiRegistry>(registry: &R, envelope: Envelope) -> Applied {
-        let Envelope {
-            chain,
-            sequence,
-            event,
-            ..
-        } = envelope;
-        match event {
+    pub fn apply<R: AbiRegistry>(registry: &R, envelope: &Envelope) -> Applied {
+        match &envelope.event {
             // A log is the only thing an event ABI decodes. A block, transaction, or
             // receipt carries calldata an ABI *could* decode, but this transform does not
-            // do that yet; with no decoded form it is dropped, since the raw topic
-            // already carries it.
-            Event::Log(log) => Self::decode(registry, &chain, sequence, &log),
-            // A control signal must survive to drive a store's retraction and compaction,
-            // so it is forwarded exactly as it arrived.
-            forwarded @ (Event::Reorg(_) | Event::Finalized(_)) => Applied {
-                output: Some(Envelope::new(chain, sequence, forwarded)),
+            // do that yet.
+            Event::Log(log) => Self::decode(registry, &envelope.chain, envelope.sequence, log),
+            // Nothing to add: a raw dataset with no decoded form, a marker the stream
+            // already carries, or a record that is already decoded.
+            Event::Block(_)
+            | Event::Transaction(_)
+            | Event::Receipt(_)
+            | Event::Decoded(_)
+            | Event::Reorg(_)
+            | Event::Finalized(_) => Applied {
+                output: None,
                 error: None,
                 discovery: None,
             },
-            // A raw dataset with no decoded form: the raw topic already carries it.
-            Event::Block(_) | Event::Transaction(_) | Event::Receipt(_) | Event::Decoded(_) => {
-                Applied {
-                    output: None,
-                    error: None,
-                    discovery: None,
-                }
-            }
         }
     }
 
-    /// Decodes a log against the registry, and assembles the published record from the
+    /// Decodes a log against the registry, and assembles the decoded record from the
     /// decoded event and the raw log it came from.
     ///
     /// A registry miss and an ABI that does not declare the log's selector are the same
@@ -261,42 +243,27 @@ mod tests {
         ]
     }
 
-    /// Invariant 1: every control signal is forwarded exactly as it arrived, keeping its
-    /// chain and sequence. Losing a reorg's retraction list makes a store keep orphaned
-    /// rows forever; losing a finality watermark stops it compacting.
+    /// Only a log can decode. Every other kind — the datasets, and the control markers
+    /// the stream already carries — produces nothing, so a marker is never duplicated
+    /// into the stored stream. Every kind is checked, not just the handy one.
     #[test]
-    fn a_control_signal_is_forwarded_unchanged_with_its_identity() {
-        for event in every_kind().into_iter().filter(|event| !event.is_dataset()) {
+    fn only_a_log_can_produce_a_record() {
+        for event in every_kind()
+            .into_iter()
+            .filter(|event| !matches!(event, Event::Log(_)))
+        {
             let kind = event.kind();
-            let source = envelope(event);
-            let applied = Transform::apply(&NoAbi, source.clone());
-
-            assert!(applied.error.is_none(), "{kind} reported an error");
-            let forwarded = applied.output.expect("a control signal is forwarded");
-            assert_eq!(forwarded.chain, source.chain, "{kind} lost its chain");
-            assert_eq!(forwarded.sequence, source.sequence, "{kind} was renumbered");
-            assert_eq!(forwarded, source, "{kind} changed across the transform");
-        }
-    }
-
-    /// A raw dataset has no decoded form, so it is dropped: the raw topic already carries
-    /// it, and the decoded topic is the decode output rather than a second copy of the
-    /// stream. Every dataset kind is checked, not just the handy one.
-    #[test]
-    fn a_raw_dataset_is_dropped_because_the_raw_topic_carries_it() {
-        for event in every_kind().into_iter().filter(Event::is_dataset) {
-            let kind = event.kind();
-            let applied = Transform::apply(&NoAbi, envelope(event));
+            let applied = Transform::apply(&NoAbi, &envelope(event));
             assert!(applied.error.is_none(), "{kind} reported an error");
             assert!(
                 applied.output.is_none(),
-                "{kind} was published, but only a decoded record belongs on the topic"
+                "{kind} produced a record, but only a log decodes"
             );
         }
     }
 
     /// The decode path: a registered log whose selector matches becomes a decoded
-    /// record. The raw log is not republished, and the record joins back to it by
+    /// record, and the record joins back to the raw log by
     /// `source_key`.
     #[test]
     fn a_matching_log_becomes_a_decoded_record() {
@@ -335,7 +302,7 @@ mod tests {
         let source = envelope(Event::Log(Box::new(log)));
 
         let registry = OneAbi { abi: Arc::new(abi) };
-        let applied = Transform::apply(&registry, source.clone());
+        let applied = Transform::apply(&registry, &source);
         assert!(applied.error.is_none(), "the log decodes");
 
         let decoded = applied.output.expect("a decoded record");
@@ -355,8 +322,8 @@ mod tests {
         assert_eq!(record.body.len(), 1);
     }
 
-    /// Invariant 2: a log whose data does not decode produces no record, but the failure
-    /// is reported rather than swallowed. The raw log is already on the raw topic, so a
+    /// Invariant 1: a log whose data does not decode produces no record, but the failure
+    /// is reported rather than swallowed. The raw log is already stored, so a
     /// corrected ABI recovers it.
     #[test]
     fn a_log_that_fails_to_decode_reports_and_produces_no_record() {
@@ -389,7 +356,7 @@ mod tests {
         let registry = OneAbi {
             abi: Arc::new(Abi::from_json(ERC20).expect("ABI loads")),
         };
-        let applied = Transform::apply(&registry, envelope(Event::Log(Box::new(log))));
+        let applied = Transform::apply(&registry, &envelope(Event::Log(Box::new(log))));
         assert!(applied.error.is_some(), "a bad log reports its failure");
         assert!(
             applied.output.is_none(),

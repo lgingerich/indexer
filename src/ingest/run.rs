@@ -7,9 +7,9 @@
 use anyhow::Result;
 use tracing::info;
 
-use crate::connectors::EnvelopeSink;
 use crate::ingest::pipeline::Pipeline;
 use crate::ingest::source::EvmSource;
+use crate::sink::EnvelopeSink;
 
 /// Builds and runs the ingest stage.
 #[derive(Debug)]

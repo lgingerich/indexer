@@ -38,8 +38,8 @@
 //! is involved and the registry never has to block. The only ordering fact relied on is
 //! that a factory emits its creation event before the child emits anything — true by
 //! construction, so a sequential pass over the stream registers the child before its
-//! first log. The stage surfaces the effect and applies it; see
-//! [`super::transform`] and [`super::run`].
+//! first log. The transform surfaces the effect and the sink applies it; see
+//! [`super::transform`] and [`super::sink`].
 //!
 //! The ABI is keyed by `(chain, address)` only, so a protocol that does not put its
 //! pools at an address — Uniswap V4's `PoolManager`, where a pool is a `bytes32` id — is
@@ -799,7 +799,7 @@ abi = "uniswap_v3_pool"
 
         let applied = Transform::apply(
             &registry,
-            Envelope::new(ChainId::new("base"), 1, Event::Log(Box::new(log))),
+            &Envelope::new(ChainId::new("base"), 1, Event::Log(Box::new(log))),
         );
         assert!(
             applied.error.is_none(),

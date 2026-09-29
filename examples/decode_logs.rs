@@ -1,4 +1,4 @@
-//! Decodes real Uniswap V3 swap logs, with no arguments and no broker.
+//! Decodes real Uniswap V3 swap logs, with no arguments and no network.
 //!
 //! ```bash
 //! cargo run --example decode_logs
@@ -6,8 +6,8 @@
 //!
 //! It reads two real `Swap` logs captured from a Uniswap V3 pool on Base, embeds the
 //! pool's ABI, and runs the same [`Transform`] the decode stage runs in production. For
-//! each input it prints the decoded record, which is what the stage publishes: a raw
-//! dataset has no decoded form, so only the decoded record reaches the decoded topic.
+//! each input it prints the decoded record, which is what the pipeline stores beside the
+//! raw log; a raw dataset has no decoded form, so it produces none.
 //!
 //! # What to look for
 //!
@@ -31,12 +31,12 @@
 //!
 //! # Decoding other contracts
 //!
-//! This example is self-contained on purpose: it takes no arguments and needs no broker,
+//! This example is self-contained on purpose: it takes no arguments and needs no network,
 //! because a demo that has to be configured is a demo that gets skipped. To decode a
 //! different contract, change `POOL`, `CHAIN`, and the ABI path in the registry below.
 //!
 //! To capture real input for it, run the indexer with `stdout = true` in `[ingest]`,
-//! which prints what it would publish instead of sending it to a broker:
+//! which prints the stream instead of storing it:
 //!
 //! ```bash
 //! RUST_LOG=warn cargo run --release 2>/dev/null | head -200 > envelopes.ndjson
@@ -96,7 +96,7 @@ fn main() -> ExitCode {
         }
         let envelope: Envelope =
             serde_json::from_str(line).expect("the fixture is a published envelope");
-        let applied = Transform::apply(&registry, envelope);
+        let applied = Transform::apply(&registry, &envelope);
         if let Some(error) = applied.error {
             eprintln!("line {}: {error}", number + 1);
         }

@@ -37,7 +37,7 @@ use anyhow::bail;
 use futures_util::StreamExt as _;
 use tracing::{error, info, warn};
 
-use crate::connectors::EnvelopeSink;
+use crate::sink::EnvelopeSink;
 use crate::wire::envelope::{Envelope, Event, Finalized, Reorg};
 
 use crate::ingest::source::{BlockId, BlockSource, FetchedBlock};
@@ -226,7 +226,7 @@ impl<S: BlockSource, K: EnvelopeSink> Pipeline<S, K> {
         let first_sequence = self.sequence;
         for event in events {
             let envelope = Envelope::new(self.source.chain().clone(), self.sequence, event);
-            self.sink.publish(&envelope).await?;
+            self.sink.publish(envelope).await?;
             self.sequence += 1;
         }
 
@@ -272,7 +272,7 @@ impl<S: BlockSource, K: EnvelopeSink> Pipeline<S, K> {
                 hash: finalized.hash,
             }),
         );
-        self.sink.publish(&marker).await?;
+        self.sink.publish(marker).await?;
         self.sequence += 1;
         Ok(())
     }
@@ -318,7 +318,7 @@ impl<S: BlockSource, K: EnvelopeSink> Pipeline<S, K> {
                 orphaned_hashes,
             }),
         );
-        self.sink.publish(&reorg).await?;
+        self.sink.publish(reorg).await?;
         self.sequence += 1;
         Ok(())
     }
@@ -383,7 +383,7 @@ mod tests {
     use super::{Mode, Pipeline};
     use crate::wire::envelope::{Block, ChainId, Envelope, Event, Log};
 
-    use crate::connectors::EnvelopeSink;
+    use crate::sink::EnvelopeSink;
 
     use crate::ingest::source::{BlockId, BlockSource, FetchedBlock, HeadStream, SourceError};
 
@@ -474,8 +474,8 @@ mod tests {
     }
 
     impl EnvelopeSink for CollectSink {
-        async fn publish(&mut self, envelope: &Envelope) -> anyhow::Result<()> {
-            self.seen.push(envelope.clone());
+        async fn publish(&mut self, envelope: Envelope) -> anyhow::Result<()> {
+            self.seen.push(envelope);
             Ok(())
         }
     }

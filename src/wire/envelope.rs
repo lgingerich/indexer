@@ -10,7 +10,7 @@
 //!   module and a variant here.
 //! - **Derived** ([`Event::Decoded`]): a record the decode stage produces from a
 //!   dataset, carrying its typed arguments under their ABI names. It is a dataset,
-//!   not a control signal, and it only ever appears on a decoded stream.
+//!   not a control signal, and it always follows the log it was decoded from.
 //! - **Control** ([`Reorg`], [`Finalized`]): signals about the indexer's own state,
 //!   not records of a chain. They carry no verbatim payload and exist to drive a
 //!   consumer's state machine, so they are defined here.
@@ -22,7 +22,7 @@
 //! An [`Envelope`] carries the [`Event`], the [`ChainId`] it came from, the
 //! [`Envelope::sequence`] the pipeline assigned, and the [`SCHEMA_VERSION`] the
 //! encoder wrote. The version is a field on the envelope rather than a property of
-//! a sink's framing because one of the sinks is a local database: a broker header
+//! a sink's framing because one of the sinks is a local database: a transport header
 //! survives no hop into `DuckDB`, a file, or a pipe, so a consumer reading those
 //! could not tell two shapes apart.
 //!
@@ -34,8 +34,8 @@
 //! do not bump it; consumers must skip an unknown `type` and ignore unknown fields,
 //! which is what keeps an additive change safe without a version bump.
 //!
-//! A breaking change needs a coexistence window on the topic, because a consumer
-//! group reading across the change sees both shapes interleaved. That is the point of
+//! A breaking change needs a coexistence window in the store, because a reader
+//! reading across the change sees both shapes interleaved. That is the point of
 //! the number: it lets a consumer reading a stream tell which shape it has.
 //!
 //! The line every sink writes is pinned by `every_variant_round_trips_through_json`
@@ -135,14 +135,14 @@ pub struct Finalized {
 
 /// One log decoded against a contract ABI, as typed arguments.
 ///
-/// Produced by the decode stage, not the indexer: nothing in the ingest path knows
-/// an ABI, so this record only ever appears on a decoded stream. It is a *dataset*
+/// Produced by the decode layer, not ingest: nothing in the ingest path knows an ABI,
+/// so this record is only ever added after the raw log it came from. It is a *dataset*
 /// rather than a control signal — a durable on-chain record a consumer can store —
 /// and it carries everything needed to identify the row it becomes without a second
 /// lookup.
 ///
 /// The raw log it came from is referenced by [`Log::dedupe_key`], not embedded:
-/// the raw stream is the archive, so re-decoding with a later ABI is a replay of
+/// the stored raw log is the archive, so re-decoding with a later ABI is a replay of
 /// that record rather than a re-fetch from a node.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Decoded {

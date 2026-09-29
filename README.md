@@ -2,45 +2,79 @@
 
 A low-latency, chain-agnostic blockchain indexer.
 
-It reads a chain's live tip, parses each block into ordered events, and publishes
-them as newline-delimited JSON. Chain-specific knowledge sits behind one trait and
-egress behind another, so new chains and new brokers are additions rather than
-rewrites.
+It reads a chain's live tip, parses each block into ordered events, decodes the logs
+it has ABIs for, and stores everything in a local database. Chain-specific knowledge sits
+behind one trait and where events go behind another, so new chains and new stores are
+additions rather than rewrites.
+
+## Architecture
+
+```
+chain (RPC) ─▶ ingest ─▶ decode ─▶ channel ═══▶ drain ─▶ DuckDB
+              └────────── task 1 ──────────┘     └──── task 2 ────┘
+                                        bounded, in memory,
+                                        one block per message
+```
+
+Each block takes the same path:
+
+1. **Ingest** hears a new head over WebSocket, fetches the block with its transactions,
+   receipts and logs in one batched request, and turns it into ordered events. It gives
+   every event a per-chain `sequence`, checks parent-hash linkage against a bounded undo
+   ring, and emits a `reorg` marker when the chain forks and a `finalized` marker when
+   finality advances.
+2. **Decode** sees each envelope as ingest publishes it. A log whose address is in the
+   contract registry is decoded against its ABI, and the decoded record is forwarded right
+   after the raw log. Everything else passes through untouched.
+3. **The channel** collects the block's envelopes and sends them to storage as one message
+   when ingest flushes at the block boundary.
+4. **Storage** writes the block's raw and decoded rows to DuckDB in one commit.
+
+Three choices shape it:
+
+**Ingest and decode are direct calls, not a queue.** `DecodingSink` wraps another sink:
+ingest publishes an envelope, and the same call decodes it and forwards both the raw
+envelope and its decoded record. Decoding a block takes a small fraction of a block time,
+so there is nothing to decouple.
+
+**The channel is the one queue, and it exists for the store.** A store stalls — a
+checkpoint, a slow fsync — and ingest must not stop reading heads while it does. The
+channel holds a few dozen blocks; when it is full, ingest waits, so lag is felt instead
+of buffered. A block travels as one message, so its raw rows and decoded rows commit
+together. When the store has fallen behind it folds the waiting blocks into one commit
+(`runtime.batch_records`), which is how it catches up.
+
+**The channel is not durable, and does not need to be.** The chain is the record upstream
+and the store is the record downstream; a crash loses only what was in flight, and the
+store's high-water mark says where to resume. Resuming from it is not built yet, and is the
+first thing that needs to be.
 
 ## Layout
 
 One crate, one binary, four layers as modules. What runs is not hardcoded: the settings
-file states it, and `runtime` assembles the pipeline — ingest iff a chain is configured,
-decode iff a registry has entries, storage always — on whichever bus and store the
-settings chose. `main` is only the process boundary. The layers share one definition of
-the stream through `wire`, without sharing a process.
+file states it, and `runtime` assembles the pipeline — ingest follows the configured chain,
+decode uses the configured registry, storage writes the configured store. `main` is only
+the process boundary. The layers share one definition of the stream through `wire`.
 
 ```
 src/
 ├── main.rs         the process boundary: logging, the settings path, the exit code
 ├── runtime.rs      assembles the pipeline the settings describe, and runs it
-├── config.rs       typed settings — stage configuration, not string lookups
+├── config.rs       typed settings — layer configuration, not string lookups
 ├── wire/           the wire contract: envelope, events, dataset records. Pure data.
-├── connectors/     the traits, the transports (kafka, memory, stdout, duckdb), the drain loop.
 ├── ingest/         block sources and the reorg-aware pipeline.
-└── decode/         the stateless ABI decode transform and its registry.
+├── decode/         the stateless ABI decode transform, its registry, and the sink that applies it.
+└── sink/           where envelopes go: the sink trait, the decode→storage channel, the store, stdout.
 ```
 
 `wire` depends on `alloy` and `serde` and on nothing else in the tree. `decode`
 knows nothing about `ingest`, so it cannot reach into the pipeline's ordering and reorg
 state machine.
 
-`connectors` holds no domain logic: it is the traits, the transports, and the shared
-drain loop the stages drive (`connectors/mod.rs`). The loop lives there rather than in a
-module of its own because it is the sink's contract — the publish → flush → commit order
-exists once, so storage and decode cannot drift on it.
-
 The layers are modules, so their one-way dependency direction is a convention a
 reviewer checks rather than one the compiler enforces. At this size, one owner reads
-all of it, and each module documents the direction it may depend in.
-
-The pipeline is `ingest` → `raw.chain` → `decode` → `decoded.chain` → storage.
-Aggregation and windowing are not built.
+all of it, and each module documents the direction it may depend in. CI checks the one
+that matters most: `decode` must not depend on `ingest`.
 
 ## What works
 
@@ -56,17 +90,15 @@ Aggregation and windowing are not built.
 - **Ordered events.** Every event gets a per-chain monotonic `sequence`; every
   dataset exposes a `dedupe_key` derived from its natural key. See
   `src/wire/envelope.rs`.
-- **A decode stage.** `src/decode` is a stateless transform over an ABI registry.
-  It consumes `raw.chain`, decodes each registered log against the ABI for its
-  `(chain, address)`, and produces the decoded record to `decoded.chain`. Raw datasets
-  have no decoded form, so they are dropped there — the raw topic is their home — and
-  only decoded records and control signals land on the decoded topic. Reorgs and
-  finality watermarks are forwarded because a store retracts and compacts on them. It
-  reimplements no ordering or reorg logic, so replaying a record is safe. Offsets are
-  committed only after the producer's flush, so a crash replays a batch rather than
-  losing one.
-- **A local store.** The process drains `raw.chain` and `decoded.chain` into a local
-  `DuckDB` database, one consumer group per topic and one append-only `events` table.
+- **A decode stage.** `src/decode` is a stateless transform over an ABI registry, run
+  inline by `DecodingSink`. It decodes each registered log against the ABI for its
+  `(chain, address)` and stores the decoded record right after the raw log. Everything is
+  forwarded as it arrived — decode adds records and removes none — so a reorg or finality
+  marker reaches the store exactly once, from ingest. It reimplements no ordering or reorg
+  logic, so decoding a log again is safe: the same log gives the same record and the same
+  `dedupe_key`.
+- **A local store.** The process writes every envelope, raw and decoded, into a local
+  `DuckDB` database: one append-only `events` table.
 - **Finality watermark.** A `finalized` event says a block and everything below
   it are permanent. Its height comes from the node's own `finalized` tag, so each
   chain's rules apply with no confirmation count to tune; on Base it trails the
@@ -76,41 +108,35 @@ Aggregation and windowing are not built.
   reclaims the sequence numbers those blocks had used. The undo window is bounded
   (128 blocks by default, and finalized blocks are dropped first). See
   `src/ingest/pipeline.rs`.
-- **NDJSON to stdout.** See `src/connectors/stdout.rs`.
-- **Two buses, one pipeline.** The stages share a topic bus: a Kafka-protocol transport
-  (behind the `kafka` feature) whose sink is keyed by chain so a chain's stream keeps its
-  `sequence` order on one partition, or an in-process transport (`kind = "memory"`) that
-  runs the whole pipeline with no broker. The stages and the publish → flush → commit
-  order are identical either way; only durability differs.
+- **NDJSON to stdout.** See `src/sink/stdout.rs`; `[ingest] stdout = true` prints the
+  stream instead of storing it.
 - **A local `DuckDB` store**, behind the `duckdb` feature (on by default). Embedded and
-  single-writer, so it is an archive/analytics endpoint, not the fan-out.
+  single-writer, so it is the archive; anything downstream reads from it rather than from
+  the live stream.
 
-`duckdb` is on by default because the pipeline needs a store to run; `kafka` is off by
-default so a plain `cargo build` does not compile the C `librdkafka`. A memory-bus run
-needs no broker, so `cargo run` alone runs the pipeline.
+`duckdb` is on by default because the pipeline needs a store to run. No broker is involved
+anywhere, so `cargo run` alone runs the pipeline.
 
 ## Not built yet
 
-Backfill-to-live handoff, checkpoint resume, mempool, filtered subscriptions, derived
-state (balances/nonces), the aggregation layer, and the Parquet/GCS archiver. The
-crate is a walking skeleton: it indexes forward from whatever the chain does next and
-does not fill gaps that predate startup.
+Resume from the store's high-water mark (and rebuilding the undo ring from it), backfill
+and the backfill-to-live handoff, mempool, filtered subscriptions, derived state
+(balances/nonces), the aggregation layer, and the Parquet/GCS archiver. The crate is a
+walking skeleton: it indexes forward from whatever the chain does next, and a restart
+begins at the live tip again rather than where it stopped.
 
 ## Run it
 
-One binary runs the pipeline the settings describe: ingest follows the chain, decode reads
-`raw.chain` and writes `decoded.chain`, and storage drains both into the store. What runs
-is not hardcoded — the settings decide it. Stages run concurrently and stop together: a
-stage that ends for good stops the process, because continuing without it would leave a
-stream that looks alive but is not.
+One binary runs the pipeline the settings describe: ingest follows the chain, decode adds
+a record for each log it has an ABI for, and storage writes both into the store. Ingest and
+decode run together in one task and storage in another; a part that ends for good stops the
+process, because continuing without it would leave a stream that looks alive but is not.
 
-- **Ingest runs iff `[ingest]` is present** — configuring a chain is the statement that it
-  should be followed.
-- **Decode runs iff `[decode] registry` names a registry with entries.** Decode is purely
-  additive: with none it would drop every raw dataset and forward only the control
-  signals, which ingest already publishes to the topic storage reads, so skipping it
-  loses nothing.
-- **Storage always runs**, reading the raw topic and (when decode ran) the decoded topic.
+- **`[ingest]` is required** — it names the chain to follow.
+- **Decode uses `[decode] registry`.** An absent or empty registry decodes nothing, which
+  is a legitimate way to run and is said at startup.
+- **Storage is the `[storage]` backend.** With `[ingest] stdout = true` no store is opened
+  and the stream is printed instead.
 
 Settings come from a TOML file, named by the first argument or defaulting to
 `indexer.toml`. `indexer.toml` in the repository is a working example. What decode decodes
@@ -118,10 +144,6 @@ lives in a separate registry file, named by `[decode] registry` and defaulting t
 `registry.toml` is a working example; see [The contract registry](#the-contract-registry).
 
 ```bash
-# With a broker (the kafka feature compiles librdkafka):
-RUST_LOG=info cargo run --release --features kafka -- indexer.toml
-
-# Or no broker at all: an in-process bus, one process, no message queue.
 RUST_LOG=info cargo run --release -- indexer.toml
 ```
 
@@ -130,15 +152,6 @@ RUST_LOG=info cargo run --release -- indexer.toml
 chain = "base"
 http_url = "https://base-rpc.publicnode.com"
 ws_url = "wss://base-rpc.publicnode.com"
-
-[bus]
-kind = "kafka"          # or "memory" for a single, broker-less process
-
-[bus.kafka]
-brokers = "localhost:9092"
-
-[runtime]
-drain_secs = 5   # omit for a live indexer
 
 [storage]
 kind = "duckdb"
@@ -152,21 +165,18 @@ registry = "registry.toml"
 
 Each table names what owns its fields, not where a field was first needed:
 
-- `[bus]` — the transport (`kind`), the topics, and the group prefix. A topic is a bus
-  concept, not a Kafka one, so the same names apply under either transport. The broker's
-  own settings live under `[bus.kafka]`, needed only when `kind = "kafka"`.
-- `[runtime]` — how every stage drains: the batch size and time bound, and the drain
-  bound. Transport-independent, so it is not under `[bus]`.
+- `[ingest]` — the chain to follow and its endpoints.
+- `[runtime]` — how storage commits: the most records one commit may cover.
 - `[storage.<kind>]` — one backend's own settings. `[storage] kind` selects it, so a
   second backend (ClickHouse, Postgres) is a variant there plus its own table, not
   another top-level `database` whose owner a reader has to guess.
+- `[decode]` — the contract registry.
 
 **Required** — no value could be right by accident, so each errors at startup naming
 the field:
 
 | Key | Meaning |
 | --- | --- |
-| `bus.kafka.brokers` | Bootstrap servers, when `bus.kind = "kafka"` |
 | `ingest.chain` | Chain id stamped on every event |
 | `ingest.http_url` | JSON-RPC endpoint for blocks and receipts |
 | `ingest.ws_url` | WebSocket endpoint for `newHeads` |
@@ -175,14 +185,8 @@ the field:
 
 | Key | Default | Meaning |
 | --- | --- | --- |
-| `bus.kind` | `kafka` | The transport: `kafka` or `memory` |
-| `bus.raw_topic` | `raw.chain` | Ingest's output and decode's input |
-| `bus.decoded_topic` | `decoded.chain` | Decode's output |
-| `bus.group_prefix` | `indexer` | Consumer group prefix, per stage (Kafka only) |
-| `ingest.stdout` | `false` | Print instead of publishing |
-| `runtime.batch_records` | `500` | Records per flush |
-| `runtime.batch_ms` | `1000` | Time bound on a batch |
-| `runtime.drain_secs` | unset | Stop a topic after this idle; bounds decode's input too. **Omit for a live indexer** |
+| `ingest.stdout` | `false` | Print the stream instead of storing it; no store is opened |
+| `runtime.batch_records` | `500` | Most records one store commit may cover; a backlog of blocks is folded into one commit up to this, and a block is never split |
 | `storage.kind` | `duckdb` | The store backend |
 | `storage.duckdb.path` | `indexer.duckdb` | Path to the store |
 
@@ -191,10 +195,8 @@ the field:
 | Key | Meaning |
 | --- | --- |
 | `decode.registry` | Path to the contract registry file, relative to the settings file. Absent means nothing is decoded |
-| `bus.kafka.properties` | Any other librdkafka property, passed straight through |
 | `storage.duckdb.settings` | Any other DuckDB setting, passed straight through |
 
-Omit `[ingest]` entirely to run decode and storage against a topic filled elsewhere.
 `RUST_LOG` is still read from the environment, because a log filter is not deployment
 configuration.
 
@@ -206,7 +208,7 @@ is likewise an error rather than a silent fallback to the default backend.
 
 What decode decodes lives in its own file, named by `[decode] registry` — `registry.toml`
 in the repository is a working example. It is deliberately not part of `indexer.toml`: the
-settings file is deployment topology (brokers, endpoints, paths), while the registry is a
+settings file is deployment topology (endpoints, paths), while the registry is a
 catalog of contracts that grows on its own schedule. Splitting them keeps a new protocol
 from churning the deployment diff.
 
@@ -288,40 +290,29 @@ belongs where the joins are. Two payoffs from keeping it that way:
   be a mapper that has to know every protocol, and a new DEX would be a new Rust file.
 - **A new DEX is rows in reference tables**, not code.
 
-When stream processing lands, the decoded stream and the reference tables are what it
+When stream processing lands, the decoded records and the reference tables are what it
 joins. `protocol` and the argument names are the join keys, which is why they are on the
 wire rather than re-derived downstream.
 
 ### Other client settings
 
-Both clients take settings this file does not restate, passed straight through and
+The store takes settings this file does not restate, passed straight through and
 validated by the engine:
 
 ```toml
-[bus.kafka.properties]
-"compression.codec" = "gzip"   # quote keys: most contain dots
-"fetch.max.bytes" = "1048576"
-
 [storage.duckdb.settings]
 threads = "4"
 max_memory = "1GB"
 ```
 
-Anything unrecognized is an error from librdkafka or DuckDB naming the property, so a
-typo is caught at startup rather than silently ignored. `bus.kafka.properties` applies to
-every client the process builds, so a property that means different things to a producer
-and a consumer — `auto.offset.reset` is the usual one — is better left out.
+Anything unrecognized is an error from DuckDB naming the setting, so a typo is caught at
+startup rather than silently ignored. Every envelope lands in an append-only `events` table
+with the envelope as JSON beside the columns a query filters on.
 
-On Kafka, each topic-consumer pair uses its own consumer group, named `<prefix>-<stage>`,
-because an offset is per group: one group spanning two topics would commit a single
-position across both. Every envelope lands in an append-only `events` table with the
-envelope as JSON beside the columns a query filters on. A topic with nothing more to read
-is drained and the run stops.
-
-Configuration is a typed builder in `src/config.rs`, not a string lookup scattered
-through each stage, so a stage can be constructed in a test with no environment at all.
+Configuration is a typed struct in `src/config.rs`, not a string lookup scattered through
+each layer, so a layer can be constructed in a test with no environment at all.
 `src/runtime.rs` turns those settings into the pipeline, so the wiring is testable without
-a broker.
+a network.
 
 ## Event shape
 
@@ -332,7 +323,7 @@ a broker.
  "data":"0x…","removed":false,"block_number":51883702,"block_hash":"0x…"}
 ```
 
-`v` is the wire shape's version. It is a field on the envelope rather than a broker
+`v` is the wire shape's version. It is a field on the envelope rather than a transport
 header because one of the sinks is a local database: a header survives no hop into
 `DuckDB`, a file, or a pipe, so a consumer reading those could not tell two shapes
 apart. It is bumped only for a breaking change — a field's type or meaning changing,
@@ -362,8 +353,8 @@ is pinned by tests in `src/wire/envelope.rs`: `every_variant_round_trips_through
 covers every event kind, `the_wire_object_carries_only_the_envelope_and_event_fields`
 pins the exact key set, and
 `the_schema_version_is_stamped_and_absent_v_parses` pins both the `v` stamp and
-backward compatibility with a line written without the field. Every connector
-renders through the same encoding, so stdout, the broker, and the local
+backward compatibility with a line written without the field. Every sink
+renders through the same encoding, so stdout and the local
 store cannot drift apart. A chain whose
 identity does not fit that shape — Solana's base58 blockhash and 64-byte signature
 are the expected case — gets its own module beside `src/datasets/evm.rs` plus a
@@ -376,10 +367,9 @@ cargo run --example decode_logs
 ```
 
 Decodes two real Uniswap V3 swap logs captured from a Base pool, using the same
-`Transform` the decode stage runs. No arguments and no broker: the capture and the ABI
-are embedded, and each input is printed as its decoded record — which is what the stage
-publishes, since a raw dataset has no decoded form and only the record reaches the
-decoded topic.
+`Transform` the decode layer runs. No arguments and no network: the capture and the ABI
+are embedded, and each input is printed as its decoded record — which is what the
+pipeline stores beside the raw log.
 
 Worth reading the output for two things: `amount0` is negative, because the amount is an
 `int256` and the sign says which way the pool sent that token; and `sqrtPriceX96` carries
@@ -387,8 +377,7 @@ Worth reading the output for two things: `amount0` is negative, because the amou
 pick a column and a width is not recoverable from a number.
 
 To point it at other contracts, capture real input by setting `stdout = true` in the
-`[ingest]` table, which prints what the indexer would publish instead of sending it to a
-broker, and change the address, chain, ABI, and fixture the example names.
+`[ingest]` table, which prints the stream instead of storing it, and change the address, chain, ABI, and fixture the example names.
 
 ## Benchmarks
 
@@ -437,5 +426,5 @@ The published shape is versioned by `wire::envelope::SCHEMA_VERSION`, stamped on
 every line as `v`. It is bumped only for a **breaking** change — a field's type or
 meaning changing, or a field or variant being removed. Adding an optional field or a
 new event variant does not bump it, so a consumer must skip an unknown `type` and
-ignore unknown fields. A breaking change needs a coexistence window on the topic,
-because one consumer group reading across the change sees both shapes interleaved.
+ignore unknown fields. A breaking change needs a coexistence window in the store,
+because a reader reading across the change sees both shapes interleaved.

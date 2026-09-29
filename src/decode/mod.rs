@@ -1,7 +1,9 @@
 //! Decoding a log against a contract ABI.
 //!
-//! The second stage: it consumes raw records from `raw.chain` and publishes the decoded
-//! ones to `decoded.chain`. This module is the whole stage.
+//! The second layer: it sits between ingest and storage as a wrapper around a sink,
+//! adding a decoded record after each raw log it can decode. It runs inline — ingest's
+//! call to publish an envelope is the call that decodes it — so there is no queue
+//! between the two. This module is the whole layer.
 //!
 //! # Architecture
 //!
@@ -18,10 +20,11 @@
 //!   become data.
 //! - [`transform`] — **the pure function.** One envelope in, its decoded record or a
 //!   forwarded control signal out. No I/O, no state; the registry is passed per call.
-//! - [`run`] — **the runtime.** A loop over a source and a sink, driving the transform and
-//!   applying any discovery the transform surfaces, between records.
+//! - [`sink`] — **the runtime.** A wrapper around another sink that drives the transform
+//!   on each envelope, applies any discovery the transform surfaces between records, and
+//!   forwards the raw envelope and its decoded record to the sink it wraps.
 //!
-//! The direction is one-way: `run` drives `transform`, which reads `registry`, which holds
+//! The direction is one-way: `sink` drives `transform`, which reads `registry`, which holds
 //! `abi`. Nothing below knows about the layer above it — `Abi` cannot see a chain, and the
 //! transform cannot open a socket.
 //!
@@ -30,23 +33,23 @@
 //! One raw envelope goes through the stage like this:
 //!
 //! ```text
-//!                       raw.chain
+//!                      envelope (from ingest)
 //!                           │
 //!                    ┌──────▼───────┐
-//!                    │  run         │  owns the registry, drives the loop
+//!                    │  sink        │  owns the registry, forwards every envelope
 //!                    └──────┬───────┘
-//!                           │  envelope
+//!                           │  &envelope
 //!                    ┌──────▼───────┐
 //!                    │  transform   │
 //!                    └──────┬───────┘
 //!         not a Log ────────┤
 //!         (block, tx,       │  a Log
-//!          receipt)   ┌─────▼──────────────┐
-//!         dropped     │ registry.contract  │──── miss ──▶ dropped
-//!                     └─────┬──────────────┘
-//!                           │  Contract { abi, protocol }
+//!          receipt,   ┌─────▼──────────────┐
+//!          marker)    │ registry.contract  │──── miss ──▶ nothing added
+//!         nothing     └─────┬──────────────┘
+//!         added             │  Contract { abi, protocol }
 //!                     ┌─────▼──────────────┐
-//!                     │ abi.decode_log     │──── no selector ──▶ dropped
+//!                     │ abi.decode_log     │──── no selector ──▶ nothing added
 //!                     └─────┬──────────────┘
 //!                           │  DecodedEvent
 //!                     ┌─────▼──────────────┐
@@ -54,33 +57,31 @@
 //!                     └─────┬──────────────┘
 //!                           │  Discovery { child, abi, protocol }
 //!                           ▼
-//!                  Decoded record ──▶ decoded.chain
-//!                  Discovery      ──▶ registry.register_discovered  (in run, next record)
+//!                  Decoded record ──▶ inner sink, right after the raw log
+//!                  Discovery      ──▶ registry.register_discovered  (in sink, next record)
 //! ```
 //!
-//! Three outcomes for a log, and only the first publishes:
+//! Three outcomes for a log, and only the first adds a record:
 //!
 //! 1. **Decoded** — the address is registered, the ABI declares the log's selector, and
-//!    the data decodes. The record is published; a discovery effect, if the event matched
-//!    a rule, is handed back to `run`.
-//! 2. **Missed** — no ABI for the address, or no such event on the ABI. Dropped silently:
-//!    the raw log is already on `raw.chain`, so nothing is lost.
-//! 3. **Failed** — an event matched but the data did not decode. Dropped, with the failure
-//!    reported on [`Applied::error`] so `run` logs it. Almost always an ABI from the wrong
-//!    block range.
+//!    the data decodes. The record follows the raw log; a discovery effect, if the event
+//!    matched a rule, is handed back to `sink`.
+//! 2. **Missed** — no ABI for the address, or no such event on the ABI. Nothing is added,
+//!    silently: the raw log is forwarded regardless, so nothing is lost.
+//! 3. **Failed** — an event matched but the data did not decode. Nothing is added, with
+//!    the failure reported on [`Applied::error`] so `sink` logs it. Almost always an ABI
+//!    from the wrong block range.
 //!
-//! Control signals ([`Reorg`](crate::wire::envelope::Event::Reorg) and
-//! [`Finalized`](crate::wire::envelope::Event::Finalized)) are forwarded verbatim, because
-//! a store retracts orphaned rows and compacts below the watermark on them. Everything
-//! else — block, transaction, receipt — has no decoded form and is dropped; the raw topic
-//! is its home.
+//! Every envelope is forwarded as it arrived, so decode never removes anything from the
+//! stream: a reorg or finality marker reaches the store once, from ingest, and a block,
+//! transaction, or receipt — which has no decoded form — passes through untouched.
 //!
 //! # Discovery, in one paragraph
 //!
 //! A pool created by a factory is not in the registry file, because it did not exist
 //! when that file was written. A discovery rule closes that gap: when a factory's
 //! creation event decodes, the rule names the argument holding the new child address and
-//! what ABI it decodes with. `run` applies the registration immediately, in the same
+//! what ABI it decodes with. `sink` applies the registration immediately, in the same
 //! sequential pass. That is deterministic — the child's ABI is already loaded, so no
 //! network is involved — and correct because a factory emits its creation event before
 //! the child emits anything, so the child is registered before its first log is read.
@@ -98,14 +99,14 @@
 //!
 //! # Dependency direction
 //!
-//! This module may depend on [`crate::connectors`] and [`crate::wire`]. It deliberately
+//! This module may depend on [`crate::sink`] and [`crate::wire`]. It deliberately
 //! knows nothing about [`crate::ingest`]: the ordering and reorg state machine lives
 //! there, and a decode that needed it would be a decode that has to reimplement it.
 //! The layers are modules, so nothing enforces that direction; it is on a reviewer.
 
 pub mod abi;
 pub mod registry;
-pub mod run;
+pub mod sink;
 pub mod transform;
 
 pub use abi::{Abi, DecodeError, DecodedEvent};
@@ -113,5 +114,5 @@ pub use registry::{
     AbiEntry, AbiRegistry, Contract, ContractEntry, ContractRegistry, Discovery, DiscoveryEntry,
     RegistryConfig, RegistryError,
 };
-pub use run::{Decode, DecodeBuilder};
+pub use sink::DecodingSink;
 pub use transform::{Applied, Transform};

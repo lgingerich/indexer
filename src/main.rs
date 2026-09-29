@@ -1,20 +1,18 @@
 //! The indexer's entry point: reads the settings file and runs the pipeline it describes.
 //!
 //! One binary, started as a process. What runs is not decided here — the settings file
-//! says it, and [`indexer::runtime`] assembles it: ingest iff a chain is configured,
-//! decode iff a registry has entries, and storage always, on whichever bus and store the
-//! settings chose. So this file is only the process boundary: logging, the settings path,
-//! and the exit code.
+//! says it, and [`indexer::runtime`] assembles it: ingest follows the configured chain,
+//! decode uses the configured registry, and storage writes the configured store. So this
+//! file is only the process boundary: logging, the settings path, and the exit code.
 //!
 //! # Settings
 //!
 //! A TOML file, named by the first argument or `indexer.toml`. Every setting and its
-//! default is documented in [`indexer::config`], and the required ones — a broker for a
-//! Kafka bus, a chain's endpoints when ingest is configured — error at startup naming the
-//! field.
+//! default is documented in [`indexer::config`], and the required ones — the chain and its
+//! endpoints — error at startup naming the field.
 //!
 //! ```bash
-//! cargo run --release --features kafka,duckdb -- indexer.toml
+//! cargo run --release -- indexer.toml
 //! ```
 
 use std::process::ExitCode;

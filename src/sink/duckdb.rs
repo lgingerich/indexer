@@ -1,6 +1,6 @@
 //! The `DuckDB` sink: envelopes into a local, queryable database.
 //!
-//! Where [`StdoutJsonSink`](crate::connectors::StdoutJsonSink) is fire-and-forward, this
+//! Where [`StdoutJsonSink`](crate::sink::StdoutJsonSink) is fire-and-forward, this
 //! one is a *store*: it appends each envelope as a row so a later process can
 //! query the history locally with SQL. That split matters — `DuckDB` is an
 //! embedded, single-writer engine, so it is an archive/analytics endpoint, not a
@@ -31,16 +31,16 @@
 //!
 //! `DuckDB`'s appender is the bulk-import path, and it borrows the connection, so
 //! the sink cannot hold one open across calls. Instead `publish` buffers a
-//! rendered row and [`flush`](crate::connectors::EnvelopeSink::flush) opens one appender and commits the
-//! whole batch — the `DuckDB` analogue of the Kafka sink's accumulator. One
-//! process writes at a time, so there is no lock and no `Mutex`; a second process
-//! against the same file is the engine's error to report, not this sink's.
+//! rendered row and [`flush`](crate::sink::EnvelopeSink::flush) opens one appender and
+//! commits the whole batch. One process writes at a time, so there is no lock and no
+//! `Mutex`; a second process against the same file is the engine's error to report,
+//! not this sink's.
 
 use crate::wire::envelope::Envelope;
 use anyhow::Context as _;
 use duckdb::{Connection, params};
 
-use crate::connectors::EnvelopeSink;
+use crate::sink::EnvelopeSink;
 
 /// DDL for the append-only event table.
 ///
@@ -99,8 +99,8 @@ impl DuckDbSink {
 }
 
 impl EnvelopeSink for DuckDbSink {
-    async fn publish(&mut self, envelope: &Envelope) -> anyhow::Result<()> {
-        self.write(envelope)
+    async fn publish(&mut self, envelope: Envelope) -> anyhow::Result<()> {
+        self.write(&envelope)
     }
 
     async fn flush(&mut self) -> anyhow::Result<()> {
@@ -159,8 +159,8 @@ mod tests {
     use crate::wire::envelope::{ChainId, Envelope, Event, Finalized};
     use duckdb::Connection;
 
-    use crate::connectors::EnvelopeSink as _;
-    use crate::connectors::duckdb::DuckDbSink;
+    use crate::sink::EnvelopeSink as _;
+    use crate::sink::duckdb::DuckDbSink;
 
     fn sink() -> DuckDbSink {
         let connection = Connection::open_in_memory().expect("open in-memory DuckDB");
@@ -185,7 +185,7 @@ mod tests {
     async fn a_row_carries_the_lifted_columns_and_the_raw_envelope() {
         let mut sink = sink();
         let source = envelope();
-        sink.publish(&source).await.expect("row buffers");
+        sink.publish(source.clone()).await.expect("row buffers");
         // Nothing is durable before the flush.
         assert_eq!(row_count(&sink), 0);
         sink.flush().await.expect("batch flushes");
@@ -247,7 +247,7 @@ mod tests {
                     hash: alloy_primitives::B256::from([0x11; 32]),
                 }),
             );
-            sink.publish(&envelope).await.expect("row buffers");
+            sink.publish(envelope).await.expect("row buffers");
         }
         sink.flush().await.expect("batch flushes");
 

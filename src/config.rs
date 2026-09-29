@@ -9,27 +9,26 @@
 //! A required field is one with no `#[serde(default)]`: serde refuses a document that
 //! cannot fill it, naming the field, so absence is enforced by the type rather than
 //! re-checked by hand. A required `String` also carries `deserialize_with = "non_empty"`,
-//! because a present empty value — `brokers = ""` — is not absence and would otherwise
-//! start a process that connects to nothing. A defaulted field carries
+//! because a present empty value — `chain = ""` — is not absence and would otherwise
+//! start a process that stamps every event with a blank chain. A defaulted field carries
 //! `#[serde(default)]`: the value's `Default` when that is the right one (`PathBuf`,
 //! `BTreeMap`, an `Option` that means "unset"), or a `default_*` function when it is not.
 //!
-//! Required means no value could be right by accident. An endpoint, a broker address, or
-//! a chain name that is guessed produces a process that starts, looks healthy, and
-//! indexes the wrong thing, so the field is simply absent from the defaults.
+//! Required means no value could be right by accident. An endpoint or a chain name that
+//! is guessed produces a process that starts, looks healthy, and indexes the wrong
+//! thing, so the field is simply absent from the defaults.
 //!
 //! # Grouping
 //!
 //! A table names what owns its fields, not where a field was first needed:
 //!
-//! - `[bus]` — the transport (`kind`), the topics, and the group prefix. A topic is a bus
-//!   concept, not a Kafka one, so the same names apply under either transport. The
-//!   broker's own settings live under `[bus.kafka]`, needed only when `kind = "kafka"`.
-//! - `[runtime]` — how every stage drains: the batch size and time bound, and the drain
-//!   bound. Transport-independent, so it is not under `[bus]`.
+//! - `[ingest]` — the chain to follow and its endpoints. Required: with nothing to
+//!   follow there is nothing to run.
+//! - `[runtime]` — how storage commits: the most records one commit may cover.
 //! - `[storage.<kind>]` — one backend's own settings, chosen by `[storage] kind`.
 //!   Backend-specific keys stay out of the generic table so a second backend is an
 //!   addition rather than an ambiguity about which `database` is meant.
+//! - `[decode]` — the contract registry decode uses.
 //!
 //! # Example
 //!
@@ -38,15 +37,6 @@
 //! chain = "base"
 //! http_url = "https://base-rpc.publicnode.com"
 //! ws_url = "wss://base-rpc.publicnode.com"
-//!
-//! [bus]
-//! kind = "kafka"   # or "memory" for a single, broker-less process
-//!
-//! [bus.kafka]
-//! brokers = "localhost:9092"
-//!
-//! [runtime]
-//! drain_secs = 5   # omit for a live indexer
 //!
 //! [storage]
 //! kind = "duckdb"
@@ -69,7 +59,6 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 
 use serde::Deserialize;
 use serde::de::{self, Unexpected};
@@ -77,8 +66,8 @@ use serde::de::{self, Unexpected};
 /// Deserializes a required string, refusing an empty or whitespace-only one.
 ///
 /// A `#[serde(default)]`-less field already makes absence an error, but a present empty
-/// value is not absence: `brokers = ""` or `chain = ""` is a deployment that starts and
-/// connects to nothing, or stamps every event with a blank chain. Putting the check on
+/// value is not absence: `http_url = ""` is a deployment that starts and connects to
+/// nothing, and `chain = ""` stamps every event with a blank chain. Putting the check on
 /// the field keeps it with the field's documentation and lets serde name it, rather than
 /// a hand-written pass over every required key after the fact.
 fn non_empty<'de, D>(deserializer: D) -> Result<String, D::Error>
@@ -99,16 +88,12 @@ where
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Settings {
-    /// Ingest's settings. Absent means run without ingest.
-    #[serde(default)]
-    pub ingest: Option<IngestSettings>,
-    /// The bus the stages share: the transport, the topics, the group prefix.
-    #[serde(default)]
-    pub bus: BusSettings,
-    /// How every stage batches, and when a bounded run stops.
+    /// The chain to follow. Required: the pipeline starts at ingest.
+    pub ingest: IngestSettings,
+    /// How storage commits.
     #[serde(default)]
     pub runtime: RuntimeSettings,
-    /// Where decoded records are persisted.
+    /// Where records are persisted.
     #[serde(default)]
     pub storage: StorageSettings,
     /// What the decode stage decodes.
@@ -127,8 +112,8 @@ pub struct Settings {
 /// `chain`, `http_url`, and `ws_url` are required — a chain with no endpoint cannot be
 /// followed, and a default would silently index nothing — so they have no serde default
 /// and serde refuses a table that omits them, naming the field. `stdout` is a debug mode
-/// rather than a deployment setting: it changes where ingest writes, not what the process
-/// is.
+/// rather than a deployment setting: it changes where the stream goes, not what the
+/// process is.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct IngestSettings {
@@ -142,138 +127,29 @@ pub struct IngestSettings {
     /// The WebSocket endpoint used for heads. Required, and non-empty.
     #[serde(deserialize_with = "non_empty")]
     pub ws_url: String,
-    /// Print to stdout instead of publishing, for watching the raw stream.
+    /// Print the stream to stdout instead of storing it, for watching what the indexer
+    /// would write. No store is opened.
     #[serde(default)]
     pub stdout: bool,
 }
 
-/// The bus the stages share: which transport, which topics, which group prefix.
-///
-/// A topic is a bus concept, not a Kafka one, which is why the topics live here and not
-/// under [`KafkaSettings`]: the same names apply whichever transport carries them.
-#[derive(Debug, Clone, Default, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct BusSettings {
-    /// The transport the stages share. Absent means `kafka`.
-    #[serde(default)]
-    pub kind: BusKind,
-    /// The topic ingest publishes to, and decode consumes. Defaults to
-    /// [`DEFAULT_RAW_TOPIC`].
-    ///
-    /// Ingest's output and decode's input are the same topic, so changing this means
-    /// changing both. That is why the default exists and why overriding it is a
-    /// deliberate act rather than a routine one.
-    #[serde(default = "default_raw_topic")]
-    pub raw_topic: String,
-    /// The topic decode writes and storage reads. Defaults to [`DEFAULT_DECODED_TOPIC`].
-    #[serde(default = "default_decoded_topic")]
-    pub decoded_topic: String,
-    /// The consumer group prefix. Each stage appends its own name, and storage appends
-    /// the topic, because an offset is per group.
-    ///
-    /// The in-memory bus has no offsets to keep, so the prefix is unused there; it is
-    /// still named so one settings file reads the same under either transport.
-    #[serde(default = "default_group_prefix")]
-    pub group_prefix: String,
-    /// The broker's own settings, when `kind = "kafka"`.
-    #[serde(default)]
-    pub kafka: KafkaSettings,
-}
-
-impl BusSettings {
-    /// The consumer group a stage commits its offsets under, named `<prefix>-<stage>`.
-    ///
-    /// An offset is per group, so every stage that commits needs its own name.
-    #[must_use]
-    pub fn group(&self, stage: &str) -> String {
-        format!("{}-{stage}", self.group_prefix)
-    }
-
-    /// The consumer group storage reads `topic` under, named `<prefix>-storage-<topic>`.
-    ///
-    /// Storage drains two topics (the raw stream and, when decode runs, the decoded one)
-    /// and an offset is per group *and* per topic, so it needs one group each. The topic
-    /// is in the name — not a `storage-raw`/`storage-decoded` alias — so the group is a
-    /// pure function of the deployment's topic names. Renaming one resets that topic's
-    /// committed offsets and replays it, so the name is a durability contract.
-    #[must_use]
-    pub fn storage_group(&self, topic: &str) -> String {
-        self.group(&format!("storage-{topic}"))
-    }
-}
-
-/// The transport the stages share.
-///
-/// One variant per bus. Serde rejects an unknown tag, so a typo or a transport this
-/// build does not have is a startup error rather than a silent fallback to the default.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum BusKind {
-    /// A Kafka-protocol broker over the network. Durable and resumable.
-    #[default]
-    Kafka,
-    /// In-process queues. No broker and no durability: a crash loses in-flight events,
-    /// and there is no offset to resume from. For a single-process run, not a deployment.
-    Memory,
-}
-
-/// How to reach a Kafka-protocol broker, and the client properties passed through.
-///
-/// `brokers` is required — no default could be right, and a guessed one produces a
-/// process that starts and connects to nothing — so it has no serde default. Present only
-/// when the bus is Kafka; a memory bus ignores it.
-#[derive(Debug, Clone, Default, Deserialize)]
-#[serde(deny_unknown_fields, default)]
-pub struct KafkaSettings {
-    /// Comma-separated `host:port` bootstrap servers. Required when the bus is Kafka, and
-    /// non-empty then; the check is in `Settings::confirm`, because serde cannot make a
-    /// field required only for one value of a sibling.
-    pub brokers: String,
-    /// Any other librdkafka property, passed straight through.
-    ///
-    /// librdkafka has well over a hundred properties — `security.protocol`, `sasl.*`,
-    /// `compression.type`, `message.timeout.ms`, `enable.idempotence` — and restating
-    /// them here would be a second, stale copy of its documentation. Anything set here
-    /// reaches [`rdkafka::ClientConfig::set`] on both the producer and the consumer, and
-    /// an unrecognized key is an error from librdkafka naming the property.
-    ///
-    /// These apply to every Kafka client the process builds, so a property that means
-    /// different things to a producer and a consumer — `auto.offset.reset` is the usual
-    /// one — is better left unset here than set globally.
-    ///
-    /// ```toml
-    /// [bus.kafka.properties]
-    /// security.protocol = "SASL_SSL"
-    /// compression.type = "zstd"
-    /// ```
-    pub properties: BTreeMap<String, String>,
-}
-
-/// How every stage drains: the batch it flushes on, and when a bounded run stops.
-///
-/// Transport-independent by design. A stage's flush cadence is its own decision, not a
-/// property of the bus, which is why these are not under `[bus]`.
+/// How storage commits.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct RuntimeSettings {
-    /// How many records to accumulate before flushing, per stage.
-    pub batch_records: usize,
-    /// How long to wait before flushing a partial batch, in milliseconds.
-    pub batch_ms: u64,
-    /// How long a topic may be idle before storage treats it as drained, in seconds.
+    /// The most records one store commit may cover.
     ///
-    /// Absent means never stop, which is what a live stream needs: a stage that exits
-    /// when a topic goes quiet would take the process down with it. Set it for a bounded
-    /// run — a backfill, a test — not for a live indexer.
-    pub drain_secs: Option<u64>,
+    /// Storage receives one block at a time and commits each as it arrives. When it has
+    /// fallen behind, it folds the blocks already waiting into one commit until this many
+    /// records are reached, so a stalled store catches up in fewer, larger transactions.
+    /// A block is never split, so a commit can run past the bound by up to one block.
+    pub batch_records: usize,
 }
 
 impl Default for RuntimeSettings {
     fn default() -> Self {
         Self {
-            batch_records: 500,
-            batch_ms: 1_000,
-            drain_secs: None,
+            batch_records: DEFAULT_BATCH_RECORDS,
         }
     }
 }
@@ -337,7 +213,7 @@ impl Default for DuckDbSettings {
 /// What the decode stage decodes, in its own file.
 ///
 /// Kept out of the indexer's settings because it is a different kind of thing: the
-/// settings file is deployment topology — brokers, endpoints, paths — and the registry
+/// settings file is deployment topology — endpoints, paths — and the registry
 /// is a catalog of contracts that grows on its own schedule. It also rotates addresses,
 /// which would otherwise churn the settings file's diff on every new protocol.
 ///
@@ -361,26 +237,11 @@ impl std::str::FromStr for Settings {
     /// This is the in-memory form of [`Settings::from_file`], for a caller that has the
     /// text already; prefer reading a file.
     fn from_str(text: &str) -> anyhow::Result<Self> {
-        let settings: Self = toml::from_str(text)?;
-        settings.confirm()?;
-        Ok(settings)
+        Ok(toml::from_str(text)?)
     }
 }
 
 impl Settings {
-    /// Refuses a combination of settings no default could make right.
-    ///
-    /// One rule, and the only one: a broker is required exactly when the bus is Kafka.
-    /// The broker field must still default to something for `kind = "memory"`, where it
-    /// is unused, and serde has no way to make a field conditional on a sibling — so the
-    /// check lives here rather than on the field.
-    fn confirm(&self) -> anyhow::Result<()> {
-        if self.bus.kind == BusKind::Kafka && self.bus.kafka.brokers.trim().is_empty() {
-            anyhow::bail!("bus.kafka.brokers is required when bus.kind = \"kafka\"");
-        }
-        Ok(())
-    }
-
     /// Reads settings from a TOML file.
     ///
     /// # Errors
@@ -420,77 +281,13 @@ impl Settings {
             .as_ref()
             .map(|registry| self.dir.join(registry))
     }
-
-    /// The batch configuration the stages share.
-    #[must_use]
-    pub const fn batch(&self) -> BatchConfig {
-        BatchConfig::new(
-            self.runtime.batch_records,
-            Duration::from_millis(self.runtime.batch_ms),
-        )
-    }
-
-    /// The drain bound, if one is set.
-    #[must_use]
-    pub const fn drain(&self) -> Option<Duration> {
-        match self.runtime.drain_secs {
-            Some(secs) => Some(Duration::from_secs(secs)),
-            None => None,
-        }
-    }
 }
-
-/// The default topic ingest publishes to, and decode consumes.
-pub const DEFAULT_RAW_TOPIC: &str = "raw.chain";
-
-/// The default topic decode publishes to, and storage consumes.
-pub const DEFAULT_DECODED_TOPIC: &str = "decoded.chain";
-
-/// The default consumer group prefix. Each stage appends its own name.
-pub const DEFAULT_GROUP_PREFIX: &str = "indexer";
 
 /// The default `DuckDB` path.
 pub const DEFAULT_DATABASE: &str = "indexer.duckdb";
 
-fn default_raw_topic() -> String {
-    DEFAULT_RAW_TOPIC.to_owned()
-}
-
-fn default_decoded_topic() -> String {
-    DEFAULT_DECODED_TOPIC.to_owned()
-}
-
-fn default_group_prefix() -> String {
-    DEFAULT_GROUP_PREFIX.to_owned()
-}
-
-/// How a stage batches before flushing.
-///
-/// Shared by every stage on the bus, because the trade is the same everywhere: a larger
-/// batch amortizes the transport's per-request cost, and the time bound is what stops a
-/// quiet topic from leaving records unflushed — which matters because an unflushed
-/// record is an uncommitted offset, and so a record that will be replayed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct BatchConfig {
-    /// Records to accumulate before flushing.
-    pub records: usize,
-    /// How long to wait before flushing a partial batch.
-    pub every: Duration,
-}
-
-impl BatchConfig {
-    /// A batch of `records` or `every`, whichever comes first.
-    #[must_use]
-    pub const fn new(records: usize, every: Duration) -> Self {
-        Self { records, every }
-    }
-}
-
-impl Default for BatchConfig {
-    fn default() -> Self {
-        Self::new(500, Duration::from_secs(1))
-    }
-}
+/// The default for [`RuntimeSettings::batch_records`].
+pub const DEFAULT_BATCH_RECORDS: usize = 500;
 
 #[cfg(test)]
 // The crate denies `expect`/`unwrap` to keep production paths honest; tests are
@@ -499,20 +296,16 @@ impl Default for BatchConfig {
 #[expect(clippy::expect_used)]
 mod tests {
     use std::str::FromStr as _;
-    use std::time::Duration;
 
-    use super::{DEFAULT_DATABASE, DEFAULT_DECODED_TOPIC, DEFAULT_RAW_TOPIC, Settings};
+    use super::{DEFAULT_BATCH_RECORDS, DEFAULT_DATABASE, Settings};
 
-    /// The minimum a file needs: a broker and, to ingest, a chain and its endpoints.
+    /// The minimum a file needs: a chain and its endpoints.
     fn minimal() -> &'static str {
         r#"
 [ingest]
 chain = "base"
 http_url = "https://example.invalid"
 ws_url = "wss://example.invalid"
-
-[bus.kafka]
-brokers = "localhost:9092"
 "#
     }
 
@@ -522,28 +315,14 @@ brokers = "localhost:9092"
     fn a_minimal_file_supplies_every_default() {
         let settings = Settings::from_str(minimal()).expect("minimal settings parse");
 
-        let ingest = settings.ingest.as_ref().expect("ingest is present");
-        assert!(!ingest.stdout, "stdout is off unless asked for");
-
-        assert_eq!(settings.bus.raw_topic, DEFAULT_RAW_TOPIC);
-        assert_eq!(settings.bus.decoded_topic, DEFAULT_DECODED_TOPIC);
-        assert_eq!(settings.bus.group_prefix, "indexer");
-        assert_eq!(
-            settings.batch(),
-            super::BatchConfig::new(500, Duration::from_secs(1))
-        );
-
+        assert!(!settings.ingest.stdout, "stdout is off unless asked for");
+        assert_eq!(settings.runtime.batch_records, DEFAULT_BATCH_RECORDS);
         assert_eq!(settings.storage.kind, super::StorageKind::Duckdb);
         assert_eq!(
             settings.storage.duckdb.path,
             std::path::PathBuf::from(DEFAULT_DATABASE)
         );
         assert!(settings.decode.registry.is_none(), "nothing is decoded");
-        assert_eq!(
-            settings.drain(),
-            None,
-            "no drain bound by default, because a live stream must not stop"
-        );
     }
 
     /// The shipped `indexer.toml` is an example an operator copies, so it must stay
@@ -554,22 +333,17 @@ brokers = "localhost:9092"
     }
 
     /// The fixture file yields the values each stage is built from — the endpoints, the
-    /// batch, the drain, and the resolved registry path — so the seam between the file
-    /// and the stages is exercised without a broker or a store.
+    /// batch, and the resolved registry path — so the seam between the file and the
+    /// stages is exercised without a store.
     #[test]
     fn the_repository_file_yields_the_values_the_stages_are_built_from() {
         let settings =
             Settings::from_str(include_str!("../indexer.toml")).expect("indexer.toml parses");
 
-        let ingest = settings.ingest.as_ref().expect("ingest is configured");
-        assert_eq!(ingest.chain, "base");
-        assert!(!ingest.http_url.is_empty());
-        assert!(!ingest.ws_url.is_empty());
-
-        assert_eq!(settings.bus.raw_topic, DEFAULT_RAW_TOPIC);
-        assert_eq!(settings.bus.decoded_topic, DEFAULT_DECODED_TOPIC);
-        assert_eq!(settings.batch(), super::BatchConfig::default());
-        assert_eq!(settings.drain(), None, "a live indexer does not stop");
+        assert_eq!(settings.ingest.chain, "base");
+        assert!(!settings.ingest.http_url.is_empty());
+        assert!(!settings.ingest.ws_url.is_empty());
+        assert_eq!(settings.runtime.batch_records, DEFAULT_BATCH_RECORDS);
         // The fixture names `registry.toml`. Parsed from text it has no directory, so the
         // path is left as written rather than resolved against the working directory.
         assert_eq!(
@@ -587,13 +361,7 @@ brokers = "localhost:9092"
         let path = dir.join("indexer.toml");
         std::fs::write(
             &path,
-            r#"
-[bus.kafka]
-brokers = "localhost:9092"
-
-[decode]
-registry = "registry.toml"
-"#,
+            format!("{}\n[decode]\nregistry = \"registry.toml\"\n", minimal()),
         )
         .expect("write settings");
 
@@ -607,9 +375,10 @@ registry = "registry.toml"
     /// written rather than silently resolved against the working directory.
     #[test]
     fn a_registry_path_from_text_is_left_as_written() {
-        let settings = Settings::from_str(
-            "[bus.kafka]\nbrokers = \"x\"\n[decode]\nregistry = \"registry.toml\"\n",
-        )
+        let settings = Settings::from_str(&format!(
+            "{}\n[decode]\nregistry = \"registry.toml\"\n",
+            minimal()
+        ))
         .expect("settings parse");
         assert_eq!(
             settings.registry_path(),
@@ -617,57 +386,26 @@ registry = "registry.toml"
         );
     }
 
-    /// The topic defaults live with the broker, beside `decoded_topic`, because every
-    /// stage agrees on them and none of them owns a topic.
+    /// Ingest is where the pipeline starts, so a file without it is an error rather than
+    /// a process with nothing to do.
     #[test]
-    fn the_raw_topic_is_a_broker_setting() {
-        let settings = Settings::from_str(minimal()).expect("minimal settings parse");
-        // Decode and storage read the raw topic even with no ingest configured, so it
-        // cannot be nested under `[ingest]` where it would be absent when they still
-        // need it.
-        assert_eq!(settings.bus.raw_topic, DEFAULT_RAW_TOPIC);
-    }
-
-    /// A broker is required when the bus is Kafka: no default could be right, and
-    /// guessing one produces a process that starts and connects to nothing. The default
-    /// bus is Kafka, so an absent `[bus.kafka]` is an error.
-    #[test]
-    fn a_kafka_bus_without_a_broker_is_an_error() {
-        let error = Settings::from_str("[bus]\ngroup_prefix = \"x\"\n")
-            .expect_err("a broker is required")
+    fn a_file_without_ingest_is_an_error() {
+        let error = Settings::from_str("[storage]\nkind = \"duckdb\"\n")
+            .expect_err("ingest is required")
             .to_string();
-        assert!(error.contains("brokers"), "the error names it: {error}");
-    }
-
-    /// The same absence is fine for a memory bus, where the broker is unused: the bus is
-    /// chosen by `kind`, and only the chosen transport's requirements apply.
-    #[test]
-    fn a_memory_bus_needs_no_broker() {
-        let settings = Settings::from_str("[bus]\nkind = \"memory\"\n").expect("memory bus parses");
-        assert_eq!(settings.bus.kind, super::BusKind::Memory);
-        assert_eq!(settings.bus.raw_topic, DEFAULT_RAW_TOPIC);
-        assert_eq!(settings.bus.decoded_topic, DEFAULT_DECODED_TOPIC);
+        assert!(error.contains("ingest"), "the error names it: {error}");
     }
 
     /// A present-but-empty required value is refused too. Serde's requiredness catches an
-    /// absent key; `brokers = ""` would otherwise start a process that connects to
-    /// nothing, and `chain = ""` would stamp every event with a blank chain.
+    /// absent key; `chain = ""` would otherwise stamp every event with a blank chain.
     #[test]
     fn an_empty_required_value_is_an_error() {
-        let error = Settings::from_str("[bus.kafka]\nbrokers = \"\"\n")
-            .expect_err("an empty broker is not a broker")
-            .to_string();
-        assert!(error.contains("brokers"), "the error names it: {error}");
-
         let error = Settings::from_str(
             r#"
 [ingest]
 chain = "  "
 http_url = "https://example.invalid"
 ws_url = "wss://example.invalid"
-
-[bus.kafka]
-brokers = "localhost:9092"
 "#,
         )
         .expect_err("a blank chain is not a chain")
@@ -675,21 +413,13 @@ brokers = "localhost:9092"
         assert!(error.contains("chain"), "the error names it: {error}");
     }
 
-    /// So is an endpoint once ingest is configured: a chain with nowhere to read is
-    /// not a deployable state, and `http_url`/`ws_url` carry no default.
+    /// So is an endpoint: a chain with nowhere to read is not a deployable state, and
+    /// `http_url`/`ws_url` carry no default.
     #[test]
     fn a_missing_endpoint_is_an_error() {
-        let error = Settings::from_str(
-            r#"
-[ingest]
-chain = "base"
-
-[bus.kafka]
-brokers = "localhost:9092"
-"#,
-        )
-        .expect_err("http_url and ws_url are required")
-        .to_string();
+        let error = Settings::from_str("[ingest]\nchain = \"base\"\n")
+            .expect_err("http_url and ws_url are required")
+            .to_string();
         assert!(
             error.contains("missing field") && error.contains("url"),
             "serde names the absent field: {error}"
@@ -700,105 +430,30 @@ brokers = "localhost:9092"
     /// startup instead of leaving a setting silently at its default.
     #[test]
     fn an_unknown_key_is_rejected() {
-        let error = Settings::from_str(
-            r#"
-[bus.kafka]
-brokers = "localhost:9092"
-brokres = "typo"
-"#,
-        )
-        .expect_err("a typo must not be ignored")
-        .to_string();
-        assert!(
-            error.contains("brokres"),
-            "the error names the key: {error}"
-        );
+        let error = Settings::from_str(&format!("{}stdoot = true\n", minimal()))
+            .expect_err("a typo must not be ignored")
+            .to_string();
+        assert!(error.contains("stdoot"), "the error names the key: {error}");
     }
 
-    /// Ingest is optional, so decode and storage can run against a topic filled
-    /// elsewhere.
+    /// A settings file from before the bus was removed still names `[bus]`. It must fail
+    /// naming the table, not start a pipeline that ignores a transport it was told to use.
     #[test]
-    fn ingest_may_be_absent() {
-        let settings = Settings::from_str("[bus.kafka]\nbrokers = \"localhost:9092\"\n")
-            .expect("settings parse");
-        assert!(settings.ingest.is_none());
-        // The raw topic still has a name, so decode and storage agree on it.
-        assert_eq!(settings.bus.raw_topic, DEFAULT_RAW_TOPIC);
-    }
-
-    /// A stage's consumer group is `<prefix>-<stage>`, and storage's is
-    /// `<prefix>-storage-<topic>`. The name is a durability contract — an offset is per
-    /// group, so renaming one silently resets it — which is why it is derived in one place
-    /// rather than formatted at each call site.
-    #[test]
-    fn a_consumer_group_is_the_prefix_and_stage() {
-        let settings =
-            Settings::from_str("[bus]\ngroup_prefix = \"team\"\n[bus.kafka]\nbrokers = \"x\"\n")
-                .expect("settings parse");
-        assert_eq!(settings.bus.group("decode"), "team-decode");
-        // The topic is in the name, not a `storage-raw` alias: the group must not move
-        // when the stage's shape does, or a deploy replays both topics from offset 0.
-        assert_eq!(
-            settings.bus.storage_group("raw.chain"),
-            "team-storage-raw.chain"
-        );
-        assert_eq!(
-            settings.bus.storage_group("decoded.chain"),
-            "team-storage-decoded.chain"
-        );
-    }
-
-    /// A drain bound is opt-in, lives with the other run settings, and reaches the stage
-    /// as a duration.
-    #[test]
-    fn a_drain_bound_is_opt_in() {
-        let settings = Settings::from_str(
-            r#"
-[bus.kafka]
-brokers = "localhost:9092"
-
-[runtime]
-drain_secs = 5
-"#,
-        )
-        .expect("settings parse");
-        assert_eq!(settings.drain(), Some(Duration::from_secs(5)));
-    }
-
-    /// The `[decode]` table names a registry file, so a config points the stage at its
-    /// contract catalog rather than carrying the catalog itself.
-    #[test]
-    fn the_decode_table_names_a_registry_file() {
-        let settings = Settings::from_str(
-            r#"
-[bus.kafka]
-brokers = "localhost:9092"
-
-[decode]
-registry = "registry.toml"
-"#,
-        )
-        .expect("settings parse");
-
-        assert_eq!(
-            settings.decode.registry,
-            Some(std::path::PathBuf::from("registry.toml"))
-        );
+    fn the_removed_bus_table_is_rejected() {
+        let error = Settings::from_str(&format!("{}\n[bus]\nkind = \"kafka\"\n", minimal()))
+            .expect_err("a removed table must not be ignored")
+            .to_string();
+        assert!(error.contains("bus"), "the error names the table: {error}");
     }
 
     /// The store's kind is a tagged choice, and a backend this build does not have is a
     /// startup error rather than a silent fallback to the default.
     #[test]
     fn an_unknown_storage_kind_is_rejected() {
-        let error = Settings::from_str(
-            r#"
-[bus.kafka]
-brokers = "localhost:9092"
-
-[storage]
-kind = "clickhouse"
-"#,
-        )
+        let error = Settings::from_str(&format!(
+            "{}\n[storage]\nkind = \"clickhouse\"\n",
+            minimal()
+        ))
         .expect_err("an unknown backend must not fall back to duckdb")
         .to_string();
         assert!(error.contains("clickhouse"), "{error}");
@@ -808,11 +463,8 @@ kind = "clickhouse"
     /// store key, and the path is not a generic `database`.
     #[test]
     fn duckdb_settings_live_under_the_duckdb_table() {
-        let settings = Settings::from_str(
-            r#"
-[bus.kafka]
-brokers = "localhost:9092"
-
+        let settings = Settings::from_str(&format!(
+            r#"{}
 [storage]
 kind = "duckdb"
 
@@ -822,7 +474,8 @@ path = "/tmp/custom.duckdb"
 [storage.duckdb.settings]
 threads = "4"
 "#,
-        )
+            minimal()
+        ))
         .expect("settings parse");
 
         assert_eq!(
@@ -844,19 +497,10 @@ threads = "4"
 chain = "ethereum"
 http_url = "https://example.invalid"
 ws_url = "wss://example.invalid"
-
-[bus]
-raw_topic = "custom.raw"
-decoded_topic = "custom.decoded"
-group_prefix = "team-x"
-
-[bus.kafka]
-brokers = "broker:9092"
+stdout = true
 
 [runtime]
 batch_records = 50
-batch_ms = 250
-drain_secs = 3
 
 [storage.duckdb]
 path = "/tmp/custom.duckdb"
@@ -864,17 +508,12 @@ path = "/tmp/custom.duckdb"
         )
         .expect("settings parse");
 
-        assert_eq!(settings.bus.raw_topic, "custom.raw");
-        assert_eq!(settings.bus.decoded_topic, "custom.decoded");
-        assert_eq!(settings.bus.group_prefix, "team-x");
-        assert_eq!(
-            settings.batch(),
-            super::BatchConfig::new(50, Duration::from_millis(250))
-        );
+        assert_eq!(settings.ingest.chain, "ethereum");
+        assert!(settings.ingest.stdout);
+        assert_eq!(settings.runtime.batch_records, 50);
         assert_eq!(
             settings.storage.duckdb.path,
             std::path::PathBuf::from("/tmp/custom.duckdb")
         );
-        assert_eq!(settings.drain(), Some(Duration::from_secs(3)));
     }
 }
