@@ -560,8 +560,12 @@ brokers = "localhost:9092"
         assert_eq!(settings.bus.decoded_topic, DEFAULT_DECODED_TOPIC);
         assert_eq!(settings.batch(), super::BatchConfig::default());
         assert_eq!(settings.drain(), None, "a live indexer does not stop");
-        // No registry is named in the fixture, so nothing is decoded.
-        assert_eq!(settings.registry_path(), None);
+        // The fixture names `registry.toml`. Parsed from text it has no directory, so the
+        // path is left as written rather than resolved against the working directory.
+        assert_eq!(
+            settings.registry_path(),
+            Some(std::path::PathBuf::from("registry.toml"))
+        );
     }
 
     /// A registry path resolves against the settings file's own directory, not the

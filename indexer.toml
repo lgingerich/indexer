@@ -14,13 +14,14 @@ ws_url = "wss://base-rpc.publicnode.com"
 # The bus the stages share. `kind = "memory"` runs everything in one process with no
 # broker and no durability — for a single-process run, not a deployment.
 [bus]
+kind = "memory"
 # kind = "kafka"          # or "memory"
 # Both topics live here because every stage agrees on them, not because a broker owns
 # them: ingest publishes the raw topic and decode consumes it, decode publishes the
 # decoded topic and storage consumes it.
-# raw_topic = "raw.chain"
-# decoded_topic = "decoded.chain"
-# group_prefix = "indexer"
+raw_topic = "raw.chain"
+decoded_topic = "decoded.chain"
+group_prefix = "indexer"
 
 [bus.kafka]
 brokers = "localhost:9092"
@@ -35,7 +36,7 @@ brokers = "localhost:9092"
 # How every stage drains. Transport-independent, so it is not under `[bus]`.
 [runtime]
 # batch_records = 500
-# batch_ms = 1000
+batch_ms = 1000
 # Set to stop a topic once it has been idle this long. Omit for a live indexer, which
 # must never stop on a quiet block.
 # drain_secs = 5
@@ -43,18 +44,18 @@ brokers = "localhost:9092"
 [storage]
 # The backend to write. `duckdb` is the only kind today; an unknown one is a startup
 # error rather than a silent fallback.
-# kind = "duckdb"
+kind = "duckdb"
 
 [storage.duckdb]
-# path = "indexer.duckdb"
+path = "indexer.duckdb"
 
 # Any other DuckDB setting, passed straight through and validated by the engine.
-# [storage.duckdb.settings]
-# threads = "4"
-# max_memory = "1GB"
+[storage.duckdb.settings]
+threads = "4"
+max_memory = "1GB"
 
 # What the decode stage decodes. The registry is its own file — see `registry.toml` —
 # so the contract catalog grows without churning these settings. An absent registry
 # means nothing is decoded, which is a legitimate way to run and is said at startup.
-# [decode]
-# registry = "registry.toml"
+[decode]
+registry = "registry.toml"

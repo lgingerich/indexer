@@ -12,9 +12,10 @@
 //! Its state is a machine: [`Mode`] names what it is doing, and the linkage rules in
 //! [`Pipeline::process_block`] decide the transition. A head linking to the published tip
 //! advances the chain; one that does not is a fork, retracted to the fork point in the
-//! same call and published as an [`Event::Reorg`]. A height gap, a first head above
-//! genesis, and a fork deeper than the undo ring all fail loudly rather than publishing
-//! across a hole.
+//! same call and published as an [`Event::Reorg`]. A height gap and a fork deeper than
+//! the undo ring both fail loudly rather than publishing across a hole. The *first* head
+//! of a fresh pipeline is adopted as the start of the stream — wherever the chain happens
+//! to be — so a mid-chain start indexes forward from there instead of refusing.
 //!
 //! Building the stream means three things: a per-chain monotonic sequence number on
 //! every envelope, parent-hash linkage so a reorg surfaces as an [`Event::Reorg`] instead
@@ -59,11 +60,14 @@ pub const DEFAULT_UNDO_DEPTH: usize = 128;
 pub enum Mode {
     /// Subscribed to live heads and publishing each one as it arrives.
     Following,
-    /// Filling a contiguous height range up to the live tip before trusting heads.
+    /// A head arrived that does not link to the published tip, so the stream cannot
+    /// continue without filling the range first.
     ///
-    /// A fresh pipeline starts mid-chain at whatever head arrives next, since there is
-    /// no backfill-to-live handoff, and this mode is entered when a head would leave a
-    /// gap. It is terminal: a gap is an error, not a silent hole.
+    /// Entered when a head would leave a gap. Backfill is not built, so this mode is
+    /// terminal in practice: a gap fails rather than being published as a silent hole.
+    /// The first head of a fresh pipeline is *not* a gap — there is nothing before it to
+    /// be contiguous with — so it does not enter this mode; see
+    /// [`Pipeline::process_block`].
     Backfilling,
 }
 
@@ -156,10 +160,10 @@ impl<S: BlockSource, K: EnvelopeSink> Pipeline<S, K> {
     /// # Errors
     ///
     /// Returns an error when the sink cannot deliver an event — fatal, since skipping
-    /// one leaves a sequence gap — and when linkage cannot be resolved locally: a
-    /// height gap, a first head above genesis with no remembered history, or a fork
-    /// deeper than the undo ring. Those are coverage breaks, not reorgs, and cannot be
-    /// published honestly from here.
+    /// one leaves a sequence gap — and when linkage cannot be resolved locally: a height
+    /// gap after the stream has started, or a fork deeper than the undo ring. Those are
+    /// coverage breaks, not reorgs, and cannot be published honestly from here. A *first*
+    /// head above genesis is not one of them: it is where the stream starts.
     pub async fn process_block(&mut self, block: FetchedBlock) -> anyhow::Result<u64> {
         let FetchedBlock { events, finalized } = block;
         let Some((first, _)) = events.split_first() else {
@@ -206,12 +210,16 @@ impl<S: BlockSource, K: EnvelopeSink> Pipeline<S, K> {
                 ));
             }
         } else if height > 1 {
-            // A first block above genesis with nothing remembered means history was
-            // skipped; publishing it would present a chain with no prior block.
-            self.mode = Mode::Backfilling;
-            bail!(
-                "first head is {height}, above genesis, with no remembered history; \
-                 backfill-to-live handoff is not built"
+            // A fresh pipeline's first head is wherever the chain is now, not genesis:
+            // there is no backfill, so the stream simply begins at this height. That is
+            // a legitimate place to start — the operator gets live data and not the
+            // history before it — so it is adopted rather than refused. Parent linkage
+            // is still enforced from here on, so the first head is the base of the
+            // stream and every block after it links back to it.
+            warn!(
+                chain = %self.source.chain(),
+                height,
+                "starting mid-chain: no history before this block is indexed"
             );
         }
 
@@ -635,15 +643,25 @@ mod tests {
         assert_eq!(pipeline.mode(), Mode::Backfilling);
     }
 
+    /// A fresh pipeline's first head is wherever the chain is, not genesis: there is no
+    /// backfill, so the stream starts there. Missing the history before it is the
+    /// operator's trade, not an error, so the block is published and the stream follows.
     #[tokio::test]
-    async fn a_first_head_above_genesis_is_a_coverage_error() {
+    async fn a_first_head_above_genesis_starts_the_stream() {
         let mut pipeline = pipeline(128);
-        let error = pipeline
-            .process_block(fetched(vec![block_event(5, hash(5), hash(4))]))
-            .await
-            .expect_err("a fresh pipeline cannot start mid-chain");
-        assert!(error.to_string().contains("first head"), "{error}");
-        assert_eq!(pipeline.mode(), Mode::Backfilling);
+        process_all(
+            &mut pipeline,
+            vec![
+                vec![block_event(5, hash(5), hash(4))],
+                vec![block_event(6, hash(6), hash(5))],
+            ],
+        )
+        .await;
+
+        assert_eq!(pipeline.sink.kinds(), ["block", "block"]);
+        assert_eq!(pipeline.mode(), Mode::Following);
+        // No earlier height was invented to stand in as the stream's base.
+        assert_eq!(pipeline.history.front().map(|block| block.height), Some(5));
     }
 
     #[tokio::test]
