@@ -35,7 +35,9 @@
 //! which is what keeps an additive change safe without a version bump.
 //!
 //! A breaking change needs a coexistence window on the topic, because a consumer
-//! group reading across the change sees both shapes interleaved.
+//! group reading across the change sees both shapes interleaved. That is the point of
+//! the number: it exists for consumers reading a stream while the shape moves under
+//! them, which is why it starts at 1 and stays there until something is published.
 //!
 //! The line every sink writes is pinned by `every_variant_round_trips_through_json`
 //! and `the_wire_object_carries_only_the_envelope_and_event_fields`.
@@ -62,23 +64,11 @@ pub use crate::wire::typed::TypedValue;
 /// shape it is reading without out-of-band knowledge. Bumped only for a breaking
 /// change; see the compatibility policy in the module docs.
 ///
-/// - **1** — the initial shape.
-/// - **2** — [`Decoded`] carries named arguments ([`DecodedArg`]) and its event's
-///   `signature`; `Decoded` and [`Log`] both carry `block_timestamp`. Breaking:
-///   `Decoded`'s `indexed` and `body` changed from bare values to named ones, so a
-///   v1 consumer cannot read a v2 record.
-/// - **3** — [`Decoded`] carries its identity as typed fields (`transaction_hash`,
-///   `transaction_index`, `log_index`) rather than a formatted `source` string, and
-///   an explicit `anonymous` flag. Breaking: a v2 consumer reading `source` finds no
-///   such field, and can rebuild it with [`Decoded::source_key`].
-/// - **4** — [`Decoded`] carries `protocol` from the registry. Additive in shape but
-///   required on the wire, so a v3 consumer deserializing a v4 record without it fails;
-///   bumping says so rather than surprising one.
-///
-/// The current version is 4. A `dataset` field was added in 4 and removed in the same
-/// unreleased change, so it never shipped; the number stands rather than being reused,
-/// since a record written during development may carry it.
-pub const SCHEMA_VERSION: u16 = 4;
+/// It sits at 1 because nothing has shipped: the shape has changed several times
+/// during development, and numbering those changes would describe a history no
+/// consumer ever saw. The first number a consumer reads should be the first shape
+/// that existed when they started reading.
+pub const SCHEMA_VERSION: u16 = 1;
 
 /// Identifies the chain an event came from, for example `ethereum` or `solana`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
