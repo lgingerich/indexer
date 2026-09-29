@@ -5,7 +5,7 @@
 //! - [`convert`] is the only place that knows alloy's dynamic value model.
 //! - [`transform`] is the stateless transform: one envelope in, its decoded record or
 //!   a forwarded control signal out.
-//! - [`stage`] is the runtime that drives it off a source.
+//! - [`run`] is the runtime that drives it off a source.
 //!
 //! # What this deliberately does not do
 //!
@@ -30,11 +30,11 @@ pub mod contracts;
 pub mod convert;
 pub mod registry;
 #[cfg(all(feature = "kafka", feature = "duckdb"))]
-pub mod stage;
+pub mod run;
 pub mod transform;
 
 pub use convert::ConversionError;
 pub use registry::{Abi, AbiRegistry, Contract, DecodedEvent, RegistryError};
 #[cfg(all(feature = "kafka", feature = "duckdb"))]
-pub use stage::{Decode, DecodeBuilder};
+pub use run::{Decode, DecodeBuilder};
 pub use transform::{Applied, Transform};

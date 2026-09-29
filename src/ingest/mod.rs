@@ -3,7 +3,7 @@
 //! - [`source`] knows one chain: how to hear about heads and fetch a block.
 //! - [`pipeline`] is the only stateful part: it turns a source's events into one
 //!   ordered stream and hands each envelope to a sink.
-//! - [`stage`] is the runtime that drives the two together.
+//! - [`run`] is the runtime that drives the two together.
 //!
 //! # Dependency direction
 //!
@@ -14,9 +14,9 @@
 pub mod pipeline;
 pub mod source;
 #[cfg(feature = "kafka")]
-pub mod stage;
+pub mod run;
 
 pub use pipeline::Pipeline;
 pub use source::{BlockSource, EvmSource};
 #[cfg(feature = "kafka")]
-pub use stage::Ingest;
+pub use run::Ingest;
