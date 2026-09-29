@@ -3,7 +3,7 @@
 use crate::wire::envelope::Envelope;
 use tokio::io::AsyncWriteExt as _;
 
-use crate::connectors::EventSink;
+use crate::connectors::EnvelopeSink;
 
 /// Writes newline-delimited JSON to standard output.
 ///
@@ -21,7 +21,7 @@ impl StdoutJsonSink {
     }
 }
 
-impl EventSink for StdoutJsonSink {
+impl EnvelopeSink for StdoutJsonSink {
     async fn publish(&mut self, envelope: &Envelope) -> anyhow::Result<()> {
         // The same encoding the other sinks render, so a consumer of the pipe and a
         // consumer of the broker read the same bytes.

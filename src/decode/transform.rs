@@ -1,29 +1,43 @@
-//! The decode transform: raw envelopes in, decoded envelopes out.
+//! The decode transform: a raw log in, its decoded record out.
 //!
 //! This is the whole of the second stage. It is a pure function of its input and a
 //! [`AbiRegistry`], with no I/O and no state of its own, so it can be tested
 //! exhaustively and replayed safely.
+//!
+//! # What lands on the decoded topic
+//!
+//! The stage republishes exactly two things and drops everything else:
+//!
+//! - **Decoded records.** A log whose address is registered and whose selector the
+//!   ABI declares becomes a [`Decoded`] record. The raw log is *not* republished —
+//!   it is already on the raw topic, and [`Decoded::source_key`] joins back to it —
+//!   so the decoded topic is the decode *output*, not a second copy of the raw stream.
+//! - **Control signals.** [`Event::Reorg`] and [`Event::Finalized`] are forwarded
+//!   verbatim, because a store retracts orphaned rows from the reorg's
+//!   `orphaned_hashes` and compacts below the finality watermark.
+//!
+//! A block, transaction, or receipt has no decoded form; a log with no registered ABI,
+//! or one whose data does not decode, has nothing to publish. All of them are dropped,
+//! since the raw topic already carries them.
 //!
 //! # The invariants it must preserve
 //!
 //! Whatever decoding is added later, [`Transform::apply`] may never break these:
 //!
 //! 1. **Control signals pass through verbatim.** [`Event::Reorg`] and
-//!    [`Event::Finalized`] come out exactly as they went in. A store retracts
-//!    orphaned rows from the reorg's `orphaned_hashes` and compacts below the
-//!    finality watermark, so losing either makes the decoded stream quietly wrong.
-//! 2. **Nothing is dropped for lack of an ABI, or for a failed decode.** An event
-//!    with no matching ABI is forwarded unchanged, and so is a log whose data did not
-//!    decode: the raw log is always the first output, so the decoded topic is a
-//!    lossless superset of the raw one and a later ABI fix is a replay rather than a
-//!    re-fetch. A failed decode is reported on [`Applied`], not by withholding the log.
-//! 3. **Identity is preserved.** Every output carries its source envelope's `chain`
-//!    and `dedupe_key`. `sequence` orders the stream and is never renumbered.
+//!    [`Event::Finalized`] come out exactly as they went in, with their `chain` and
+//!    `sequence` intact. Losing either makes the decoded stream quietly wrong.
+//! 2. **A failed decode is reported, not silent.** A log whose data does not decode
+//!    produces no record, but the failure rides on [`Applied::error`] so a caller logs
+//!    it. A miss — no ABI for the address, or no selector on the ABI — is not a
+//!    failure: the raw log is already upstream, so a later ABI fix is a replay rather
+//!    than a re-fetch.
+//! 3. **Identity is preserved.** Every published envelope carries the input's `chain`
+//!    and `sequence`, and a decoded record's on-chain identity comes from the raw log,
+//!    so it traces to the exact log it came from. `sequence` is never renumbered.
 //!
-//! A decoded record is emitted *alongside* the log it came from, not instead of it:
-//! step 2 is what makes that the only defensible choice, since a consumer that wants
-//! the raw log must not have to reconstruct it from a decoded row.
-//!
+//! [`Decoded`]: crate::wire::envelope::Event::Decoded
+//! [`Decoded::source_key`]: crate::wire::envelope::Decoded::source_key
 //! [`Event::Reorg`]: crate::wire::envelope::Event::Reorg
 //! [`Event::Finalized`]: crate::wire::envelope::Event::Finalized
 
@@ -34,16 +48,18 @@ use crate::decode::registry::{AbiRegistry, Contract, RegistryError};
 
 /// What one input envelope produced, and whether anything went wrong.
 ///
-/// The log is always in [`outputs`](Self::outputs) — a failed decode is reported, not
-/// withheld — so a caller forwards the raw log and decides for itself how loud a
-/// failure is. [`Transform::apply`] never returns `Err` for a bad log.
+/// Usually nothing: most events are raw datasets with no decoded form, and most logs
+/// are unregistered. [`Transform::apply`] never returns `Err` for a bad log — a failed
+/// decode is reported on [`error`](Self::error) so a caller logs it and moves on.
 #[derive(Debug)]
 pub struct Applied {
-    /// The envelopes to republish: the source, and its decoded record if it decoded.
-    pub outputs: Vec<Envelope>,
+    /// The envelope to republish: the decoded record, or a control signal forwarded
+    /// verbatim. `None` when the input has no decoded form.
+    pub output: Option<Envelope>,
     /// The decode failure, if a log matched an ABI but did not decode against it.
     ///
-    /// Present alongside a pass-through of the raw log, so a caller logs it and moves on.
+    /// Independent of [`output`](Self::output): a failed decode produces no record, so
+    /// this is what a caller logs instead.
     pub error: Option<RegistryError>,
 }
 
@@ -64,39 +80,55 @@ impl<R: AbiRegistry> Transform<R> {
         Self { registry }
     }
 
-    /// The envelopes to republish for one raw input envelope.
+    /// The envelope to republish for one raw input envelope, if any.
     ///
     /// Returns an [`Applied`] rather than a `Result`, because a log that fails to
-    /// decode still has to be forwarded: the raw log is the first output whether or
-    /// not a decoded record follows it, and the failure rides alongside it. That keeps
-    /// invariant 2 — the decoded stream stays a superset of the raw one — while still
-    /// surfacing the failure a caller may want to act on.
+    /// decode is not an error the pipeline can act on: it produces no record and the
+    /// failure rides alongside for a caller to log. A miss and a non-log are silent —
+    /// there is nothing to publish and nothing to report.
     pub fn apply(&self, envelope: Envelope) -> Applied {
-        let (decoded, error) = match &envelope.event {
+        let Envelope {
+            chain,
+            sequence,
+            event,
+            ..
+        } = envelope;
+        match event {
             // A log is the only thing an event ABI decodes. A block, transaction, or
             // receipt carries calldata an ABI *could* decode, but this transform does
-            // not do that yet; they pass through unchanged.
-            Event::Log(log) => match self.decode(&envelope.chain, log) {
-                Ok(decoded) => (decoded, None),
-                Err(error) => (None, Some(error)),
+            // not do that yet; with no decoded form it is dropped, since the raw topic
+            // already carries it.
+            Event::Log(log) => match self.decode(&chain, &log) {
+                Ok(Some(record)) => Applied {
+                    output: Some(Envelope::new(
+                        chain,
+                        sequence,
+                        Event::Decoded(Box::new(record)),
+                    )),
+                    error: None,
+                },
+                Ok(None) => Applied {
+                    output: None,
+                    error: None,
+                },
+                Err(error) => Applied {
+                    output: None,
+                    error: Some(error),
+                },
             },
-            _ => (None, None),
-        };
-
-        let mut output = Vec::with_capacity(2);
-        let sequence = envelope.sequence;
-        let chain = envelope.chain.clone();
-        output.push(envelope);
-        if let Some(record) = decoded {
-            output.push(Envelope::new(
-                chain,
-                sequence,
-                Event::Decoded(Box::new(record)),
-            ));
-        }
-        Applied {
-            outputs: output,
-            error,
+            // A control signal must survive to drive a store's retraction and
+            // compaction, so it is forwarded exactly as it arrived.
+            forwarded @ (Event::Reorg(_) | Event::Finalized(_)) => Applied {
+                output: Some(Envelope::new(chain, sequence, forwarded)),
+                error: None,
+            },
+            // A raw dataset with no decoded form: the raw topic already carries it.
+            Event::Block(_) | Event::Transaction(_) | Event::Receipt(_) | Event::Decoded(_) => {
+                Applied {
+                    output: None,
+                    error: None,
+                }
+            }
         }
     }
 
@@ -104,7 +136,8 @@ impl<R: AbiRegistry> Transform<R> {
     /// the decoded event and the raw log it came from.
     ///
     /// A registry miss and an ABI that does not declare the log's selector are the
-    /// same answer here: the log is forwarded undecoded.
+    /// same answer here: `None`, which the caller drops — the raw log is already on
+    /// the raw topic.
     fn decode(&self, chain: &ChainId, log: &Log) -> Result<Option<Decoded>, RegistryError> {
         let Some(Contract { abi, protocol }) =
             self.registry.contract(chain, log.address, log.block_number)
@@ -250,13 +283,9 @@ mod tests {
             "a control signal is not a decode error"
         );
 
-        let output = applied.outputs;
-        assert_eq!(output, vec![source]);
-        let Some(Envelope {
-            event: Event::Reorg(reorg),
-            ..
-        }) = output.first()
-        else {
+        let output = applied.output.expect("a reorg is forwarded");
+        assert_eq!(output, source);
+        let Event::Reorg(reorg) = &output.event else {
             panic!("a reorg must come out a reorg");
         };
         assert_eq!(reorg.height, 4);
@@ -273,38 +302,53 @@ mod tests {
         }));
         let applied = Transform::new(NoAbi).apply(source.clone());
         assert!(applied.error.is_none());
-        assert_eq!(applied.outputs, vec![source]);
+        assert_eq!(applied.output, Some(source));
     }
 
-    /// Invariants 2 and 3: with no ABI registered, every kind is forwarded, never
-    /// dropped, and each output keeps its source's identity.
+    /// Invariant 1: every control signal is forwarded exactly as it arrived, keeping its
+    /// chain and sequence. Losing a reorg's retraction list makes a store keep orphaned
+    /// rows forever; losing a finality watermark stops it compacting.
     #[test]
-    fn every_kind_is_forwarded_unchanged_with_its_identity() {
-        for event in every_kind() {
+    fn a_control_signal_is_forwarded_unchanged_with_its_identity() {
+        for event in every_kind().into_iter().filter(|event| !event.is_dataset()) {
             let kind = event.kind();
             let source = envelope(event);
             let applied = Transform::new(NoAbi).apply(source.clone());
 
             assert!(applied.error.is_none(), "{kind} reported an error");
-            let output = applied.outputs;
-            assert_eq!(output.len(), 1, "{kind} was dropped or duplicated");
-            let forwarded = output.first().expect("one output");
+            let forwarded = applied.output.expect("a control signal is forwarded");
             assert_eq!(forwarded.chain, source.chain, "{kind} lost its chain");
+            assert_eq!(forwarded.sequence, source.sequence, "{kind} was renumbered");
             assert_eq!(
                 forwarded.event.dedupe_key(),
                 source.event.dedupe_key(),
                 "{kind} changed its dedupe key"
             );
-            assert_eq!(forwarded.sequence, source.sequence, "{kind} was renumbered");
-            assert_eq!(*forwarded, source, "{kind} changed across the transform");
+            assert_eq!(forwarded, source, "{kind} changed across the transform");
         }
     }
 
-    /// The decode path: a log that matches a registered ABI comes out *with* its
-    /// decoded record, and the raw log is still there — the decoded stream is a
-    /// superset, never a replacement.
+    /// A raw dataset has no decoded form, so it is dropped: the raw topic already carries
+    /// it, and the decoded topic is the decode output rather than a second copy of the
+    /// stream. Every dataset kind is checked, not just the handy one.
     #[test]
-    fn a_matching_log_is_emitted_with_its_decoded_record() {
+    fn a_raw_dataset_is_dropped_because_the_raw_topic_carries_it() {
+        for event in every_kind().into_iter().filter(Event::is_dataset) {
+            let kind = event.kind();
+            let applied = Transform::new(NoAbi).apply(envelope(event));
+            assert!(applied.error.is_none(), "{kind} reported an error");
+            assert!(
+                applied.output.is_none(),
+                "{kind} was published, but only a decoded record belongs on the topic"
+            );
+        }
+    }
+
+    /// The decode path: a registered log whose selector matches becomes a decoded
+    /// record. The raw log is not republished — it is already on the raw topic, and the
+    /// decoded record joins back to it by `source_key`.
+    #[test]
+    fn a_matching_log_becomes_a_decoded_record() {
         const ERC20: &str = r#"[{
             "type": "event",
             "name": "Transfer",
@@ -346,18 +390,12 @@ mod tests {
         };
         let applied = Transform::new(registry).apply(source.clone());
         assert!(applied.error.is_none(), "the log decodes");
-        let output = applied.outputs;
 
-        assert_eq!(output.len(), 2, "the raw log and its decoded record");
-        // The raw log is forwarded first and unchanged.
-        assert_eq!(output.first(), Some(&source));
-        // The decoded record follows, carrying the same chain and sequence, and its
-        // own identity is derived from the log it came from.
-        let decoded = output.get(1).expect("a decoded record");
+        let decoded = applied.output.expect("a decoded record");
         assert_eq!(decoded.chain, source.chain);
         assert_eq!(decoded.sequence, source.sequence);
         let Event::Decoded(record) = &decoded.event else {
-            panic!("the second output must be the decoded record");
+            panic!("the output must be the decoded record");
         };
         assert_eq!(record.name, "Transfer");
         // The protocol comes from the same lookup that found the ABI.
@@ -371,12 +409,11 @@ mod tests {
         assert_eq!(record.body.len(), 1);
     }
 
-    /// Invariant 2: a log whose data does not decode is still forwarded, so the
-    /// decoded stream stays a superset of the raw one. The failure is reported on the
-    /// result rather than by withholding the log — the regression was a `continue` in
-    /// the stage that dropped the pass-through, breaking the superset guarantee.
+    /// Invariant 2: a log whose data does not decode produces no record, but the failure
+    /// is reported rather than swallowed. The raw log is already on the raw topic, so a
+    /// corrected ABI recovers it — nothing is lost by not republishing it here.
     #[test]
-    fn a_log_that_fails_to_decode_is_still_forwarded() {
+    fn a_log_that_fails_to_decode_reports_and_produces_no_record() {
         const ERC20: &str = r#"[{
             "type": "event",
             "name": "Transfer",
@@ -409,13 +446,12 @@ mod tests {
         let registry = OneAbi {
             abi: Abi::from_json(ERC20).expect("ABI loads"),
         };
-        let applied = Transform::new(registry).apply(source.clone());
+        let applied = Transform::new(registry).apply(source);
 
         assert!(applied.error.is_some(), "a bad log reports its failure");
-        assert_eq!(
-            applied.outputs,
-            vec![source],
-            "the raw log is forwarded even when it does not decode"
+        assert!(
+            applied.output.is_none(),
+            "a failed decode produces no record"
         );
     }
 }

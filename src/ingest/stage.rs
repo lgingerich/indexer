@@ -7,7 +7,7 @@
 use anyhow::Result;
 use tracing::info;
 
-use crate::connectors::EventSink;
+use crate::connectors::EnvelopeSink;
 use crate::ingest::pipeline::Pipeline;
 use crate::ingest::source::EvmSource;
 
@@ -33,7 +33,7 @@ impl Ingest {
     ///
     /// Returns an error when the subscription, a block fetch, or a publish fails, and
     /// when the subscription closes — a live indexer should never stop.
-    pub async fn run<S: EventSink>(self, sink: S) -> Result<()> {
+    pub async fn run<S: EnvelopeSink>(self, sink: S) -> Result<()> {
         info!(
             chain = %self.chain,
             http = %self.http_url,

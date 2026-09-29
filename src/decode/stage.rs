@@ -1,4 +1,4 @@
-//! Running the decode stage: raw envelopes in, decoded envelopes out.
+//! Running the decode stage: raw records in, decoded records and control signals out.
 //!
 //! The stage is a loop over a source and a sink, both handed in. It builds no clients
 //! and names no broker, so it runs over anything that implements the two traits — which
@@ -6,7 +6,7 @@
 //! touching the decoder.
 //!
 //! [`crate::ingest`] works the same way, and for the same reason. The loop itself is
-//! [`crate::connectors::drain::run`], shared with the storage stage so the two cannot
+//! [`crate::connectors::run`], shared with the store's own drain so the two cannot
 //! drift on the one ordering that matters: publish, then flush, then commit.
 //!
 //! # Delivery
@@ -26,7 +26,7 @@ use anyhow::Result;
 use tracing::{info, warn};
 
 use crate::config::BatchConfig;
-use crate::connectors::{EnvelopeSource, EventSink};
+use crate::connectors::{EnvelopeSink, EnvelopeSource};
 use crate::decode::Transform;
 use crate::decode::contracts::ContractRegistry;
 
@@ -51,12 +51,12 @@ impl Decode {
     ///
     /// Returns an error when a record cannot be read, when a decoded record cannot be
     /// published, or when the checkpoint cannot be advanced. A single record that does
-    /// not *decode* is logged and its raw log is still forwarded, because the raw
-    /// record is already on the input topic and a corrected ABI recovers it.
+    /// not *decode* is logged and produces no output; the raw log is already on the
+    /// input topic, so a corrected ABI recovers it.
     pub async fn run<S, K>(self, source: &mut S, sink: &mut K) -> Result<()>
     where
         S: EnvelopeSource,
-        K: EventSink,
+        K: EnvelopeSink,
     {
         let contracts = self.registry.len();
         let transform = Transform::new(self.registry);
@@ -67,26 +67,20 @@ impl Decode {
             "decode started"
         );
 
-        // Each input expands to the raw log plus, when it decodes, its decoded record.
-        // A log that fails to decode is reported but still forwarded: the decoded stream
-        // stays a superset of the raw one, so a later ABI fix is a replay.
-        super::super::connectors::drain::run(
-            source,
-            sink,
-            self.batch,
-            self.drain,
-            |envelope, out| {
-                let applied = transform.apply(envelope);
-                if let Some(error) = applied.error {
-                    // A log that matched an ABI but did not decode usually means the ABI
-                    // is the wrong version for this height. It must not stall the stream,
-                    // and it must not be silent either — the raw log is already upstream,
-                    // so a corrected ABI recovers it.
-                    warn!(%error, "a log did not decode and was forwarded raw");
-                }
-                out.extend(applied.outputs);
-            },
-        )
+        // Each registered log expands to its decoded record; everything else — raw
+        // datasets, unregistered logs — is dropped, since the raw topic already carries
+        // it. A log that fails to decode is reported but produces no record.
+        crate::connectors::run(source, sink, self.batch, self.drain, |envelope, out| {
+            let applied = transform.apply(envelope);
+            if let Some(error) = applied.error {
+                // A log that matched an ABI but did not decode usually means the ABI
+                // is the wrong version for this height. It must not stall the stream,
+                // and it must not be silent either — the raw log is already upstream,
+                // so a corrected ABI recovers it.
+                warn!(%error, "a log did not decode and produced no record");
+            }
+            out.extend(applied.output);
+        })
         .await?;
         Ok(())
     }
@@ -122,7 +116,7 @@ impl DecodeBuilder {
     ///
     /// For a bounded run — a backfill, a one-shot drain — not for a live stream, where a
     /// quiet input is normal and stopping is a fault. Without it a bounded run has no way
-    /// to finish, which is why the storage stage takes the same bound.
+    /// to finish, which is why the store's drain takes the same bound.
     #[must_use]
     pub const fn drain(mut self, drain: Duration) -> Self {
         self.drain = Some(drain);
@@ -145,7 +139,7 @@ impl DecodeBuilder {
     /// call site at that point.
     pub fn build(self) -> Result<Decode> {
         if self.registry.is_empty() {
-            warn!("no contracts registered; every log will pass through undecoded");
+            warn!("no contracts registered; every log will be dropped undecoded");
         }
         Ok(Decode {
             batch: self.batch,
@@ -171,8 +165,8 @@ mod tests {
 
     use alloy_primitives::{Address, B256, TxHash};
 
-    use crate::connectors::{EnvelopeSource, EventSink};
-    use crate::wire::envelope::{ChainId, Envelope, Event, Log};
+    use crate::connectors::{EnvelopeSink, EnvelopeSource};
+    use crate::wire::envelope::{ChainId, Envelope, Event, Finalized, Log};
 
     use super::Decode;
 
@@ -202,7 +196,7 @@ mod tests {
         flushes: Mutex<usize>,
     }
 
-    impl EventSink for CollectSink {
+    impl EnvelopeSink for CollectSink {
         async fn publish(&mut self, envelope: &Envelope) -> anyhow::Result<()> {
             self.seen.lock().expect("lock").push(envelope.clone());
             Ok(())
@@ -214,8 +208,8 @@ mod tests {
         }
     }
 
-    /// A log no registry entry covers, so it takes the pass-through path.
-    fn passthrough(sequence: u64) -> Envelope {
+    /// A log no registry entry covers: it has no decoded form, so the stage drops it.
+    fn unregistered_log(sequence: u64) -> Envelope {
         Envelope::new(
             ChainId::new("base"),
             sequence,
@@ -231,14 +225,26 @@ mod tests {
         )
     }
 
+    /// A control signal: it must be forwarded, because a store retracts and compacts on
+    /// it.
+    fn finalized(sequence: u64) -> Envelope {
+        Envelope::new(
+            ChainId::new("base"),
+            sequence,
+            Event::Finalized(Finalized {
+                height: sequence,
+                hash: B256::from([0x03; 32]),
+            }),
+        )
+    }
+
     /// The stage runs over anything implementing the traits, with no broker and no
-    /// client construction. This is what the refactor bought: before it the loop could
-    /// only be exercised against a live Kafka, which is why a stamping bug slipped past
-    /// every unit test.
+    /// client construction, and publishes only what belongs on the decoded topic: a
+    /// control signal survives, an unregistered raw log is dropped.
     #[tokio::test]
-    async fn the_stage_runs_over_an_in_memory_source_and_sink() {
+    async fn the_stage_forwards_control_signals_and_drops_raw_logs() {
         let mut source = FakeSource {
-            queued: vec![passthrough(2), passthrough(1)],
+            queued: vec![unregistered_log(2), finalized(1)],
             commits: 0,
         };
         let mut sink = CollectSink::default();
@@ -254,12 +260,12 @@ mod tests {
         let seen = sink.seen.lock().expect("lock");
         assert_eq!(
             seen.len(),
-            2,
-            "an unregistered log is forwarded, not dropped"
+            1,
+            "only the control signal belongs on the decoded topic"
         );
         assert!(matches!(
             seen.first().map(|e| &e.event),
-            Some(Event::Log(_))
+            Some(Event::Finalized(_))
         ));
     }
 
@@ -268,7 +274,7 @@ mod tests {
     #[tokio::test]
     async fn the_checkpoint_advances_after_the_sink_is_flushed() {
         let mut source = FakeSource {
-            queued: vec![passthrough(1)],
+            queued: vec![finalized(1)],
             commits: 0,
         };
         let mut sink = CollectSink::default();

@@ -1,4 +1,4 @@
-//! The core processing layer, between [`BlockSource`] and [`EventSink`].
+//! The core processing layer, between [`BlockSource`] and [`EnvelopeSink`].
 //!
 //! The three layers split responsibilities like this:
 //!
@@ -6,7 +6,7 @@
 //!   turn it into [`Event`]s. It holds no state about what was published.
 //! - A **sink** knows one destination: how to deliver an [`Envelope`] to a given
 //!   chain's stream. It knows nothing about ordering, and it buffers until
-//!   [`flush`](EventSink::flush), which the pipeline calls once per block.
+//!   [`flush`](EnvelopeSink::flush), which the pipeline calls once per block.
 //! - The **pipeline** is the only stateful part. It drives the source, turns its
 //!   events into a single ordered stream, and hands each envelope to the sink.
 //!
@@ -38,7 +38,7 @@ use anyhow::bail;
 use futures_util::StreamExt as _;
 use tracing::{error, info, warn};
 
-use crate::connectors::EventSink;
+use crate::connectors::EnvelopeSink;
 use crate::wire::envelope::{Envelope, Event, Finalized, Reorg};
 
 use crate::ingest::source::{BlockId, BlockSource, FetchedBlock};
@@ -90,7 +90,7 @@ pub struct Pipeline<S, K> {
     mode: Mode,
 }
 
-impl<S: BlockSource, K: EventSink> Pipeline<S, K> {
+impl<S: BlockSource, K: EnvelopeSink> Pipeline<S, K> {
     /// Builds a pipeline with [`DEFAULT_UNDO_DEPTH`] of history.
     #[must_use]
     pub fn new(source: S, sink: K) -> Self {
@@ -381,7 +381,7 @@ mod tests {
     use super::{Mode, Pipeline};
     use crate::wire::envelope::{Block, ChainId, Envelope, Event, Log};
 
-    use crate::connectors::EventSink;
+    use crate::connectors::EnvelopeSink;
 
     use crate::ingest::source::{BlockId, BlockSource, FetchedBlock, HeadStream, SourceError};
 
@@ -471,7 +471,7 @@ mod tests {
         }
     }
 
-    impl EventSink for CollectSink {
+    impl EnvelopeSink for CollectSink {
         async fn publish(&mut self, envelope: &Envelope) -> anyhow::Result<()> {
             self.seen.push(envelope.clone());
             Ok(())

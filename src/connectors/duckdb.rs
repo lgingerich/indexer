@@ -31,7 +31,7 @@
 //!
 //! `DuckDB`'s appender is the bulk-import path, and it borrows the connection, so
 //! the sink cannot hold one open across calls. Instead `publish` buffers a
-//! rendered row and [`flush`](crate::connectors::EventSink::flush) opens one appender and commits the
+//! rendered row and [`flush`](crate::connectors::EnvelopeSink::flush) opens one appender and commits the
 //! whole batch — the `DuckDB` analogue of the Kafka sink's accumulator. One
 //! process writes at a time, so there is no lock and no `Mutex`; a second process
 //! against the same file is the engine's error to report, not this sink's.
@@ -40,7 +40,7 @@ use crate::wire::envelope::Envelope;
 use anyhow::Context as _;
 use duckdb::{Connection, params};
 
-use crate::connectors::EventSink;
+use crate::connectors::EnvelopeSink;
 
 /// DDL for the append-only event table.
 ///
@@ -58,7 +58,7 @@ CREATE TABLE IF NOT EXISTS events (
 
 /// Appends envelopes to a local `DuckDB` database, one batch per [`flush`].
 ///
-/// [`flush`]: EventSink::flush
+/// [`flush`]: EnvelopeSink::flush
 pub struct DuckDbSink {
     connection: Connection,
     rows: Vec<Row>,
@@ -98,7 +98,7 @@ impl DuckDbSink {
     }
 }
 
-impl EventSink for DuckDbSink {
+impl EnvelopeSink for DuckDbSink {
     async fn publish(&mut self, envelope: &Envelope) -> anyhow::Result<()> {
         self.write(envelope)
     }
@@ -159,7 +159,7 @@ mod tests {
     use crate::wire::envelope::{ChainId, Envelope, Event, Finalized};
     use duckdb::Connection;
 
-    use crate::connectors::EventSink as _;
+    use crate::connectors::EnvelopeSink as _;
     use crate::connectors::duckdb::DuckDbSink;
 
     fn sink() -> DuckDbSink {

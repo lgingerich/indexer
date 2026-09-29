@@ -19,7 +19,7 @@ src/
 ├── main.rs         builds every stage from the environment and runs them together
 ├── config.rs       typed builders — stage configuration, not string lookups
 ├── wire/           the wire contract: envelope, events, dataset records. Pure data.
-├── connectors/     the traits, the concrete connectors, and the storage runtime.
+├── connectors/     the traits, the concrete connectors, and the shared drain loop.
 ├── ingest/         block sources and the reorg-aware pipeline.
 └── decode/         the stateless ABI decode transform and its registry.
 ```
@@ -28,11 +28,10 @@ src/
 knows nothing about `ingest`, so it cannot reach into the pipeline's ordering and reorg
 state machine.
 
-`connectors` holds no domain logic: it is the traits, the transports, and the stages
-whose whole job is wiring — the shared drain loop (`connectors/drain.rs`) and the
-storage stage live there rather than in a module of its own, because they are the sink
-and the process that drives it. Decode drives the same loop, so the publish → flush →
-commit order exists once and the two stages cannot drift on it.
+`connectors` holds no domain logic: it is the traits, the transports, and the shared
+drain loop the stages drive (`connectors/mod.rs`). The loop lives there rather than in a
+module of its own because it is the sink's contract — the publish → flush → commit order
+exists once, so storage and decode cannot drift on it.
 
 The layers were separate crates, which enforced that direction with the compiler. They
 are modules now, so it is a convention a reviewer checks. The trade: breaking the
@@ -58,15 +57,16 @@ Aggregation and windowing are not built.
   dataset exposes a `dedupe_key` derived from its natural key. See
   `src/wire/envelope.rs`.
 - **A decode stage.** `src/decode` is a stateless transform over an ABI registry.
-  It consumes `raw.chain`, decodes each log against the ABI registered for its
-  `(chain, address)`, and produces to `decoded.chain`. It emits the decoded record
-  *alongside* the raw log, so the decoded stream is a lossless superset, and forwards
-  everything else — including reorgs and finality watermarks, which must survive for a
-  store to retract and compact. It reimplements no ordering or reorg logic, so
-  replaying a record is safe. Offsets are committed only after the producer's flush,
-  so a crash replays a batch rather than losing one.
-- **A storage stage.** It drains `raw.chain` and `decoded.chain` into a local `DuckDB`
-  database, one consumer group per topic and one append-only `events` table.
+  It consumes `raw.chain`, decodes each registered log against the ABI for its
+  `(chain, address)`, and produces the decoded record to `decoded.chain`. Raw datasets
+  have no decoded form, so they are dropped there — the raw topic is their home — and
+  only decoded records and control signals land on the decoded topic. Reorgs and
+  finality watermarks are forwarded because a store retracts and compacts on them. It
+  reimplements no ordering or reorg logic, so replaying a record is safe. Offsets are
+  committed only after the producer's flush, so a crash replays a batch rather than
+  losing one.
+- **A local store.** The process drains `raw.chain` and `decoded.chain` into a local
+  `DuckDB` database, one consumer group per topic and one append-only `events` table.
 - **Finality watermark.** A `finalized` event says a block and everything below
   it are permanent. Its height comes from the node's own `finalized` tag, so each
   chain's rules apply with no confirmation count to tune; on Base it trails the
@@ -237,7 +237,7 @@ typo is caught at startup rather than silently ignored. `kafka.properties` appli
 every client the process builds, so a property that means different things to a producer
 and a consumer — `auto.offset.reset` is the usual one — is better left out.
 
-Storage uses one consumer group per topic, named `<group>-<topic>`, because an offset
+The store uses one consumer group per topic, named `<group>-<topic>`, because an offset
 is per group: one group spanning two topics would commit a single position across both.
 Every envelope lands in an append-only `events` table with the envelope as JSON beside
 the columns a query filters on. A topic with nothing more to read is drained and the
@@ -300,8 +300,9 @@ cargo run --example decode_logs
 
 Decodes two real Uniswap V3 swap logs captured from a Base pool, using the same
 `Transform` the decode stage runs. No arguments and no broker: the capture and the ABI
-are embedded, and each input is printed followed by its decoded record — which is what
-the stage publishes, since the decoded stream keeps the raw log rather than replacing it.
+are embedded, and each input is printed as its decoded record — which is what the stage
+publishes, since a raw dataset has no decoded form and only the record reaches the
+decoded topic.
 
 Worth reading the output for two things: `amount0` is negative, because the amount is an
 `int256` and the sign says which way the pool sent that token; and `sqrtPriceX96` carries

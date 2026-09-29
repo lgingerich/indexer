@@ -3,7 +3,8 @@
 //! - [`registry`] loads one contract's ABI and decodes a log against it.
 //! - [`contracts`] answers which contract applies to a log, and what it is.
 //! - [`convert`] is the only place that knows alloy's dynamic value model.
-//! - [`transform`] is the stateless transform: one envelope in, its decoded records out.
+//! - [`transform`] is the stateless transform: one envelope in, its decoded record or
+//!   a forwarded control signal out.
 //! - [`stage`] is the runtime that drives it off a source.
 //!
 //! # What this deliberately does not do

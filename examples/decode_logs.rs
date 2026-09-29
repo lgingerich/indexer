@@ -6,9 +6,8 @@
 //!
 //! It reads two real `Swap` logs captured from a Uniswap V3 pool on Base, embeds the
 //! pool's ABI, and runs the same [`Transform`] the decode stage runs in production. For
-//! each input it prints the raw envelope followed by the decoded record, which is what
-//! the stage publishes: the decoded stream is a lossless superset, so nothing is
-//! replaced.
+//! each input it prints the decoded record, which is what the stage publishes: a raw
+//! dataset has no decoded form, so only the decoded record reaches the decoded topic.
 //!
 //! # What to look for
 //!
@@ -101,7 +100,7 @@ fn main() -> ExitCode {
         if let Some(error) = applied.error {
             eprintln!("line {}: {error}", number + 1);
         }
-        for out in applied.outputs {
+        if let Some(out) = applied.output {
             if matches!(out.event, indexer::wire::envelope::Event::Decoded(_)) {
                 decoded_count += 1;
             }
@@ -113,7 +112,7 @@ fn main() -> ExitCode {
         eprintln!("line {}: decoded", number + 1);
     }
 
-    eprintln!("{decoded_count} swaps decoded, each printed after its source log");
+    eprintln!("{decoded_count} swaps decoded into their records");
     if decoded_count == 0 {
         eprintln!("nothing decoded, which means the fixture or the ABI changed");
         return ExitCode::FAILURE;

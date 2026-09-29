@@ -41,9 +41,9 @@ use rdkafka::consumer::{CommitMode, Consumer as _, StreamConsumer};
 use rdkafka::message::Message as _;
 use rdkafka::producer::{BaseProducer, BaseRecord, Producer as _};
 
-use crate::connectors::{EnvelopeSource, EventSink};
+use crate::connectors::{EnvelopeSink, EnvelopeSource};
 
-/// How long [`flush`](crate::connectors::EventSink::flush) waits for the accumulator to drain.
+/// How long [`flush`](crate::connectors::EnvelopeSink::flush) waits for the accumulator to drain.
 ///
 /// Not a config knob: a runtime that wants a different drain can call
 /// `Producer::flush` on its own producer after the pipeline stops.
@@ -60,10 +60,10 @@ const POLL_INTERVAL: Duration = Duration::from_millis(0);
 ///
 /// `publish` only enqueues — `BaseProducer::send` returns as soon as the record is in
 /// `librdkafka`'s accumulator, so the caller is never blocked on a delivery report.
-/// [`flush`](crate::connectors::EventSink::flush) is the durability point and the drain.
+/// [`flush`](crate::connectors::EnvelopeSink::flush) is the durability point and the drain.
 /// `ponytail:` delivery failures between flushes are reported by `librdkafka`'s own
 /// callback, not surfaced as a `Result` here; a delivery report carried back through
-/// [`EventSink`] is the upgrade path if a lost record must fail the pipeline.
+/// [`EnvelopeSink`] is the upgrade path if a lost record must fail the pipeline.
 pub struct KafkaSink {
     producer: BaseProducer,
     topic: String,
@@ -106,7 +106,7 @@ impl KafkaSink {
     }
 }
 
-impl EventSink for KafkaSink {
+impl EnvelopeSink for KafkaSink {
     async fn publish(&mut self, envelope: &Envelope) -> anyhow::Result<()> {
         // Serve any delivery callbacks that are ready first, so a stuck broker does
         // not accumulate unpolled reports; `POLL_INTERVAL` of zero makes this a
@@ -194,16 +194,18 @@ impl EnvelopeSource for KafkaSource {
 // means the fixture or setup is wrong.
 #[expect(clippy::expect_used)]
 mod tests {
+    use std::time::Duration;
+
     use crate::wire::envelope::{ChainId, Envelope, Event, Finalized};
 
     use super::KafkaSink;
 
-    fn envelope(chain: &str) -> Envelope {
+    fn envelope(chain: &str, sequence: u64) -> Envelope {
         Envelope::new(
             ChainId::new(chain),
-            3,
+            sequence,
             Event::Finalized(Finalized {
-                height: 9,
+                height: sequence,
                 hash: alloy_primitives::B256::from([0x22; 32]),
             }),
         )
@@ -213,18 +215,66 @@ mod tests {
     /// and keeps its `sequence` order.
     #[test]
     fn partition_key_is_the_chain() {
-        assert_eq!(KafkaSink::partition_key(&envelope("base")), "base");
-        assert_eq!(KafkaSink::partition_key(&envelope("ethereum")), "ethereum");
+        assert_eq!(KafkaSink::partition_key(&envelope("base", 0)), "base");
+        assert_eq!(
+            KafkaSink::partition_key(&envelope("ethereum", 0)),
+            "ethereum"
+        );
     }
 
-    /// The sink's rendering and the source's parsing are inverses, which is the whole
-    /// contract between the two halves. Pinned here because a change to either alone
-    /// would otherwise only show up against a live broker.
-    #[test]
-    fn the_rendering_round_trips_through_the_parsing() {
-        let source = envelope("base");
-        let rendered = serde_json::to_string(&source).expect("envelope renders");
-        let parsed: Envelope = serde_json::from_str(&rendered).expect("envelope parses");
-        assert_eq!(parsed, source);
+    /// A live round trip through a mock broker: the sink's rendering and the source's
+    /// parsing are inverses, records survive in order, and the checkpoint advances.
+    ///
+    /// This is the only test that exercises `publish`/`flush`/`next`/`commit` against a
+    /// broker, so a change to either half fails here instead of only in production.
+    #[tokio::test]
+    async fn the_sink_and_source_round_trip_through_a_broker() {
+        use rdkafka::ClientConfig;
+        use rdkafka::consumer::{Consumer as _, StreamConsumer};
+        use rdkafka::mocking::MockCluster;
+        use rdkafka::producer::BaseProducer;
+
+        use crate::connectors::{EnvelopeSink as _, EnvelopeSource as _};
+
+        use super::KafkaSource;
+
+        const TOPIC: &str = "raw.chain";
+        let cluster = MockCluster::new(1).expect("mock cluster starts");
+        let bootstrap = cluster.bootstrap_servers();
+        // One partition, so the round trip is order-preserving and the assertion below
+        // is deterministic rather than a race between partitions.
+        cluster.create_topic(TOPIC, 1, 1).expect("topic is created");
+
+        let mut config = ClientConfig::new();
+        config.set("bootstrap.servers", &bootstrap);
+        let producer: BaseProducer = config.create().expect("producer builds");
+        let mut sink = KafkaSink::new(producer, TOPIC);
+
+        let sent: Vec<Envelope> = (0..8).map(|sequence| envelope("base", sequence)).collect();
+        for envelope in &sent {
+            sink.publish(envelope).await.expect("record enqueues");
+        }
+        sink.flush().await.expect("batch drains");
+
+        config.set("group.id", "round-trip");
+        config.set("auto.offset.reset", "earliest");
+        // The commit point is the caller's decision, matching the runtime's consumers.
+        config.set("enable.auto.commit", "false");
+        let consumer: StreamConsumer = config.create().expect("consumer builds");
+        consumer.subscribe(&[TOPIC]).expect("subscribe");
+        let mut source = KafkaSource::new(consumer);
+
+        let mut received = Vec::new();
+        for _ in 0..sent.len() {
+            let envelope = tokio::time::timeout(Duration::from_secs(10), source.next())
+                .await
+                .expect("a record arrives before the deadline")
+                .expect("record reads")
+                .expect("the stream has the record");
+            received.push(envelope);
+        }
+        source.commit().await.expect("checkpoint advances");
+
+        assert_eq!(received, sent, "the bytes survive the round trip in order");
     }
 }
