@@ -428,7 +428,7 @@ published with its fields spelled out rather than as one opaque `raw` string.
 cargo fmt --check
 cargo clippy --all-targets --all-features -- -D warnings
 cargo doc --no-deps --all-features
-cargo test
+cargo nextest run --all-targets --all-features
 ```
 
 ## Compatibility policy

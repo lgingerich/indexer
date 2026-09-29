@@ -18,7 +18,6 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --all-targets --all-features -- -D warnings
       - run: cargo doc --no-deps --all-features
-      - run: cargo test
       - run: cargo nextest run --all-targets --all-features
       # The modules were once crates, and the compiler enforced that `decode` could not
       # reach into `ingest`. Now it is a convention; this is what keeps it one. See the

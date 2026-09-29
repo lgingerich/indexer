@@ -56,12 +56,6 @@ After code changes, run the relevant checks:
 cargo fmt --check
 cargo clippy --all-targets --all-features -- -D warnings
 cargo doc --no-deps --all-features
-cargo test
-```
-
-If `cargo nextest` is installed, also run:
-
-```bash
 cargo nextest run --all-targets --all-features
 ```
 
