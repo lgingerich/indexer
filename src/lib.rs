@@ -37,5 +37,9 @@ pub mod config;
 pub mod connectors;
 pub mod decode;
 pub mod ingest;
+/// Absent without the `duckdb` feature: it assembles a store, so nothing in it can build
+/// without the engine. The binary requires the feature too, so this only affects the
+/// library's other consumers.
+#[cfg(feature = "duckdb")]
 pub mod runtime;
 pub mod wire;

@@ -1,6 +1,6 @@
 //! In-process topics: envelopes from one stage to another with no broker.
 //!
-//! The same [`EnvelopeSource`]/[`EnvelopeSink`](crate::connectors::EnvelopeSink)
+//! The same [`EnvelopeSource`]/[`EnvelopeSink`]
 //! boundary Kafka implements, backed by in-memory queues. It carries the pipeline's
 //! *architecture* without the broker — the stages, the topics, the publish → flush →
 //! commit order are identical — so a single process can run the whole pipeline with
@@ -24,6 +24,15 @@
 //! the way to ingest rather than losing events. That is deliberately not a broadcast
 //! channel, which would overwrite the oldest record on lag: silently dropping a store
 //! write is the one failure a store must never have.
+//!
+//! The ceiling that implies: a subscriber that holds its receiver but never drains it —
+//! a stage parked on a downstream that is not moving — blocks the topic's publish loop,
+//! and therefore every other publisher and subscriber of that topic, until it drains or
+//! is dropped. That is backpressure, not a fault, and it is the deliberate trade for
+//! never losing a record. Only a subscriber whose receiver has been *dropped* is retired;
+//! a stuck-but-alive one is meant to be felt. `ponytail:` if a deployment needs a stalled
+//! consumer to be evicted instead of halting the topic, it needs a broker, whose retention
+//! policy is the thing that bounds the wait.
 //!
 //! `ponytail:` a publisher round-robins across subscribers rather than over per-topic
 //! queues, so fairness across topics is approximate; a scheduler over topic queues is the
@@ -101,10 +110,10 @@ impl MemoryBus {
             id
         };
         lock(&self.topics)
-            .entry(topic.clone())
+            .entry(topic)
             .or_default()
             .push((id, sender));
-        MemorySource { topic, receiver }
+        MemorySource { receiver }
     }
 }
 
@@ -113,14 +122,6 @@ impl MemoryBus {
 pub struct MemorySink {
     bus: MemoryBus,
     topic: String,
-}
-
-impl MemorySink {
-    /// The topic this sink publishes to.
-    #[must_use]
-    pub fn topic(&self) -> &str {
-        &self.topic
-    }
 }
 
 impl EnvelopeSink for MemorySink {
@@ -139,8 +140,9 @@ impl EnvelopeSink for MemorySink {
         }
         for (id, sender) in &senders {
             if sender.send(envelope.clone()).await.is_err() {
-                // The receiver is gone; retire it and move on. A stage that has stopped
-                // must not stall the publisher.
+                // The receiver was dropped; retire it and move on. A *parked* subscriber
+                // with a live receiver blocks here on purpose — that is backpressure, not
+                // a fault, and it is bounded by the queue's capacity. See the module docs.
                 if let Some(senders) = lock(&self.bus.topics).get_mut(&self.topic) {
                     senders.retain(|(other, _)| other != id);
                 }
@@ -159,16 +161,7 @@ impl EnvelopeSink for MemorySink {
 /// Yields envelopes from one in-process topic.
 #[derive(Debug)]
 pub struct MemorySource {
-    topic: String,
     receiver: mpsc::Receiver<Envelope>,
-}
-
-impl MemorySource {
-    /// The topic this source reads.
-    #[must_use]
-    pub fn topic(&self) -> &str {
-        &self.topic
-    }
 }
 
 impl EnvelopeSource for MemorySource {
@@ -291,6 +284,31 @@ mod tests {
         assert_eq!(
             alive.next().await.expect("read").expect("record").sequence,
             1
+        );
+    }
+
+    /// The other half of that pair, and the deliberate ceiling: a subscriber that holds
+    /// its receiver but never reads is not retired, so it blocks the publish once the
+    /// queue fills. That is backpressure reaching the publisher — the price of never
+    /// dropping a record — so it must be felt, not silently skipped.
+    #[tokio::test]
+    async fn a_parked_subscriber_applies_backpressure_rather_than_being_retired() {
+        let bus = MemoryBus::new();
+        let mut sink = bus.sink("raw.chain");
+        // Held, never polled: the queue fills and then the publisher waits.
+        let _parked = bus.source("raw.chain");
+
+        let published = tokio::time::timeout(Duration::from_secs(2), async {
+            let mut count = 0_u64;
+            loop {
+                sink.publish(&envelope(count)).await.expect("publish");
+                count += 1;
+            }
+        })
+        .await;
+        assert!(
+            published.is_err(),
+            "a full queue must block the publisher, not drop or retire the subscriber"
         );
     }
 }

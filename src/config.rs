@@ -183,12 +183,22 @@ pub struct BusSettings {
 impl BusSettings {
     /// The consumer group a stage commits its offsets under, named `<prefix>-<stage>`.
     ///
-    /// An offset is per group, so every stage that commits needs its own name. Storage
-    /// reads two topics under separate groups, so it passes a compound stage name
-    /// (`storage-<topic>`) rather than sharing one across both.
+    /// An offset is per group, so every stage that commits needs its own name.
     #[must_use]
     pub fn group(&self, stage: &str) -> String {
         format!("{}-{stage}", self.group_prefix)
+    }
+
+    /// The consumer group storage reads `topic` under, named `<prefix>-storage-<topic>`.
+    ///
+    /// Storage drains two topics (the raw stream and, when decode runs, the decoded one)
+    /// and an offset is per group *and* per topic, so it needs one group each. The topic
+    /// is in the name — not a `storage-raw`/`storage-decoded` alias — so the group is a
+    /// pure function of the deployment's topic names. Renaming one resets that topic's
+    /// committed offsets and replays it, so the name is a durability contract.
+    #[must_use]
+    pub fn storage_group(&self, topic: &str) -> String {
+        self.group(&format!("storage-{topic}"))
     }
 }
 
@@ -216,7 +226,7 @@ pub enum BusKind {
 #[serde(deny_unknown_fields, default)]
 pub struct KafkaSettings {
     /// Comma-separated `host:port` bootstrap servers. Required when the bus is Kafka, and
-    /// non-empty then; the check is in [`Settings::confirm`], because serde cannot make a
+    /// non-empty then; the check is in `Settings::confirm`, because serde cannot make a
     /// field required only for one value of a sibling.
     pub brokers: String,
     /// Any other librdkafka property, passed straight through.
@@ -716,19 +726,25 @@ brokres = "typo"
         assert_eq!(settings.bus.raw_topic, DEFAULT_RAW_TOPIC);
     }
 
-    /// A stage's consumer group is `<prefix>-<stage>`, and storage appends the topic. The
-    /// name is a durability contract — an offset is per group, so renaming one silently
-    /// resets it — which is why it is derived in one place rather than formatted at each
-    /// call site.
+    /// A stage's consumer group is `<prefix>-<stage>`, and storage's is
+    /// `<prefix>-storage-<topic>`. The name is a durability contract — an offset is per
+    /// group, so renaming one silently resets it — which is why it is derived in one place
+    /// rather than formatted at each call site.
     #[test]
     fn a_consumer_group_is_the_prefix_and_stage() {
         let settings =
             Settings::from_str("[bus]\ngroup_prefix = \"team\"\n[bus.kafka]\nbrokers = \"x\"\n")
                 .expect("settings parse");
         assert_eq!(settings.bus.group("decode"), "team-decode");
+        // The topic is in the name, not a `storage-raw` alias: the group must not move
+        // when the stage's shape does, or a deploy replays both topics from offset 0.
         assert_eq!(
-            settings.bus.group("storage-raw.chain"),
+            settings.bus.storage_group("raw.chain"),
             "team-storage-raw.chain"
+        );
+        assert_eq!(
+            settings.bus.storage_group("decoded.chain"),
+            "team-storage-decoded.chain"
         );
     }
 

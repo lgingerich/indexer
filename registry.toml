@@ -31,8 +31,22 @@ abi = "uniswap_v3_factory"
 # `Initialize` record it emits *is* the pool's metadata.
 [[contract]]
 chain = "base"
-address = "0x000000000004444c5dc75cB358380D2e3dE08A90" # V4 PoolManager
+address = "0x498581fF718922c3f8e6A244956aF099B2652b2b" # V4 PoolManager on Base
 abi = "uniswap_v4_pool_manager"
+
+# Two busy V3 pools, registered directly so `cargo run` decodes swaps out of the box.
+# The factory rule above is the scalable path — these are here because a fresh run has no
+# `PoolCreated` in its window to discover from, so without them nothing would decode on a
+# short run. Delete either once the factory rule has registered a pool on its own.
+[[contract]]
+chain = "base"
+address = "0x2df380544b88adb3ad0a94100dcc45fd705aae2d" # V3 pool, high volume
+abi = "uniswap_v3_pool"
+
+[[contract]]
+chain = "base"
+address = "0x1ef035205f94c7734827961c438474d089a334a0" # V3 pool, high volume
+abi = "uniswap_v3_pool"
 
 # A rule: when this factory's creation event decodes, register its child. The child's ABI
 # is already loaded, so registration is deterministic — no network, no lookahead. The

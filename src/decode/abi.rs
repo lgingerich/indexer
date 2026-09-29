@@ -79,8 +79,7 @@ impl Abi {
     /// Anonymous events are excluded: they carry no selector in `topic0`, so they cannot
     /// be found by one, and pretending otherwise would match the wrong event on an
     /// unrelated log.
-    #[must_use]
-    pub fn from_abi(abi: &JsonAbi) -> Self {
+    fn from_abi(abi: &JsonAbi) -> Self {
         let by_selector = abi
             .events()
             .filter(|event| !event.anonymous)

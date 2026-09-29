@@ -98,12 +98,6 @@ impl KafkaSink {
     pub fn partition_key(envelope: &Envelope) -> &str {
         envelope.chain.as_str()
     }
-
-    /// The topic this sink produces to.
-    #[must_use]
-    pub fn topic(&self) -> &str {
-        &self.topic
-    }
 }
 
 impl EnvelopeSink for KafkaSink {

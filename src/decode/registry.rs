@@ -157,7 +157,6 @@ pub trait AbiRegistry {
 /// The loaded registry: one shared ABI per address, plus the discovery rules.
 #[derive(Debug, Default)]
 pub struct ContractRegistry {
-    abis: HashMap<String, Arc<Abi>>,
     entries: HashMap<(ChainId, Address), Contract>,
     rules: HashMap<(ChainId, Address, B256), Rule>,
 }
@@ -244,21 +243,41 @@ impl ContractRegistry {
         let base = base.as_ref();
         let mut registry = Self::default();
 
+        // A load-time name map, deliberately local: contracts and rules resolve their ABI
+        // by name here, and once both loops finish nothing references a name again, so the
+        // registry retains one `Arc<Abi>` per address and drops the map. A duplicate name
+        // is refused rather than last-wins, because every other registry mistake is a
+        // startup error and a name is a reference, not an address.
+        let mut by_name: HashMap<String, Arc<Abi>> = HashMap::with_capacity(abis.len());
         for entry in abis {
             let path = base.join(&entry.path);
             let json = std::fs::read_to_string(&path).map_err(|source| RegistryError::AbiFile {
                 path: path.display().to_string(),
                 source,
             })?;
-            registry
-                .abis
-                .insert(entry.name.clone(), Arc::new(Abi::from_json(&json)?));
+            if by_name
+                .insert(entry.name.clone(), Arc::new(Abi::from_json(&json)?))
+                .is_some()
+            {
+                return Err(RegistryError::DuplicateAbi {
+                    name: entry.name.clone(),
+                });
+            }
         }
+        let abi_named = |name: &str, entry: &str| -> Result<Arc<Abi>, RegistryError> {
+            by_name
+                .get(name)
+                .cloned()
+                .ok_or_else(|| RegistryError::UnknownAbi {
+                    entry: entry.to_owned(),
+                    name: name.to_owned(),
+                })
+        };
 
         for contract in contracts {
             let address = parse_address(&contract.chain, &contract.address)?;
             let origin = format!("{}.{}", contract.chain, contract.address);
-            let abi = registry.abi_named(&contract.abi, &origin)?;
+            let abi = abi_named(&contract.abi, &origin)?;
             let key = (ChainId::new(&contract.chain), address);
             // The ABI's name is the protocol tag: an ABI is exactly the granularity a
             // protocol has, and the settings already name it.
@@ -277,7 +296,7 @@ impl ContractRegistry {
         for discovery in discoveries {
             let address = parse_address(&discovery.chain, &discovery.address)?;
             let origin = format!("{}.{}", discovery.chain, discovery.address);
-            let abi = registry.abi_named(&discovery.abi, &origin)?;
+            let abi = abi_named(&discovery.abi, &origin)?;
             // The factory must itself be registered to emit the event, so the rule is
             // validated against the factory's ABI.
             let selector = registry
@@ -303,17 +322,6 @@ impl ContractRegistry {
         }
 
         Ok(registry)
-    }
-
-    /// The ABI registered under `name`, or an error naming who referenced it.
-    fn abi_named(&self, name: &str, entry: &str) -> Result<Arc<Abi>, RegistryError> {
-        self.abis
-            .get(name)
-            .cloned()
-            .ok_or_else(|| RegistryError::UnknownAbi {
-                entry: entry.to_owned(),
-                name: name.to_owned(),
-            })
     }
 
     /// Registers a contract learned at runtime, from a [`Discovery`] the transform
@@ -423,6 +431,12 @@ pub enum RegistryError {
         /// The registration as written, for locating it.
         entry: String,
         /// The ABI name it referenced.
+        name: String,
+    },
+    /// Two `[[abi]]` entries declare one name.
+    #[error("two [[abi]] entries are named {name:?}; a name must label one ABI")]
+    DuplicateAbi {
+        /// The name both entries claimed.
         name: String,
     },
     /// Two registry entries claim one `(chain, address)`.
@@ -548,6 +562,18 @@ mod tests {
             abi_dir(),
         );
         assert!(result.is_err(), "a dangling ABI reference must be caught");
+    }
+
+    /// A name is a reference, not an address, so two `[[abi]]` entries claiming one name
+    /// is a malformed catalog — a startup error rather than a silent last-wins that leaves
+    /// whichever contract referenced it decoding with the other's ABI.
+    #[test]
+    fn two_abis_with_one_name_are_refused() {
+        let result = ContractRegistry::load(&[pool_abi(), pool_abi()], &[], &[], abi_dir());
+        assert!(
+            matches!(result, Err(super::RegistryError::DuplicateAbi { .. })),
+            "a duplicate ABI name must be caught"
+        );
     }
 
     #[test]

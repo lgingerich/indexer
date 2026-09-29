@@ -248,10 +248,12 @@ impl Pipeline {
             None
         };
         // Storage reads the raw topic under its own group, and the decoded topic under a
-        // second one, because an offset is per group and per topic.
-        let raw_for_store = transport.source(&bus.raw_topic, &bus.group("storage-raw"))?;
+        // second one, because an offset is per group and per topic. The topic is part of
+        // the group name: it is a durability contract, and the name is what a deployment
+        // upgrades under, so it must not change when the stage's shape does.
+        let raw_for_store = transport.source(&bus.raw_topic, &bus.storage_group(&bus.raw_topic))?;
         let decoded_for_store = if decoding {
-            Some(transport.source(&bus.decoded_topic, &bus.group("storage-decoded"))?)
+            Some(transport.source(&bus.decoded_topic, &bus.storage_group(&bus.decoded_topic))?)
         } else {
             None
         };
