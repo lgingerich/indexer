@@ -712,4 +712,61 @@ mod tests {
         let remembered: Vec<u64> = pipeline.history.iter().map(|block| block.height).collect();
         assert_eq!(remembered, [3, 4]);
     }
+
+    /// The live loop: each head the subscription reports is fetched and published in
+    /// turn, and the subscription ending is a failure rather than a clean stop — a live
+    /// indexer that silently stops is the worst outcome there is.
+    #[tokio::test]
+    async fn run_drives_each_head_through_fetch_and_publish() {
+        /// Emits two heads, then ends; serves each head's block on demand.
+        struct HeadingSource {
+            chain: ChainId,
+        }
+
+        impl BlockSource for HeadingSource {
+            fn chain(&self) -> &ChainId {
+                &self.chain
+            }
+
+            async fn subscribe_heads(&self) -> Result<HeadStream, SourceError> {
+                let heads = vec![
+                    Ok(BlockId {
+                        height: 1,
+                        hash: hash(1),
+                    }),
+                    Ok(BlockId {
+                        height: 2,
+                        hash: hash(2),
+                    }),
+                ];
+                Ok(Box::pin(stream::iter(heads)))
+            }
+
+            async fn fetch_block(&self, height: u64) -> Result<FetchedBlock, SourceError> {
+                let (block_hash, parent) = if height == 1 {
+                    (hash(1), hash(0))
+                } else {
+                    (hash(2), hash(1))
+                };
+                Ok(fetched(vec![block_event(height, block_hash, parent)]))
+            }
+        }
+
+        let source = HeadingSource {
+            chain: ChainId::new("ethereum"),
+        };
+        let mut pipeline = Pipeline::new(source, CollectSink::default());
+
+        let error = pipeline
+            .run()
+            .await
+            .expect_err("a closed subscription must not be a clean stop");
+
+        // Both heads were followed in order before the subscription ended.
+        assert_eq!(pipeline.sink.kinds(), ["block", "block"]);
+        assert_eq!(pipeline.sink.sequences(), [0, 1]);
+        assert_eq!(pipeline.next_sequence(), 2);
+        // The error names the last height it saw, so a stopped live run is diagnosable.
+        assert!(error.to_string().contains('2'), "{error}");
+    }
 }

@@ -119,8 +119,10 @@ mod tests {
         Address::from([byte; 20])
     }
 
-    /// Every variant must survive the round trip an event takes: serialized, then
-    /// read back by a consumer.
+    /// The round trip a value takes through a sink and back. The derive makes this
+    /// pass by construction, so it guards only against someone replacing the derive
+    /// with a hand-written `Serialize`/`Deserialize`; the tagging is pinned by the two
+    /// format tests below.
     #[test]
     fn every_variant_round_trips_through_json() {
         let variants = [

@@ -451,10 +451,13 @@ pub enum RegistryError {
 // or setup is wrong.
 #[expect(clippy::expect_used)]
 mod tests {
+    use std::sync::Arc;
+
     use alloy_primitives::{Address, B256};
 
-    use super::{AbiEntry, ContractEntry, ContractRegistry, DiscoveryEntry};
+    use super::{AbiEntry, ContractEntry, ContractRegistry, Discovery, DiscoveryEntry};
     use crate::decode::AbiRegistry as _;
+    use crate::decode::abi::Abi;
     use crate::wire::envelope::ChainId;
 
     const POOL: &str = "0xd0b53D9277642d899DF5C87A3966A349A798F224";
@@ -607,6 +610,81 @@ mod tests {
     fn no_entries_is_an_empty_registry() {
         let registry = ContractRegistry::load(&[], &[], &[], abi_dir()).expect("empty is fine");
         assert!(registry.is_empty());
+    }
+
+    /// Discovery never overrides a static registration. A learned address is
+    /// speculation; a registration in the file is a deliberate statement, so a rule that
+    /// reveals an address already claimed must leave that contract's ABI and protocol
+    /// alone rather than quietly replacing them.
+    #[test]
+    fn discovery_does_not_override_a_static_registration() {
+        let mut registry = ContractRegistry::load(
+            &[pool_abi(), factory_abi()],
+            &[contract("base", POOL, "uniswap_v3_pool")],
+            &[],
+            abi_dir(),
+        )
+        .expect("the registry loads");
+        let chain = ChainId::new("base");
+        let child: Address = POOL.parse().expect("an address");
+
+        registry.register_discovered(
+            &chain,
+            Discovery {
+                child,
+                abi: Arc::new(
+                    Abi::from_json(include_str!("../../abis/uniswap_v3_factory.json"))
+                        .expect("factory ABI"),
+                ),
+                protocol: "uniswap_v3_factory".to_owned(),
+            },
+        );
+
+        // The static protocol (its ABI name) stands; the learned one did not win.
+        assert_eq!(
+            registry
+                .contract(&chain, child, 1)
+                .expect("registered")
+                .protocol,
+            "uniswap_v3_pool"
+        );
+        assert_eq!(registry.len(), 1, "no second entry was added");
+    }
+
+    /// Re-registering a known child is a no-op, which is the normal case: a factory
+    /// replaces a pool, or a replayed stream re-discovers what a prior pass found. The
+    /// count must not grow.
+    #[test]
+    fn re_registering_a_discovered_child_is_a_no_op() {
+        let mut registry = ContractRegistry::default();
+        let chain = ChainId::new("base");
+        let child: Address = POOL.parse().expect("an address");
+        // A second, *different* discovery of the same address must be inert: the first
+        // wins, because discovery only adds addresses and never re-points one.
+        let discovery = |protocol: &str| Discovery {
+            child,
+            abi: Arc::new(
+                Abi::from_json(include_str!("../../abis/uniswap_v3_pool.json")).expect("pool ABI"),
+            ),
+            protocol: protocol.to_owned(),
+        };
+
+        registry.register_discovered(&chain, discovery("uniswap_v3_pool"));
+        registry.register_discovered(&chain, discovery("uniswap_v3_factory"));
+
+        assert_eq!(
+            registry.len(),
+            1,
+            "a second discovery of the same child is inert"
+        );
+        assert_eq!(
+            registry
+                .contract(&chain, child, 1)
+                .expect("registered")
+                .protocol,
+            "uniswap_v3_pool",
+            "the first discovery stands; a later one does not re-point the address"
+        );
     }
 
     /// A registry file loads through `from_file`, resolving its ABI paths against the
