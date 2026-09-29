@@ -1,30 +1,29 @@
-//! Running the storage stage: topics in, rows in a local store.
+//! Draining a source into a store, with no opinion about either.
 //!
-//! One consumer group per topic, because an offset is per group: one group spanning two
-//! topics would commit a single position across both.
+//! This is the loop and the policy around it: when to flush, when a source has gone
+//! quiet, when to advance the checkpoint. It names no broker and opens no database — the
+//! caller supplies both — which is the same contract [`crate::ingest`] and
+//! [`crate::decode`] have, and is what lets the same loop drive a file, a topic, or a
+//! test double.
 //!
-//! By default the stage runs until the process stops, because that is what a live stream
-//! needs. A bounded run sets a drain bound, which stops a topic once it has been idle for
-//! long enough — see [`StorageBuilder::drain`].
+//! By default the stage runs until the source ends or the process stops, because that is
+//! what a live stream needs. A bounded run sets a drain bound, which stops once the
+//! source has been idle long enough — see [`StorageBuilder::drain`].
 //!
-//! This lives beside the sink it drives rather than in a module of its own. A stage
-//! module elsewhere in the tree holds domain logic — `ingest` decodes chain data and
-//! orders it, `decode` reads ABI-encoded logs — and this holds none: it wires a
-//! [`KafkaSource`] to a [`DuckDbSink`], both defined here, and drains.
+//! # Why it lives here
+//!
+//! It has no domain logic, unlike `ingest` (which decodes chain data and orders it) and
+//! `decode` (which reads ABI-encoded logs). It is the counterpart of the sinks in this
+//! module, and exists so a caller does not write the same flush-commit-checkpoint loop
+//! per destination.
 
-use std::collections::BTreeMap;
-use std::path::PathBuf;
 use std::time::{Duration, Instant};
+
+use anyhow::Result;
 use tokio::time::error::Elapsed;
 
-use anyhow::{Context as _, Result};
-use duckdb::{Config, Connection};
-use rdkafka::ClientConfig;
-use rdkafka::consumer::{Consumer as _, StreamConsumer};
-use tracing::info;
-
-use crate::config::{BatchConfig, KafkaConfig};
-use crate::connectors::{DuckDbSink, EnvelopeSource as _, EventSink as _, KafkaSource};
+use crate::config::BatchConfig;
+use crate::connectors::{EnvelopeSource, EventSink};
 use crate::wire::envelope::Envelope;
 
 /// What one turn of the drain loop concluded from a read attempt.
@@ -79,197 +78,106 @@ fn classify(
 }
 
 /// Builds and runs the storage stage.
+///
+/// It drains a source into a sink and knows neither the broker nor the store: the
+/// connection is opened by the caller and handed in, the same way [`crate::ingest`] takes
+/// its sink and [`super::Storage`]'s own peers take theirs. What lives here is the loop
+/// and the policy around it — when to flush, when a topic has gone quiet, when to
+/// advance the checkpoint — and none of that depends on which engine is behind the sink.
 #[derive(Debug)]
 pub struct Storage {
-    kafka: KafkaConfig,
     batch: BatchConfig,
-    topics: Vec<String>,
-    database: PathBuf,
     drain: Option<Duration>,
-    /// The runtime's librdkafka properties, applied to every consumer built here.
-    client: ClientConfig,
-    /// Extra `DuckDB` settings, passed straight to `Config::with`.
-    duckdb: BTreeMap<String, String>,
 }
 
 impl Storage {
-    /// Starts a build against `kafka`.
+    /// Starts a build.
     #[must_use]
-    pub fn builder(kafka: KafkaConfig) -> StorageBuilder {
-        StorageBuilder::new(kafka)
+    pub fn builder() -> StorageBuilder {
+        StorageBuilder::new()
     }
 
-    /// Drains each topic into the store.
+    /// Drains `source` into `sink`.
     ///
-    /// Ends when every topic has been idle for the configured drain bound, or never
-    /// when none is set.
+    /// Ends when the source ends, or when it has been idle for the configured drain
+    /// bound, or never when none is set.
     ///
     /// # Errors
     ///
-    /// Returns an error when the store cannot be opened, the broker cannot be reached,
-    /// or a row cannot be written. An idle topic is not an error, and is not confused
-    /// with a failed one: see the loop below.
-    pub async fn run(self) -> Result<()> {
-        // Any `[storage.duckdb]` setting reaches the engine, which validates it: an
-        // unknown key is an error naming the setting rather than a silent no-op. The
-        // path is set last, since it is not a setting the operator should override here.
-        let mut config = Config::default();
-        for (key, value) in &self.duckdb {
-            config = config
-                .with(key, value)
-                .with_context(|| format!("duckdb setting {key:?} was rejected"))?;
-        }
-        let connection = Connection::open_with_flags(&self.database, config)
-            .with_context(|| format!("open store at {}", self.database.display()))?;
-        let mut sink = DuckDbSink::new(connection)?;
-
-        info!(
-            topics = %self.topics.join(","),
-            database = %self.database.display(),
-            group = %self.kafka.group,
-            "storage started"
-        );
-
+    /// Returns an error when a record cannot be read or a row cannot be written. An idle
+    /// source is not an error, and is not confused with a failed one: an idle read is
+    /// kept distinct from a failed one rather than reported as a drained topic.
+    pub async fn run<S, K>(&self, source: &mut S, sink: &mut K) -> Result<u64>
+    where
+        S: EnvelopeSource,
+        K: EventSink,
+    {
         let mut stored = 0_u64;
-        for topic in &self.topics {
-            // Named for the topic, so committing one topic's position cannot move
-            // another's. The runtime's properties come first and the stage's own after,
-            // so a passthrough cannot override a setting the stage depends on.
-            let mut client = self.client.clone();
-            client
-                .set("group.id", format!("{}-{topic}", self.kafka.group))
-                .set("auto.offset.reset", "earliest")
-                .set("enable.auto.commit", "false");
-            let consumer: StreamConsumer = client.create().context("create consumer")?;
-            consumer
-                .subscribe(&[topic])
-                .with_context(|| format!("subscribe to {topic}"))?;
+        let mut pending = 0;
+        let mut last_flush = Instant::now();
+        // Time since the last record, and whether any has arrived yet. The idle clock
+        // must not start until the first record, because a consumer group takes a moment
+        // to join and assign partitions: counting that as idleness makes a short drain
+        // bound fire before the source has been read at all, and report "drained" having
+        // stored nothing.
+        //
+        // `ponytail:` a genuinely empty source therefore never trips the bound, so a
+        // bounded run against one waits for the process to be stopped. Distinguishing
+        // "joined and empty" from "not yet joined" means reading the source's assignment,
+        // which is the upgrade path.
+        let mut saw_a_record = false;
+        let mut idle_since = Instant::now();
 
-            let mut source = KafkaSource::new(consumer);
-            let mut pending = 0;
-            let mut last_flush = Instant::now();
-            let mut topic_stored = 0_u64;
-            // Time since the last record, and whether any has arrived yet. The idle
-            // clock must not start until the first record, because a consumer group
-            // takes a moment to join and assign partitions: counting that as idleness
-            // makes a short drain bound fire before the topic has been read at all, and
-            // report "drained" having stored nothing.
-            //
-            // `ponytail:` a topic that is genuinely empty at startup therefore never
-            // trips the bound, so a bounded run against one waits for the process to be
-            // stopped. Distinguishing "joined and empty" from "not yet joined" means
-            // reading `assignment()`, which is the upgrade path.
-            let mut saw_a_record = false;
-            let mut idle_since = Instant::now();
+        loop {
+            // A timeout per record is what makes the idle bound observable: a source
+            // with nothing to read blocks, so silence has to be measured against a
+            // deadline rather than watched for.
+            let outcome = tokio::time::timeout(self.batch.every, source.next()).await;
+            let envelope = match classify(outcome, idle_since.elapsed(), self.drain, saw_a_record)?
+            {
+                Step::Record(envelope) => *envelope,
+                Step::Idle => continue,
+                Step::Stop => break,
+            };
 
-            loop {
-                // A timeout per record is what makes the idle bound observable: a
-                // consumer with nothing to read blocks, so silence has to be measured
-                // against a deadline rather than watched for.
-                let outcome = tokio::time::timeout(self.batch.every, source.next()).await;
-                let envelope =
-                    match classify(outcome, idle_since.elapsed(), self.drain, saw_a_record)? {
-                        Step::Record(envelope) => *envelope,
-                        Step::Idle => continue,
-                        Step::Stop => break,
-                    };
+            sink.publish(&envelope).await?;
+            stored += 1;
+            pending += 1;
+            saw_a_record = true;
+            idle_since = Instant::now();
 
-                sink.publish(&envelope).await?;
-                stored += 1;
-                topic_stored += 1;
-                pending += 1;
-                saw_a_record = true;
-                idle_since = Instant::now();
-
-                if pending >= self.batch.records || last_flush.elapsed() >= self.batch.every {
-                    sink.flush().await?;
-                    source.commit()?;
-                    pending = 0;
-                    last_flush = Instant::now();
-                }
+            if pending >= self.batch.records || last_flush.elapsed() >= self.batch.every {
+                sink.flush().await?;
+                source.commit().await?;
+                pending = 0;
+                last_flush = Instant::now();
             }
-
-            sink.flush().await?;
-            source.commit()?;
-            info!(topic, rows = topic_stored, "topic drained");
         }
 
-        info!(stored, "storage stopped");
-        Ok(())
+        sink.flush().await?;
+        source.commit().await?;
+        Ok(stored)
     }
 }
 
 /// Builds a [`Storage`].
 #[derive(Debug)]
 pub struct StorageBuilder {
-    kafka: KafkaConfig,
     batch: BatchConfig,
-    topics: Vec<String>,
-    database: PathBuf,
     drain: Option<Duration>,
-    /// The runtime's librdkafka properties, applied to every consumer built here.
-    client: ClientConfig,
-    /// Extra `DuckDB` settings, passed straight to `Config::with`.
-    duckdb: BTreeMap<String, String>,
 }
 
 impl StorageBuilder {
-    /// Starts a build against `kafka`.
+    /// Starts a build.
     #[must_use]
-    pub fn new(kafka: KafkaConfig) -> Self {
-        let mut client = ClientConfig::new();
-        client.set("bootstrap.servers", &kafka.brokers);
+    pub fn new() -> Self {
         Self {
-            kafka,
             batch: BatchConfig::default(),
-            topics: Vec::new(),
-            database: PathBuf::from(crate::config::DEFAULT_DATABASE),
-            // No drain bound by default, because the default must suit a live stream:
-            // a stage that stops whenever a topic goes quiet for a few seconds would
-            // take the process down with it. A bounded run opts in explicitly.
+            // No drain bound by default, because the default must suit a live stream: a
+            // stage that stops whenever a source goes quiet for a few seconds would take
+            // the process down with it. A bounded run opts in explicitly.
             drain: None,
-            client,
-            duckdb: BTreeMap::new(),
         }
-    }
-
-    /// Adds a topic to drain.
-    #[must_use]
-    pub fn topic(mut self, topic: impl Into<String>) -> Self {
-        self.topics.push(topic.into());
-        self
-    }
-
-    /// Drains several topics.
-    #[must_use]
-    pub fn topics<I, S>(mut self, topics: I) -> Self
-    where
-        I: IntoIterator<Item = S>,
-        S: Into<String>,
-    {
-        self.topics.extend(topics.into_iter().map(Into::into));
-        self
-    }
-
-    /// Sets the librdkafka properties every consumer this stage builds inherits.
-    #[must_use]
-    pub fn client(mut self, client: ClientConfig) -> Self {
-        self.client = client;
-        self
-    }
-
-    /// Sets extra `DuckDB` settings, passed to the engine as written.
-    #[must_use]
-    pub fn duckdb(mut self, settings: BTreeMap<String, String>) -> Self {
-        self.duckdb = settings;
-        self
-    }
-
-    /// Sets the store's path.
-    #[must_use]
-    pub fn database(mut self, path: impl Into<PathBuf>) -> Self {
-        self.database = path.into();
-        self
     }
 
     /// Sets how many records to buffer before flushing.
@@ -279,7 +187,7 @@ impl StorageBuilder {
         self
     }
 
-    /// Stops each topic once it has been idle for `drain`.
+    /// Stops once the source has been idle for `drain`.
     ///
     /// For a bounded run — a backfill, a test, a one-shot drain — not for a live stream,
     /// where idleness is normal and stopping is a fault.
@@ -290,24 +198,18 @@ impl StorageBuilder {
     }
 
     /// Finishes the build.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when no topic was named, since a storage stage with nothing to
-    /// read would start and immediately stop.
-    pub fn build(self) -> Result<Storage> {
-        if self.topics.is_empty() {
-            anyhow::bail!("storage needs at least one topic");
-        }
-        Ok(Storage {
-            kafka: self.kafka,
+    #[must_use]
+    pub fn build(self) -> Storage {
+        Storage {
             batch: self.batch,
-            topics: self.topics,
-            database: self.database,
             drain: self.drain,
-            client: self.client,
-            duckdb: self.duckdb,
-        })
+        }
+    }
+}
+
+impl Default for StorageBuilder {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

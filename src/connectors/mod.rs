@@ -4,9 +4,9 @@
 //! [`EnvelopeSource`] is its mirror for a consumer. Both sit on the same bus, so a
 //! process that decodes is a consumer of one topic and a producer of another.
 //!
-//! Both speak [`Envelope`]. This module also owns the store's runtime — [`Storage`] —
-//! because the sink and the process that drives it only make sense together, and the
-//! stage is nothing but wiring of connectors that live here.
+//! Both speak [`Envelope`]. This module also owns [`Storage`], the loop that drains a
+//! source into a sink, because it has no domain logic of its own and every destination
+//! needs the same flush-commit-checkpoint handling.
 //!
 //! A sink is a dumb serializing boundary: it renders the [`Envelope`] as-is and knows
 //! nothing about chains. The schema version is a field on the envelope, not a property
@@ -17,6 +17,10 @@
 //! client (a `librdkafka` producer or consumer, a `DuckDB` connection) and injects it,
 //! so the module stays a library and the runtime owns connection pools, group ids,
 //! timeouts, and callbacks.
+//!
+//! No stage constructs a client. [`crate::ingest`], [`crate::decode`], and [`Storage`]
+//! all take their source and sink as parameters — which is what lets them run over a
+//! file or a test double, and what keeps client settings in one place.
 
 #[cfg(feature = "duckdb")]
 pub mod duckdb;
@@ -82,10 +86,14 @@ pub trait EventSink: Send {
 ///
 /// # Checkpointing
 ///
-/// Offsets are the checkpoint, and committing them is deliberately *not* part of this
-/// trait. A consumer's correct commit point is a property of how it delivers — after a
-/// flush, after a batch, never — so a stage owning its runtime owns that decision.
-/// A source that committed per record would make at-least-once delivery unachievable.
+/// [`commit`](EnvelopeSource::commit) advances the checkpoint to everything consumed so
+/// far. The stage decides *when* to call it — after its sink's flush, never per record —
+/// because the correct commit point is a property of how the stage delivers, not of the
+/// source. A source that committed per record would make at-least-once delivery
+/// unachievable; one that never committed would replay from the beginning.
+///
+/// A source with no checkpoint to advance implements it as a no-op, which is why the
+/// default is `Ok(())` rather than a required method.
 pub trait EnvelopeSource: Send {
     /// The next envelope, or `None` when the stream has ended.
     ///
@@ -95,4 +103,16 @@ pub trait EnvelopeSource: Send {
     /// that are not an envelope. The caller stops rather than skipping, since skipping
     /// a record the source has already advanced past is data loss.
     fn next(&mut self) -> impl Future<Output = anyhow::Result<Option<Envelope>>> + Send;
+
+    /// Marks everything returned so far as processed.
+    ///
+    /// Called after the stage's output is durable, so a crash between the two replays a
+    /// batch rather than losing one.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the checkpoint cannot be advanced.
+    fn commit(&mut self) -> impl Future<Output = anyhow::Result<()>> + Send {
+        async { Ok(()) }
+    }
 }

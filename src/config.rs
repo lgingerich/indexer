@@ -236,6 +236,60 @@ impl Settings {
         }
         config
     }
+
+    /// A subscribed consumer for `topic`, under `group`.
+    ///
+    /// Applies this stage's own consumer settings after the passthrough, so a property
+    /// in `[kafka.properties]` cannot override one the checkpoint depends on.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the consumer cannot be created or the subscription fails.
+    #[cfg(feature = "kafka")]
+    pub fn consumer(
+        &self,
+        group: &str,
+        topic: &str,
+    ) -> anyhow::Result<crate::connectors::KafkaSource> {
+        use rdkafka::consumer::Consumer as _;
+
+        let consumer: rdkafka::consumer::StreamConsumer = self
+            .client_config()
+            .set("group.id", group)
+            // A fresh group starts at the beginning rather than skipping the history it
+            // was created to read.
+            .set("auto.offset.reset", "earliest")
+            // The commit point is the stage's decision, after its sink's flush.
+            .set("enable.auto.commit", "false")
+            .create()
+            .map_err(|error| anyhow::anyhow!("create consumer for {topic}: {error}"))?;
+        consumer
+            .subscribe(&[topic])
+            .map_err(|error| anyhow::anyhow!("subscribe to {topic}: {error}"))?;
+        Ok(crate::connectors::KafkaSource::new(consumer))
+    }
+
+    /// A connection to the configured store, with `[storage.duckdb]` applied.
+    ///
+    /// The engine validates each passthrough setting, so an unknown key is an error
+    /// naming it rather than a silent no-op.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a setting is rejected or the database cannot be opened.
+    #[cfg(feature = "duckdb")]
+    pub fn store_connection(&self) -> anyhow::Result<duckdb::Connection> {
+        use anyhow::Context as _;
+
+        let mut config = duckdb::Config::default();
+        for (key, value) in &self.storage.duckdb {
+            config = config
+                .with(key, value)
+                .with_context(|| format!("duckdb setting {key:?} was rejected"))?;
+        }
+        duckdb::Connection::open_with_flags(&self.storage.database, config)
+            .with_context(|| format!("open store at {}", self.storage.database.display()))
+    }
 }
 
 /// The default topic ingest publishes to, and decode consumes.

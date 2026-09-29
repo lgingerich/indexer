@@ -168,22 +168,6 @@ impl KafkaSource {
     pub const fn new(consumer: StreamConsumer) -> Self {
         Self { consumer }
     }
-
-    /// Commits the offsets of everything consumed so far.
-    ///
-    /// The caller's durability point, to be called after its own output is flushed.
-    /// Committing before a flush risks losing records on a crash; never committing
-    /// risks replaying from the last commit, which is safe where the transform applied
-    /// between the two is a pure function.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the commit is rejected by the broker.
-    pub fn commit(&self) -> anyhow::Result<()> {
-        self.consumer
-            .commit_consumer_state(CommitMode::Async)
-            .context("commit offsets")
-    }
 }
 
 impl EnvelopeSource for KafkaSource {
@@ -195,6 +179,12 @@ impl EnvelopeSource for KafkaSource {
         let envelope: Envelope = serde_json::from_slice(payload)
             .context("payload is not an envelope from this indexer")?;
         Ok(Some(envelope))
+    }
+
+    async fn commit(&mut self) -> anyhow::Result<()> {
+        self.consumer
+            .commit_consumer_state(CommitMode::Async)
+            .context("commit offsets")
     }
 }
 

@@ -28,8 +28,8 @@ use anyhow::{Context as _, Result};
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 
-use indexer::config::{KafkaConfig, Settings};
-use indexer::connectors::{KafkaSink, StdoutJsonSink, Storage};
+use indexer::config::Settings;
+use indexer::connectors::{DuckDbSink, KafkaSink, StdoutJsonSink, Storage};
 use indexer::decode::Decode;
 use indexer::decode::contracts::ContractRegistry;
 use indexer::ingest::Ingest;
@@ -58,6 +58,10 @@ async fn main() -> ExitCode {
 }
 
 /// Reads the settings file and runs every configured stage until one stops.
+///
+/// This is the only place that knows what the transport is. Every stage takes its source
+/// and sink as parameters, so swapping Kafka for a file or a test double is a change
+/// here and nowhere else.
 async fn run() -> Result<()> {
     let path = std::env::args()
         .nth(1)
@@ -67,6 +71,16 @@ async fn run() -> Result<()> {
     let batch = settings.batch();
     let raw_topic = settings.raw_topic().to_owned();
     let decoded_topic = settings.kafka.decoded_topic.clone();
+
+    // ABI paths in the settings file read as relative to it, not to the process's
+    // working directory, so the file stays portable.
+    let registry = ContractRegistry::load(&settings.storage.protocol, settings_dir(&path))?;
+    let decode = Decode::builder().registry(registry).batch(batch).build()?;
+    let mut storage = Storage::builder().batch(batch);
+    if let Some(drain) = settings.drain() {
+        storage = storage.drain(drain);
+    }
+    let storage = storage.build();
 
     let ingest = settings
         .ingest
@@ -79,37 +93,6 @@ async fn run() -> Result<()> {
         })
         .transpose()?;
 
-    // ABI paths in the settings file read as relative to it, not to the process's
-    // working directory, so the file stays portable.
-    let registry = ContractRegistry::load(&settings.storage.protocol, settings_dir(&path))?;
-    let decode = Decode::builder(
-        KafkaConfig::builder(&settings.kafka.brokers)
-            .group(format!("{}-decode", settings.kafka.group_prefix))
-            .input_topic(raw_topic.clone())
-            .output_topic(decoded_topic.clone())
-            .build()?,
-    )
-    .registry(registry)
-    .batch(batch)
-    .client(settings.client_config())
-    .build()?;
-
-    let mut storage = Storage::builder(
-        KafkaConfig::builder(&settings.kafka.brokers)
-            .group(format!("{}-storage", settings.kafka.group_prefix))
-            .input_topic(raw_topic.clone())
-            .build()?,
-    )
-    .topics([raw_topic.clone(), decoded_topic.clone()])
-    .database(settings.storage.database.clone())
-    .batch(batch)
-    .client(settings.client_config())
-    .duckdb(settings.storage.duckdb.clone());
-    if let Some(drain) = settings.drain() {
-        storage = storage.drain(drain);
-    }
-    let storage = storage.build()?;
-
     info!(
         settings = %path,
         raw_topic = %raw_topic,
@@ -118,10 +101,11 @@ async fn run() -> Result<()> {
         "starting"
     );
 
-    // Ingest publishes through whichever sink the settings chose; the other two run on
-    // the bus it feeds.
     let client = settings.client_config();
     let stdout = settings.ingest.as_ref().is_some_and(|ingest| ingest.stdout);
+
+    // Ingest publishes through whichever sink the settings chose. It takes its sink as a
+    // value, since it owns the pipeline that drives it.
     let ingest_run = async {
         let Some(ingest) = ingest else {
             // Ingest is not configured; the other stages run on their own.
@@ -138,15 +122,49 @@ async fn run() -> Result<()> {
         }
     };
 
+    // Decode and storage commit offsets after their sink's flush, so they borrow the
+    // source rather than owning it — the checkpoint is theirs to advance, the handle is
+    // not theirs to keep.
+    let decode_run = async {
+        let mut consumer = settings.consumer(&decoded_consumer_group(&settings), &raw_topic)?;
+        let producer: rdkafka::producer::BaseProducer =
+            client.create().context("create decode producer")?;
+        let mut sink = KafkaSink::new(producer, decoded_topic.clone());
+        decode.run(&mut consumer, &mut sink).await
+    };
+
+    let storage_run = async {
+        let connection = settings.store_connection()?;
+        let mut sink = DuckDbSink::new(connection)?;
+        let mut stored = 0_u64;
+        // One consumer group per topic, because an offset is per group: one group
+        // spanning two topics would commit a single position across both.
+        for topic in [&raw_topic, &decoded_topic] {
+            let mut source = settings.consumer(
+                &format!("{}-storage-{topic}", settings.kafka.group_prefix),
+                topic,
+            )?;
+            stored += storage.run(&mut source, &mut sink).await?;
+            info!(topic, "drained");
+        }
+        info!(stored, "storage stopped");
+        Ok::<(), anyhow::Error>(())
+    };
+
     // Whichever stage stops first ends the process: a stream missing a stage looks
     // alive while quietly falling behind. The stage's own error is carried with it,
     // because "decode stopped" says nothing about why.
     tokio::select! {
         result = ingest_run => result.context("ingest stopped")?,
-        result = decode.run() => result.context("decode stopped")?,
-        result = storage.run() => result.context("storage stopped")?,
+        result = decode_run => result.context("decode stopped")?,
+        result = storage_run => result.context("storage stopped")?,
     }
     Ok(())
+}
+
+/// The consumer group decode commits its offsets under.
+fn decoded_consumer_group(settings: &Settings) -> String {
+    format!("{}-decode", settings.kafka.group_prefix)
 }
 
 /// The directory a settings file lives in, which its relative paths resolve against.
