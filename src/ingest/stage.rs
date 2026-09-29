@@ -17,7 +17,6 @@ pub struct Ingest {
     chain: String,
     http_url: String,
     ws_url: String,
-    undo_depth: usize,
 }
 
 impl Ingest {
@@ -38,13 +37,10 @@ impl Ingest {
             chain = %self.chain,
             http = %self.http_url,
             ws = %self.ws_url,
-            undo_depth = self.undo_depth,
             "ingest started"
         );
         let source = EvmSource::new(self.chain, self.http_url, self.ws_url);
-        Pipeline::with_undo_depth(source, sink, self.undo_depth)
-            .run()
-            .await
+        Pipeline::new(source, sink).run().await
     }
 }
 
@@ -54,7 +50,6 @@ pub struct IngestBuilder {
     chain: String,
     http_url: Option<String>,
     ws_url: Option<String>,
-    undo_depth: usize,
 }
 
 impl IngestBuilder {
@@ -65,7 +60,6 @@ impl IngestBuilder {
             chain: chain.into(),
             http_url: None,
             ws_url: None,
-            undo_depth: crate::ingest::pipeline::DEFAULT_UNDO_DEPTH,
         }
     }
 
@@ -83,14 +77,6 @@ impl IngestBuilder {
         self
     }
 
-    /// Sets how many published blocks the undo ring remembers, and therefore how deep a
-    /// reorg can be retracted.
-    #[must_use]
-    pub const fn undo_depth(mut self, depth: usize) -> Self {
-        self.undo_depth = depth;
-        self
-    }
-
     /// Finishes the build.
     ///
     /// # Errors
@@ -105,7 +91,6 @@ impl IngestBuilder {
             ws_url: self
                 .ws_url
                 .ok_or_else(|| anyhow::anyhow!("ingest ws_url is required"))?,
-            undo_depth: self.undo_depth,
         })
     }
 }
