@@ -1,35 +1,31 @@
 //! The core processing layer, between [`BlockSource`] and [`EnvelopeSink`].
 //!
-//! The three layers split responsibilities like this:
+//! Three layers, three jobs:
 //!
-//! - A **source** knows one chain: how to hear about new heads, fetch a block, and
-//!   turn it into [`Event`]s. It holds no state about what was published.
-//! - A **sink** knows one destination: how to deliver an [`Envelope`] to a given
-//!   chain's stream. It knows nothing about ordering, and it buffers until
+//! - A **source** knows one chain: how to hear about heads, fetch a block, and turn it
+//!   into [`Event`]s. It holds no state about what was published.
+//! - A **sink** knows one destination, with no notion of ordering. It buffers until
 //!   [`flush`](EnvelopeSink::flush), which the pipeline calls once per block.
-//! - The **pipeline** is the only stateful part. It drives the source, turns its
-//!   events into a single ordered stream, and hands each envelope to the sink.
+//! - The **pipeline** is the only stateful part: it drives the source, folds its events
+//!   into one ordered stream, and hands each envelope to the sink.
 //!
-//! Its state is a machine: [`Mode`] names what it is doing, and the linkage rules
-//! in [`Pipeline::process_block`] decide the transition. A head that links to the
-//! published tip advances the chain; one that does not is a fork, which retracts to
-//! the fork point in the same call and is published as an [`Event::Reorg`]. A head
-//! that would leave a height gap, a first head above genesis, and a fork deeper
-//! than the undo ring all fail loudly rather than publishing across a hole.
+//! Its state is a machine: [`Mode`] names what it is doing, and the linkage rules in
+//! [`Pipeline::process_block`] decide the transition. A head linking to the published tip
+//! advances the chain; one that does not is a fork, retracted to the fork point in the
+//! same call and published as an [`Event::Reorg`]. A height gap, a first head above
+//! genesis, and a fork deeper than the undo ring all fail loudly rather than publishing
+//! across a hole.
 //!
-//! Turning events into the stream means three things: assigning every envelope a
-//! per-chain monotonic sequence number, checking parent-hash linkage so a reorg
-//! surfaces as an [`Event::Reorg`] rather than as silently wrong data, and
-//! publishing an [`Event::Finalized`] watermark whenever the chain's finalized
-//! block advances.
+//! Building the stream means three things: a per-chain monotonic sequence number on
+//! every envelope, parent-hash linkage so a reorg surfaces as an [`Event::Reorg`] instead
+//! of silently wrong data, and an [`Event::Finalized`] watermark whenever finality
+//! advances.
 //!
-//! Sequence numbers are per event, not per block, so reclaiming them after a reorg
-//! requires remembering where each block's run of sequences began. That is what the
-//! bounded undo ring stores.
+//! Sequences are per event, not per block, so reclaiming them after a reorg means
+//! remembering where each block's run began — what the bounded undo ring stores.
 //!
-//! What this does not do yet: it reorgs only against blocks it published in this
-//! process. Backfill-to-live handoff, checkpoint resume, and rebuilding the ring
-//! from durable history are deferred.
+//! Not yet: it reorgs only against blocks published in this process. Backfill-to-live
+//! handoff, checkpoint resume, and rebuilding the ring from durable history are deferred.
 
 use std::collections::VecDeque;
 
@@ -43,29 +39,29 @@ use crate::wire::envelope::{Envelope, Event, Finalized, Reorg};
 
 use crate::ingest::source::{BlockId, BlockSource, FetchedBlock};
 
-/// The most published blocks the undo ring remembers by default, and therefore the
-/// deepest reorg it can retract.
+/// The most published blocks the undo ring remembers by default, and so the deepest
+/// reorg it can retract.
 ///
-/// Blocks at or below the finalized height are dropped first, since no reorg can
-/// reach them, so on Ethereum the ring rarely holds more than about 64. This cap
-/// matters on chains whose finality lags far behind the tip, such as L2s waiting
-/// on L1, where it is the ceiling on how deep a reorg can be retracted.
+/// Blocks at or below the finalized height are dropped first, since no reorg reaches
+/// them, so on Ethereum the ring rarely holds more than ~64. The cap bites on chains
+/// whose finality lags far behind the tip, such as L2s waiting on L1, where it is the
+/// hard ceiling on retraction depth.
 pub const DEFAULT_UNDO_DEPTH: usize = 128;
 
 /// What the pipeline is doing when it is driven forward.
 ///
-/// The pipeline is a state machine whose state is `(sequence, history, finalized)`;
-/// this names the mode that state is in, so the driver's next step is explicit
-/// rather than implied by a stack of conditionals.
+/// The pipeline's state is `(sequence, history, finalized)`; this names the mode it is
+/// in, so the driver's next step is explicit rather than implied by a stack of
+/// conditionals.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
     /// Subscribed to live heads and publishing each one as it arrives.
     Following,
     /// Filling a contiguous height range up to the live tip before trusting heads.
     ///
-    /// Not entered yet: backfill-to-live handoff is not built, so a fresh pipeline
-    /// starts mid-chain at whatever head arrives next. It also cannot be skipped
-    /// out of — a head that would leave a gap is an error, not a silent hole.
+    /// Not entered yet: with no backfill-to-live handoff, a fresh pipeline starts
+    /// mid-chain at whatever head arrives next. And it cannot be left — a head that
+    /// would leave a gap is an error, not a silent hole.
     Backfilling,
 }
 
@@ -99,12 +95,10 @@ impl<S: BlockSource, K: EnvelopeSink> Pipeline<S, K> {
 
     /// Builds a pipeline that retracts up to `undo_depth` published blocks.
     ///
-    /// The undo ring holds at most `undo_depth` blocks, so a fork at the ring's
-    /// oldest remembered block retracts exactly `undo_depth` of them. A deeper fork
-    /// is refused rather than partially retracted.
-    ///
-    /// A depth of zero disables reorg retraction: linkage is still checked, but no
-    /// sequence numbers can be reclaimed.
+    /// The ring holds at most `undo_depth` blocks, so a fork at its oldest retracts
+    /// exactly that many; a deeper fork is refused rather than partially retracted. A
+    /// depth of zero disables retraction — linkage is still checked, but no sequences
+    /// can be reclaimed.
     #[must_use]
     pub fn with_undo_depth(source: S, sink: K, undo_depth: usize) -> Self {
         Self {
@@ -136,8 +130,8 @@ impl<S: BlockSource, K: EnvelopeSink> Pipeline<S, K> {
     ///
     /// # Errors
     ///
-    /// Returns an error when the subscription, a block fetch, or a publish fails,
-    /// and when the subscription closes, since a live indexer should never stop.
+    /// Returns an error when the subscription, a block fetch, or a publish fails, and
+    /// when the subscription closes — a live indexer should never stop.
     pub async fn run(&mut self) -> anyhow::Result<()> {
         let mut heads = self.source.subscribe_heads().await?;
         info!(chain = %self.source.chain(), "subscribed to heads");
@@ -155,16 +149,15 @@ impl<S: BlockSource, K: EnvelopeSink> Pipeline<S, K> {
     /// Publishes one block's events, emitting a reorg first if linkage broke and a
     /// finality watermark after if finality advanced.
     ///
-    /// Returns the number of [`Event::Reorg`] envelopes published, which is `0` or
-    /// `1`.
+    /// Returns the number of [`Event::Reorg`] envelopes published, `0` or `1`.
     ///
     /// # Errors
     ///
-    /// Returns an error when the sink cannot deliver an event — that is fatal,
-    /// since skipping an event would leave a sequence gap — and when linkage
-    /// cannot be resolved locally: a height gap, a first head above genesis with no
-    /// remembered history, or a fork deeper than the undo ring. Those are coverage
-    /// breaks rather than reorgs, and neither can be published honestly from here.
+    /// Returns an error when the sink cannot deliver an event — fatal, since skipping
+    /// one leaves a sequence gap — and when linkage cannot be resolved locally: a
+    /// height gap, a first head above genesis with no remembered history, or a fork
+    /// deeper than the undo ring. Those are coverage breaks, not reorgs, and cannot be
+    /// published honestly from here.
     pub async fn process_block(&mut self, block: FetchedBlock) -> anyhow::Result<u64> {
         let FetchedBlock { events, finalized } = block;
         let Some((first, _)) = events.split_first() else {
@@ -276,9 +269,9 @@ impl<S: BlockSource, K: EnvelopeSink> Pipeline<S, K> {
 
     /// Retracts the chain to `fork` (the first orphaned height) and emits the reorg marker.
     ///
-    /// The fork is the new branch's first block: the first published block that did
-    /// not build on `actual_parent`. The marker names that height, so a consumer can
-    /// retract every hash at or above it and re-request from there.
+    /// `fork` is the new branch's first block: the first published block that did not
+    /// build on `actual_parent`. The marker names that height, so a consumer retracts
+    /// every hash at or above it and re-requests from there.
     async fn publish_reorg(
         &mut self,
         fork: u64,
@@ -322,9 +315,8 @@ impl<S: BlockSource, K: EnvelopeSink> Pipeline<S, K> {
 
     /// The first height at or above which blocks are orphaned by a fork at `parent`.
     ///
-    /// `parent` is the new head's parent; the fork point is the first block that did
-    /// not build on it, which is the block one above the ring entry whose hash is
-    /// `parent`. Returns `None` when the fork is older than the ring.
+    /// `parent` is the new head's parent, so the fork point is the block one above the
+    /// ring entry whose hash is `parent`. Returns `None` when the fork predates the ring.
     fn find_fork(&self, parent: B256) -> Option<u64> {
         self.history
             .iter()
@@ -335,8 +327,8 @@ impl<S: BlockSource, K: EnvelopeSink> Pipeline<S, K> {
 
     /// Drops remembered blocks at or above `height`.
     ///
-    /// Returns the orphaned block hashes, newest first, and the sequence number to
-    /// resume from when a reorg is detected.
+    /// Returns the orphaned block hashes, newest first, and the sequence number a reorg
+    /// resumes from.
     fn rewind_to(&mut self, height: u64) -> (Vec<B256>, Option<u64>) {
         let mut orphaned = Vec::new();
         let mut reclaimed_from = None;
