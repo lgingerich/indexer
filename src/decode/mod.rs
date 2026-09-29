@@ -29,12 +29,10 @@
 pub mod contracts;
 pub mod convert;
 pub mod registry;
-#[cfg(all(feature = "kafka", feature = "duckdb"))]
 pub mod run;
 pub mod transform;
 
 pub use convert::ConversionError;
 pub use registry::{Abi, AbiRegistry, Contract, DecodedEvent, RegistryError};
-#[cfg(all(feature = "kafka", feature = "duckdb"))]
 pub use run::{Decode, DecodeBuilder};
 pub use transform::{Applied, Transform};

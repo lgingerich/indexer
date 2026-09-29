@@ -12,11 +12,9 @@
 //! what happens to an envelope after it is published is not ingestion's business.
 
 pub mod pipeline;
-pub mod source;
-#[cfg(feature = "kafka")]
 pub mod run;
+pub mod source;
 
 pub use pipeline::Pipeline;
-pub use source::{BlockSource, EvmSource};
-#[cfg(feature = "kafka")]
 pub use run::Ingest;
+pub use source::{BlockSource, EvmSource};
