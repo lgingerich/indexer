@@ -29,9 +29,10 @@ knows nothing about `ingest`, so it cannot reach into the pipeline's ordering an
 state machine.
 
 `connectors` holds no domain logic: it is the traits, the transports, and the stages
-whose whole job is wiring — the storage drain lives there rather than in a module of its
-own, because it is the sink and the process that drives it, and it would be the only
-stage module with nothing of its own in it.
+whose whole job is wiring — the shared drain loop (`connectors/drain.rs`) and the
+storage stage live there rather than in a module of its own, because they are the sink
+and the process that drives it. Decode drives the same loop, so the publish → flush →
+commit order exists once and the two stages cannot drift on it.
 
 The layers were separate crates, which enforced that direction with the compiler. They
 are modules now, so it is a convention a reviewer checks. The trade: breaking the
@@ -141,7 +142,7 @@ the field:
 | `kafka.batch_records` | `500` | Records per flush |
 | `kafka.batch_ms` | `1000` | Time bound on a batch |
 | `storage.database` | `indexer.duckdb` | Path to the store |
-| `storage.drain_secs` | unset | Stop a topic after this idle. **Omit for a live indexer** |
+| `storage.drain_secs` | unset | Stop a topic after this idle; bounds decode's input too. **Omit for a live indexer** |
 | `storage.protocol` | `[]` | Registered contracts: name, ABI, deployments |
 
 Omit `[ingest]` entirely to run decode and storage against a topic filled elsewhere.

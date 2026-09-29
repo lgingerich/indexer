@@ -352,10 +352,11 @@ fn decode_events(
         events.push(Event::Receipt(Box::new(decode_receipt(
             receipt, tx_hash, tx_index, number, hash,
         ))));
-        for (position, log) in receipt.logs().iter().enumerate() {
+        for (log_position, log) in receipt.logs().iter().enumerate() {
             events.push(Event::Log(Box::new(log_record(
                 log,
-                position as u64,
+                log_position as u64,
+                tx_index,
                 number,
                 hash,
                 block.0.inner.header.inner.timestamp,
@@ -480,12 +481,23 @@ fn decode_receipt(
 /// dedupe). alloy models them optional only because `eth_getLogs` filters can
 /// omit them; a log nested in a receipt always has them.
 ///
+/// `transaction_index` is the *transaction's* position in the block, passed in by
+/// the caller from the receipt loop. It is deliberately not defaulted to the log's
+/// own index: for the second transaction in a block the two differ, and filing the
+/// log under the wrong transaction index corrupts a downstream join. `log_index` is
+/// the log's position within the receipt, which is the right fallback for it.
+///
+/// Both defaults are latent today — alloy models `logIndex` and `transactionIndex`
+/// as required, so a log missing either fails to deserialize before this runs — but
+/// they are the correct values if alloy ever relaxes that.
+///
 /// # Errors
 ///
 /// Returns [`SourceError::Malformed`] when the log has no transaction hash.
 fn log_record(
     log: &RpcLog,
-    fallback_index: u64,
+    log_index: u64,
+    transaction_index: u64,
     block_number: u64,
     block_hash: B256,
     block_timestamp: u64,
@@ -496,9 +508,9 @@ fn log_record(
         .ok_or_else(|| malformed(CONTEXT, "log has no transactionHash"))?;
     let topics = log.topics();
     Ok(Log {
-        log_index: log.log_index.unwrap_or(fallback_index),
+        log_index: log.log_index.unwrap_or(log_index),
         transaction_hash,
-        transaction_index: log.transaction_index.unwrap_or(fallback_index),
+        transaction_index: log.transaction_index.unwrap_or(transaction_index),
         address: log.address(),
         topic0: topics.first().copied(),
         topic1: topics.get(1).copied(),

@@ -12,9 +12,11 @@
 //!    [`Event::Finalized`] come out exactly as they went in. A store retracts
 //!    orphaned rows from the reorg's `orphaned_hashes` and compacts below the
 //!    finality watermark, so losing either makes the decoded stream quietly wrong.
-//! 2. **Nothing is dropped for lack of an ABI.** An event with no matching ABI is
-//!    forwarded unchanged, so the decoded topic is a lossless superset of the raw
-//!    one and a later ABI addition is a replay rather than a re-fetch.
+//! 2. **Nothing is dropped for lack of an ABI, or for a failed decode.** An event
+//!    with no matching ABI is forwarded unchanged, and so is a log whose data did not
+//!    decode: the raw log is always the first output, so the decoded topic is a
+//!    lossless superset of the raw one and a later ABI fix is a replay rather than a
+//!    re-fetch. A failed decode is reported on [`Applied`], not by withholding the log.
 //! 3. **Identity is preserved.** Every output carries its source envelope's `chain`
 //!    and `dedupe_key`. `sequence` orders the stream and is never renumbered.
 //!
@@ -28,7 +30,22 @@
 use crate::wire::envelope::{ChainId, Decoded, Envelope, Event, Log};
 use alloy_primitives::B256;
 
-use crate::decode::registry::{AbiRegistry, RawLog, RegistryError};
+use crate::decode::registry::{AbiRegistry, Contract, RegistryError};
+
+/// What one input envelope produced, and whether anything went wrong.
+///
+/// The log is always in [`outputs`](Self::outputs) — a failed decode is reported, not
+/// withheld — so a caller forwards the raw log and decides for itself how loud a
+/// failure is. [`Transform::apply`] never returns `Err` for a bad log.
+#[derive(Debug)]
+pub struct Applied {
+    /// The envelopes to republish: the source, and its decoded record if it decoded.
+    pub outputs: Vec<Envelope>,
+    /// The decode failure, if a log matched an ABI but did not decode against it.
+    ///
+    /// Present alongside a pass-through of the raw log, so a caller logs it and moves on.
+    pub error: Option<RegistryError>,
+}
 
 /// Decodes one raw envelope into the envelopes to republish.
 ///
@@ -49,22 +66,21 @@ impl<R: AbiRegistry> Transform<R> {
 
     /// The envelopes to republish for one raw input envelope.
     ///
-    /// Returns a `Vec` because one input can yield more than one output: a log that
-    /// decodes is followed by its decoded record.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when a log matched an event in its ABI but did not decode
-    /// against it. That is a blot on the batch rather than a log to skip silently:
-    /// the usual cause is an ABI from the wrong block range, and a caller that wanted
-    /// to tolerate it can, while a caller that did not must not have it hidden.
-    pub fn apply(&self, envelope: Envelope) -> Result<Vec<Envelope>, RegistryError> {
-        let decoded = match &envelope.event {
+    /// Returns an [`Applied`] rather than a `Result`, because a log that fails to
+    /// decode still has to be forwarded: the raw log is the first output whether or
+    /// not a decoded record follows it, and the failure rides alongside it. That keeps
+    /// invariant 2 — the decoded stream stays a superset of the raw one — while still
+    /// surfacing the failure a caller may want to act on.
+    pub fn apply(&self, envelope: Envelope) -> Applied {
+        let (decoded, error) = match &envelope.event {
             // A log is the only thing an event ABI decodes. A block, transaction, or
             // receipt carries calldata an ABI *could* decode, but this transform does
             // not do that yet; they pass through unchanged.
-            Event::Log(log) => self.decode(&envelope.chain, log)?,
-            _ => None,
+            Event::Log(log) => match self.decode(&envelope.chain, log) {
+                Ok(decoded) => (decoded, None),
+                Err(error) => (None, Some(error)),
+            },
+            _ => (None, None),
         };
 
         let mut output = Vec::with_capacity(2);
@@ -78,21 +94,23 @@ impl<R: AbiRegistry> Transform<R> {
                 Event::Decoded(Box::new(record)),
             ));
         }
-        Ok(output)
+        Applied {
+            outputs: output,
+            error,
+        }
     }
 
-    /// Decodes a log against the registry, or `None` when no ABI applies.
+    /// Decodes a log against the registry, and assembles the published record from
+    /// the decoded event and the raw log it came from.
     ///
     /// A registry miss and an ABI that does not declare the log's selector are the
     /// same answer here: the log is forwarded undecoded.
     fn decode(&self, chain: &ChainId, log: &Log) -> Result<Option<Decoded>, RegistryError> {
-        let Some(abi) = self.registry.abi(chain, log.address, log.block_number) else {
+        let Some(Contract { abi, protocol }) =
+            self.registry.contract(chain, log.address, log.block_number)
+        else {
             return Ok(None);
         };
-        // The protocol comes from the same lookup that found the ABI, because an ABI
-        // does not know it: it is a list of signatures, and which protocol an address
-        // implements is a registry fact.
-        let protocol = self.registry.describe(chain, log.address).unwrap_or("");
 
         // The wire flattens a log's topics into `topic0..topic3`, so they have to be
         // packed back into the contiguous list the decoder expects. Topics are
@@ -100,21 +118,29 @@ impl<R: AbiRegistry> Transform<R> {
         let mut flattened = [log.topic0, log.topic1, log.topic2, log.topic3];
         let topics: Vec<B256> = flattened.iter_mut().map_while(Option::take).collect();
 
-        abi.decode_log_as(
-            RawLog {
-                chain,
-                address: log.address,
-                topics: &topics,
-                data: &log.data,
-                transaction_hash: log.transaction_hash,
-                transaction_index: log.transaction_index,
-                log_index: log.log_index,
-                block_number: log.block_number,
-                block_hash: log.block_hash,
-                block_timestamp: log.block_timestamp,
-            },
-            protocol,
-        )
+        let Some(event) = abi.decode_log(&topics, &log.data)? else {
+            return Ok(None);
+        };
+
+        // The identity comes from the raw log, not the decoded event: the event is a
+        // list of arguments, and where it sat on chain is the log's fact. Assembling
+        // it here is what keeps [`Decoded`] pointing at the exact log it came from.
+        Ok(Some(Decoded {
+            name: event.name,
+            address: log.address,
+            protocol: protocol.to_owned(),
+            selector: event.selector,
+            signature: event.signature,
+            anonymous: event.anonymous,
+            transaction_hash: log.transaction_hash,
+            transaction_index: log.transaction_index,
+            log_index: log.log_index,
+            indexed: event.indexed,
+            body: event.body,
+            block_number: log.block_number,
+            block_hash: log.block_hash,
+            block_timestamp: log.block_timestamp,
+        }))
     }
 }
 
@@ -127,7 +153,7 @@ mod tests {
     use crate::wire::envelope::{Block, ChainId, Envelope, Event, Finalized, Log, Receipt, Reorg};
     use alloy_primitives::{Address, B256, TxHash, U256};
 
-    use crate::decode::registry::Abi;
+    use crate::decode::registry::{Abi, Contract};
 
     use super::Transform;
 
@@ -146,8 +172,11 @@ mod tests {
     }
 
     impl crate::decode::registry::AbiRegistry for OneAbi {
-        fn abi(&self, chain: &ChainId, address: Address, _block: u64) -> Option<&Abi> {
-            (chain.as_str() == "base" && address == Address::from([0xaa; 20])).then_some(&self.abi)
+        fn contract(&self, chain: &ChainId, address: Address, _block: u64) -> Option<Contract<'_>> {
+            (chain.as_str() == "base" && address == Address::from([0xaa; 20])).then_some(Contract {
+                abi: &self.abi,
+                protocol: "uniswap_v3",
+            })
         }
     }
 
@@ -155,7 +184,12 @@ mod tests {
     struct NoAbi;
 
     impl crate::decode::registry::AbiRegistry for NoAbi {
-        fn abi(&self, _chain: &ChainId, _address: Address, _block: u64) -> Option<&Abi> {
+        fn contract(
+            &self,
+            _chain: &ChainId,
+            _address: Address,
+            _block: u64,
+        ) -> Option<Contract<'_>> {
             None
         }
     }
@@ -210,10 +244,13 @@ mod tests {
             new_head_hash: hash(0x20),
             orphaned_hashes: vec![hash(5), hash(6)],
         }));
-        let output = Transform::new(NoAbi)
-            .apply(source.clone())
-            .expect("a control signal decodes");
+        let applied = Transform::new(NoAbi).apply(source.clone());
+        assert!(
+            applied.error.is_none(),
+            "a control signal is not a decode error"
+        );
 
+        let output = applied.outputs;
         assert_eq!(output, vec![source]);
         let Some(Envelope {
             event: Event::Reorg(reorg),
@@ -234,10 +271,9 @@ mod tests {
             height: 3,
             hash: hash(3),
         }));
-        let output = Transform::new(NoAbi)
-            .apply(source.clone())
-            .expect("a control signal decodes");
-        assert_eq!(output, vec![source]);
+        let applied = Transform::new(NoAbi).apply(source.clone());
+        assert!(applied.error.is_none());
+        assert_eq!(applied.outputs, vec![source]);
     }
 
     /// Invariants 2 and 3: with no ABI registered, every kind is forwarded, never
@@ -247,10 +283,10 @@ mod tests {
         for event in every_kind() {
             let kind = event.kind();
             let source = envelope(event);
-            let output = Transform::new(NoAbi)
-                .apply(source.clone())
-                .expect("a miss is not an error");
+            let applied = Transform::new(NoAbi).apply(source.clone());
 
+            assert!(applied.error.is_none(), "{kind} reported an error");
+            let output = applied.outputs;
             assert_eq!(output.len(), 1, "{kind} was dropped or duplicated");
             let forwarded = output.first().expect("one output");
             assert_eq!(forwarded.chain, source.chain, "{kind} lost its chain");
@@ -308,9 +344,9 @@ mod tests {
         let registry = OneAbi {
             abi: Abi::from_json(ERC20).expect("ABI loads"),
         };
-        let output = Transform::new(registry)
-            .apply(source.clone())
-            .expect("the log decodes");
+        let applied = Transform::new(registry).apply(source.clone());
+        assert!(applied.error.is_none(), "the log decodes");
+        let output = applied.outputs;
 
         assert_eq!(output.len(), 2, "the raw log and its decoded record");
         // The raw log is forwarded first and unchanged.
@@ -324,11 +360,62 @@ mod tests {
             panic!("the second output must be the decoded record");
         };
         assert_eq!(record.name, "Transfer");
+        // The protocol comes from the same lookup that found the ABI.
+        assert_eq!(record.protocol, "uniswap_v3");
+        assert_eq!(record.address, Address::from([0xaa; 20]));
         assert_eq!(
             record.source_key(),
             format!("5:{}:3", TxHash::from([0x01; 32]))
         );
         assert_eq!(record.indexed.len(), 2);
         assert_eq!(record.body.len(), 1);
+    }
+
+    /// Invariant 2: a log whose data does not decode is still forwarded, so the
+    /// decoded stream stays a superset of the raw one. The failure is reported on the
+    /// result rather than by withholding the log — the regression was a `continue` in
+    /// the stage that dropped the pass-through, breaking the superset guarantee.
+    #[test]
+    fn a_log_that_fails_to_decode_is_still_forwarded() {
+        const ERC20: &str = r#"[{
+            "type": "event",
+            "name": "Transfer",
+            "anonymous": false,
+            "inputs": [
+                {"name": "from", "type": "address", "indexed": true},
+                {"name": "to", "type": "address", "indexed": true},
+                {"name": "value", "type": "uint256", "indexed": false}
+            ]
+        }]"#;
+
+        let log = Log {
+            log_index: 3,
+            transaction_hash: TxHash::from([0x01; 32]),
+            address: Address::from([0xaa; 20]),
+            topic0: Some(
+                "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
+                    .parse()
+                    .expect("selector parses"),
+            ),
+            // The selector matches but `data` is too short for the `uint256` the event
+            // declares, so the decode fails.
+            data: vec![0u8; 16].into(),
+            block_number: 5,
+            block_hash: hash(5),
+            ..Log::default()
+        };
+        let source = envelope(Event::Log(Box::new(log)));
+
+        let registry = OneAbi {
+            abi: Abi::from_json(ERC20).expect("ABI loads"),
+        };
+        let applied = Transform::new(registry).apply(source.clone());
+
+        assert!(applied.error.is_some(), "a bad log reports its failure");
+        assert_eq!(
+            applied.outputs,
+            vec![source],
+            "the raw log is forwarded even when it does not decode"
+        );
     }
 }

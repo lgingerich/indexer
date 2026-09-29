@@ -5,7 +5,9 @@
 //! is what makes it testable without Kafka, and what lets the transport change without
 //! touching the decoder.
 //!
-//! [`crate::ingest`] works the same way, and for the same reason.
+//! [`crate::ingest`] works the same way, and for the same reason. The loop itself is
+//! [`crate::connectors::drain::run`], shared with the storage stage so the two cannot
+//! drift on the one ordering that matters: publish, then flush, then commit.
 //!
 //! # Delivery
 //!
@@ -18,7 +20,7 @@
 //! mutable reference rather than owning it: it must advance the checkpoint, but the
 //! caller keeps the handle.
 
-use std::time::Instant;
+use std::time::Duration;
 
 use anyhow::Result;
 use tracing::{info, warn};
@@ -32,6 +34,7 @@ use crate::decode::contracts::ContractRegistry;
 #[derive(Debug)]
 pub struct Decode {
     batch: BatchConfig,
+    drain: Option<Duration>,
     registry: ContractRegistry,
 }
 
@@ -48,7 +51,7 @@ impl Decode {
     ///
     /// Returns an error when a record cannot be read, when a decoded record cannot be
     /// published, or when the checkpoint cannot be advanced. A single record that does
-    /// not *decode* is logged and skipped rather than failing the run, because the raw
+    /// not *decode* is logged and its raw log is still forwarded, because the raw
     /// record is already on the input topic and a corrected ABI recovers it.
     pub async fn run<S, K>(self, source: &mut S, sink: &mut K) -> Result<()>
     where
@@ -64,42 +67,27 @@ impl Decode {
             "decode started"
         );
 
-        let mut pending = 0;
-        let mut last_flush = Instant::now();
-        loop {
-            let Some(envelope) = source.next().await? else {
-                info!("input ended");
-                break;
-            };
-
-            let outputs = match transform.apply(envelope) {
-                Ok(outputs) => outputs,
-                Err(error) => {
-                    // One undecodable log must not stall the stream, but it must not be
-                    // silent either: the usual cause is an ABI from the wrong block
-                    // range, and the raw log is already on the input topic, so skipping
-                    // it loses nothing a corrected ABI could not recover.
-                    warn!(%error, "skipping a record that does not decode");
-                    continue;
+        // Each input expands to the raw log plus, when it decodes, its decoded record.
+        // A log that fails to decode is reported but still forwarded: the decoded stream
+        // stays a superset of the raw one, so a later ABI fix is a replay.
+        super::super::connectors::drain::run(
+            source,
+            sink,
+            self.batch,
+            self.drain,
+            |envelope, out| {
+                let applied = transform.apply(envelope);
+                if let Some(error) = applied.error {
+                    // A log that matched an ABI but did not decode usually means the ABI
+                    // is the wrong version for this height. It must not stall the stream,
+                    // and it must not be silent either — the raw log is already upstream,
+                    // so a corrected ABI recovers it.
+                    warn!(%error, "a log did not decode and was forwarded raw");
                 }
-            };
-            for output in &outputs {
-                sink.publish(output).await?;
-            }
-            pending += 1;
-
-            // Flush on either bound, then commit: the checkpoint never advances past
-            // bytes that are not yet on the output.
-            if pending >= self.batch.records || last_flush.elapsed() >= self.batch.every {
-                sink.flush().await?;
-                source.commit().await?;
-                pending = 0;
-                last_flush = Instant::now();
-            }
-        }
-
-        sink.flush().await?;
-        source.commit().await?;
+                out.extend(applied.outputs);
+            },
+        )
+        .await?;
         Ok(())
     }
 }
@@ -108,6 +96,7 @@ impl Decode {
 #[derive(Debug)]
 pub struct DecodeBuilder {
     batch: BatchConfig,
+    drain: Option<Duration>,
     registry: ContractRegistry,
 }
 
@@ -117,6 +106,7 @@ impl DecodeBuilder {
     pub fn new() -> Self {
         Self {
             batch: BatchConfig::default(),
+            drain: None,
             registry: ContractRegistry::default(),
         }
     }
@@ -125,6 +115,17 @@ impl DecodeBuilder {
     #[must_use]
     pub const fn batch(mut self, batch: BatchConfig) -> Self {
         self.batch = batch;
+        self
+    }
+
+    /// Stops once the input has been idle for `drain`.
+    ///
+    /// For a bounded run — a backfill, a one-shot drain — not for a live stream, where a
+    /// quiet input is normal and stopping is a fault. Without it a bounded run has no way
+    /// to finish, which is why the storage stage takes the same bound.
+    #[must_use]
+    pub const fn drain(mut self, drain: Duration) -> Self {
+        self.drain = Some(drain);
         self
     }
 
@@ -148,6 +149,7 @@ impl DecodeBuilder {
         }
         Ok(Decode {
             batch: self.batch,
+            drain: self.drain,
             registry: self.registry,
         })
     }
@@ -158,6 +160,7 @@ impl Default for DecodeBuilder {
         Self::new()
     }
 }
+
 #[cfg(test)]
 // The crate denies `expect`/`unwrap` to keep production paths honest; tests are
 // allowed them per the repository test style, since a failed expectation there

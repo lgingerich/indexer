@@ -97,7 +97,11 @@ fn main() -> ExitCode {
         }
         let envelope: Envelope =
             serde_json::from_str(line).expect("the fixture is a published envelope");
-        for out in transform.apply(envelope).expect("the log decodes") {
+        let applied = transform.apply(envelope);
+        if let Some(error) = applied.error {
+            eprintln!("line {}: {error}", number + 1);
+        }
+        for out in applied.outputs {
             if matches!(out.event, indexer::wire::envelope::Event::Decoded(_)) {
                 decoded_count += 1;
             }

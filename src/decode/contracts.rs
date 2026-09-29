@@ -43,7 +43,7 @@ use crate::wire::envelope::ChainId;
 use alloy_primitives::Address;
 use serde::Deserialize;
 
-use super::{Abi, AbiRegistry, RegistryError};
+use super::{Abi, AbiRegistry, Contract, RegistryError};
 
 /// One protocol: its name, its ABI, and where it is deployed.
 #[derive(Debug, Clone, Deserialize)]
@@ -145,30 +145,16 @@ impl ContractRegistry {
     pub fn len(&self) -> usize {
         self.entries.len()
     }
-
-    /// What the registry knows about an address, for the decode stage to stamp onto the
-    /// record it produces.
-    ///
-    /// The trait method forwards here, so a caller holding a `dyn AbiRegistry` — which
-    /// is what the transform holds — gets the same answer as one holding a
-    /// [`ContractRegistry`] directly.
-    #[must_use]
-    fn describe_entry(&self, chain: &ChainId, address: Address) -> Option<&str> {
-        self.entries
-            .get(&(chain.clone(), address))
-            .map(|entry| entry.protocol.as_str())
-    }
 }
 
 impl AbiRegistry for ContractRegistry {
-    fn abi(&self, chain: &ChainId, address: Address, _block: u64) -> Option<&Abi> {
+    fn contract(&self, chain: &ChainId, address: Address, _block: u64) -> Option<Contract<'_>> {
         self.entries
             .get(&(chain.clone(), address))
-            .map(|entry| &entry.abi)
-    }
-
-    fn describe(&self, chain: &ChainId, address: Address) -> Option<&str> {
-        self.describe_entry(chain, address)
+            .map(|entry| Contract {
+                abi: &entry.abi,
+                protocol: entry.protocol.as_str(),
+            })
     }
 }
 
@@ -232,13 +218,13 @@ mod tests {
         ] {
             let chain = ChainId::new(chain);
             let address: Address = address.parse().expect("an address");
-            assert!(registry.abi(&chain, address, 1).is_some());
-            assert_eq!(registry.describe_entry(&chain, address), Some("uniswap_v3"));
+            let contract = registry.contract(&chain, address, 1).expect("registered");
+            assert_eq!(contract.protocol, "uniswap_v3");
         }
     }
 
-    /// The protocol travels with the address, which is what an ABI JSON cannot supply:
-    /// nothing in a list of signatures says what the contract is.
+    /// The protocol travels with the ABI in one lookup, which is what an ABI JSON cannot
+    /// supply: nothing in a list of signatures says what the contract is.
     #[test]
     fn a_registry_entry_says_what_a_contract_is() {
         let registry =
@@ -246,14 +232,15 @@ mod tests {
                 .expect("the registry loads");
 
         let address: Address = POOL.parse().expect("an address");
-        assert_eq!(
-            registry.describe_entry(&ChainId::new("base"), address),
-            Some("uniswap_v3")
-        );
+        let contract = registry
+            .contract(&ChainId::new("base"), address, 1)
+            .expect("registered");
+        assert_eq!(contract.protocol, "uniswap_v3");
         // A different chain is a miss, so one chain's registry does not leak into another.
-        assert_eq!(
-            registry.describe_entry(&ChainId::new("ethereum"), address),
-            None
+        assert!(
+            registry
+                .contract(&ChainId::new("ethereum"), address, 1)
+                .is_none()
         );
     }
 

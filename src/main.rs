@@ -75,11 +75,15 @@ async fn run() -> Result<()> {
     // ABI paths in the settings file read as relative to it, not to the process's
     // working directory, so the file stays portable.
     let registry = ContractRegistry::load(&settings.storage.protocol, settings_dir(&path))?;
-    let decode = Decode::builder().registry(registry).batch(batch).build()?;
+    let mut decode = Decode::builder().registry(registry).batch(batch);
     let mut storage = Storage::builder().batch(batch);
     if let Some(drain) = settings.drain() {
+        // The same bound for both consumers, so a bounded run lets decode finish its
+        // topic rather than waiting forever on an input dry storage already drained.
+        decode = decode.drain(drain);
         storage = storage.drain(drain);
     }
+    let decode = decode.build()?;
     let storage = storage.build();
 
     let ingest = settings

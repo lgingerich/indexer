@@ -376,6 +376,37 @@ mod tests {
         B256::from([byte; 32])
     }
 
+    /// A decoded record's `source_key` must stay byte-for-byte the raw log's
+    /// `dedupe_key`. The two are built by separate `format!` calls — one here, one on
+    /// [`Log`] — so nothing but this test stops them drifting; if they do, every
+    /// decoded record silently stops joining back to the log it came from.
+    #[test]
+    fn a_decoded_records_source_key_is_the_raw_logs_dedupe_key() {
+        let log = Log {
+            log_index: 767,
+            transaction_hash: TxHash::from([0x2a; 32]),
+            block_number: 51_913_794,
+            ..Log::default()
+        };
+        let decoded = Decoded {
+            name: "Swap".to_owned(),
+            address: Address::from([0xd0; 20]),
+            protocol: "uniswap_v3".to_owned(),
+            selector: hash(0x07),
+            signature: "Swap(address,address,int256,int256,uint160,uint128,int24)".to_owned(),
+            anonymous: false,
+            transaction_hash: log.transaction_hash,
+            transaction_index: 12,
+            log_index: log.log_index,
+            indexed: Vec::new(),
+            body: Vec::new(),
+            block_number: log.block_number,
+            block_hash: hash(0xd4),
+            block_timestamp: 1_700_000_000,
+        };
+        assert_eq!(decoded.source_key(), log.dedupe_key());
+    }
+
     #[test]
     fn datasets_are_flagged_and_control_signals_are_not() {
         assert!(

@@ -22,6 +22,8 @@
 //! all take their source and sink as parameters — which is what lets them run over a
 //! file or a test double, and what keeps client settings in one place.
 
+#[cfg(all(feature = "kafka", feature = "duckdb"))]
+pub mod drain;
 #[cfg(feature = "duckdb")]
 pub mod duckdb;
 #[cfg(feature = "kafka")]
