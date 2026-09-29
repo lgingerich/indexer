@@ -142,7 +142,7 @@ the field:
 | `kafka.batch_ms` | `1000` | Time bound on a batch |
 | `storage.database` | `indexer.duckdb` | Path to the store |
 | `storage.drain_secs` | unset | Stop a topic after this idle. **Omit for a live indexer** |
-| `storage.protocol` | `[]` | Registered contracts: name, dataset, ABI, deployments |
+| `storage.protocol` | `[]` | Registered contracts: name, ABI, deployments |
 
 Omit `[ingest]` entirely to run decode and storage against a topic filled elsewhere.
 `RUST_LOG` is still read from the environment, because a log filter is not deployment
@@ -154,12 +154,11 @@ caught rather than silently leaving a setting at its default.
 ### Registered contracts
 
 The ABI says what a contract's events look like. It cannot say what the contract *is*,
-or where its rows belong — so both are written down, once per protocol:
+so that is written down, once per protocol:
 
 ```toml
 [[storage.protocol]]
 name = "uniswap_v3"        # what it is, stamped on every decoded record
-dataset = "dex.trades"     # where its rows belong
 abi = "abis/uniswap_v3_pool.json"
 
 [[storage.protocol.deployment]]
@@ -167,7 +166,7 @@ chain = "base"
 address = "0xd0b53D9277642d899DF5C87A3966A349A798F224"
 ```
 
-Every decoded record then carries `protocol` and `dataset`, so a consumer routes a row
+Every decoded record then carries `protocol`, so a consumer can group rows by protocol
 without knowing any address.
 
 **Why a list rather than tagging ABI filenames.** Uniswap V3 has thousands of pools
@@ -184,21 +183,38 @@ One ABI per address applies at every height. A proxy that upgrades changes its A
 height, which this cannot express — the `AbiRegistry` seam is what a table-backed
 registry keyed by `(chain, address, block_range)` replaces.
 
-### Dataset mappers
+### What decode does not do
 
-The registry says *which dataset* a record belongs to. A mapper says *with what columns*
-— that a `Swap`'s `amount0` is a token amount, and a negative one means the pool sent
-that token out. That is per-protocol knowledge, so it is code rather than configuration:
+**It does not project a record into a dataset.** Decoding produces *facts* — an
+argument's name and its typed value, straight off the ABI:
 
-```rust
-impl DatasetMapper for UniswapV3 {
-    fn dataset(&self) -> &str { "dex.trades" }
-    fn map(&self, decoded: &Decoded) -> Option<Row> { /* the projection */ }
-}
+```json
+{"name": "amount0", "value": {"type": "int", "value": "-3180585820646654", "bits": 256}}
 ```
 
-`src/decode/uniswap_v3.rs` is one. A new protocol feeding an existing dataset adds no
-mapper; a new dataset adds one.
+Turning that into a `dex.trades` row needs three things the decoder does not have:
+
+| Needed | Source | Have it? |
+| --- | --- | --- |
+| What the arguments mean | the ABI | yes |
+| Which contract this is | the registry | yes |
+| Which tokens, and their decimals and symbols | **reference data** | not yet |
+
+Token metadata is the gap. A Uniswap `Swap` event names neither token — only the pool
+address — so `token0`/`token1` come from calling the pool, and decimals and symbols from
+calling the tokens. None of that is derivable from a log, which is why the projection
+cannot live here.
+
+So `protocol` is a fact and travels on the record; a *dataset* is a modeling choice and
+belongs where the joins are. Two payoffs from keeping it that way:
+
+- **No per-protocol code in the decoder.** A mapper that knew what `amount0` means would
+  be a mapper that has to know every protocol, and a new DEX would be a new Rust file.
+- **A new DEX is rows in reference tables**, not code.
+
+When stream processing lands, the decoded stream and the reference tables are what it
+joins. `protocol` and the argument names are the join keys, which is why they are on the
+wire rather than re-derived downstream.
 
 ### Other client settings
 

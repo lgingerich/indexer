@@ -89,13 +89,10 @@ impl<R: AbiRegistry> Transform<R> {
         let Some(abi) = self.registry.abi(chain, log.address, log.block_number) else {
             return Ok(None);
         };
-        // The protocol and dataset come from the same lookup that found the ABI, because
-        // an ABI does not know either: it is a list of signatures, and which protocol an
-        // address implements is a registry fact.
-        let (protocol, dataset) = self
-            .registry
-            .describe(chain, log.address)
-            .unwrap_or(("", ""));
+        // The protocol comes from the same lookup that found the ABI, because an ABI
+        // does not know it: it is a list of signatures, and which protocol an address
+        // implements is a registry fact.
+        let protocol = self.registry.describe(chain, log.address).unwrap_or("");
 
         // The wire flattens a log's topics into `topic0..topic3`, so they have to be
         // packed back into the contiguous list the decoder expects. Topics are
@@ -117,7 +114,6 @@ impl<R: AbiRegistry> Transform<R> {
                 block_timestamp: log.block_timestamp,
             },
             protocol,
-            dataset,
         )
     }
 }

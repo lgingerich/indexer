@@ -71,9 +71,13 @@ pub use crate::wire::typed::TypedValue;
 ///   `transaction_index`, `log_index`) rather than a formatted `source` string, and
 ///   an explicit `anonymous` flag. Breaking: a v2 consumer reading `source` finds no
 ///   such field, and can rebuild it with [`Decoded::source_key`].
-/// - **4** — [`Decoded`] carries `protocol` and `dataset` from the registry. Additive
-///   in shape but required on the wire, so a v3 consumer deserializing a v4 record
-///   without them fails; bumping says so rather than surprising one.
+/// - **4** — [`Decoded`] carries `protocol` from the registry. Additive in shape but
+///   required on the wire, so a v3 consumer deserializing a v4 record without it fails;
+///   bumping says so rather than surprising one.
+///
+/// The current version is 4. A `dataset` field was added in 4 and removed in the same
+/// unreleased change, so it never shipped; the number stands rather than being reused,
+/// since a record written during development may carry it.
 pub const SCHEMA_VERSION: u16 = 4;
 
 /// Identifies the chain an event came from, for example `ethereum` or `solana`.
@@ -163,16 +167,15 @@ pub struct Decoded {
     ///
     /// Not derivable from the ABI: an ABI is a list of signatures and says nothing
     /// about which protocol an address implements. It comes from the registry entry
-    /// that matched, so a consumer can route a record — `uniswap_v3` rows go to
-    /// `dex.trades` — without knowing anything about addresses.
-    pub protocol: String,
-    /// The dataset this event's rows belong to, from the registry, for example
-    /// `dex.trades`.
+    /// that matched, so a consumer can group a record by protocol without knowing any
+    /// address.
     ///
-    /// On the record rather than looked up downstream, because the registry that
-    /// knows it is here. A consumer that has to re-derive it needs the same
-    /// address-to-protocol mapping this stage already has.
-    pub dataset: String,
+    /// Deliberately *not* accompanied by a dataset name. Which table an event's rows
+    /// belong to depends on context this stage does not have — which token a pool
+    /// trades, how many decimals it has — and on modeling choices that change for
+    /// reasons the decoder should not care about. The decoder supplies the protocol as
+    /// a fact; the projection supplies the dataset.
+    pub protocol: String,
     /// The event selector, `keccak256` of its signature.
     ///
     /// [`B256::ZERO`] for an anonymous event, which has no selector in `topic0`. A
@@ -545,7 +548,6 @@ mod tests {
                 name: "Transfer".to_owned(),
                 address: Address::from([0x22; 20]),
                 protocol: "erc20".to_owned(),
-                dataset: "assets.erc20_transfers".to_owned(),
                 selector: hash(0x07),
                 signature: "Transfer(address,address,uint256)".to_owned(),
                 anonymous: false,

@@ -5,7 +5,6 @@
 //! ```toml
 //! [[protocol]]
 //! name = "uniswap_v3"
-//! dataset = "dex.trades"
 //! abi = "abis/uniswap_v3_pool.json"
 //!
 //! [[protocol.deployment]]
@@ -23,15 +22,14 @@
 //!
 //! # What an entry carries that an ABI cannot
 //!
-//! Two facts the ABI JSON does not contain and cannot be derived from:
+//! **`name`** — what the contract is. An ABI is a list of signatures; nothing in it says
+//! "this is a Uniswap V3 pool". That is a fact about a deployed contract and it travels
+//! onto every [`Decoded`](crate::wire::envelope::Decoded) record.
 //!
-//! - **`name`** — what the contract is. An ABI is a list of signatures; nothing in it
-//!   says "this is a Uniswap V3 pool".
-//! - **`dataset`** — where its rows belong. Which table a protocol's events feed is a
-//!   modeling decision, not a property of the contract.
-//!
-//! Both travel onto every [`Decoded`](crate::wire::envelope::Decoded) record, so a
-//! consumer can route a row without knowing any address.
+//! Deliberately *not* the dataset. Where an event's rows belong depends on context this
+//! registry does not have — which token a pool trades, how many decimals it has — and on
+//! modeling choices that change for reasons decoding should not care about. See
+//! [`super`] for why the projection lives downstream.
 //!
 //! # Known limitation
 //!
@@ -47,7 +45,7 @@ use serde::Deserialize;
 
 use super::{Abi, AbiRegistry, RegistryError};
 
-/// One protocol: its name, its dataset, its ABI, and where it is deployed.
+/// One protocol: its name, its ABI, and where it is deployed.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProtocolEntry {
@@ -56,10 +54,6 @@ pub struct ProtocolEntry {
     /// Travels onto every decoded record, so a consumer can route on protocol rather
     /// than on addresses.
     pub name: String,
-    /// The dataset this protocol's rows belong to, for example `dex.trades`.
-    ///
-    /// A logical name rather than a table, so renaming a table is not a change here.
-    pub dataset: String,
     /// The ABI file, relative to the settings file's directory.
     pub abi: std::path::PathBuf,
     /// Where this protocol is deployed.
@@ -88,7 +82,6 @@ pub struct ContractRegistry {
 struct Entry {
     abi: Abi,
     protocol: String,
-    dataset: String,
 }
 
 impl ContractRegistry {
@@ -129,7 +122,6 @@ impl ContractRegistry {
                 let entry = Entry {
                     abi: abi.clone(),
                     protocol: protocol.name.clone(),
-                    dataset: protocol.dataset.clone(),
                 };
                 if registry.entries.insert(key, entry).is_some() {
                     return Err(RegistryError::Duplicate {
@@ -161,10 +153,10 @@ impl ContractRegistry {
     /// is what the transform holds — gets the same answer as one holding a
     /// [`ContractRegistry`] directly.
     #[must_use]
-    fn describe_entry(&self, chain: &ChainId, address: Address) -> Option<(&str, &str)> {
+    fn describe_entry(&self, chain: &ChainId, address: Address) -> Option<&str> {
         self.entries
             .get(&(chain.clone(), address))
-            .map(|entry| (entry.protocol.as_str(), entry.dataset.as_str()))
+            .map(|entry| entry.protocol.as_str())
     }
 }
 
@@ -175,7 +167,7 @@ impl AbiRegistry for ContractRegistry {
             .map(|entry| &entry.abi)
     }
 
-    fn describe(&self, chain: &ChainId, address: Address) -> Option<(&str, &str)> {
+    fn describe(&self, chain: &ChainId, address: Address) -> Option<&str> {
         self.describe_entry(chain, address)
     }
 }
@@ -195,10 +187,9 @@ mod tests {
     const POOL: &str = "0xd0b53D9277642d899DF5C87A3966A349A798F224";
 
     /// A protocol entry pointing at the crate's own ABI.
-    fn entry(name: &str, dataset: &str, deployments: Vec<(&str, &str)>) -> ProtocolEntry {
+    fn entry(name: &str, deployments: Vec<(&str, &str)>) -> ProtocolEntry {
         ProtocolEntry {
             name: name.to_owned(),
-            dataset: dataset.to_owned(),
             abi: std::path::PathBuf::from("uniswap_v3_pool.json"),
             deployment: deployments
                 .into_iter()
@@ -222,7 +213,6 @@ mod tests {
         let registry = ContractRegistry::load(
             &[entry(
                 "uniswap_v3",
-                "dex.trades",
                 vec![
                     ("base", POOL),
                     ("base", "0x1111111111111111111111111111111111111111"),
@@ -243,26 +233,22 @@ mod tests {
             let chain = ChainId::new(chain);
             let address: Address = address.parse().expect("an address");
             assert!(registry.abi(&chain, address, 1).is_some());
-            let (protocol, dataset) = registry.describe_entry(&chain, address).expect("described");
-            assert_eq!(protocol, "uniswap_v3");
-            assert_eq!(dataset, "dex.trades");
+            assert_eq!(registry.describe_entry(&chain, address), Some("uniswap_v3"));
         }
     }
 
-    /// A protocol and its dataset travel with the address, which is what an ABI JSON
-    /// cannot supply: nothing in a list of signatures says what the contract is.
+    /// The protocol travels with the address, which is what an ABI JSON cannot supply:
+    /// nothing in a list of signatures says what the contract is.
     #[test]
     fn a_registry_entry_says_what_a_contract_is() {
-        let registry = ContractRegistry::load(
-            &[entry("uniswap_v3", "dex.trades", vec![("base", POOL)])],
-            abi_dir(),
-        )
-        .expect("the registry loads");
+        let registry =
+            ContractRegistry::load(&[entry("uniswap_v3", vec![("base", POOL)])], abi_dir())
+                .expect("the registry loads");
 
         let address: Address = POOL.parse().expect("an address");
         assert_eq!(
             registry.describe_entry(&ChainId::new("base"), address),
-            Some(("uniswap_v3", "dex.trades"))
+            Some("uniswap_v3")
         );
         // A different chain is a miss, so one chain's registry does not leak into another.
         assert_eq!(
@@ -277,8 +263,8 @@ mod tests {
     fn a_duplicate_address_is_refused() {
         let result = ContractRegistry::load(
             &[
-                entry("uniswap_v3", "dex.trades", vec![("base", POOL)]),
-                entry("something_else", "other.dataset", vec![("base", POOL)]),
+                entry("uniswap_v3", vec![("base", POOL)]),
+                entry("something_else", vec![("base", POOL)]),
             ],
             abi_dir(),
         );
@@ -289,7 +275,7 @@ mod tests {
     /// that silently decodes nothing.
     #[test]
     fn a_missing_abi_is_an_error() {
-        let mut bad = entry("uniswap_v3", "dex.trades", vec![("base", POOL)]);
+        let mut bad = entry("uniswap_v3", vec![("base", POOL)]);
         bad.abi = std::path::PathBuf::from("nope.json");
         assert!(ContractRegistry::load(&[bad], abi_dir()).is_err());
     }
@@ -299,11 +285,7 @@ mod tests {
     #[test]
     fn a_bad_address_is_refused() {
         let result = ContractRegistry::load(
-            &[entry(
-                "uniswap_v3",
-                "dex.trades",
-                vec![("base", "not-an-address")],
-            )],
+            &[entry("uniswap_v3", vec![("base", "not-an-address")])],
             abi_dir(),
         );
         assert!(result.is_err());

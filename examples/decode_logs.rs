@@ -21,12 +21,20 @@
 //! - Every argument carries the ABI's own name. That is what lets a consumer address
 //!   `amount0` rather than count positions, which breaks silently when an ABI revision
 //!   reorders a parameter.
+//! - The record carries `protocol`, taken from the registry entry that matched the
+//!   address. Nothing in the ABI could supply it, and it is what lets a downstream
+//!   consumer group rows by protocol without knowing any address.
+//!
+//!    The record deliberately carries **no** dataset. Turning these arguments into a
+//!   `dex.trades` row needs to know which tokens the pool trades and how many decimals
+//!   they have, and none of that is in a log — it comes from calling the pool and the
+//!   tokens. That projection belongs where those joins are, not here.
 //!
 //! # Decoding other contracts
 //!
 //! This example is self-contained on purpose: it takes no arguments and needs no broker,
 //! because a demo that has to be configured is a demo that gets skipped. To decode a
-//! different contract, change `POOL`, `CHAIN`, and the two `include_str!` files above.
+//! different contract, change `POOL`, `CHAIN`, and the ABI path in the registry below.
 //!
 //! To capture real input for it, run the indexer with `stdout = true` in `[ingest]`,
 //! which prints what it would publish instead of sending it to a broker:
@@ -35,18 +43,17 @@
 //! RUST_LOG=warn cargo run --release 2>/dev/null | head -200 > envelopes.ndjson
 //! ```
 //!
-//! A real registry is keyed by `(chain, address, block)` and answers per log; the fixed
-//! registry here stands in for it so the example needs no configuration.
+//! A real registry is keyed by `(chain, address, block)` and answers per log. This
+//! example builds the same `ContractRegistry` the settings file builds, so it exercises
+//! the path the pipeline does — including the `protocol` stamped from the entry.
 
 // A runnable tool rather than a library, so printing is the whole job.
 #![expect(clippy::print_stdout, clippy::print_stderr, clippy::expect_used)]
 
 use std::process::ExitCode;
 
-use alloy_primitives::Address;
 use indexer::decode::Transform;
-use indexer::decode::registry::{Abi, AbiRegistry};
-use indexer::wire::envelope::ChainId;
+use indexer::decode::contracts::{ContractRegistry, Deployment, ProtocolEntry};
 use indexer::wire::envelope::Envelope;
 
 /// The pool these logs came from, and the address its ABI is registered against.
@@ -62,28 +69,26 @@ const CHAIN: &str = "base";
 /// kilobyte, and a fixture that needs fetching would make this unrunnable.
 const SWAPS: &str = include_str!("fixtures/uniswap_v3_swaps.ndjson");
 
-/// One ABI for every address on one chain, which is all a demo needs.
-struct FixedRegistry {
-    chain: ChainId,
-    address: Address,
-    abi: Abi,
-}
-
-impl AbiRegistry for FixedRegistry {
-    fn abi(&self, chain: &ChainId, address: Address, _block: u64) -> Option<&Abi> {
-        (chain == &self.chain && address == self.address).then_some(&self.abi)
-    }
-}
-
 fn main() -> ExitCode {
-    let address: Address = POOL.parse().expect("the pool address parses");
-    let abi =
-        Abi::from_json(include_str!("../abis/uniswap_v3_pool.json")).expect("the pool ABI loads");
-    let transform = Transform::new(FixedRegistry {
-        chain: ChainId::new(CHAIN),
-        address,
-        abi,
-    });
+    // The real registry, built the way the settings file builds it, so the example
+    // exercises the same path the pipeline does rather than a stub that would not
+    // stamp `protocol`.
+    let registry = ContractRegistry::load(
+        &[ProtocolEntry {
+            name: "uniswap_v3".to_owned(),
+            abi: std::path::PathBuf::from(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/abis/uniswap_v3_pool.json"
+            )),
+            deployment: vec![Deployment {
+                chain: CHAIN.to_owned(),
+                address: POOL.to_owned(),
+            }],
+        }],
+        ".",
+    )
+    .expect("the registry loads");
+    let transform = Transform::new(registry);
 
     let mut decoded_count = 0_usize;
     for (number, line) in SWAPS.lines().enumerate() {

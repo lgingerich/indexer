@@ -31,16 +31,18 @@ brokers = "localhost:9092"
 # drain_secs = 5
 
 # A registered contract. The ABI says what the events look like; it cannot say what the
-# contract *is* or where its rows belong, so both are written here and stamped onto every
-# decoded record.
+# contract *is*, so that is written here and stamped onto every decoded record.
 #
 # One entry per protocol, with its deployments listed under it: a protocol like Uniswap
 # V3 has thousands of pools sharing one ABI, so naming an ABI file per address would
 # repeat the same file thousands of times.
 #
+# Note what is deliberately absent: where the rows go. A dataset is a modeling choice
+# that needs context this stage does not have — which token a pool trades, how many
+# decimals it has — so the projection happens downstream, where the joins are.
+#
 # [[storage.protocol]]
 # name = "uniswap_v3"        # what it is, onto every decoded record
-# dataset = "dex.trades"     # where its rows belong
 # abi = "abis/uniswap_v3_pool.json"   # relative to this file
 #
 # [[storage.protocol.deployment]]

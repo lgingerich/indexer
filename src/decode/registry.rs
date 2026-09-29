@@ -120,14 +120,14 @@ impl Abi {
     /// mismatch usually means the ABI is the wrong version for this height, and
     /// silently dropping the log would hide exactly that.
     pub fn decode_log(&self, log: RawLog<'_>) -> Result<Option<Decoded>, RegistryError> {
-        self.decode_log_as(log, "", "")
+        self.decode_log_as(log, "")
     }
 
-    /// Decodes a log, stamping the protocol and dataset it belongs to.
+    /// Decodes a log, stamping the protocol the contract implements.
     ///
-    /// The caller knows these because it found the ABI through a registry entry that
-    /// carries them; an [`Abi`] alone does not, which is why they are parameters rather
-    /// than a lookup here.
+    /// The caller knows it because it found the ABI through a registry entry that
+    /// carries it; an [`Abi`] alone does not, which is why it is a parameter rather than
+    /// a lookup here.
     ///
     /// # Errors
     ///
@@ -136,7 +136,6 @@ impl Abi {
         &self,
         log: RawLog<'_>,
         protocol: &str,
-        dataset: &str,
     ) -> Result<Option<Decoded>, RegistryError> {
         let Some(selector) = log.topics.first() else {
             return Ok(None);
@@ -161,7 +160,6 @@ impl Abi {
             name: event.name.clone(),
             address: log.address,
             protocol: protocol.to_owned(),
-            dataset: dataset.to_owned(),
             selector: *selector,
             signature: event.signature(),
             anonymous: event.anonymous,
@@ -219,12 +217,12 @@ pub trait AbiRegistry {
     /// forwards the log undecoded rather than stalling the pipeline behind a lookup.
     fn abi(&self, chain: &ChainId, address: Address, block: u64) -> Option<&Abi>;
 
-    /// What the registry knows about `address`: its protocol and its dataset.
+    /// What the registry knows about `address`: the protocol it implements.
     ///
     /// Defaults to nothing, so a registry that only answers ABIs — a test double, or a
     /// minimal implementation — stays valid. A record decoded through such a registry
-    /// carries empty strings, which is honest: nothing knows what the contract is.
-    fn describe(&self, _chain: &ChainId, _address: Address) -> Option<(&str, &str)> {
+    /// carries an empty protocol, which is honest: nothing knows what the contract is.
+    fn describe(&self, _chain: &ChainId, _address: Address) -> Option<&str> {
         None
     }
 }
