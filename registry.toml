@@ -1,0 +1,46 @@
+# The contract registry: what the decode stage decodes, and what discovery learns.
+# Three lists, all data, no code per protocol. See `src/decode/registry.rs`.
+#
+# Kept separate from `indexer.toml` because it is a catalog, not deployment topology: it
+# grows as protocols are added, on its own schedule. ABI paths below are relative to this
+# file, so the pair can be moved together.
+
+# An ABI, named once. A pool protocol like Uniswap V3 has thousands of pools with an
+# identical ABI, so the ABI is loaded once and shared, and an address is a line.
+[[abi]]
+name = "uniswap_v3_pool"
+path = "abis/uniswap_v3_pool.json"
+
+[[abi]]
+name = "uniswap_v3_factory"
+path = "abis/uniswap_v3_factory.json"
+
+[[abi]]
+name = "uniswap_v4_pool_manager"
+path = "abis/uniswap_v4_pool_manager.json"
+
+# Addresses that decode with an ABI from the first block. The ABI's name becomes the
+# `protocol` on every decoded record.
+[[contract]]
+chain = "base"
+address = "0x1F98431c8aD98523631AE4a59f267346ea31F984" # V3 factory
+abi = "uniswap_v3_factory"
+
+# Uniswap V4 has no per-pool contract: one PoolManager holds every pool, and a pool is a
+# bytes32 id, not an address. So it is a single static contract and needs no rule — the
+# `Initialize` record it emits *is* the pool's metadata.
+[[contract]]
+chain = "base"
+address = "0x000000000004444c5dc75cB358380D2e3dE08A90" # V4 PoolManager
+abi = "uniswap_v4_pool_manager"
+
+# A rule: when this factory's creation event decodes, register its child. The child's ABI
+# is already loaded, so registration is deterministic — no network, no lookahead. The
+# factory emits its creation event before the child emits anything, so a sequential pass
+# registers the pool before its first `Swap`.
+[[discovery]]
+chain = "base"
+address = "0x1F98431c8aD98523631AE4a59f267346ea31F984" # the V3 factory
+event = "PoolCreated(address,address,uint24,int24,address)"
+child = "pool"          # the decoded argument holding the new pool address
+abi = "uniswap_v3_pool" # what the child decodes with; becomes its protocol tag

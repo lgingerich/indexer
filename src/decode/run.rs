@@ -23,12 +23,12 @@
 use std::time::Duration;
 
 use anyhow::Result;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::config::BatchConfig;
 use crate::connectors::{EnvelopeSink, EnvelopeSource};
 use crate::decode::Transform;
-use crate::decode::contracts::ContractRegistry;
+use crate::decode::registry::ContractRegistry;
 
 /// Builds and runs the decode stage.
 #[derive(Debug)]
@@ -59,7 +59,9 @@ impl Decode {
         K: EnvelopeSink,
     {
         let contracts = self.registry.len();
-        let transform = Transform::new(self.registry);
+        // The registry is owned here, not inside the transform: discovery mutates it
+        // between records, and the transform reads the current snapshot per call.
+        let mut registry = self.registry;
 
         info!(
             contracts,
@@ -70,14 +72,23 @@ impl Decode {
         // Each registered log expands to its decoded record; everything else — raw
         // datasets, unregistered logs — is dropped, since the raw topic already carries
         // it. A log that fails to decode is reported but produces no record.
+        //
+        // Registration happens inline, in the same sequential pass: a factory's creating
+        // log always precedes its child's own logs, so a child is registered before it
+        // emits anything. No lookahead, no network — the child's ABI is already loaded.
         crate::connectors::run(source, sink, self.batch, self.drain, |envelope, out| {
-            let applied = transform.apply(envelope);
+            let chain = envelope.chain.clone();
+            let applied = Transform::apply(&registry, envelope);
             if let Some(error) = applied.error {
                 // A log that matched an ABI but did not decode usually means the ABI
                 // is the wrong version for this height. It must not stall the stream,
                 // and it must not be silent either — the raw log is already upstream,
                 // so a corrected ABI recovers it.
                 warn!(%error, "a log did not decode and produced no record");
+            }
+            if let Some(discovery) = applied.discovery {
+                debug!(child = %discovery.child, protocol = %discovery.protocol, "registered a discovered contract");
+                registry.register_discovered(&chain, discovery);
             }
             out.extend(applied.output);
         })
@@ -250,7 +261,7 @@ mod tests {
         let mut sink = CollectSink::default();
 
         Decode::builder()
-            .registry(crate::decode::contracts::ContractRegistry::default())
+            .registry(crate::decode::registry::ContractRegistry::default())
             .build()
             .expect("builds")
             .run(&mut source, &mut sink)
@@ -280,7 +291,7 @@ mod tests {
         let mut sink = CollectSink::default();
 
         Decode::builder()
-            .registry(crate::decode::contracts::ContractRegistry::default())
+            .registry(crate::decode::registry::ContractRegistry::default())
             .build()
             .expect("builds")
             .run(&mut source, &mut sink)
@@ -298,7 +309,7 @@ mod tests {
         let mut source = FakeSource::default();
         let mut sink = CollectSink::default();
         Decode::builder()
-            .registry(crate::decode::contracts::ContractRegistry::default())
+            .registry(crate::decode::registry::ContractRegistry::default())
             .build()
             .expect("builds")
             .run(&mut source, &mut sink)

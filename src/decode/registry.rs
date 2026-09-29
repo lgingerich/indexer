@@ -1,262 +1,429 @@
-//! Decoding one log against one contract's ABI.
+//! Which ABI applies where, and what discovery reveals.
 //!
-//! [`Abi`] owns a parsed [`JsonAbi`] and turns a log's topics and data into a
-//! [`DecodedEvent`]: the event's name and its named, typed arguments. It knows
-//! nothing about the wire — no chain, no block, no envelope — so the same decoder
-//! drives the pipeline, a batch, or a test. The published record is assembled from a
-//! `DecodedEvent` and the raw log it came from by
-//! [`Transform`](crate::decode::Transform), which is the layer that owns identity.
+//! Three lists, all data, no code per protocol:
 //!
-//! [`AbiRegistry`] answers which [`Contract`] — an ABI plus what the contract is —
-//! applies to an address at a block. Lookup is keyed by `(chain, contract address,
-//! block)` and not by address alone. A contract's ABI is valid over a *block range*:
-//! a proxy upgrades, a new implementation appears, and the same address answers
-//! different selectors at different heights. An implicit "latest" would silently
-//! decode an old log with a new ABI, which is the failure mode that produces
-//! plausible but wrong rows — so the height is part of the key and there is no
-//! default for it.
+//! ```toml
+//! [[abi]]
+//! name = "uniswap_v3_pool"
+//! path = "abis/uniswap_v3_pool.json"
 //!
-//! # Static and dynamic ABIs
+//! [[contract]]
+//! chain = "base"
+//! address = "0x1F98431c8aD98523631AE4a59f267346ea31F984"
+//! abi = "uniswap_v3_factory"
 //!
-//! The two sources are complementary rather than alternatives:
+//! [[discovery]]
+//! chain = "base"
+//! address = "0x1F98431c8aD98523631AE4a59f267346ea31F984"
+//! event = "PoolCreated(address,address,uint24,int24,address)"
+//! child = "pool"
+//! abi = "uniswap_v3_pool"
+//! ```
 //!
-//! - A **compile-time** ABI is checked code. `sol!`-generated bindings, or a JSON
-//!   ABI load, give a decoder that cannot silently mis-type a field.
-//! - A **runtime** ABI is data. No compile-time set can cover an open-ended set of
-//!   contracts deployed by third parties, and a proxy's ABI is not knowable at build
-//!   time at all.
+//! # Why an ABI is named once
 //!
-//! [`Abi`] is the runtime path; a compile-time binding would be converted into one
-//! for a uniform call site. [`AbiRegistry`] is the seam either way, so the transform
-//! does not know which answered — and so a registry backed by a table of ABI
-//! versions can be swapped in without touching the decoder.
+//! A protocol like Uniswap V3 has thousands of pools across many chains with an
+//! *identical* ABI, so naming an ABI file per address would repeat the same file
+//! thousands of times. Here the ABI is a shared [`Arc`], loaded once, and an address is
+//! a line.
 //!
-//! The production registry is [`ContractRegistry`](crate::decode::contracts),
-//! which lists each protocol once and its deployments under it.
+//! # Discovery
+//!
+//! A pool created by a factory did not exist when the settings were written, so it
+//! cannot be a `[[contract]]`. A `[[discovery]]` rule closes that: when the factory's
+//! creation event decodes, the named argument holds the new child's address, and the
+//! child is registered with the named ABI.
+//!
+//! Registration is **deterministic**: the child's ABI is already loaded, so no network
+//! is involved and the registry never has to block. The only ordering fact relied on is
+//! that a factory emits its creation event before the child emits anything — true by
+//! construction, so a sequential pass over the stream registers the child before its
+//! first log. The stage surfaces the effect and applies it; see
+//! [`super::transform`] and [`super::run`].
+//!
+//! The ABI is keyed by `(chain, address)` only, so a protocol that does not put its
+//! pools at an address — Uniswap V4's `PoolManager`, where a pool is a `bytes32` id — is
+//! simply one `[[contract]]` with no `[[discovery]]`. Logical pools need no entry at all.
 //!
 //! # Known limitation
 //!
-//! One ABI per `(chain, address)`, applying at every height. A proxy that upgrades
-//! changes its ABI at a height, which the current registries cannot express; the
-//! [`AbiRegistry`] seam is what a table-backed registry — keyed by
-//! `(chain, address, block_range)` — replaces without the decoder changing.
+//! A contract applies at every height. A proxy that upgrades changes its ABI at a
+//! height, which this cannot express; [`AbiRegistry::contract`] already takes a `block`
+//! so a block-ranged version can replace it without the decoder changing. A rule also
+//! cannot yet resolve a proxy or fetch an unknown ABI — both are additive behind the
+//! same rule shape.
 
-use std::collections::BTreeMap;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
-use crate::wire::envelope::{ChainId, DecodedArg};
-use alloy_dyn_abi::{DynSolValue, EventExt as _};
-use alloy_json_abi::{Event, JsonAbi};
 use alloy_primitives::{Address, B256};
+use serde::Deserialize;
 
-use crate::decode::convert::{self, ConversionError};
+use super::abi::{Abi, DecodedEvent};
+use crate::wire::envelope::ChainId;
 
-/// One decoded event: its name and its named, typed arguments.
-///
-/// The decoder's whole output. It carries no chain, block, or transaction — those
-/// are the raw log's, and [`Transform`](crate::decode::Transform) stamps them on when
-/// it assembles the published record.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DecodedEvent {
-    /// The event name from the ABI, for example `Transfer`.
+/// One ABI file, named so a `[[contract]]` or `[[discovery]]` can reference it.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AbiEntry {
+    /// The name to reference it by, for example `uniswap_v3_pool`.
     pub name: String,
-    /// The event selector, `keccak256` of its signature.
-    pub selector: B256,
-    /// The event's human-readable signature, for example
-    /// `Transfer(address,address,uint256)`.
-    pub signature: String,
-    /// Whether the ABI declares this event anonymous.
-    pub anonymous: bool,
-    /// The indexed arguments, in ABI order, each carrying its name.
-    pub indexed: Vec<DecodedArg>,
-    /// The non-indexed arguments, in ABI order, each carrying its name.
-    pub body: Vec<DecodedArg>,
+    /// The ABI file, relative to the settings file's directory.
+    pub path: PathBuf,
 }
 
-/// One contract as the registry knows it: its ABI, and what it is.
+/// One address that decodes with an ABI from the first block.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ContractEntry {
+    /// The chain the address is on.
+    pub chain: String,
+    /// The contract address.
+    pub address: String,
+    /// The `[[abi]]` name it decodes with.
+    pub abi: String,
+}
+
+/// One factory the registry learns children from.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DiscoveryEntry {
+    /// The chain the factory is on.
+    pub chain: String,
+    /// The factory address that emits the creation event.
+    pub address: String,
+    /// The creation event's signature, for example
+    /// `PoolCreated(address,address,uint24,int24,address)`.
+    pub event: String,
+    /// The decoded argument holding the new child's address.
+    pub child: String,
+    /// The `[[abi]]` name the child decodes with.
+    pub abi: String,
+}
+
+/// One contract as the registry knows it: its ABI and what it is.
 ///
-/// Returned by [`AbiRegistry::contract`] as a borrowed pair so the lookup that found
-/// the ABI also yields the protocol. An [`Abi`] is a list of signatures and says
-/// nothing about which protocol an address implements, and a second lookup for the
-/// protocol could disagree with the first — so the two travel together.
-#[derive(Debug, Clone, Copy)]
-pub struct Contract<'a> {
-    /// The contract's ABI.
-    pub abi: &'a Abi,
-    /// What the contract is, for example `uniswap_v3`, or `""` if unknown.
-    pub protocol: &'a str,
+/// The ABI is an `Arc` because one ABI serves every address that uses it: a registry
+/// stores it once and clones a pointer, not the event map.
+#[derive(Debug, Clone)]
+pub struct Contract {
+    /// The contract's ABI, shared with every address that uses it.
+    pub abi: Arc<Abi>,
+    /// What the contract is, for example `uniswap_v3_pool`.
+    pub protocol: String,
 }
 
-/// One loaded contract ABI, able to decode a log against its events.
+/// One decoded log's discovery effect: which address is a child, and how to decode it.
+#[derive(Debug, Clone)]
+pub struct Discovery {
+    /// The child contract the creating event revealed, to register.
+    pub child: Address,
+    /// The ABI the child decodes with.
+    pub abi: Arc<Abi>,
+    /// What the child is, for example `uniswap_v3_pool`.
+    pub protocol: String,
+}
+
+/// What the decoder needs from a registry: the ABI for an address, and what a decoded
+/// log revealed.
 ///
-/// Indexed by selector at load, because the lookup path must not do I/O and must not
-/// scan: a registry that reads a file, or walks the events, per log is a registry that
-/// stalls the pipeline under load.
-#[derive(Debug, Clone, Default)]
-pub struct Abi {
-    /// Selector to event, built once so the per-log lookup is a map hit rather than
-    /// a linear scan over the ABI's events.
-    by_selector: BTreeMap<B256, Event>,
-}
-
-impl Abi {
-    /// Loads an ABI from its JSON form.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`RegistryError::Abi`] if the JSON is not a valid ABI.
-    pub fn from_json(json: &str) -> Result<Self, RegistryError> {
-        let abi: JsonAbi = serde_json::from_str(json).map_err(|error| RegistryError::Abi {
-            detail: error.to_string(),
-        })?;
-        Ok(Self::from_abi(&abi))
-    }
-
-    /// Indexes an already-parsed ABI by event selector.
-    ///
-    /// Takes a reference and clones only the events it keeps, because the caller may
-    /// still want the parsed ABI; [`Self::from_json`] hands it a temporary.
-    ///
-    /// Anonymous events are excluded: they carry no selector in `topic0`, so they
-    /// cannot be found by one, and pretending otherwise would match the wrong event
-    /// on an unrelated log.
-    #[must_use]
-    pub fn from_abi(abi: &JsonAbi) -> Self {
-        let by_selector = abi
-            .events()
-            .filter(|event| !event.anonymous)
-            .map(|event| (event.selector(), event.clone()))
-            .collect();
-        Self { by_selector }
-    }
-
-    /// Decodes a log's topics and data into a [`DecodedEvent`], if this ABI declares
-    /// an event with the log's selector.
-    ///
-    /// Returns `Ok(None)` when no event in the ABI has the log's selector. That is a
-    /// normal miss, not an error: a contract emits events outside any ABI the
-    /// consumer cares about, and the transform forwards the log undecoded.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`RegistryError::Decode`] when an event *did* match and its data does
-    /// not decode against it. That is worth surfacing rather than skipping: a
-    /// mismatch usually means the ABI is the wrong version for this height, and
-    /// silently dropping the log would hide exactly that.
-    pub fn decode_log(
-        &self,
-        topics: &[B256],
-        data: &[u8],
-    ) -> Result<Option<DecodedEvent>, RegistryError> {
-        let Some(selector) = topics.first() else {
-            return Ok(None);
-        };
-        let Some(event) = self.by_selector.get(selector) else {
-            return Ok(None);
-        };
-
-        let decoded = event
-            .decode_log_parts(topics.iter().copied(), data)
-            .map_err(|error| RegistryError::Decode {
-                selector: *selector,
-                detail: error.to_string(),
-            })?;
-
-        // `decode_log_parts` splits the event's inputs into indexed and non-indexed
-        // exactly as the ABI declares them, so the names come from the same split.
-        let (indexed_params, body_params): (Vec<_>, Vec<_>) =
-            event.inputs.iter().partition(|param| param.indexed);
-
-        Ok(Some(DecodedEvent {
-            name: event.name.clone(),
-            selector: *selector,
-            signature: event.signature(),
-            anonymous: event.anonymous,
-            indexed: typed_args(&indexed_params, &decoded.indexed)?,
-            body: typed_args(&body_params, &decoded.body)?,
-        }))
-    }
-}
-
-/// Converts decoded values to named arguments, pairing each with its ABI parameter.
-///
-/// The decoder returns values in ABI order with no names, so the names come from the
-/// event's own input list — the same split the decoder used. A length mismatch would
-/// mean the decoder disagreed with the ABI about its own shape, which is a bug rather
-/// than bad input, so it is an error rather than a truncation.
-fn typed_args(
-    params: &[&alloy_json_abi::EventParam],
-    values: &[DynSolValue],
-) -> Result<Vec<DecodedArg>, RegistryError> {
-    if params.len() != values.len() {
-        return Err(RegistryError::Shape {
-            decoded: values.len(),
-            declared: params.len(),
-        });
-    }
-
-    params
-        .iter()
-        .zip(values)
-        .map(|(param, value)| {
-            Ok(DecodedArg {
-                name: param.name.clone(),
-                value: convert::value(value)?,
-            })
-        })
-        .collect::<Result<Vec<_>, ConversionError>>()
-        .map_err(RegistryError::Conversion)
-}
-
-/// Where an ABI comes from, so the transform does not know.
-///
-/// The height is part of the key because an ABI is valid over a block range, not
-/// forever. Implement this over a table of `(address, block_range) -> ABI` for a
-/// proxy-aware registry.
+/// Kept a trait so the transform can be driven by a test double without a settings file,
+/// and so a block-ranged or proxy-aware registry can replace the concrete one without
+/// the decoder changing.
 pub trait AbiRegistry {
     /// The contract for `address` on `chain` as of `block`, or `None` if unknown.
     ///
-    /// Returns the ABI and what the contract is together, so the protocol cannot
-    /// disagree with the ABI that decoded the log. A registry that knows only the ABI
-    /// reports an empty protocol, which is honest: nothing knows what the contract is.
+    /// Must not do I/O on the hot path: a miss returns `None`, and the caller drops the
+    /// log rather than stalling the pipeline behind a lookup.
+    fn contract(&self, chain: &ChainId, address: Address, block: u64) -> Option<Contract>;
+
+    /// The discovery rule a just-decoded record triggered, if any.
     ///
-    /// Must not do I/O on the hot path: a miss returns `None`, and the caller
-    /// forwards the log undecoded rather than stalling the pipeline behind a lookup.
-    fn contract(&self, chain: &ChainId, address: Address, block: u64) -> Option<Contract<'_>>;
+    /// `address` is the contract that emitted the log, `selector` is the event that
+    /// matched, and `event` is the decoded event. The default answers `None`, so a
+    /// registry without discovery needs nothing.
+    fn discovery(
+        &self,
+        _chain: &ChainId,
+        _address: Address,
+        _selector: B256,
+        _event: &DecodedEvent,
+    ) -> Option<Discovery> {
+        None
+    }
 }
 
-/// Why a log could not be decoded.
+/// The loaded registry: one shared ABI per address, plus the discovery rules.
+#[derive(Debug, Default)]
+pub struct ContractRegistry {
+    abis: HashMap<String, Arc<Abi>>,
+    entries: HashMap<(ChainId, Address), Contract>,
+    rules: HashMap<(ChainId, Address, B256), Rule>,
+}
+
+/// A discovery rule, resolved against its factory's ABI at load.
+#[derive(Debug, Clone)]
+struct Rule {
+    /// The decoded argument holding the new child's address.
+    child: String,
+    /// The ABI the child decodes with.
+    abi: Arc<Abi>,
+    /// What the child is, for the decoded record it produces.
+    protocol: String,
+}
+
+/// The three lists a registry file holds, on their own so the file is self-contained.
+///
+/// Parse this with [`toml::from_str`], or load it with [`ContractRegistry::from_file`].
+/// The shape is documented in the module docs; the entries carry their own docs.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RegistryConfig {
+    /// The ABI files, named so a contract or rule can reference one.
+    #[serde(default)]
+    pub abi: Vec<AbiEntry>,
+    /// The addresses that decode with an ABI from the first block.
+    #[serde(default)]
+    pub contract: Vec<ContractEntry>,
+    /// The factories the registry learns child contracts from.
+    #[serde(default)]
+    pub discovery: Vec<DiscoveryEntry>,
+}
+
+impl ContractRegistry {
+    /// Loads ABIs, static contracts, and discovery rules from a registry file.
+    ///
+    /// The file is [`RegistryConfig`]; ABI paths in it resolve relative to the file's own
+    /// directory, so a moved file keeps working.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RegistryError::RegistryFile`] when the file cannot be read or parsed,
+    /// and otherwise whatever [`Self::load`] returns.
+    pub fn from_file(path: impl AsRef<Path>) -> Result<Self, RegistryError> {
+        let path = path.as_ref();
+        let text = std::fs::read_to_string(path).map_err(|source| RegistryError::RegistryFile {
+            path: path.display().to_string(),
+            source: Box::new(source),
+        })?;
+        let config: RegistryConfig =
+            toml::from_str(&text).map_err(|source| RegistryError::RegistryFile {
+                path: path.display().to_string(),
+                source: Box::new(source),
+            })?;
+        Self::load(
+            &config.abi,
+            &config.contract,
+            &config.discovery,
+            path.parent().unwrap_or_else(|| Path::new(".")),
+        )
+    }
+
+    /// Loads the ABIs, the static contracts, and the discovery rules.
+    ///
+    /// Prefer [`Self::from_file`]; this is the in-memory form, for a caller that has the
+    /// lists already. `base` is the directory relative ABI paths resolve against: a path
+    /// in a registry file reads as relative to that file, not to the process's working
+    /// directory.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when an ABI cannot be read or is not an ABI, when a name
+    /// referenced by a contract or rule is not declared, when an address does not parse,
+    /// when two contracts claim one `(chain, address)`, and when a discovery rule names
+    /// an event its factory's ABI does not declare. Each is a startup error rather than a
+    /// silent no-op: a registry that decodes less than it was told to is a wrong answer
+    /// that looks like a quiet chain.
+    pub fn load(
+        abis: &[AbiEntry],
+        contracts: &[ContractEntry],
+        discoveries: &[DiscoveryEntry],
+        base: impl AsRef<Path>,
+    ) -> Result<Self, RegistryError> {
+        let base = base.as_ref();
+        let mut registry = Self::default();
+
+        for entry in abis {
+            let path = base.join(&entry.path);
+            let json = std::fs::read_to_string(&path).map_err(|source| RegistryError::AbiFile {
+                path: path.display().to_string(),
+                source,
+            })?;
+            registry
+                .abis
+                .insert(entry.name.clone(), Arc::new(Abi::from_json(&json)?));
+        }
+
+        for contract in contracts {
+            let address = parse_address(&contract.chain, &contract.address)?;
+            let origin = format!("{}.{}", contract.chain, contract.address);
+            let abi = registry.abi_named(&contract.abi, &origin)?;
+            let key = (ChainId::new(&contract.chain), address);
+            // The ABI's name is the protocol tag: an ABI is exactly the granularity a
+            // protocol has, and the settings already name it.
+            let entry = Contract {
+                abi,
+                protocol: contract.abi.clone(),
+            };
+            if registry.entries.insert(key, entry).is_some() {
+                return Err(RegistryError::Duplicate {
+                    chain: contract.chain.clone(),
+                    address: contract.address.clone(),
+                });
+            }
+        }
+
+        for discovery in discoveries {
+            let address = parse_address(&discovery.chain, &discovery.address)?;
+            let origin = format!("{}.{}", discovery.chain, discovery.address);
+            let abi = registry.abi_named(&discovery.abi, &origin)?;
+            // The factory must itself be registered to emit the event, so the rule is
+            // validated against the factory's ABI.
+            let selector = registry
+                .entries
+                .get(&(ChainId::new(&discovery.chain), address))
+                .and_then(|factory| factory.abi.selector(&discovery.event))
+                .ok_or_else(|| RegistryError::Discovery {
+                    chain: discovery.chain.clone(),
+                    address: discovery.address.clone(),
+                    detail: format!(
+                        "event {:?} is not declared by the factory's ABI",
+                        discovery.event
+                    ),
+                })?;
+            registry.rules.insert(
+                (ChainId::new(&discovery.chain), address, selector),
+                Rule {
+                    child: discovery.child.clone(),
+                    protocol: discovery.abi.clone(),
+                    abi,
+                },
+            );
+        }
+
+        Ok(registry)
+    }
+
+    /// The ABI registered under `name`, or an error naming who referenced it.
+    fn abi_named(&self, name: &str, entry: &str) -> Result<Arc<Abi>, RegistryError> {
+        self.abis
+            .get(name)
+            .cloned()
+            .ok_or_else(|| RegistryError::UnknownAbi {
+                entry: entry.to_owned(),
+                name: name.to_owned(),
+            })
+    }
+
+    /// Registers a contract learned at runtime, from a [`Discovery`] the transform
+    /// surfaced.
+    ///
+    /// A no-op when the address is already known, which is the normal case: a factory
+    /// replaces a pool, or a replayed stream re-registers what a prior pass found.
+    /// Discovery adds an address to the set that decodes; it never overrides one that is
+    /// already there, because a static registration is a deliberate statement and a
+    /// learned one is not.
+    pub fn register_discovered(&mut self, chain: &ChainId, discovery: Discovery) {
+        self.entries
+            .entry((chain.clone(), discovery.child))
+            .or_insert_with(|| Contract {
+                abi: discovery.abi,
+                protocol: discovery.protocol,
+            });
+    }
+
+    /// Whether any address is registered.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// How many addresses are registered, for logging what was picked up.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+}
+
+impl AbiRegistry for ContractRegistry {
+    fn contract(&self, chain: &ChainId, address: Address, _block: u64) -> Option<Contract> {
+        self.entries.get(&(chain.clone(), address)).cloned()
+    }
+
+    fn discovery(
+        &self,
+        chain: &ChainId,
+        address: Address,
+        selector: B256,
+        event: &DecodedEvent,
+    ) -> Option<Discovery> {
+        // The rule is keyed by the factory that emitted the log, which is the log's
+        // address — the child's address is in the decoded argument, not the map key.
+        let rule = self.rules.get(&(chain.clone(), address, selector))?;
+        Some(Discovery {
+            child: child_address(event, &rule.child)?,
+            abi: Arc::clone(&rule.abi),
+            protocol: rule.protocol.clone(),
+        })
+    }
+}
+
+/// Parses an address, naming the entry it came from when it does not.
+fn parse_address(chain: &str, address: &str) -> Result<Address, RegistryError> {
+    address.parse().map_err(|_| RegistryError::Address {
+        entry: format!("{chain}.{address}"),
+    })
+}
+
+/// Reads a child address from the decoded event's named argument `name`.
+fn child_address(event: &DecodedEvent, name: &str) -> Option<Address> {
+    let arg = event
+        .indexed
+        .iter()
+        .chain(&event.body)
+        .find(|arg| arg.name == name)?;
+    match &arg.value {
+        crate::wire::typed::TypedValue::Address { value } => Some(*value),
+        _ => None,
+    }
+}
+
+/// Why the registry could not be loaded.
 #[derive(Debug, thiserror::Error)]
 pub enum RegistryError {
-    /// The ABI could not be loaded.
-    #[error("invalid ABI: {detail}")]
-    Abi {
-        /// What was wrong with it.
-        detail: String,
+    /// The registry file could not be read or parsed.
+    #[error("registry file {path}: {source}")]
+    RegistryFile {
+        /// The path that failed.
+        path: String,
+        /// The read or parse error.
+        source: Box<dyn std::error::Error + Send + Sync>,
     },
-    /// An event matched the log's selector but the data did not decode against it.
-    #[error("log {selector} does not decode against its ABI: {detail}")]
-    Decode {
-        /// The event selector that matched.
-        selector: B256,
-        /// The decoder's own explanation.
-        detail: String,
+    /// An ABI file could not be read.
+    #[error("read {path}: {source}")]
+    AbiFile {
+        /// The path that failed, as resolved against the registry file's directory.
+        path: String,
+        /// The underlying I/O error.
+        source: std::io::Error,
     },
-    /// The decoder returned a different number of values than the ABI declares.
-    #[error("ABI declares {declared} arguments but {decoded} were decoded")]
-    Shape {
-        /// How many values the decoder produced.
-        decoded: usize,
-        /// How many the ABI declares.
-        declared: usize,
-    },
-    /// A decoded value could not be published.
+    /// An ABI could not be parsed, or the registry could not be read otherwise.
     #[error(transparent)]
-    Conversion(#[from] ConversionError),
-    /// A registration's address did not parse.
+    Abi(#[from] super::abi::DecodeError),
+    /// An entry's address did not parse.
     #[error("registration {entry:?} has an invalid address")]
     Address {
         /// The entry as written.
         entry: String,
+    },
+    /// A `[[abi]]` entry references an ABI name that no ABI declares.
+    #[error("entry {entry:?} references ABI {name:?}, which no [[abi]] declares")]
+    UnknownAbi {
+        /// The registration as written, for locating it.
+        entry: String,
+        /// The ABI name it referenced.
+        name: String,
     },
     /// Two registry entries claim one `(chain, address)`.
     #[error("both {chain}.{address} are registered; one address decodes with one ABI")]
@@ -266,282 +433,302 @@ pub enum RegistryError {
         /// The address, as written.
         address: String,
     },
+    /// A discovery rule's event is not declared by its factory's ABI.
+    #[error("discovery rule for {chain}.{address}: {detail}")]
+    Discovery {
+        /// The chain, as written.
+        chain: String,
+        /// The factory address, as written.
+        address: String,
+        /// What was wrong with the rule.
+        detail: String,
+    },
 }
 
 #[cfg(test)]
-// The crate denies `expect`/`unwrap` to keep production paths honest; tests are
-// allowed them per the repository test style, since a failed expectation there
-// means the fixture or setup is wrong.
+// The crate denies `expect`/`unwrap` to keep production paths honest; tests are allowed
+// them per the repository test style, since a failed expectation there means the fixture
+// or setup is wrong.
 #[expect(clippy::expect_used)]
 mod tests {
-    use alloy_primitives::{Address, B256, I256, U256};
+    use alloy_primitives::{Address, B256};
 
-    use super::{Abi, AbiRegistry, Contract, RegistryError};
-    use crate::wire::envelope::{ChainId, DecodedArg};
-    use crate::wire::typed::TypedValue;
+    use super::{AbiEntry, ContractEntry, ContractRegistry, DiscoveryEntry};
+    use crate::decode::AbiRegistry as _;
+    use crate::wire::envelope::ChainId;
 
-    /// The canonical ERC-20 event, as an ABI JSON would spell it.
-    const ERC20: &str = r#"[{
-        "type": "event",
-        "name": "Transfer",
-        "anonymous": false,
-        "inputs": [
-            {"name": "from", "type": "address", "indexed": true},
-            {"name": "to", "type": "address", "indexed": true},
-            {"name": "value", "type": "uint256", "indexed": false}
-        ]
-    }]"#;
+    const POOL: &str = "0xd0b53D9277642d899DF5C87A3966A349A798F224";
+    const FACTORY: &str = "0x1F98431c8aD98523631AE4a59f267346ea31F984";
+    const SIGNATURE: &str = "PoolCreated(address,address,uint24,int24,address)";
 
-    fn address(byte: u8) -> Address {
-        Address::from([byte; 20])
+    /// The crate's ABI directory, so the fixture does not have to be copied.
+    fn abi_dir() -> std::path::PathBuf {
+        std::path::PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/abis"))
     }
 
-    /// `keccak256("Transfer(address,address,uint256)")`. Pinned as a constant rather
-    /// than computed, so a change in how the selector is derived shows up as a
-    /// failure here rather than as a silent mismatch against real chain data.
-    fn transfer_selector() -> B256 {
-        "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
-            .parse()
-            .expect("selector parses")
+    fn pool_abi() -> AbiEntry {
+        AbiEntry {
+            name: "uniswap_v3_pool".to_owned(),
+            path: std::path::PathBuf::from("uniswap_v3_pool.json"),
+        }
     }
 
-    /// A real `Transfer` log: two indexed addresses as topics, the amount as data.
-    fn transfer_log() -> (Vec<B256>, Vec<u8>) {
-        let mut from = [0u8; 32];
-        from[12..].copy_from_slice(&[0x11; 20]);
-        let mut to = [0u8; 32];
-        to[12..].copy_from_slice(&[0x22; 20]);
-        let value = U256::from(1_000_000_000_000_000_000u64).to_be_bytes::<32>();
-        (
-            vec![transfer_selector(), B256::from(from), B256::from(to)],
-            value.to_vec(),
+    fn factory_abi() -> AbiEntry {
+        AbiEntry {
+            name: "uniswap_v3_factory".to_owned(),
+            path: std::path::PathBuf::from("uniswap_v3_factory.json"),
+        }
+    }
+
+    fn contract(chain: &str, address: &str, abi: &str) -> ContractEntry {
+        ContractEntry {
+            chain: chain.to_owned(),
+            address: address.to_owned(),
+            abi: abi.to_owned(),
+        }
+    }
+
+    fn discovery(
+        chain: &str,
+        address: &str,
+        event: &str,
+        child: &str,
+        abi: &str,
+    ) -> DiscoveryEntry {
+        DiscoveryEntry {
+            chain: chain.to_owned(),
+            address: address.to_owned(),
+            event: event.to_owned(),
+            child: child.to_owned(),
+            abi: abi.to_owned(),
+        }
+    }
+
+    /// One ABI shared by several addresses: the point of naming an ABI once, since a
+    /// protocol like Uniswap V3 has thousands of pools with identical ABIs.
+    #[test]
+    fn one_abi_serves_many_addresses() {
+        let registry = ContractRegistry::load(
+            &[pool_abi()],
+            &[
+                contract("base", POOL, "uniswap_v3_pool"),
+                contract(
+                    "base",
+                    "0x1111111111111111111111111111111111111111",
+                    "uniswap_v3_pool",
+                ),
+                contract("ethereum", POOL, "uniswap_v3_pool"),
+            ],
+            &[],
+            abi_dir(),
         )
+        .expect("the registry loads");
+
+        assert_eq!(registry.len(), 3);
+        for (chain, address) in [
+            ("base", POOL),
+            ("base", "0x1111111111111111111111111111111111111111"),
+            ("ethereum", POOL),
+        ] {
+            let chain = ChainId::new(chain);
+            let address: Address = address.parse().expect("an address");
+            assert!(registry.contract(&chain, address, 1).is_some());
+        }
     }
 
-    /// The happy path: a real log decodes into named, typed arguments.
     #[test]
-    fn a_transfer_log_decodes_into_typed_arguments() {
-        let abi = Abi::from_json(ERC20).expect("ABI loads");
-        let (topics, data) = transfer_log();
-        let decoded = abi
-            .decode_log(&topics, &data)
-            .expect("log decodes")
-            .expect("an event matched");
-
-        assert_eq!(decoded.name, "Transfer");
-        assert_eq!(decoded.selector, transfer_selector());
-        assert_eq!(decoded.signature, "Transfer(address,address,uint256)");
-        assert!(!decoded.anonymous);
-        assert_eq!(decoded.indexed.len(), 2);
-        assert_eq!(decoded.body.len(), 1);
-        // Each argument carries the ABI's own name, so a store can address it rather
-        // than count positions.
-        assert_eq!(
-            decoded.indexed,
-            vec![
-                DecodedArg {
-                    name: "from".to_owned(),
-                    value: TypedValue::Address {
-                        value: address(0x11)
-                    },
-                },
-                DecodedArg {
-                    name: "to".to_owned(),
-                    value: TypedValue::Address {
-                        value: address(0x22)
-                    },
-                },
-            ]
+    fn an_unknown_abi_name_is_refused() {
+        let result = ContractRegistry::load(
+            &[pool_abi()],
+            &[contract("base", POOL, "nope")],
+            &[],
+            abi_dir(),
         );
-        assert_eq!(
-            decoded.body,
-            vec![DecodedArg {
-                name: "value".to_owned(),
-                value: TypedValue::Uint {
-                    value: U256::from(1_000_000_000_000_000_000u64),
-                    bits: 256,
-                },
-            }]
-        );
+        assert!(result.is_err(), "a dangling ABI reference must be caught");
     }
 
-    /// A log whose selector the ABI does not declare is a miss, not an error: the
-    /// transform forwards it undecoded rather than failing the batch.
     #[test]
-    fn an_unknown_selector_is_a_miss_not_an_error() {
-        let abi = Abi::from_json(ERC20).expect("ABI loads");
-        let topics = vec![B256::from([0x99; 32])];
+    fn a_duplicate_address_is_refused() {
+        let result = ContractRegistry::load(
+            &[pool_abi()],
+            &[
+                contract("base", POOL, "uniswap_v3_pool"),
+                contract("base", POOL, "uniswap_v3_pool"),
+            ],
+            &[],
+            abi_dir(),
+        );
+        assert!(result.is_err(), "one address must decode with one ABI");
+    }
+
+    #[test]
+    fn a_missing_abi_is_an_error() {
+        let mut bad = pool_abi();
+        bad.path = std::path::PathBuf::from("nope.json");
+        assert!(ContractRegistry::load(&[bad], &[], &[], abi_dir()).is_err());
+    }
+
+    #[test]
+    fn a_bad_address_is_refused() {
+        let result = ContractRegistry::load(
+            &[pool_abi()],
+            &[contract("base", "not-an-address", "uniswap_v3_pool")],
+            &[],
+            abi_dir(),
+        );
+        assert!(result.is_err());
+    }
+
+    /// A discovery rule that names an event its factory's ABI does not declare is a
+    /// startup error, not a rule that silently never fires.
+    #[test]
+    fn a_rule_for_an_unknown_event_is_refused() {
+        let registry = ContractRegistry::load(
+            &[pool_abi()],
+            &[contract("base", FACTORY, "uniswap_v3_pool")],
+            &[discovery(
+                "base",
+                FACTORY,
+                "Nope(uint256)",
+                "pool",
+                "uniswap_v3_pool",
+            )],
+            abi_dir(),
+        );
         assert!(
-            abi.decode_log(&topics, &[])
-                .expect("a miss is not an error")
-                .is_none()
+            registry.is_err(),
+            "a rule for a missing event must be caught"
         );
     }
 
-    /// A log with no topics at all, which is legal for an anonymous event, is also a
-    /// miss rather than a panic.
+    /// No entries is an empty registry, not an error: running without decoding is
+    /// legitimate and the caller says so at startup.
     #[test]
-    fn a_log_with_no_topics_is_a_miss() {
-        let abi = Abi::from_json(ERC20).expect("ABI loads");
-        assert!(
-            abi.decode_log(&[], &[])
-                .expect("a miss is not an error")
-                .is_none()
-        );
+    fn no_entries_is_an_empty_registry() {
+        let registry = ContractRegistry::load(&[], &[], &[], abi_dir()).expect("empty is fine");
+        assert!(registry.is_empty());
     }
 
-    /// A selector that matches but data that is too short to decode is an error,
-    /// because the likely cause is an ABI from the wrong block range and hiding it
-    /// would publish the wrong contract's values.
+    /// A registry file loads through `from_file`, resolving its ABI paths against the
+    /// file's own directory rather than the working directory.
     #[test]
-    fn a_selector_that_matches_with_undecodable_data_is_an_error() {
-        let abi = Abi::from_json(ERC20).expect("ABI loads");
-        let (topics, _) = transfer_log();
-        // Half a word where the event declares a `uint256`.
-        let short = [0u8; 16];
-        assert!(matches!(
-            abi.decode_log(&topics, &short),
-            Err(RegistryError::Decode { .. })
-        ));
+    fn a_registry_file_loads_and_resolves_its_own_abi_dir() {
+        let dir = std::env::temp_dir().join(format!("indexer-registry-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let registry_path = dir.join("registry.toml");
+        std::fs::write(
+            &registry_path,
+            r#"
+[[abi]]
+name = "uniswap_v3_pool"
+path = "uniswap_v3_pool.json"
+
+[[contract]]
+chain = "base"
+address = "0xd0b53D9277642d899DF5C87A3966A349A798F224"
+abi = "uniswap_v3_pool"
+"#,
+        )
+        .expect("write registry file");
+        std::fs::copy(
+            abi_dir().join("uniswap_v3_pool.json"),
+            dir.join("uniswap_v3_pool.json"),
+        )
+        .expect("copy the ABI beside it");
+
+        let registry = ContractRegistry::from_file(&registry_path).expect("the file loads");
+        assert_eq!(registry.len(), 1);
+        std::fs::remove_dir_all(&dir).expect("clean up");
     }
 
-    /// An ABI that is not JSON fails loudly at load, not at first decode.
-    #[test]
-    fn malformed_abi_json_is_rejected_at_load() {
-        assert!(matches!(
-            Abi::from_json("not an abi"),
-            Err(RegistryError::Abi { .. })
-        ));
-    }
-
-    /// A regression test against a real Uniswap V3 `Swap` log captured from Base.
+    /// End to end: a real Uniswap V3 `PoolCreated` log decodes, the discovery rule reads
+    /// the pool address out of it, and registering that address makes the pool decode.
     ///
-    /// Every other test here builds its own bytes, so they would all still pass if
-    /// the decoder agreed with itself about a layout the chain does not use. This one
-    /// pins the layout to the chain: the `int256` amounts are signed, the pool's
-    /// `uint160` price is read at 160 bits, and the trailing `int24` tick is not
-    /// silently widened.
+    /// Checked against the factory's real event — topics carry `token0,token1,fee` and
+    /// the pool address is the *second word of `data`*, not a topic — rather than a
+    /// convenient shape.
     #[test]
-    fn a_real_uniswap_v3_swap_log_decodes_with_signed_amounts() {
-        let abi = Abi::from_json(include_str!("../../abis/uniswap_v3_pool.json"))
-            .expect("the pool ABI loads");
-        let topic0: B256 = "0xc42079f94a6350d7e6235f29174924f928cc2ac818eb64fed8004e115fbcca67"
-            .parse()
-            .expect("selector parses");
-        let topic1: B256 = "0x0000000000000000000000006ff5693b99212da76ad316178a184ab56d299b43"
-            .parse()
-            .expect("topic parses");
-        let data = hex_bytes(
-            "fffffffffffffffffffffffffffffffffffffffffffffffffff4b34627fb9302\
-             0000000000000000000000000000000000000000000000000000000000830544\
-             00000000000000000000000000000000000000000003678007a6bbf505d858fa\
-             00000000000000000000000000000000000000000000000012fb062ae6731f9d\
-             fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffcfd3b",
-        );
-        let log_topics = vec![topic0, topic1, topic1];
+    fn a_factory_event_reveals_and_registers_its_pool() {
+        use alloy_primitives::{B256, TxHash};
 
-        let decoded = abi
-            .decode_log(&log_topics, &data)
-            .expect("the log decodes")
-            .expect("the ABI declares Swap");
+        use crate::decode::abi::Abi;
+        use crate::decode::transform::Transform;
+        use crate::wire::datasets::evm::Log;
+        use crate::wire::envelope::{Envelope, Event};
 
-        assert_eq!(decoded.name, "Swap");
-        assert_eq!(
-            decoded.signature,
-            "Swap(address,address,int256,int256,uint160,uint128,int24)"
-        );
-        // Every argument is named from the ABI, which is what lets a store map
-        // `amount0` to a column instead of counting positions.
-        let names: Vec<&str> = decoded
-            .indexed
-            .iter()
-            .chain(&decoded.body)
-            .map(|arg| arg.name.as_str())
-            .collect();
-        assert_eq!(
-            names,
-            [
-                "sender",
-                "recipient",
-                "amount0",
-                "amount1",
-                "sqrtPriceX96",
-                "liquidity",
-                "tick"
-            ]
-        );
+        let selector = Abi::from_json(include_str!("../../abis/uniswap_v3_factory.json"))
+            .expect("factory ABI")
+            .selector(SIGNATURE)
+            .expect("declares PoolCreated");
 
-        // `amount0` is negative: this swap sold token0, and reading the two's
-        // complement word as unsigned would produce 1.15e77 instead.
-        assert_eq!(
-            decoded.body.first().map(|arg| &arg.value),
-            Some(&TypedValue::Int {
-                value: I256::try_from(-3_180_585_820_646_654_i64).expect("fits"),
-                bits: 256,
-            })
-        );
-        assert_eq!(
-            decoded.body.get(1).map(|arg| &arg.value),
-            Some(&TypedValue::Int {
-                value: I256::try_from(8_586_564_i64).expect("fits"),
-                bits: 256,
-            })
-        );
-        // `sqrtPriceX96` is `uint160`, not `uint256`.
-        assert_eq!(
-            decoded.body.get(2).and_then(rebuild_type),
-            Some(alloy_dyn_abi::DynSolType::Uint(160))
-        );
-        assert_eq!(
-            decoded.body.get(4).and_then(rebuild_type),
-            Some(alloy_dyn_abi::DynSolType::Int(24))
-        );
-    }
+        let mut registry = ContractRegistry::load(
+            &[factory_abi(), pool_abi()],
+            &[contract("base", FACTORY, "uniswap_v3_factory")],
+            &[discovery(
+                "base",
+                FACTORY,
+                SIGNATURE,
+                "pool",
+                "uniswap_v3_pool",
+            )],
+            abi_dir(),
+        )
+        .expect("the registry loads");
 
-    /// The Solidity type a published argument declares, for asserting a width.
-    fn rebuild_type(arg: &DecodedArg) -> Option<alloy_dyn_abi::DynSolType> {
-        crate::decode::convert::dyn_type(&arg.value).ok()
-    }
-
-    /// Decodes a hex string with whitespace, so a long fixture stays readable.
-    fn hex_bytes(hex: &str) -> Vec<u8> {
-        let compact: String = hex.chars().filter(|c| !c.is_whitespace()).collect();
-        alloy_primitives::hex::decode(compact).expect("fixture is valid hex")
-    }
-
-    /// The registry is keyed by chain as well as address, so the same address on two
-    /// chains does not resolve to one ABI.
-    #[test]
-    fn the_registry_is_keyed_by_chain_and_address() {
-        struct OneAbi {
-            base: Abi,
-        }
-
-        impl AbiRegistry for OneAbi {
-            fn contract(
-                &self,
-                chain: &ChainId,
-                contract: Address,
-                _block: u64,
-            ) -> Option<Contract<'_>> {
-                (chain.as_str() == "base" && contract == address(0xaa)).then_some(Contract {
-                    abi: &self.base,
-                    protocol: "erc20",
-                })
-            }
-        }
-
-        let registry = OneAbi {
-            base: Abi::from_json(ERC20).expect("ABI loads"),
+        let child: Address = POOL.parse().expect("a pool address");
+        let mut data = Vec::new();
+        data.extend_from_slice(word(60).as_slice()); // tickSpacing: int24
+        data.extend_from_slice(address_word(child).as_slice()); // pool: address
+        let log = Log {
+            log_index: 1,
+            transaction_hash: TxHash::from([0x01; 32]),
+            address: FACTORY.parse().expect("a factory address"),
+            topic0: Some(selector),
+            topic1: Some(address_word(Address::from([0x11; 20]))),
+            topic2: Some(address_word(Address::from([0x22; 20]))),
+            topic3: Some(word(3_000)),
+            data: data.into(),
+            block_number: 100,
+            block_hash: B256::from([0x02; 32]),
+            ..Log::default()
         };
-        let base = ChainId::new("base");
-        let other = ChainId::new("ethereum");
 
-        let found = registry
-            .contract(&base, address(0xaa), 100)
-            .expect("base answers");
-        assert_eq!(found.protocol, "erc20");
-        assert!(registry.contract(&base, address(0xbb), 100).is_none());
-        assert!(registry.contract(&other, address(0xaa), 100).is_none());
+        let applied = Transform::apply(
+            &registry,
+            Envelope::new(ChainId::new("base"), 1, Event::Log(Box::new(log))),
+        );
+        assert!(
+            applied.error.is_none(),
+            "the factory log decodes: {:?}",
+            applied.error
+        );
+        let discovery = applied.discovery.expect("a PoolCreated reveals a pool");
+        assert_eq!(discovery.child, child);
+
+        // The pool is unknown until the rule fires, and decodes with the pool ABI after.
+        let chain = ChainId::new("base");
+        assert!(registry.contract(&chain, child, 100).is_none());
+        registry.register_discovered(&chain, discovery);
+        assert_eq!(
+            registry
+                .contract(&chain, child, 100)
+                .expect("registered")
+                .protocol,
+            "uniswap_v3_pool"
+        );
+    }
+
+    /// A 32-byte big-endian word holding `value`, the form an ABI integer takes.
+    fn word(value: u64) -> B256 {
+        let mut word = [0u8; 32];
+        word[24..].copy_from_slice(&value.to_be_bytes());
+        B256::from(word)
+    }
+
+    /// A 32-byte word holding an address in its low 20 bytes.
+    fn address_word(address: Address) -> B256 {
+        let mut word = [0u8; 32];
+        word[12..].copy_from_slice(address.as_slice());
+        B256::from(word)
     }
 }

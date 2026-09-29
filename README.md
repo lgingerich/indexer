@@ -102,7 +102,9 @@ and stop together — a stage that ends for good stops the process, because cont
 without it would leave a stream that looks alive but is not.
 
 Settings come from a TOML file, named by the first argument or defaulting to
-`indexer.toml`. `indexer.toml` in the repository is a working example.
+`indexer.toml`. `indexer.toml` in the repository is a working example. What decode decodes
+lives in a separate registry file, named by `[decode] registry` and defaulting to nothing —
+`registry.toml` is a working example; see [The contract registry](#the-contract-registry).
 
 ```bash
 RUST_LOG=info cargo run --release --features kafka,duckdb -- indexer.toml
@@ -143,7 +145,12 @@ the field:
 | `kafka.batch_ms` | `1000` | Time bound on a batch |
 | `storage.database` | `indexer.duckdb` | Path to the store |
 | `storage.drain_secs` | unset | Stop a topic after this idle; bounds decode's input too. **Omit for a live indexer** |
-| `storage.protocol` | `[]` | Registered contracts: name, ABI, deployments |
+
+**Optional table:**
+
+| Key | Meaning |
+| --- | --- |
+| `decode.registry` | Path to the contract registry file, relative to the settings file. Absent means nothing is decoded |
 
 Omit `[ingest]` entirely to run decode and storage against a topic filled elsewhere.
 `RUST_LOG` is still read from the environment, because a log filter is not deployment
@@ -152,33 +159,58 @@ configuration.
 An unknown key is a startup error naming the line and the key, so a misspelling is
 caught rather than silently leaving a setting at its default.
 
-### Registered contracts
+### The contract registry
 
-The ABI says what a contract's events look like. It cannot say what the contract *is*,
-so that is written down, once per protocol:
+What decode decodes lives in its own file, named by `[decode] registry` — `registry.toml`
+in the repository is a working example. It is deliberately not part of `indexer.toml`: the
+settings file is deployment topology (brokers, endpoints, paths), while the registry is a
+catalog of contracts that grows on its own schedule. Splitting them keeps a new protocol
+from churning the deployment diff.
+
+The registry file holds three lists, all data:
 
 ```toml
-[[storage.protocol]]
-name = "uniswap_v3"        # what it is, stamped on every decoded record
-abi = "abis/uniswap_v3_pool.json"
+[[abi]]
+name = "uniswap_v3_pool"
+path = "abis/uniswap_v3_pool.json"
 
-[[storage.protocol.deployment]]
+[[contract]]
 chain = "base"
-address = "0xd0b53D9277642d899DF5C87A3966A349A798F224"
+address = "0x1F98431c8aD98523631AE4a59f267346ea31F984"   # V3 factory
+abi = "uniswap_v3_factory"
+
+[[discovery]]
+chain = "base"
+address = "0x1F98431c8aD98523631AE4a59f267346ea31F984"   # the V3 factory
+event = "PoolCreated(address,address,uint24,int24,address)"
+child = "pool"           # the decoded argument holding the new pool address
+abi = "uniswap_v3_pool"  # what the child decodes with, and its protocol tag
 ```
 
-Every decoded record then carries `protocol`, so a consumer can group rows by protocol
+**Why an ABI is named once.** Uniswap V3 has thousands of pools sharing one ABI. The ABI
+is loaded once and shared; an address is a line.
+
+**Discovery.** A pool created at runtime cannot be a `[[contract]]`. A rule closes that:
+when the factory's creation event decodes, the named argument holds the child's address,
+and the child is registered with the named ABI. Registration is deterministic — the
+child's ABI is already loaded, so no network is involved — and a factory emits its
+creation event before the child emits anything, so a sequential pass registers a child
+before its first log.
+
+A protocol that does not put its pools at an address needs no rule: **Uniswap V4's
+`PoolManager` is a single `[[contract]]`**, because a V4 pool is a `bytes32` id (`keccak256`
+of the `PoolKey`), not a deployed contract. The `Initialize` record it emits *is* the pool's
+metadata.
+
+Every decoded record carries `protocol` — the ABI's name — so a consumer can group rows
 without knowing any address.
 
-**Why a list rather than tagging ABI filenames.** Uniswap V3 has thousands of pools
-sharing one ABI, so a file per address would repeat the same file thousands of times.
-Here the ABI is referenced once and the addresses are lines, and adding a pool is one
-`deployment` block.
+Two entries claiming one address, a dangling ABI name, a malformed address, and a rule for
+an event its factory's ABI does not declare are each a startup error rather than a silent
+no-op: a registry that decodes less than it was told to looks like a quiet chain.
 
-Two entries claiming one address is a startup error rather than last-wins, because which
-ABI decoded a log would otherwise depend on file order.
-
-ABI paths resolve relative to the settings file, not the working directory.
+ABI paths resolve relative to the registry file, not the working directory, so the file
+and its `abis/` directory move together.
 
 One ABI per address applies at every height. A proxy that upgrades changes its ABI at a
 height, which this cannot express — the `AbiRegistry` seam is what a table-backed

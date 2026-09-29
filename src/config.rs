@@ -27,6 +27,9 @@
 //!
 //! [storage]
 //! database = "indexer.duckdb"
+//!
+//! [decode]
+//! registry = "registry.toml"   # the contract catalog; optional
 //! ```
 //!
 //! Every field that is not required above may be omitted.
@@ -55,6 +58,9 @@ pub struct Settings {
     /// Where decoded records are persisted. Optional: absent means the defaults below.
     #[serde(default)]
     pub storage: StorageSettings,
+    /// What the decode stage decodes. Absent means nothing is decoded.
+    #[serde(default)]
+    pub decode: Option<DecodeSettings>,
 }
 
 /// How ingest follows a chain.
@@ -125,7 +131,7 @@ pub struct KafkaSettings {
     pub properties: std::collections::BTreeMap<String, String>,
 }
 
-/// Where decoded records are stored, and what the decode stage decodes.
+/// Where decoded records are stored.
 ///
 /// No `#[serde(default)]` on the struct: that would fill an absent table from
 /// `Default::default()`, which for a `PathBuf` is empty and would bypass the per-field
@@ -143,13 +149,6 @@ pub struct StorageSettings {
     /// run — a backfill, a test — not for a live indexer.
     #[serde(default)]
     pub drain_secs: Option<u64>,
-    /// The registered contracts, each with its ABI and its deployments.
-    ///
-    /// Absent means nothing is decoded, which is a legitimate way to run and is said at
-    /// startup rather than being silent. See [`crate::decode::contracts`] for the shape
-    /// and why a list beats encoding the tag in a filename.
-    #[serde(default)]
-    pub protocol: Vec<crate::decode::contracts::ProtocolEntry>,
     /// Any other `DuckDB` setting, passed straight through.
     ///
     /// `DuckDB` accepts dozens of settings and this file does not restate them. Anything
@@ -165,6 +164,22 @@ pub struct StorageSettings {
     pub duckdb: std::collections::BTreeMap<String, String>,
 }
 
+/// What the decode stage decodes, in its own file.
+///
+/// Kept out of the indexer's settings because it is a different kind of thing: the
+/// settings file is deployment topology — brokers, endpoints, paths — and the registry
+/// is a catalog of contracts that grows on its own schedule. It also rotates addresses,
+/// which would otherwise churn the settings file's diff on every new protocol.
+///
+/// Absent means nothing is decoded, which is a legitimate way to run and is said at
+/// startup rather than being silent. See [`crate::decode::registry`] for the shape.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DecodeSettings {
+    /// The registry file, relative to the settings file's directory.
+    pub registry: PathBuf,
+}
+
 impl Default for StorageSettings {
     /// The same values the field-level `default` functions supply, so an absent
     /// `[storage]` table and an empty one agree.
@@ -172,7 +187,6 @@ impl Default for StorageSettings {
         Self {
             database: default_database(),
             drain_secs: None,
-            protocol: Vec::new(),
             duckdb: std::collections::BTreeMap::new(),
         }
     }
@@ -328,7 +342,7 @@ brokers = "localhost:9092"
             settings.storage.database,
             std::path::PathBuf::from(DEFAULT_DATABASE)
         );
-        assert!(settings.storage.protocol.is_empty());
+        assert!(settings.decode.is_none(), "decode is absent by default");
         assert_eq!(
             settings.drain(),
             None,
@@ -403,6 +417,25 @@ drain_secs = 5
         )
         .expect("settings parse");
         assert_eq!(settings.drain(), Some(Duration::from_secs(5)));
+    }
+
+    /// The `[decode]` table names a registry file, so a config points the stage at its
+    /// contract catalog rather than carrying the catalog itself.
+    #[test]
+    fn the_decode_table_names_a_registry_file() {
+        let settings: Settings = toml::from_str(
+            r#"
+[kafka]
+brokers = "localhost:9092"
+
+[decode]
+registry = "registry.toml"
+"#,
+        )
+        .expect("settings parse");
+
+        let decode = settings.decode.as_ref().expect("decode is present");
+        assert_eq!(decode.registry, std::path::PathBuf::from("registry.toml"));
     }
 
     /// Inputs the operator must choose are taken as written, not defaulted.

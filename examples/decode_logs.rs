@@ -52,7 +52,7 @@
 use std::process::ExitCode;
 
 use indexer::decode::Transform;
-use indexer::decode::contracts::{ContractRegistry, Deployment, ProtocolEntry};
+use indexer::decode::registry::{AbiEntry, ContractEntry, ContractRegistry};
 use indexer::wire::envelope::Envelope;
 
 /// The pool these logs came from, and the address its ABI is registered against.
@@ -70,24 +70,24 @@ const SWAPS: &str = include_str!("fixtures/uniswap_v3_swaps.ndjson");
 
 fn main() -> ExitCode {
     // The real registry, built the way the settings file builds it, so the example
-    // exercises the same path the pipeline does rather than a stub that would not
-    // stamp `protocol`.
+    // exercises the same path the pipeline does rather than a stub.
     let registry = ContractRegistry::load(
-        &[ProtocolEntry {
-            name: "uniswap_v3".to_owned(),
-            abi: std::path::PathBuf::from(concat!(
+        &[AbiEntry {
+            name: "uniswap_v3_pool".to_owned(),
+            path: std::path::PathBuf::from(concat!(
                 env!("CARGO_MANIFEST_DIR"),
                 "/abis/uniswap_v3_pool.json"
             )),
-            deployment: vec![Deployment {
-                chain: CHAIN.to_owned(),
-                address: POOL.to_owned(),
-            }],
         }],
+        &[ContractEntry {
+            chain: CHAIN.to_owned(),
+            address: POOL.to_owned(),
+            abi: "uniswap_v3_pool".to_owned(),
+        }],
+        &[],
         ".",
     )
     .expect("the registry loads");
-    let transform = Transform::new(registry);
 
     let mut decoded_count = 0_usize;
     for (number, line) in SWAPS.lines().enumerate() {
@@ -96,7 +96,7 @@ fn main() -> ExitCode {
         }
         let envelope: Envelope =
             serde_json::from_str(line).expect("the fixture is a published envelope");
-        let applied = transform.apply(envelope);
+        let applied = Transform::apply(&registry, envelope);
         if let Some(error) = applied.error {
             eprintln!("line {}: {error}", number + 1);
         }

@@ -30,24 +30,11 @@ brokers = "localhost:9092"
 # must never stop on a quiet block.
 # drain_secs = 5
 
-# A registered contract. The ABI says what the events look like; it cannot say what the
-# contract *is*, so that is written here and stamped onto every decoded record.
-#
-# One entry per protocol, with its deployments listed under it: a protocol like Uniswap
-# V3 has thousands of pools sharing one ABI, so naming an ABI file per address would
-# repeat the same file thousands of times.
-#
-# Note what is deliberately absent: where the rows go. A dataset is a modeling choice
-# that needs context this stage does not have — which token a pool trades, how many
-# decimals it has — so the projection happens downstream, where the joins are.
-#
-# [[storage.protocol]]
-# name = "uniswap_v3"        # what it is, onto every decoded record
-# abi = "abis/uniswap_v3_pool.json"   # relative to this file
-#
-# [[storage.protocol.deployment]]
-# chain = "base"
-# address = "0xd0b53D9277642d899DF5C87A3966A349A798F224"
+# What the decode stage decodes. Absent means nothing is decoded, which is a legitimate
+# way to run and is said at startup. The registry is its own file — see `registry.toml` —
+# so the contract catalog grows without churning these settings.
+# [decode]
+# registry = "registry.toml"
 
 # Any other DuckDB setting, passed straight through and validated by the engine.
 # [storage.duckdb]

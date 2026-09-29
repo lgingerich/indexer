@@ -31,7 +31,7 @@ use tracing_subscriber::EnvFilter;
 use indexer::config::Settings;
 use indexer::connectors::{self, DuckDbSink, KafkaSink, KafkaSource, StdoutJsonSink};
 use indexer::decode::Decode;
-use indexer::decode::contracts::ContractRegistry;
+use indexer::decode::registry::ContractRegistry;
 use indexer::ingest::Ingest;
 
 /// The settings file used when none is named on the command line.
@@ -72,9 +72,12 @@ async fn run() -> Result<()> {
     let raw_topic = settings.raw_topic().to_owned();
     let decoded_topic = settings.kafka.decoded_topic.clone();
 
-    // ABI paths in the settings file read as relative to it, not to the process's
-    // working directory, so the file stays portable.
-    let registry = ContractRegistry::load(&settings.storage.protocol, settings_dir(&path))?;
+    // The registry is its own file, so the contract catalog grows without churning the
+    // deployment settings. Its ABI paths resolve relative to it, not to this file.
+    let registry = match &settings.decode {
+        Some(decode) => ContractRegistry::from_file(settings_dir(&path).join(&decode.registry))?,
+        None => ContractRegistry::default(),
+    };
     let mut decode = Decode::builder().registry(registry).batch(batch);
     if let Some(drain) = settings.drain() {
         // The same bound for both consumers, so a bounded run lets decode finish its
