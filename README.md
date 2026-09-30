@@ -14,40 +14,112 @@ chain (RPC) ─▶ ingest ─▶ decode ─▶ channel ═══▶ drain ─▶
               └────────── task 1 ──────────┘     └──── task 2 ────┘
                                         bounded, in memory,
                                         one block per message
+
+stdout = true:  ingest ─▶ decode ─▶ stdout        no channel, no store
 ```
 
-Each block takes the same path:
+Ingest and decode are direct calls in one task. The channel is the only queue, and it
+exists so a stalled store does not stall the head subscription.
 
-1. **Ingest** hears a new head over WebSocket, fetches the block with its transactions,
-   receipts and logs in one batched request, and turns it into ordered events. It gives
-   every event a per-chain `sequence`, checks parent-hash linkage against a bounded undo
-   ring, and emits a `reorg` marker when the chain forks and a `finalized` marker when
-   finality advances.
-2. **Decode** sees each envelope as ingest publishes it. A log whose address is in the
-   contract registry is decoded against its ABI, and the decoded record is forwarded right
-   after the raw log. Everything else passes through untouched.
-3. **The channel** collects the block's envelopes and sends them to storage as one message
-   when ingest flushes at the block boundary.
-4. **Storage** writes the block's raw and decoded rows to DuckDB in one commit.
+### One block
 
-Three choices shape it:
+```
+WebSocket head
+      │
+      ▼
+JSON-RPC batch: block + receipts          one request, nothing the node returns is dropped
+      │
+      ▼
+ordered events, one sequence each
+      │
+      │   block
+      │   transaction, receipt, log, decoded, log, …
+      │   transaction, receipt, …
+      │   finalized                         only when the watermark advanced
+      │
+      ▼  flush, once
+one channel message
+      │
+      ▼
+one DuckDB commit                         raw rows and decoded rows together
+```
 
-**Ingest and decode are direct calls, not a queue.** `DecodingSink` wraps another sink:
-ingest publishes an envelope, and the same call decodes it and forwards both the raw
-envelope and its decoded record. Decoding a block takes a small fraction of a block time,
-so there is nothing to decouple.
+A `reorg` marker, when there is one, is the first envelope of that message: the fork is
+recorded before the replacement block.
 
-**The channel is the one queue, and it exists for the store.** A store stalls — a
-checkpoint, a slow fsync — and ingest must not stop reading heads while it does. The
-channel holds a few dozen blocks; when it is full, ingest waits, so lag is felt instead
-of buffered. A block travels as one message, so its raw rows and decoded rows commit
-together. When the store has fallen behind it folds the waiting blocks into one commit
-(`runtime.batch_records`), which is how it catches up.
+### What decode adds
 
-**The channel is not durable, and does not need to be.** The chain is the record upstream
-and the store is the record downstream; a crash loses only what was in flight, and the
-store's high-water mark says where to resume. Resuming from it is not built yet, and is the
-first thing that needs to be.
+Decode never removes or rewrites an envelope. It only inserts a record after a log it
+can decode.
+
+```
+envelope
+   │
+   ├─ block, transaction, receipt, reorg, finalized ──▶ forwarded as it arrived
+   │
+   └─ log
+        ├─ no ABI for (chain, address), or no such event ──▶ the log, nothing added
+        ├─ ABI matches, data does not decode ──────────────▶ the log, error logged
+        └─ decodes ─────────────────────────────────────────▶ the log, then its decoded record
+                                                               register a discovered contract
+                                                               before the next envelope
+```
+
+A factory's creation log therefore registers its child before that child's own logs are
+read, in the same pass, with no network call: the child's ABI is already loaded.
+
+### A reorg
+
+Parent-hash linkage is checked on every head, against the last 128 published blocks
+(finalized ones are dropped first, since nothing can reorg them).
+
+```
+published     1 ─── 2 ─── 3
+new head           └─── 2'          2' builds on 1, not on 2
+
+the store sees
+  …  block 1 …  block 2 …  block 3 …
+  reorg { height: 2, orphaned: [3, 2] }
+  block 2' …
+```
+
+The sequences block 2 used are reclaimed and reused by the reorg marker and by 2'. A
+fork older than the ring is an error rather than an empty retraction.
+
+### When the store stalls
+
+Caught up, one block arrives and leaves as its own commit:
+
+```
+ingest ──▶ [ block ] ──▶ one commit
+```
+
+Behind, the blocks already waiting share a commit, up to `runtime.batch_records`. A
+block is never split across commits:
+
+```
+ingest ──▶ [ block | block | block ] ──▶ one commit
+```
+
+Full — 32 blocks waiting and the store still flushing — the next flush waits. Ingest
+stops taking heads until there is room. That wait is the backpressure; nothing is
+dropped:
+
+```
+ingest ── flush waits ──▶ [ ████ | ████ | ████ ] ◀── store still flushing
+```
+
+### A crash
+
+```
+chain (replayable) ──▶ in flight on the channel ──▶ committed in DuckDB
+                              lost                        kept
+```
+
+The channel holds no durable log. The chain is the record upstream and the store is
+the record downstream, so a restart should continue from the last committed height.
+That resume is not built: a restart begins again at the live tip. See
+[Not built yet](#not-built-yet).
 
 ## Layout
 
@@ -119,11 +191,113 @@ anywhere, so `cargo run` alone runs the pipeline.
 
 ## Not built yet
 
-Resume from the store's high-water mark (and rebuilding the undo ring from it), backfill
-and the backfill-to-live handoff, mempool, filtered subscriptions, derived state
-(balances/nonces), the aggregation layer, and the Parquet/GCS archiver. The crate is a
-walking skeleton: it indexes forward from whatever the chain does next, and a restart
-begins at the live tip again rather than where it stopped.
+The process follows the live tip and appends every envelope. A restart begins at the
+tip again, a reorg is a row the store never acts on, and a decoded log is a fact with
+no join behind it. The work below is what closes those gaps. The first four are one
+piece of machinery; the last three sit on top of a store that is already correct.
+
+```
+idempotent writes ─┬─▶ resume from the store ─▶ re-decode stored logs
+                   └─▶ backfill ─▶ handoff to live
+reorg + finality applied in the store
+streaming aggregation: joins and derived calculations
+Avro as the envelope, inside the process and downstream
+```
+
+### Resume from the store
+
+Dropping the broker made the store the durability plan. The chain can replay any
+block, and the store says how far that replay has already been committed.
+
+```
+startup
+   │
+   ├─ read the last committed height
+   ├─ rebuild the undo ring from the recent rows at and above it
+   └─ continue from the next height
+```
+
+Without the rebuilt ring, a reorg in the blocks the process no longer remembers
+cannot be retracted. `pipeline.rs` and the channel docs both name this as unbuilt.
+
+### Backfill, and the handoff to live
+
+A height gap is a hard error today. `Mode::Backfilling` is entered and then the
+pipeline bails. Resume needs the same path, and so does indexing history instead of
+only whatever the chain does next.
+
+```
+today     published tip ── ✕ gap ✕ ── head          error, nothing fetched
+
+planned   published tip ── fetch the range, in order ── join the live head
+                          no hole, no second copy of a block already stored
+```
+
+### Reorgs and finality in the store
+
+`reorg` and `finalized` are written into `events` and then ignored. Orphaned blocks
+stay forever, and nothing below the watermark is dropped. Readers are told to dedupe
+on `dedupe_key`, but the table is append-only and unkeyed, so a reorg inserts a
+second row at the same height.
+
+```
+today     reorg { orphaned: [3, 2] }  ──▶ another row in `events`
+          finalized { height: 100 }    ──▶ another row in `events`
+
+planned   reorg      ──▶ delete the rows for those block hashes
+          finalized  ──▶ rows at or below this height are permanent
+```
+
+### Idempotent writes
+
+Resume and backfill both replay a block that may already be stored. The key is
+already on every event; the table does not use it.
+
+```
+today     insert the envelope                     a replay is a second row
+
+planned   upsert on (chain, dedupe_key)           a replay is the same row
+```
+
+### Re-decode from the store
+
+A new or corrected ABI should replay stored raw logs, not re-fetch the chain. That
+only works once raw logs are retained and resume exists, so the replay starts from
+rows already on disk.
+
+```
+today     new ABI ──▶ re-fetch blocks from the node ──▶ decode
+
+planned   new ABI ──▶ read raw logs from the store ──▶ decode ──▶ upsert
+```
+
+### Streaming aggregation
+
+Decode emits facts. A swap's tokens, decimals, and windows over those facts are
+joins and derived calculations, and they belong in a streaming layer after the
+store rather than in the decoder. See [What decode does not do](#what-decode-does-not-do).
+
+```
+raw logs + decoded records ──▶ aggregation ──▶ trades, balances, windows
+                │                    ▲
+                └──── reference data ┘     tokens, decimals, symbols
+```
+
+### Avro as the wire protocol
+
+The envelope is JSON: newline-delimited on stdout, and a JSON column in `events`.
+Avro replaces that encoding everywhere an envelope is serialized — inside the
+indexer and in every stage downstream — so there is one schema instead of a JSON
+object each consumer parses for itself.
+
+```
+today     Envelope ── JSON ──▶ stdout, the `events.envelope` column, downstream
+
+planned   Envelope ── Avro ──▶ the same hops, one schema for all of them
+```
+
+Also not built, and not on the path above: mempool ingestion, filtered
+subscriptions, and a Parquet archive.
 
 ## Run it
 
@@ -290,8 +464,8 @@ belongs where the joins are. Two payoffs from keeping it that way:
   be a mapper that has to know every protocol, and a new DEX would be a new Rust file.
 - **A new DEX is rows in reference tables**, not code.
 
-When stream processing lands, the decoded records and the reference tables are what it
-joins. `protocol` and the argument names are the join keys, which is why they are on the
+That join is the streaming aggregation layer in [Not built yet](#not-built-yet).
+`protocol` and the argument names are the join keys, which is why they are on the
 wire rather than re-derived downstream.
 
 ### Other client settings
