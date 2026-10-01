@@ -20,6 +20,16 @@ use std::process::ExitCode;
 use tracing::error;
 use tracing_subscriber::EnvFilter;
 
+/// The settings file used when none is named on the command line.
+const DEFAULT_SETTINGS: &str = "indexer.toml";
+
+/// The settings file's path as given on the command line, or [`DEFAULT_SETTINGS`].
+fn settings_path() -> String {
+    std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| DEFAULT_SETTINGS.to_owned())
+}
+
 #[tokio::main]
 async fn main() -> ExitCode {
     tracing_subscriber::fmt()
@@ -28,7 +38,7 @@ async fn main() -> ExitCode {
         .with_env_filter(EnvFilter::from_default_env())
         .init();
 
-    let path = indexer::runtime::settings_path();
+    let path = settings_path();
     match indexer::runtime::run(&path).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {

@@ -10,7 +10,7 @@ use crate::sink::EnvelopeSink;
 /// Unlike the buffering sinks, each line is written and flushed as it arrives:
 /// stdout is the human/pipe view of the live stream, so its value is liveness,
 /// not throughput.
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default)]
 pub struct StdoutJsonSink;
 
 impl StdoutJsonSink {

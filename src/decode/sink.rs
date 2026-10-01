@@ -5,7 +5,7 @@
 //! and no task of its own: ingest calls `publish`, the decode happens in that call, and
 //! the inner sink is called next. Decoding a block is far cheaper than the block time,
 //! so it needs no decoupling from ingest; the one hop that does need it — a slow store —
-//! is the channel behind this sink. See [`crate::sink::channel`].
+//! is the channel behind this sink. See `crate::sink::channel`.
 //!
 //! # Delivery
 //!

@@ -68,7 +68,7 @@ pub use crate::wire::typed::TypedValue;
 pub const SCHEMA_VERSION: u16 = 1;
 
 /// Identifies the chain an event came from, for example `ethereum` or `solana`.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct ChainId(String);
 
@@ -265,22 +265,6 @@ impl Event {
             Self::Decoded(_) => "decoded",
             Self::Reorg(_) => "reorg",
             Self::Finalized(_) => "finalized",
-        }
-    }
-
-    /// Whether this event is a dataset record rather than a control signal.
-    ///
-    /// Datasets are durable on-chain records a consumer can store and deduplicate;
-    /// control signals only drive the stream's state machine.
-    #[must_use]
-    pub const fn is_dataset(&self) -> bool {
-        match self {
-            Self::Block(_)
-            | Self::Transaction(_)
-            | Self::Receipt(_)
-            | Self::Log(_)
-            | Self::Decoded(_) => true,
-            Self::Reorg(_) | Self::Finalized(_) => false,
         }
     }
 

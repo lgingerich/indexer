@@ -10,7 +10,7 @@
 //! ```
 //!
 //! Ingest and decode are direct calls in one task; the channel is the only queue, and it
-//! exists so a stalled store does not stall ingest. See [`sink::channel`].
+//! exists so a stalled store does not stall ingest. See `sink::channel`.
 //!
 //! # Layering
 //!

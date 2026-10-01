@@ -43,7 +43,7 @@ const CAPACITY: usize = 32;
 /// Opens the channel: the sending half decode publishes into, and the receiving half
 /// storage drains.
 #[must_use]
-pub fn open() -> (ChannelSink, ChannelReceiver) {
+pub(crate) fn open() -> (ChannelSink, ChannelReceiver) {
     let (sender, receiver) = mpsc::channel(CAPACITY);
     (
         ChannelSink {
@@ -56,7 +56,7 @@ pub fn open() -> (ChannelSink, ChannelReceiver) {
 
 /// The sending half: buffers a block's envelopes and sends them on flush.
 #[derive(Debug)]
-pub struct ChannelSink {
+pub(crate) struct ChannelSink {
     sender: mpsc::Sender<Vec<Envelope>>,
     batch: Vec<Envelope>,
 }
@@ -84,7 +84,7 @@ impl EnvelopeSink for ChannelSink {
 
 /// The receiving half: what storage drains.
 #[derive(Debug)]
-pub struct ChannelReceiver {
+pub(crate) struct ChannelReceiver {
     receiver: mpsc::Receiver<Vec<Envelope>>,
 }
 
@@ -102,7 +102,11 @@ impl ChannelReceiver {
     ///
     /// Returns an error when the sink cannot accept an envelope or flush. The blocks
     /// still in the channel are dropped, and the sending half fails on its next flush.
-    pub async fn drain<K: EnvelopeSink>(mut self, sink: &mut K, max_records: usize) -> Result<u64> {
+    pub(crate) async fn drain<K: EnvelopeSink>(
+        mut self,
+        sink: &mut K,
+        max_records: usize,
+    ) -> Result<u64> {
         let mut stored = 0_u64;
         while let Some(first) = self.receiver.recv().await {
             let mut pending = first.len();

@@ -15,7 +15,7 @@
 //! Ingest and decode are one task because decoding a block is far cheaper than the block
 //! time and needs no decoupling. Storage is its own task because a store stalls, and the
 //! channel between them is what keeps a stall from stopping ingest; see
-//! [`crate::sink::channel`]. The store gets its own task — spawned, not merely polled
+//! `crate::sink::channel`. The store gets its own task — spawned, not merely polled
 //! alongside ingest — because its writes block, and a blocked poll would stall ingest
 //! anyway.
 //!
@@ -44,12 +44,9 @@ use crate::decode::registry::ContractRegistry;
 use crate::ingest::Ingest;
 use crate::sink::{self, DuckDbSink, StdoutJsonSink};
 
-/// The settings file used when none is named on the command line.
-pub const DEFAULT_SETTINGS: &str = "indexer.toml";
-
 /// The pipeline the settings describe: the parts, built and ready.
 #[derive(Debug)]
-pub struct Pipeline {
+pub(crate) struct Pipeline {
     ingest: Ingest,
     registry: ContractRegistry,
 }
@@ -64,7 +61,7 @@ impl Pipeline {
     ///
     /// Returns an error when the registry cannot be read or an ingest endpoint is
     /// missing.
-    pub fn from_settings(settings: &Settings) -> Result<Self> {
+    pub(crate) fn from_settings(settings: &Settings) -> Result<Self> {
         let ingest = Ingest::builder(&settings.ingest.chain)
             .http_url(&settings.ingest.http_url)
             .ws_url(&settings.ingest.ws_url)
@@ -83,7 +80,7 @@ impl Pipeline {
     /// Returns an error when the store cannot be opened, or when a part fails. The
     /// part's own error is carried with it, because "storage stopped" says nothing about
     /// why.
-    pub async fn run(self, settings: &Settings) -> Result<()> {
+    pub(crate) async fn run(self, settings: &Settings) -> Result<()> {
         let Self { ingest, registry } = self;
 
         if settings.ingest.stdout {
@@ -139,14 +136,6 @@ fn connect_store(settings: &Settings) -> Result<DuckDbSink> {
         .with_context(|| format!("open store at {}", duckdb.path.display()))?;
     info!(store = %duckdb.path.display(), "storage opened");
     DuckDbSink::new(connection)
-}
-
-/// The settings file's path as given on the command line, or [`DEFAULT_SETTINGS`].
-#[must_use]
-pub fn settings_path() -> String {
-    std::env::args()
-        .nth(1)
-        .unwrap_or_else(|| DEFAULT_SETTINGS.to_owned())
 }
 
 /// Loads the settings at `path` and runs the pipeline they describe.

@@ -50,7 +50,7 @@ use crate::wire::envelope::{ChainId, Event};
 const RECEIPT_BATCH_LIMIT: usize = 10;
 
 /// A source that talks to one EVM chain over HTTP JSON-RPC and WebSocket.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct EvmSource {
     chain: ChainId,
     http_url: String,

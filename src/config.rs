@@ -85,7 +85,7 @@ where
 }
 
 /// The whole settings file.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Settings {
     /// The chain to follow. Required: the pipeline starts at ingest.
@@ -114,7 +114,7 @@ pub struct Settings {
 /// and serde refuses a table that omits them, naming the field. `stdout` is a debug mode
 /// rather than a deployment setting: it changes where the stream goes, not what the
 /// process is.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct IngestSettings {
     /// The chain id stamped on every event. Required, and non-empty.
@@ -134,7 +134,7 @@ pub struct IngestSettings {
 }
 
 /// How storage commits.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct RuntimeSettings {
     /// The most records one store commit may cover.
@@ -160,7 +160,7 @@ impl Default for RuntimeSettings {
 /// generic. [`StorageKind`] is the tag: exactly one backend is selected, and adding
 /// `ClickHouse` or Postgres is a variant there plus its own table here, not another
 /// top-level `database` whose owner a reader has to guess.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct StorageSettings {
     /// The backend to write. Absent means `duckdb`.
@@ -182,10 +182,10 @@ pub enum StorageKind {
 }
 
 /// `DuckDB`'s settings: the database to write, and the engine settings passed through.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct DuckDbSettings {
-    /// The `DuckDB` database file to write. Defaults to [`DEFAULT_DATABASE`].
+    /// The `DuckDB` database file to write. Defaults to `indexer.duckdb`.
     pub path: PathBuf,
     /// Any other `DuckDB` setting, passed straight through.
     ///
@@ -220,7 +220,7 @@ impl Default for DuckDbSettings {
 /// A table, not an `Option`, because decode always runs: an absent `registry` means an
 /// empty registry and nothing is decoded, which is a legitimate way to run and is said at
 /// startup rather than being silent. See [`crate::decode::registry`] for the file's shape.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct DecodeSettings {
     /// The registry file, relative to the settings file's directory. Absent means an
@@ -284,10 +284,10 @@ impl Settings {
 }
 
 /// The default `DuckDB` path.
-pub const DEFAULT_DATABASE: &str = "indexer.duckdb";
+pub(crate) const DEFAULT_DATABASE: &str = "indexer.duckdb";
 
 /// The default for [`RuntimeSettings::batch_records`].
-pub const DEFAULT_BATCH_RECORDS: usize = 500;
+pub(crate) const DEFAULT_BATCH_RECORDS: usize = 500;
 
 #[cfg(test)]
 // The crate denies `expect`/`unwrap` to keep production paths honest; tests are

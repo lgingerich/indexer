@@ -10,7 +10,7 @@
 //!           (same task, direct calls)                (own task, the store's writer)
 //! ```
 //!
-//! - [`channel`] — the one hop that crosses tasks: a bounded in-process channel of
+//! - `channel` — the one hop that crosses tasks: a bounded in-process channel of
 //!   blocks, from decode to storage. It is what lets a slow store stall without stalling
 //!   ingest.
 //! - [`duckdb`] — the store, an embedded `DuckDB` database.
@@ -19,12 +19,11 @@
 //! Sinks do not own their engine: the runtime opens and tunes the `DuckDB` connection and
 //! injects it, so client settings live in one place and a sink runs over a test double.
 
-pub mod channel;
+pub(crate) mod channel;
 #[cfg(feature = "duckdb")]
 pub mod duckdb;
 pub mod stdout;
 
-pub use channel::{ChannelReceiver, ChannelSink};
 #[cfg(feature = "duckdb")]
 pub use duckdb::DuckDbSink;
 pub use stdout::StdoutJsonSink;

@@ -32,7 +32,7 @@ use crate::wire::typed::TypedValue;
 /// The decoder's whole output. It carries no chain, block, or transaction — those are
 /// the raw log's, and [`Transform`](crate::decode::Transform) stamps them on when it
 /// assembles the published record.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
 pub struct DecodedEvent {
     /// The event name from the ABI, for example `Transfer`.
     pub name: String,
@@ -54,7 +54,7 @@ pub struct DecodedEvent {
 /// Indexed by selector at load, because the lookup path must not do I/O and must not
 /// scan: a registry that reads a file, or walks the events, per log is a registry that
 /// stalls the pipeline under load.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct Abi {
     /// Selector to event, built once so the per-log lookup is a map hit rather than a
     /// linear scan over the ABI's events.

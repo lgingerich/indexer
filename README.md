@@ -514,7 +514,7 @@ records — `decoded` — are what the decode stage produces from a dataset, car
 typed ABI arguments; the type of every argument travels with it, so a consumer can
 rebuild a typed column without reading the ABI. **Control
 signals** — `reorg`, `finalized` — drive a consumer's state machine and carry no
-payload; `Event::is_dataset` tells them apart. The line is one flat object: `chain`,
+payload. The line is one flat object: `chain`,
 `sequence`, and the event's fields under its `type` tag. Consumers deduplicate on
 each event's `dedupe_key`, not `sequence`: a sequence can be reused after a reorg or
 a restart, and the key is scoped to the stream. Each dataset's key comes from its

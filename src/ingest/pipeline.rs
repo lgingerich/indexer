@@ -9,8 +9,8 @@
 //! - The **pipeline** is the only stateful part: it drives the source, folds its events
 //!   into one ordered stream, and hands each envelope to the sink.
 //!
-//! Its state is a machine: [`Mode`] names what it is doing, and the linkage rules in
-//! [`Pipeline::process_block`] decide the transition. A head linking to the published tip
+//! Its state is a machine: `Mode` names what it is doing, and the linkage rules in
+//! `Pipeline::process_block` decide the transition. A head linking to the published tip
 //! advances the chain; one that does not is a fork, retracted to the fork point in the
 //! same call and published as an [`Event::Reorg`]. A height gap and a fork deeper than
 //! the undo ring both fail loudly rather than publishing across a hole. The *first* head
@@ -49,7 +49,7 @@ use crate::ingest::source::{BlockId, BlockSource, FetchedBlock};
 /// them, so on Ethereum the ring rarely holds more than ~64. The cap bites on chains
 /// whose finality lags far behind the tip, such as L2s waiting on L1, where it is the
 /// hard ceiling on retraction depth.
-pub const DEFAULT_UNDO_DEPTH: usize = 128;
+pub(crate) const DEFAULT_UNDO_DEPTH: usize = 128;
 
 /// What the pipeline is doing when it is driven forward.
 ///
@@ -57,7 +57,7 @@ pub const DEFAULT_UNDO_DEPTH: usize = 128;
 /// in, so the driver's next step is explicit rather than implied by a stack of
 /// conditionals.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Mode {
+pub(crate) enum Mode {
     /// Subscribed to live heads and publishing each one as it arrives.
     Following,
     /// A head arrived that does not link to the published tip, so the stream cannot
@@ -72,7 +72,7 @@ pub enum Mode {
 }
 
 /// One block's slice of the published stream.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug)]
 struct PublishedBlock {
     height: u64,
     hash: B256,
@@ -93,7 +93,7 @@ pub struct Pipeline<S, K> {
 }
 
 impl<S: BlockSource, K: EnvelopeSink> Pipeline<S, K> {
-    /// Builds a pipeline with [`DEFAULT_UNDO_DEPTH`] of history.
+    /// Builds a pipeline with `DEFAULT_UNDO_DEPTH` blocks of history.
     #[must_use]
     pub fn new(source: S, sink: K) -> Self {
         Self::with_undo_depth(source, sink, DEFAULT_UNDO_DEPTH)
@@ -106,7 +106,7 @@ impl<S: BlockSource, K: EnvelopeSink> Pipeline<S, K> {
     /// depth of zero disables retraction — linkage is still checked, but no sequences
     /// can be reclaimed.
     #[must_use]
-    pub fn with_undo_depth(source: S, sink: K, undo_depth: usize) -> Self {
+    fn with_undo_depth(source: S, sink: K, undo_depth: usize) -> Self {
         Self {
             source,
             sink,
@@ -116,18 +116,6 @@ impl<S: BlockSource, K: EnvelopeSink> Pipeline<S, K> {
             finalized_height: 0,
             mode: Mode::Following,
         }
-    }
-
-    /// The sequence number that the next published envelope will carry.
-    #[must_use]
-    pub const fn next_sequence(&self) -> u64 {
-        self.sequence
-    }
-
-    /// The mode the pipeline is currently in.
-    #[must_use]
-    pub const fn mode(&self) -> Mode {
-        self.mode
     }
 
     /// Follows the live chain tip until the head subscription ends.
@@ -164,7 +152,7 @@ impl<S: BlockSource, K: EnvelopeSink> Pipeline<S, K> {
     /// gap after the stream has started, or a fork deeper than the undo ring. Those are
     /// coverage breaks, not reorgs, and cannot be published honestly from here. A *first*
     /// head above genesis is not one of them: it is where the stream starts.
-    pub async fn process_block(&mut self, block: FetchedBlock) -> anyhow::Result<u64> {
+    pub(crate) async fn process_block(&mut self, block: FetchedBlock) -> anyhow::Result<u64> {
         let FetchedBlock { events, finalized } = block;
         let Some((first, _)) = events.split_first() else {
             return Ok(0);
@@ -528,7 +516,7 @@ mod tests {
 
         assert_eq!(pipeline.sink.kinds(), ["block", "log", "block", "log"]);
         assert_eq!(pipeline.sink.sequences(), [0, 1, 2, 3]);
-        assert_eq!(pipeline.next_sequence(), 4);
+        assert_eq!(pipeline.sequence, 4);
     }
 
     #[tokio::test]
@@ -576,7 +564,7 @@ mod tests {
         assert_eq!(pipeline.sink.reorg_orphans(), vec![vec![hash(3), hash(2)]]);
         // Block 2's run started at sequence 2, so the reorg and replacement reuse it.
         assert_eq!(pipeline.sink.sequences(), [0, 1, 2, 3, 4, 5, 2, 3, 4, 5]);
-        assert_eq!(pipeline.next_sequence(), 6);
+        assert_eq!(pipeline.sequence, 6);
     }
 
     #[tokio::test]
@@ -589,7 +577,7 @@ mod tests {
 
         assert_eq!(reorgs, 0);
         assert!(pipeline.sink.kinds().is_empty());
-        assert_eq!(pipeline.next_sequence(), 0);
+        assert_eq!(pipeline.sequence, 0);
     }
 
     #[tokio::test]
@@ -606,7 +594,7 @@ mod tests {
         process_all(&mut pipeline, blocks).await;
 
         assert_eq!(pipeline.history.len(), 2);
-        assert_eq!(pipeline.next_sequence(), 20);
+        assert_eq!(pipeline.sequence, 20);
     }
 
     #[tokio::test]
@@ -624,7 +612,7 @@ mod tests {
         .await;
 
         assert_eq!(pipeline.sink.kinds(), ["block", "log", "block", "log"]);
-        assert_eq!(pipeline.next_sequence(), 4);
+        assert_eq!(pipeline.sequence, 4);
         assert!(pipeline.sink.reorg_orphans().is_empty());
     }
 
@@ -640,7 +628,7 @@ mod tests {
             .await
             .expect_err("a gap must fail");
         assert!(error.to_string().contains("height gap"), "{error}");
-        assert_eq!(pipeline.mode(), Mode::Backfilling);
+        assert_eq!(pipeline.mode, Mode::Backfilling);
     }
 
     /// A fresh pipeline's first head is wherever the chain is, not genesis: there is no
@@ -659,7 +647,7 @@ mod tests {
         .await;
 
         assert_eq!(pipeline.sink.kinds(), ["block", "block"]);
-        assert_eq!(pipeline.mode(), Mode::Following);
+        assert_eq!(pipeline.mode, Mode::Following);
         // No earlier height was invented to stand in as the stream's base.
         assert_eq!(pipeline.history.front().map(|block| block.height), Some(5));
     }
@@ -783,7 +771,7 @@ mod tests {
         // Both heads were followed in order before the subscription ended.
         assert_eq!(pipeline.sink.kinds(), ["block", "block"]);
         assert_eq!(pipeline.sink.sequences(), [0, 1]);
-        assert_eq!(pipeline.next_sequence(), 2);
+        assert_eq!(pipeline.sequence, 2);
         // The error names the last height it saw, so a stopped live run is diagnosable.
         assert!(error.to_string().contains('2'), "{error}");
     }

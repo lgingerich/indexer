@@ -63,8 +63,8 @@ use serde::Deserialize;
 use super::abi::{Abi, DecodedEvent};
 use crate::wire::envelope::ChainId;
 
-/// One ABI file, named so a `[[contract]]` or `[[discovery]]` can reference it.
-#[derive(Debug, Clone, Deserialize)]
+/// One ABI file, named so a `[[contract]]` or a `[[discovery]]` can reference it.
+#[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AbiEntry {
     /// The name to reference it by, for example `uniswap_v3_pool`.
@@ -74,7 +74,7 @@ pub struct AbiEntry {
 }
 
 /// One address that decodes with an ABI from the first block.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ContractEntry {
     /// The chain the address is on.
@@ -86,7 +86,7 @@ pub struct ContractEntry {
 }
 
 /// One factory the registry learns children from.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DiscoveryEntry {
     /// The chain the factory is on.
@@ -115,7 +115,7 @@ pub struct Contract {
 }
 
 /// One decoded log's discovery effect: which address is a child, and how to decode it.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct Discovery {
     /// The child contract the creating event revealed, to register.
     pub child: Address,
@@ -162,7 +162,7 @@ pub struct ContractRegistry {
 }
 
 /// A discovery rule, resolved against its factory's ABI at load.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct Rule {
     /// The decoded argument holding the new child's address.
     child: String,
@@ -176,7 +176,7 @@ struct Rule {
 ///
 /// Parse this with [`toml::from_str`], or load it with [`ContractRegistry::from_file`].
 /// The shape is documented in the module docs; the entries carry their own docs.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RegistryConfig {
     /// The ABI files, named so a contract or rule can reference one.
