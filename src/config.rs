@@ -120,11 +120,13 @@ pub struct IngestSettings {
 /// point of the wider name: the layer is where envelopes go, and a webhook or a Kafka
 /// topic would sit here beside the databases.
 ///
-/// `DuckDB`'s settings are [`DuckDbSettings`](crate::sink::duckdb::DuckDbSettings), which
-/// lives in the sink that opens them. Its variant is behind the `duckdb` feature, so a
-/// build without the engine does not carry a store it cannot open: there, naming
-/// `[sink.duckdb]` is an unknown backend — a startup error naming the table, rather
-/// than settings that parse and fail later.
+/// Each backend's settings live in that backend's sink — `DuckDB`'s are
+/// [`DuckDbSettings`](crate::sink::duckdb::DuckDbSettings), `stdout`'s are
+/// [`StdoutSettings`](crate::sink::stdout::StdoutSettings) — so where to look for a
+/// backend's keys is one rule, and this file says only which backends exist. The
+/// `duckdb` variant is behind its feature, so a build without the engine does not carry
+/// a store it cannot open: there, naming `[sink.duckdb]` is an unknown backend — a
+/// startup error naming the table, rather than settings that parse and fail later.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Sink {
@@ -133,8 +135,8 @@ pub enum Sink {
     ///
     /// A payload rather than a unit variant so a key under `[sink.stdout]` is answered
     /// with what is valid — which is nothing — rather than an empty `available keys:`
-    /// list. See [`StdoutSettings`].
-    Stdout(StdoutSettings),
+    /// list. See [`StdoutSettings`](crate::sink::stdout::StdoutSettings).
+    Stdout(crate::sink::stdout::StdoutSettings),
     /// An embedded `DuckDB` database, opened and committed by its own task.
     ///
     /// Renamed explicitly because `snake_case` would spell the table `duck_db`, and the
@@ -143,16 +145,6 @@ pub enum Sink {
     #[serde(rename = "duckdb")]
     DuckDb(crate::sink::duckdb::DuckDbSettings),
 }
-
-/// `[sink.stdout]` takes no settings, and this is the type that says so.
-///
-/// Empty, so there is nothing an operator can set — but a distinct type rather than
-/// `()`, so serde can answer a stray key with a list of what is valid. Every message
-/// reaches the user through [`SettingsError`], so an unexplained empty list is a real
-/// error text, not a debug artifact.
-#[derive(Debug, Default, Deserialize)]
-#[serde(deny_unknown_fields, default)]
-pub struct StdoutSettings {}
 
 /// What the decode stage decodes, in its own file.
 ///

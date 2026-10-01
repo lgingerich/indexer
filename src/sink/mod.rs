@@ -27,7 +27,7 @@ pub mod stdout;
 
 #[cfg(feature = "duckdb")]
 pub use duckdb::{DuckDbSettings, DuckDbSink};
-pub use stdout::StdoutJsonSink;
+pub use stdout::{StdoutJsonSink, StdoutSettings};
 
 use anyhow::Result;
 

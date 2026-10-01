@@ -1,9 +1,25 @@
 //! Newline-delimited JSON to standard output.
+//!
+//! Beside the sink rather than in [`crate::config`] because it is the `[sink.stdout]`
+//! table's payload, and every sink keeps its own there: `DuckDB`'s are
+//! [`DuckDbSettings`](crate::sink::duckdb::DuckDbSettings), so where a backend's
+//! settings live is one rule rather than one case and one exception.
 
 use crate::wire::envelope::Envelope;
+use serde::Deserialize;
 use tokio::io::AsyncWriteExt as _;
 
 use crate::sink::EnvelopeSink;
+
+/// `[sink.stdout]` takes no settings, and this is the type that says so.
+///
+/// Empty, so there is nothing an operator can set — but a distinct type rather than
+/// `()`, so serde can answer a stray key with a list of what is valid. Every message
+/// reaches the user through [`SettingsError`](crate::config::SettingsError), so an
+/// unexplained empty list is a real error text, not a debug artifact.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct StdoutSettings {}
 
 /// Writes newline-delimited JSON to standard output.
 ///
