@@ -9,13 +9,14 @@
 //! - The **pipeline** is the only stateful part: it drives the source, folds its events
 //!   into one ordered stream, and hands each envelope to the sink.
 //!
-//! Its state is a machine: `Mode` names what it is doing, and the linkage rules in
-//! `Pipeline::process_block` decide the transition. A head linking to the published tip
-//! advances the chain; one that does not is a fork, retracted to the fork point in the
-//! same call and published as an [`Event::Reorg`]. A height gap and a fork deeper than
-//! the undo ring both fail loudly rather than publishing across a hole. The *first* head
-//! of a fresh pipeline is adopted as the start of the stream — wherever the chain happens
-//! to be — so a mid-chain start indexes forward from there instead of refusing.
+//! Its state is a machine, and the linkage rules in `Pipeline::process_block` drive it.
+//! A head linking to the published tip advances the chain; one that does not is a fork,
+//! retracted to the fork point in the same call and published as an [`Event::Reorg`]. A
+//! head already in the stream is a re-announcement rather than a fork, and is ignored. A
+//! height gap and a fork deeper than the undo ring both fail loudly rather than
+//! publishing across a hole. The *first* head of a fresh pipeline is adopted as the start
+//! of the stream — wherever the chain happens to be — so a mid-chain start indexes
+//! forward from there instead of refusing.
 //!
 //! Building the stream means three things: a per-chain monotonic sequence number on
 //! every envelope, parent-hash linkage so a reorg surfaces as an [`Event::Reorg`] instead
@@ -35,7 +36,7 @@ use std::collections::VecDeque;
 use alloy_primitives::B256;
 use anyhow::bail;
 use futures_util::StreamExt as _;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::sink::EnvelopeSink;
 use crate::wire::envelope::{Envelope, Event, Finalized, Reorg};
@@ -50,26 +51,6 @@ use crate::ingest::source::{BlockId, BlockSource, FetchedBlock};
 /// whose finality lags far behind the tip, such as L2s waiting on L1, where it is the
 /// hard ceiling on retraction depth.
 pub(crate) const DEFAULT_UNDO_DEPTH: usize = 128;
-
-/// What the pipeline is doing when it is driven forward.
-///
-/// The pipeline's state is `(sequence, history, finalized)`; this names the mode it is
-/// in, so the driver's next step is explicit rather than implied by a stack of
-/// conditionals.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Mode {
-    /// Subscribed to live heads and publishing each one as it arrives.
-    Following,
-    /// A head arrived that does not link to the published tip, so the stream cannot
-    /// continue without filling the range first.
-    ///
-    /// Entered when a head would leave a gap. Backfill is not built, so this mode is
-    /// terminal in practice: a gap fails rather than being published as a silent hole.
-    /// The first head of a fresh pipeline is *not* a gap — there is nothing before it to
-    /// be contiguous with — so it does not enter this mode; see
-    /// [`Pipeline::process_block`].
-    Backfilling,
-}
 
 /// One block's slice of the published stream.
 #[derive(Debug)]
@@ -89,7 +70,6 @@ pub struct Pipeline<S, K> {
     undo_depth: usize,
     sequence: u64,
     finalized_height: u64,
-    mode: Mode,
 }
 
 impl<S: BlockSource, K: EnvelopeSink> Pipeline<S, K> {
@@ -114,7 +94,6 @@ impl<S: BlockSource, K: EnvelopeSink> Pipeline<S, K> {
             undo_depth,
             sequence: 0,
             finalized_height: 0,
-            mode: Mode::Following,
         }
     }
 
@@ -143,19 +122,18 @@ impl<S: BlockSource, K: EnvelopeSink> Pipeline<S, K> {
     /// Publishes one block's events, emitting a reorg first if linkage broke and a
     /// finality watermark after if finality advanced.
     ///
-    /// Returns the number of [`Event::Reorg`] envelopes published, `0` or `1`.
-    ///
     /// # Errors
     ///
     /// Returns an error when the sink cannot deliver an event — fatal, since skipping
     /// one leaves a sequence gap — and when linkage cannot be resolved locally: a height
-    /// gap after the stream has started, or a fork deeper than the undo ring. Those are
-    /// coverage breaks, not reorgs, and cannot be published honestly from here. A *first*
-    /// head above genesis is not one of them: it is where the stream starts.
-    pub(crate) async fn process_block(&mut self, block: FetchedBlock) -> anyhow::Result<u64> {
+    /// gap after the stream has started, on either the canonical or the forked branch, or
+    /// a fork deeper than the undo ring. Those are coverage breaks, not reorgs, and
+    /// cannot be published honestly from here. A *first* head above genesis is not one of
+    /// them: it is where the stream starts.
+    pub(crate) async fn process_block(&mut self, block: FetchedBlock) -> anyhow::Result<()> {
         let FetchedBlock { events, finalized } = block;
         let Some((first, _)) = events.split_first() else {
-            return Ok(0);
+            return Ok(());
         };
 
         let Event::Block(block) = first else {
@@ -164,32 +142,60 @@ impl<S: BlockSource, K: EnvelopeSink> Pipeline<S, K> {
                 first_kind = first.kind(),
                 "fetched block must lead with a block marker; skipping block"
             );
-            return Ok(0);
+            return Ok(());
         };
         let (height, hash, parent_hash) = (block.number, block.hash, block.parent_hash);
-        let mut reorgs = 0;
 
         if let Some(previous) = self.history.back() {
             let latest = previous.height;
-            if height == latest && hash == previous.hash {
-                // The tip was already published and re-announced. Not a fork.
-                return Ok(0);
+
+            // A head already in the stream is a re-announcement, not a fork. A node
+            // resends a head after a slow fetch, on reconnect, or from a lagging
+            // replica, and such a head's parent is the canonical parent — so linkage
+            // alone cannot tell the two apart. The block's own identity can: a
+            // re-announcement carries a height and hash already published, and
+            // treating it as a fork would retract canonical blocks. Only the tip used
+            // to be special-cased, so a head for an *older* height fell through to
+            // `find_fork` and destroyed every block above it.
+            if self.is_published(height, hash) {
+                debug!(
+                    chain = %self.source.chain(),
+                    height,
+                    "head already published; re-announcement, not a fork"
+                );
+                // Finality still advances. The source re-reads the finalized header
+                // per block, so a re-announcement routinely carries a newer watermark
+                // than the one published, and dropping it here loses the advance and
+                // the ring trim that rides on it.
+                self.advance_finality(finalized).await?;
+                self.sink.flush().await?;
+                return Ok(());
             }
+
             if parent_hash == previous.hash {
                 // Links to the published tip. With no gap this is the next height;
                 // a gap means a head was missed, which is a coverage hole rather
                 // than a fork, and publishing across it would leave a silent hole.
                 if height != latest + 1 {
-                    self.mode = Mode::Backfilling;
                     bail!(
                         "height gap: published tip {latest} -> head {height}; \
                          backfill catches this up, but backfill-to-live handoff is not built"
                     );
                 }
             } else if let Some(fork) = self.find_fork(parent_hash) {
+                // The forked branch is held to the same contiguity as the canonical
+                // one. `fork` is the first block of the new branch, so a head above
+                // it skips heights of that branch — the same silent hole, reached
+                // through a door the check above never covered.
+                if height != fork {
+                    bail!(
+                        "height gap on the forked branch: fork point {fork} -> head \
+                         {height}; backfill catches this up, but backfill-to-live \
+                         handoff is not built"
+                    );
+                }
                 // A genuine fork: retract to the fork point, not to the head.
                 self.publish_reorg(fork, hash, parent_hash).await?;
-                reorgs = 1;
             } else {
                 return Err(anyhow::anyhow!(
                     "no fork point for head {height} (parent {parent_hash}); the reorg is \
@@ -230,7 +236,6 @@ impl<S: BlockSource, K: EnvelopeSink> Pipeline<S, K> {
         // durable together, so a buffering sink opens its engine once per block
         // instead of once per event.
         self.sink.flush().await?;
-        self.mode = Mode::Following;
 
         info!(
             chain = %self.source.chain(),
@@ -239,7 +244,7 @@ impl<S: BlockSource, K: EnvelopeSink> Pipeline<S, K> {
             sequence = self.sequence,
             "published block"
         );
-        Ok(reorgs)
+        Ok(())
     }
 
     /// Publishes a watermark if `finalized` is newer than the current one, and drops
@@ -311,6 +316,18 @@ impl<S: BlockSource, K: EnvelopeSink> Pipeline<S, K> {
         Ok(())
     }
 
+    /// Whether this exact block is already in the published stream.
+    ///
+    /// The test for a re-announcement: a head whose height and hash both match a
+    /// remembered block carries no new information, whether or not it is the tip.
+    /// Only published blocks are remembered, so a fork's replacement block — same
+    /// height, different hash — is correctly not a re-announcement.
+    fn is_published(&self, height: u64, hash: B256) -> bool {
+        self.history
+            .iter()
+            .any(|block| block.height == height && block.hash == hash)
+    }
+
     /// The first height at or above which blocks are orphaned by a fork at `parent`.
     ///
     /// `parent` is the new head's parent, so the fork point is the block one above the
@@ -346,9 +363,13 @@ impl<S: BlockSource, K: EnvelopeSink> Pipeline<S, K> {
         if self.history.len() <= self.undo_depth {
             return;
         }
-        // The newest entry is only evicted when the source jumps backwards, which
-        // is a reorg this ring cannot retract; swappable for an error once the ring
-        // is rebuilt from durable history.
+        // `ponytail:` the newest entry is only evicted when the source jumps backwards,
+        // so a source whose height decreases grows the ring one block per step without
+        // limit instead of holding it at `undo_depth`. The ceiling is a peer that
+        // walks the tip backwards, which is rarer than a reorg; making it an error
+        // here — or evicting the newest entry and losing the ability to retract the
+        // block just published — is the upgrade once the ring is rebuilt from durable
+        // history.
         if self
             .history
             .front()
@@ -368,7 +389,7 @@ mod tests {
     use alloy_primitives::{B256, TxHash};
     use futures_util::stream;
 
-    use super::{Mode, Pipeline};
+    use super::Pipeline;
     use crate::wire::envelope::{Block, ChainId, Envelope, Event, Log};
 
     use crate::sink::EnvelopeSink;
@@ -455,6 +476,17 @@ mod tests {
                 .iter()
                 .filter_map(|envelope| match &envelope.event {
                     Event::Reorg(reorg) => Some(reorg.height),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        /// The head each reorg marker declares canonical.
+        fn reorg_new_heads(&self) -> Vec<B256> {
+            self.seen
+                .iter()
+                .filter_map(|envelope| match &envelope.event {
+                    Event::Reorg(reorg) => Some(reorg.new_head_hash),
                     _ => None,
                 })
                 .collect()
@@ -570,12 +602,11 @@ mod tests {
     #[tokio::test]
     async fn empty_block_publishes_nothing_and_holds_the_sequence() {
         let mut pipeline = pipeline(128);
-        let reorgs = pipeline
+        pipeline
             .process_block(fetched(Vec::new()))
             .await
             .expect("empty block is not an error");
 
-        assert_eq!(reorgs, 0);
         assert!(pipeline.sink.kinds().is_empty());
         assert_eq!(pipeline.sequence, 0);
     }
@@ -616,6 +647,101 @@ mod tests {
         assert!(pipeline.sink.reorg_orphans().is_empty());
     }
 
+    /// A head for an *older* height is also a re-announcement, not a fork. Only the tip
+    /// used to be special-cased, so this one fell through to the fork search: its parent
+    /// is the canonical parent, so the fork point resolved to its own height and the
+    /// pipeline retracted every block above it. Blocks 4 and 5 were canonical and never
+    /// reorged, and the marker named block 3 as canonical *and* as orphaned at once.
+    #[tokio::test]
+    async fn a_reannounced_head_below_the_tip_is_not_a_reorg() {
+        let mut pipeline = pipeline(128);
+        process_all(
+            &mut pipeline,
+            vec![
+                vec![block_event(1, hash(1), hash(0)), log_event(1, hash(1), 0)],
+                vec![block_event(2, hash(2), hash(1)), log_event(2, hash(2), 0)],
+                vec![block_event(3, hash(3), hash(2)), log_event(3, hash(3), 0)],
+                vec![block_event(4, hash(4), hash(3)), log_event(4, hash(4), 0)],
+                vec![block_event(5, hash(5), hash(4)), log_event(5, hash(5), 0)],
+                // A lagging peer resends head 3, already published, with its canonical
+                // parent. Nothing about it is a fork.
+                vec![block_event(3, hash(3), hash(2)), log_event(3, hash(3), 0)],
+            ],
+        )
+        .await;
+
+        // No reorg marker at all: the canonical chain is untouched.
+        assert!(
+            pipeline.sink.reorg_orphans().is_empty(),
+            "a re-announcement retracted blocks"
+        );
+        assert_eq!(
+            pipeline.sink.kinds(),
+            [
+                "block", "log", "block", "log", "block", "log", "block", "log", "block", "log"
+            ]
+        );
+        // The retracted sequences were reused by nothing, so the stream is still
+        // contiguous and the tip is still block 5.
+        assert_eq!(pipeline.sequence, 10);
+        assert_eq!(pipeline.history.back().map(|block| block.height), Some(5));
+    }
+
+    /// A marker's new head is never one of the hashes it asks a consumer to retract.
+    /// That contradiction is what made the stale-head retraction unrecoverable: a
+    /// consumer deleting every orphaned hash would delete the block the marker had just
+    /// declared canonical.
+    #[tokio::test]
+    async fn a_reorg_marker_never_orphans_the_head_it_names() {
+        let mut pipeline = pipeline(128);
+        process_all(
+            &mut pipeline,
+            vec![
+                vec![block_event(1, hash(1), hash(0))],
+                vec![block_event(2, hash(2), hash(1)), log_event(2, hash(2), 0)],
+                vec![block_event(3, hash(3), hash(2)), log_event(3, hash(3), 0)],
+                // A genuine replacement of block 3: same height, different hash.
+                vec![block_event(3, hash(30), hash(2)), log_event(3, hash(30), 0)],
+            ],
+        )
+        .await;
+
+        let orphans = pipeline.sink.reorg_orphans();
+        let new_heads = pipeline.sink.reorg_new_heads();
+        assert_eq!(orphans, vec![vec![hash(3)]]);
+        assert_eq!(new_heads, vec![hash(30)]);
+        assert!(
+            !orphans[0].contains(&new_heads[0]),
+            "the marker orphaned the head it declared canonical"
+        );
+    }
+
+    /// A re-announcement is not a no-op for finality. The source re-reads the finalized
+    /// header on every block, so a duplicate head routinely carries a watermark newer
+    /// than the one published. Returning early without advancing it dropped the advance
+    /// and the ring trim that rides on it.
+    #[tokio::test]
+    async fn a_reannounced_head_still_advances_finality() {
+        let mut pipeline = pipeline(128);
+        process_all(
+            &mut pipeline,
+            vec![
+                vec![block_event(1, hash(1), hash(0))],
+                vec![block_event(2, hash(2), hash(1))],
+            ],
+        )
+        .await;
+
+        // The same head again, now with a newer finalized height than the run above.
+        pipeline
+            .process_block(fetched_at(vec![block_event(2, hash(2), hash(1))], 1))
+            .await
+            .expect("a re-announcement is not an error");
+
+        assert_eq!(pipeline.sink.kinds(), ["block", "block", "finalized"]);
+        assert_eq!(pipeline.finalized_height, 1);
+    }
+
     #[tokio::test]
     async fn a_height_gap_is_a_coverage_error_not_a_silent_hole() {
         let mut pipeline = pipeline(128);
@@ -628,7 +754,42 @@ mod tests {
             .await
             .expect_err("a gap must fail");
         assert!(error.to_string().contains("height gap"), "{error}");
-        assert_eq!(pipeline.mode, Mode::Backfilling);
+    }
+
+    /// A fork is held to the same contiguity as the canonical branch. Once the fork
+    /// search succeeded, the head published with no height check at all, so a new branch
+    /// whose head skipped its own heights indexed straight across the hole and the run
+    /// ended cleanly — the same silent hole the canonical path refuses, reached through
+    /// the one door that skipped the check.
+    #[tokio::test]
+    async fn a_fork_that_skips_heights_is_a_coverage_error_not_a_silent_hole() {
+        let mut pipeline = pipeline(128);
+        process_all(
+            &mut pipeline,
+            vec![
+                vec![block_event(1, hash(1), hash(0))],
+                vec![block_event(2, hash(2), hash(1))],
+                vec![block_event(3, hash(3), hash(2))],
+            ],
+        )
+        .await;
+
+        // A head at height 5 building on block 2: the fork point is 3, so heights 3 and 4
+        // of the new branch never arrive.
+        let error = pipeline
+            .process_block(fetched(vec![block_event(5, hash(5), hash(2))]))
+            .await
+            .expect_err("a gap on the forked branch must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("height gap on the forked branch"),
+            "{error}"
+        );
+        // Nothing was retracted and nothing was published across the hole.
+        assert!(pipeline.sink.reorg_orphans().is_empty());
+        assert_eq!(pipeline.sink.kinds(), ["block", "block", "block"]);
+        assert_eq!(pipeline.sequence, 3);
     }
 
     /// A fresh pipeline's first head is wherever the chain is, not genesis: there is no
@@ -647,7 +808,6 @@ mod tests {
         .await;
 
         assert_eq!(pipeline.sink.kinds(), ["block", "block"]);
-        assert_eq!(pipeline.mode, Mode::Following);
         // No earlier height was invented to stand in as the stream's base.
         assert_eq!(pipeline.history.front().map(|block| block.height), Some(5));
     }
