@@ -24,10 +24,9 @@
 //!
 //! Not durable and not resumable: a crash loses whatever is in flight. That is safe only
 //! because the chain and the store are the record — the store's high-water mark says
-//! where to resume, and the node can serve the blocks after it. Resuming from it is not
-//! built yet; see the crate docs.
+//! where to resume, and the node can serve the blocks after it.
 
-use anyhow::{Result, anyhow};
+use anyhow::Result;
 use tokio::sync::mpsc;
 
 use crate::sink::EnvelopeSink;
@@ -71,14 +70,15 @@ impl EnvelopeSink for ChannelSink {
         if self.batch.is_empty() {
             return Ok(());
         }
-        // The next block is about the size of this one, so reserve for it rather than
+        // Hand the buffer over rather than copy it, leaving one already sized for the
+        // next block: blocks vary in log count, but not enough for this to lose to
         // regrowing from zero.
         let next = Vec::with_capacity(self.batch.len());
         let batch = std::mem::replace(&mut self.batch, next);
-        self.sender
-            .send(batch)
-            .await
-            .map_err(|_| anyhow!("the storage side of the channel has stopped"))
+        // Storage has stopped. `SendError` is already an `Error`, so `?` carries it as
+        // is; `runtime` labels it, and reports the store's own error first.
+        self.sender.send(batch).await?;
+        Ok(())
     }
 }
 
@@ -138,6 +138,7 @@ mod tests {
     use std::time::Duration;
 
     use alloy_primitives::B256;
+    use tokio::sync::mpsc;
 
     use crate::sink::EnvelopeSink;
     use crate::wire::envelope::{ChainId, Envelope, Event, Finalized};
@@ -251,7 +252,13 @@ mod tests {
         drop(receiver);
         sink.publish(envelope(0)).await.expect("publish buffers");
         let error = sink.flush().await.expect_err("nobody is reading");
-        assert!(error.to_string().contains("stopped"), "{error}");
+        // The error is tokio's, carried through as is: the type, not the wording.
+        assert!(
+            error
+                .downcast_ref::<mpsc::error::SendError<Vec<Envelope>>>()
+                .is_some(),
+            "{error}"
+        );
     }
 
     /// A sink error ends the drain with that error, so a failing store stops storage
