@@ -1,36 +1,23 @@
 //! The indexer's settings file, and the builders each stage takes.
 //!
-//! Configuration is a TOML file read once at startup. A setting either has a default in
-//! this module or is required — there is no third case — so a missing required value is
-//! a startup error naming the field rather than a failure somewhere inside a client.
+//! TOML, read once at startup. Two conventions carry the contract:
 //!
-//! # Required vs defaulted
+//! - **Required means no value could be right by accident.** A field with no
+//!   `#[serde(default)]` has no default, so serde refuses a document that omits it and
+//!   names the field. Required `String`s also carry `deserialize_with = "non_empty"`,
+//!   since `chain = ""` is present, not absent.
+//! - **A typo is a startup error, not a silent default.** Every table is
+//!   `deny_unknown_fields`, and an unknown [`Sink`] backend is refused rather than
+//!   falling back to another one.
 //!
-//! A required field is one with no `#[serde(default)]`: serde refuses a document that
-//! cannot fill it, naming the field, so absence is enforced by the type rather than
-//! re-checked by hand. A required `String` also carries `deserialize_with = "non_empty"`,
-//! because a present empty value — `chain = ""` — is not absence and would otherwise
-//! start a process that stamps every event with a blank chain. A defaulted field carries
-//! `#[serde(default)]`: the value's `Default` when that is the right one (`PathBuf`,
-//! `BTreeMap`, an `Option` that means "unset"), or a `default_*` function when it is not.
+//! Where records end up. The backend is the table: `[sink.duckdb]` selects `DuckDB` and
+//! holds its settings, `[sink.stdout]` selects printing and takes none. Required,
+//! because one run with no store and the next with one are different deployments, and
+//! exactly one table may be named. Every other field not shown below may be omitted.
 //!
-//! Required means no value could be right by accident. An endpoint or a chain name that
-//! is guessed produces a process that starts, looks healthy, and indexes the wrong
-//! thing, so the field is simply absent from the defaults.
-//!
-//! # Grouping
-//!
-//! A table names what owns its fields, not where a field was first needed:
-//!
-//! - `[ingest]` — the chain to follow and its endpoints. Required: with nothing to
-//!   follow there is nothing to run.
-//! - `[runtime]` — how storage commits: the most records one commit may cover.
-//! - `[storage.<kind>]` — one backend's own settings, chosen by `[storage] kind`.
-//!   Backend-specific keys stay out of the generic table so a second backend is an
-//!   addition rather than an ambiguity about which `database` is meant.
-//! - `[decode]` — the contract registry decode uses.
-//!
-//! # Example
+//! Named for [`crate::sink`] rather than for storage: a sink is where envelopes go, and
+//! not all of them are kept. `stdout` is a sink that writes nowhere, and a webhook or a
+//! Kafka topic would be one too.
 //!
 //! ```toml
 //! [ingest]
@@ -38,26 +25,18 @@
 //! http_url = "https://base-rpc.publicnode.com"
 //! ws_url = "wss://base-rpc.publicnode.com"
 //!
-//! [storage]
-//! kind = "duckdb"
-//!
-//! [storage.duckdb]
+//! [sink.duckdb]
 //! path = "indexer.duckdb"
+//!
+//! [sink.duckdb.settings]
+//! threads = "4"
+//!
+//! # ...or `[sink.stdout]`, to print the stream and open no store.
 //!
 //! [decode]
 //! registry = "registry.toml"   # the contract catalog; optional
 //! ```
-//!
-//! Every field that is not required above may be omitted.
-//!
-//! # Why one file rather than the environment
-//!
-//! A settings file is reviewable: it is checked in, it diffs per deployment, and its
-//! shape is one place rather than nine lookups scattered through a `main`. A typo is a
-//! parse error naming a line, where an unset variable names itself only if the code
-//! happens to check it.
 
-use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
@@ -90,12 +69,9 @@ where
 pub struct Settings {
     /// The chain to follow. Required: the pipeline starts at ingest.
     pub ingest: IngestSettings,
-    /// How storage commits.
-    #[serde(default)]
-    pub runtime: RuntimeSettings,
-    /// Where records are persisted.
-    #[serde(default)]
-    pub storage: StorageSettings,
+    /// Where records go. Required: a run with nowhere to send them is not a deployment,
+    /// and the table that is named is what says which one.
+    pub sink: Sink,
     /// What the decode stage decodes.
     #[serde(default)]
     pub decode: DecodeSettings,
@@ -111,9 +87,7 @@ pub struct Settings {
 ///
 /// `chain`, `http_url`, and `ws_url` are required — a chain with no endpoint cannot be
 /// followed, and a default would silently index nothing — so they have no serde default
-/// and serde refuses a table that omits them, naming the field. `stdout` is a debug mode
-/// rather than a deployment setting: it changes where the stream goes, not what the
-/// process is.
+/// and serde refuses a table that omits them, naming the field.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct IngestSettings {
@@ -127,88 +101,58 @@ pub struct IngestSettings {
     /// The WebSocket endpoint used for heads. Required, and non-empty.
     #[serde(deserialize_with = "non_empty")]
     pub ws_url: String,
-    /// Print the stream to stdout instead of storing it, for watching what the indexer
-    /// would write. No store is opened.
-    #[serde(default)]
-    pub stdout: bool,
 }
 
-/// How storage commits.
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields, default)]
-pub struct RuntimeSettings {
-    /// The most records one store commit may cover.
-    ///
-    /// Storage receives one block at a time and commits each as it arrives. When it has
-    /// fallen behind, it folds the blocks already waiting into one commit until this many
-    /// records are reached, so a stalled store catches up in fewer, larger transactions.
-    /// A block is never split, so a commit can run past the bound by up to one block.
-    pub batch_records: usize,
-}
-
-impl Default for RuntimeSettings {
-    fn default() -> Self {
-        Self {
-            batch_records: DEFAULT_BATCH_RECORDS,
-        }
-    }
-}
-
-/// Where decoded records are stored, and which backend writes them.
+/// Where records go, and by which backend.
 ///
-/// The backend-specific settings live under the backend's own table, so this table stays
-/// generic. [`StorageKind`] is the tag: exactly one backend is selected, and adding
-/// `ClickHouse` or Postgres is a variant there plus its own table here, not another
-/// top-level `database` whose owner a reader has to guess.
+/// The backend *is* the table, which is what makes `duckdb`-specific keys unambiguous:
+/// `[sink.duckdb.settings]` is inside the table that named `DuckDB`, so switching to
+/// another backend means switching tables, and a key that only `DuckDB` understands has
+/// nowhere else to sit. The variant is load-bearing, not a label — `runtime` matches on
+/// it rather than reading a field of a table the tag already selected.
+///
+/// Exactly one table may be named, and naming none is an error: a run with no store and
+/// the next with one are different deployments, and there is no default that is right for
+/// both. Serde refuses an unknown backend, so a typo here is a startup error rather than
+/// a silent fallback.
+///
+/// A sink is not necessarily a store. [`Sink::Stdout`] keeps nothing, and that is the
+/// point of the wider name: the layer is where envelopes go, and a webhook or a Kafka
+/// topic would sit here beside the databases.
+///
+/// `DuckDB`'s settings are [`DuckDbSettings`](crate::sink::duckdb::DuckDbSettings), which
+/// lives in the sink that opens them. Its variant is behind the `duckdb` feature, so a
+/// build without the engine does not carry a store it cannot open: there, naming
+/// `[sink.duckdb]` is an unknown backend — a startup error naming the table, rather
+/// than settings that parse and fail later.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Sink {
+    /// Print the stream as newline-delimited JSON, for watching what the indexer would
+    /// write. No store is opened and nothing is persisted.
+    ///
+    /// A payload rather than a unit variant so a key under `[sink.stdout]` is answered
+    /// with what is valid — which is nothing — rather than an empty `available keys:`
+    /// list. See [`StdoutSettings`].
+    Stdout(StdoutSettings),
+    /// An embedded `DuckDB` database, opened and committed by its own task.
+    ///
+    /// Renamed explicitly because `snake_case` would spell the table `duck_db`, and the
+    /// engine's own name is the one operators already know.
+    #[cfg(feature = "duckdb")]
+    #[serde(rename = "duckdb")]
+    DuckDb(crate::sink::duckdb::DuckDbSettings),
+}
+
+/// `[sink.stdout]` takes no settings, and this is the type that says so.
+///
+/// Empty, so there is nothing an operator can set — but a distinct type rather than
+/// `()`, so serde can answer a stray key with a list of what is valid. Every message
+/// reaches the user through [`SettingsError`], so an unexplained empty list is a real
+/// error text, not a debug artifact.
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields, default)]
-pub struct StorageSettings {
-    /// The backend to write. Absent means `duckdb`.
-    pub kind: StorageKind,
-    /// `DuckDB`'s settings, when `kind = "duckdb"`.
-    pub duckdb: DuckDbSettings,
-}
-
-/// The storage backend the process writes to.
-///
-/// One variant per backend. Serde rejects an unknown tag, so a typo or a backend this
-/// build does not have is a startup error rather than a silent fallback to the default.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum StorageKind {
-    /// An embedded `DuckDB` database.
-    #[default]
-    Duckdb,
-}
-
-/// `DuckDB`'s settings: the database to write, and the engine settings passed through.
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields, default)]
-pub struct DuckDbSettings {
-    /// The `DuckDB` database file to write. Defaults to `indexer.duckdb`.
-    pub path: PathBuf,
-    /// Any other `DuckDB` setting, passed straight through.
-    ///
-    /// `DuckDB` accepts dozens of settings and this file does not restate them. Anything
-    /// here reaches [`duckdb::Config::with`], which validates it, so a misspelled key is
-    /// an error from the engine naming the setting rather than a silent no-op.
-    ///
-    /// ```toml
-    /// [storage.duckdb.settings]
-    /// threads = "4"
-    /// max_memory = "1GB"
-    /// ```
-    pub settings: BTreeMap<String, String>,
-}
-
-impl Default for DuckDbSettings {
-    fn default() -> Self {
-        Self {
-            path: PathBuf::from(DEFAULT_DATABASE),
-            settings: BTreeMap::new(),
-        }
-    }
-}
+pub struct StdoutSettings {}
 
 /// What the decode stage decodes, in its own file.
 ///
@@ -228,16 +172,43 @@ pub struct DecodeSettings {
     pub registry: Option<PathBuf>,
 }
 
+/// Why a settings file could not be turned into [`Settings`].
+///
+/// Typed because the two failures are different problems — an unreadable path and a
+/// rejected document — and a caller that recovers from one (falling back to a default
+/// file) may not want to swallow the other. Neither variant names the file: `toml` gives
+/// the line and column, and the caller is the one that knows the path.
+#[derive(Debug, thiserror::Error)]
+pub enum SettingsError {
+    /// The file could not be read.
+    #[error("read settings at {path}: {source}")]
+    Read {
+        /// The path that failed.
+        path: String,
+        /// The underlying I/O error.
+        source: std::io::Error,
+    },
+    /// The document did not parse, or a required value was absent.
+    #[error("invalid settings: {source}")]
+    Parse {
+        /// `toml`'s error, which carries the line and column.
+        source: toml::de::Error,
+    },
+}
+
 impl std::str::FromStr for Settings {
-    type Err = anyhow::Error;
+    /// [`SettingsError::Parse`]; there is no file to read in this form.
+    type Err = SettingsError;
 
     /// Parses settings from TOML text, filling defaults and rejecting what is required
     /// but absent.
     ///
     /// This is the in-memory form of [`Settings::from_file`], for a caller that has the
-    /// text already; prefer reading a file.
-    fn from_str(text: &str) -> anyhow::Result<Self> {
-        Ok(toml::from_str(text)?)
+    /// text already. A relative path in the text resolves against the process's working
+    /// directory rather than a file's, since there is no file; prefer
+    /// [`Settings::from_file`].
+    fn from_str(text: &str) -> Result<Self, SettingsError> {
+        toml::from_str(text).map_err(|source| SettingsError::Parse { source })
     }
 }
 
@@ -246,26 +217,22 @@ impl Settings {
     ///
     /// # Errors
     ///
-    /// Returns an error when the file cannot be read, when it does not parse, or when a
-    /// required value is absent. A malformed file reports its line and column; an unknown
-    /// field is an error rather than being ignored, so a misspelled key is caught at
-    /// startup instead of silently leaving a setting at its default.
-    pub fn from_file(path: impl AsRef<Path>) -> anyhow::Result<Self> {
+    /// Returns [`SettingsError::Read`] when the file cannot be read and
+    /// [`SettingsError::Parse`] when it does not parse or a required value is absent. A
+    /// malformed file reports its line and column; an unknown field is an error rather
+    /// than being ignored, so a misspelled key is caught at startup instead of silently
+    /// leaving a setting at its default.
+    pub fn from_file(path: impl AsRef<Path>) -> Result<Self, SettingsError> {
         let path = path.as_ref();
-        let text = std::fs::read_to_string(path).map_err(|error| {
-            anyhow::anyhow!("cannot read settings at {}: {error}", path.display())
+        let text = std::fs::read_to_string(path).map_err(|source| SettingsError::Read {
+            path: path.display().to_string(),
+            source,
         })?;
-        let mut settings: Self = text.parse().map_err(|error: anyhow::Error| {
-            anyhow::anyhow!("invalid settings at {}:\n{error}", path.display())
-        })?;
+        let mut settings: Self = text.parse()?;
         // Remember where the file lives, so a relative path in it resolves against that
-        // directory rather than the process's working directory. A bare filename has no
-        // parent; the working directory stands in for it.
-        settings.dir = path
-            .parent()
-            .filter(|parent| !parent.as_os_str().is_empty())
-            .unwrap_or_else(|| Path::new("."))
-            .to_path_buf();
+        // directory rather than the process's working directory. A bare filename's
+        // parent is empty, and joining onto an empty path is the path as written.
+        settings.dir = path.parent().unwrap_or_else(|| Path::new("")).to_path_buf();
         Ok(settings)
     }
 
@@ -283,24 +250,33 @@ impl Settings {
     }
 }
 
-/// The default `DuckDB` path.
-pub(crate) const DEFAULT_DATABASE: &str = "indexer.duckdb";
-
-/// The default for [`RuntimeSettings::batch_records`].
-pub(crate) const DEFAULT_BATCH_RECORDS: usize = 500;
-
 #[cfg(test)]
 // The crate denies `expect`/`unwrap` to keep production paths honest; tests are
 // allowed them per the repository test style, since a failed expectation there
 // means the fixture or setup is wrong.
 #[expect(clippy::expect_used)]
 mod tests {
+    use std::path::PathBuf;
     use std::str::FromStr as _;
 
-    use super::{DEFAULT_BATCH_RECORDS, DEFAULT_DATABASE, Settings};
+    use super::{Settings, Sink};
+    use crate::sink::duckdb::DuckDbSettings;
 
-    /// The minimum a file needs: a chain and its endpoints.
+    /// The minimum a file needs: a chain, its endpoints, and a store.
     fn minimal() -> &'static str {
+        r#"
+[ingest]
+chain = "base"
+http_url = "https://example.invalid"
+ws_url = "wss://example.invalid"
+
+[sink.duckdb]
+"#
+    }
+
+    /// The same minimum with the store left to the caller, for a test that names a
+    /// backend of its own.
+    fn ingest_only() -> &'static str {
         r#"
 [ingest]
 chain = "base"
@@ -315,14 +291,19 @@ ws_url = "wss://example.invalid"
     fn a_minimal_file_supplies_every_default() {
         let settings = Settings::from_str(minimal()).expect("minimal settings parse");
 
-        assert!(!settings.ingest.stdout, "stdout is off unless asked for");
-        assert_eq!(settings.runtime.batch_records, DEFAULT_BATCH_RECORDS);
-        assert_eq!(settings.storage.kind, super::StorageKind::Duckdb);
-        assert_eq!(
-            settings.storage.duckdb.path,
-            std::path::PathBuf::from(DEFAULT_DATABASE)
-        );
         assert!(settings.decode.registry.is_none(), "nothing is decoded");
+        // Compared against the sink's own defaults, so a retune there cannot leave this
+        // asserting a value the crate no longer uses.
+        let defaults = DuckDbSettings::default();
+        let Sink::DuckDb(duckdb) = &settings.sink else {
+            panic!("the table names the backend: {settings:?}");
+        };
+        assert_eq!(duckdb.path, defaults.path);
+        assert_eq!(duckdb.batch_records, defaults.batch_records);
+        assert!(
+            duckdb.settings.is_empty(),
+            "no engine settings unless asked"
+        );
     }
 
     /// The shipped `indexer.toml` is an example an operator copies, so it must stay
@@ -343,12 +324,18 @@ ws_url = "wss://example.invalid"
         assert_eq!(settings.ingest.chain, "base");
         assert!(!settings.ingest.http_url.is_empty());
         assert!(!settings.ingest.ws_url.is_empty());
-        assert_eq!(settings.runtime.batch_records, DEFAULT_BATCH_RECORDS);
+        let Sink::DuckDb(duckdb) = &settings.sink else {
+            panic!("the table names the backend: {settings:?}");
+        };
+        assert_eq!(
+            duckdb.batch_records,
+            DuckDbSettings::default().batch_records
+        );
         // The fixture names `registry.toml`. Parsed from text it has no directory, so the
         // path is left as written rather than resolved against the working directory.
         assert_eq!(
             settings.registry_path(),
-            Some(std::path::PathBuf::from("registry.toml"))
+            Some(PathBuf::from("registry.toml"))
         );
     }
 
@@ -382,7 +369,7 @@ ws_url = "wss://example.invalid"
         .expect("settings parse");
         assert_eq!(
             settings.registry_path(),
-            Some(std::path::PathBuf::from("registry.toml"))
+            Some(PathBuf::from("registry.toml"))
         );
     }
 
@@ -390,10 +377,86 @@ ws_url = "wss://example.invalid"
     /// a process with nothing to do.
     #[test]
     fn a_file_without_ingest_is_an_error() {
-        let error = Settings::from_str("[storage]\nkind = \"duckdb\"\n")
+        let error = Settings::from_str("[sink.duckdb]\n")
             .expect_err("ingest is required")
             .to_string();
         assert!(error.contains("ingest"), "the error names it: {error}");
+    }
+
+    /// A file with no `[sink.<backend>]` has nowhere to write, and the table is what
+    /// says which write — so one is required, rather than defaulted to a backend nobody
+    /// chose.
+    #[test]
+    fn a_file_without_sink_is_an_error() {
+        let error = Settings::from_str(ingest_only())
+            .expect_err("a sink is required")
+            .to_string();
+        assert!(error.contains("sink"), "the error names it: {error}");
+    }
+
+    /// `stdout` is a backend, not an ingest flag: it is where records go, and it is
+    /// reached by naming its table rather than by a bool on the wrong one.
+    #[test]
+    fn a_stdout_backend_is_named_by_its_table() {
+        let settings = Settings::from_str(&format!("{}\n[sink.stdout]\n", ingest_only()))
+            .expect("settings parse");
+
+        assert!(
+            matches!(settings.sink, Sink::Stdout(_)),
+            "[sink.stdout] is the no-store run: {settings:?}"
+        );
+    }
+
+    /// `stdout` needs no engine, so it is a backend in every build. Gating the `DuckDB`
+    /// variant instead of the whole enum keeps the no-engine build able to do the one
+    /// thing it can: watch the stream.
+    #[test]
+    fn a_stdout_backend_needs_no_duckdb_feature() {
+        let settings = Settings::from_str(&format!("{}\n[sink.stdout]\n", ingest_only()))
+            .expect("settings parse");
+
+        assert!(
+            matches!(settings.sink, Sink::Stdout(_)),
+            "the no-store run is available whatever the features: {settings:?}"
+        );
+    }
+
+    /// Two backends named at once is a contradiction, and picking one silently is exactly
+    /// the kind of wrong answer that looks like a working deployment.
+    ///
+    /// The wording is serde's — an externally tagged enum is a one-key map, so this reads
+    /// as an element count rather than a table count. Asserting the span instead: the
+    /// error has to point at the first table, which is what a reader needs to see.
+    #[test]
+    fn two_sink_backends_are_rejected() {
+        let error = Settings::from_str(&format!(
+            "{}\n[sink.stdout]\n\n[sink.duckdb]\npath = \"/tmp/x.duckdb\"\n",
+            ingest_only()
+        ))
+        .expect_err("one backend is one table")
+        .to_string();
+        assert!(
+            error.contains("[sink.stdout]") && error.contains("1 element"),
+            "the error points at the first table: {error}"
+        );
+    }
+
+    /// A `stdout` run takes no settings, so a key under it is a leftover from a backend
+    /// that is no longer selected — not something to ignore.
+    ///
+    /// The message has to be readable, because it is all the operator gets. It names the
+    /// key and says there is nothing to set, rather than trailing an empty list of valid
+    /// keys, which is what an empty payload used to render.
+    #[test]
+    fn a_setting_under_the_stdout_table_is_rejected() {
+        let error =
+            Settings::from_str(&format!("{}\n[sink.stdout]\npath = \"x\"\n", ingest_only()))
+                .expect_err("stdout stores nothing")
+                .to_string();
+        assert!(
+            error.contains("unknown field `path`") && error.contains("no fields"),
+            "the error names the key and says nothing is valid: {error}"
+        );
     }
 
     /// A present-but-empty required value is refused too. Serde's requiredness catches an
@@ -446,46 +509,50 @@ ws_url = "wss://example.invalid"
         assert!(error.contains("bus"), "the error names the table: {error}");
     }
 
-    /// The store's kind is a tagged choice, and a backend this build does not have is a
-    /// startup error rather than a silent fallback to the default.
+    /// The backend is the table, so a backend this build does not have is named by a
+    /// table that does not parse — a startup error rather than a silent fallback.
     #[test]
-    fn an_unknown_storage_kind_is_rejected() {
+    fn an_unknown_sink_backend_is_rejected() {
         let error = Settings::from_str(&format!(
-            "{}\n[storage]\nkind = \"clickhouse\"\n",
-            minimal()
+            "{}\n[sink.clickhouse]\nurl = \"y\"\n",
+            ingest_only()
         ))
         .expect_err("an unknown backend must not fall back to duckdb")
         .to_string();
         assert!(error.contains("clickhouse"), "{error}");
     }
 
-    /// A backend's settings live under its own table: an engine key is not a top-level
-    /// store key, and the path is not a generic `database`.
+    /// A backend's own keys live in the backend's own table, so a misspelled one is
+    /// caught inside the table that owns it rather than being silently accepted.
     #[test]
-    fn duckdb_settings_live_under_the_duckdb_table() {
+    fn a_misspelled_backend_key_is_rejected() {
+        let error = Settings::from_str(&format!("{}\npah = \"/tmp/x.duckdb\"\n", minimal()))
+            .expect_err("a typo inside the backend must not be ignored")
+            .to_string();
+        assert!(error.contains("pah"), "the error names the key: {error}");
+    }
+
+    /// `DuckDB`'s engine settings nest under its own table, so a key that only `DuckDB`
+    /// understands has nowhere else to sit, and the runtime reads them from the backend
+    /// that was named.
+    #[test]
+    fn duckdb_engine_settings_nest_under_the_duckdb_table() {
         let settings = Settings::from_str(&format!(
             r#"{}
-[storage]
-kind = "duckdb"
-
-[storage.duckdb]
 path = "/tmp/custom.duckdb"
 
-[storage.duckdb.settings]
+[sink.duckdb.settings]
 threads = "4"
 "#,
             minimal()
         ))
         .expect("settings parse");
 
-        assert_eq!(
-            settings.storage.duckdb.path,
-            std::path::PathBuf::from("/tmp/custom.duckdb")
-        );
-        assert_eq!(
-            settings.storage.duckdb.settings.get("threads"),
-            Some(&"4".to_owned())
-        );
+        let Sink::DuckDb(duckdb) = &settings.sink else {
+            panic!("the table names the backend: {settings:?}");
+        };
+        assert_eq!(duckdb.path, PathBuf::from("/tmp/custom.duckdb"));
+        assert_eq!(duckdb.settings.get("threads"), Some(&"4".to_owned()));
     }
 
     /// Inputs the operator must choose are taken as written, not defaulted.
@@ -497,23 +564,19 @@ threads = "4"
 chain = "ethereum"
 http_url = "https://example.invalid"
 ws_url = "wss://example.invalid"
-stdout = true
 
-[runtime]
-batch_records = 50
-
-[storage.duckdb]
+[sink.duckdb]
 path = "/tmp/custom.duckdb"
+batch_records = 50
 "#,
         )
         .expect("settings parse");
 
         assert_eq!(settings.ingest.chain, "ethereum");
-        assert!(settings.ingest.stdout);
-        assert_eq!(settings.runtime.batch_records, 50);
-        assert_eq!(
-            settings.storage.duckdb.path,
-            std::path::PathBuf::from("/tmp/custom.duckdb")
-        );
+        let Sink::DuckDb(duckdb) = &settings.sink else {
+            panic!("the table names the backend: {settings:?}");
+        };
+        assert_eq!(duckdb.path, PathBuf::from("/tmp/custom.duckdb"));
+        assert_eq!(duckdb.batch_records, 50);
     }
 }

@@ -15,7 +15,7 @@ chain (RPC) ─▶ ingest ─▶ decode ─▶ channel ═══▶ drain ─▶
                                         bounded, in memory,
                                         one block per message
 
-stdout = true:  ingest ─▶ decode ─▶ stdout        no channel, no store
+stdout backend:  ingest ─▶ decode ─▶ stdout        no channel, no store
 ```
 
 Ingest and decode are direct calls in one task. The channel is the only queue, and it
@@ -94,7 +94,7 @@ Caught up, one block arrives and leaves as its own commit:
 ingest ──▶ [ block ] ──▶ one commit
 ```
 
-Behind, the blocks already waiting share a commit, up to `runtime.batch_records`. A
+Behind, the blocks already waiting share a commit, up to `sink.duckdb.batch_records`. A
 block is never split across commits:
 
 ```
@@ -180,8 +180,8 @@ that matters most: `decode` must not depend on `ingest`.
   reclaims the sequence numbers those blocks had used. The undo window is bounded
   (128 blocks by default, and finalized blocks are dropped first). See
   `src/ingest/pipeline.rs`.
-- **NDJSON to stdout.** See `src/sink/stdout.rs`; `[ingest] stdout = true` prints the
-  stream instead of storing it.
+- **NDJSON to stdout.** See `src/sink/stdout.rs`; the `[sink.stdout]` backend prints the
+  stream instead of storing it, and opens no store.
 - **A local `DuckDB` store**, behind the `duckdb` feature (on by default). Embedded and
   single-writer, so it is the archive; anything downstream reads from it rather than from
   the live stream.
@@ -309,8 +309,8 @@ process, because continuing without it would leave a stream that looks alive but
 - **`[ingest]` is required** — it names the chain to follow.
 - **Decode uses `[decode] registry`.** An absent or empty registry decodes nothing, which
   is a legitimate way to run and is said at startup.
-- **Storage is the `[storage]` backend.** With `[ingest] stdout = true` no store is opened
-  and the stream is printed instead.
+- **Storage is the `[sink.<backend>]` table.** With `[sink.stdout]` no store is
+  opened and the stream is printed instead.
 
 Settings come from a TOML file, named by the first argument or defaulting to
 `indexer.toml`. `indexer.toml` in the repository is a working example. What decode decodes
@@ -327,10 +327,7 @@ chain = "base"
 http_url = "https://base-rpc.publicnode.com"
 ws_url = "wss://base-rpc.publicnode.com"
 
-[storage]
-kind = "duckdb"
-
-[storage.duckdb]
+[sink.duckdb]
 path = "indexer.duckdb"
 
 [decode]
@@ -340,10 +337,14 @@ registry = "registry.toml"
 Each table names what owns its fields, not where a field was first needed:
 
 - `[ingest]` — the chain to follow and its endpoints.
-- `[runtime]` — how storage commits: the most records one commit may cover.
-- `[storage.<kind>]` — one backend's own settings. `[storage] kind` selects it, so a
-  second backend (ClickHouse, Postgres) is a variant there plus its own table, not
-  another top-level `database` whose owner a reader has to guess.
+- `[sink.<backend>]` — where records go, and by what. Exactly one backend table may be
+  present, and it is required: a run with no store and the next with one are different
+  deployments, and there is no default right for both. Naming a backend is naming its
+  table, so a second backend (ClickHouse, Postgres) is a new table rather than another
+  top-level `database` whose owner a reader has to guess — and a key only that backend
+  understands has nowhere else to sit. Commit batching is part of this, because it is a
+  property of the store: `DuckDB` folds a backlog into larger transactions, where a
+  remote backend would batch unconditionally.
 - `[decode]` — the contract registry.
 
 **Required** — no value could be right by accident, so each errors at startup naming
@@ -354,29 +355,29 @@ the field:
 | `ingest.chain` | Chain id stamped on every event |
 | `ingest.http_url` | JSON-RPC endpoint for blocks and receipts |
 | `ingest.ws_url` | WebSocket endpoint for `newHeads` |
+| one `[sink.<backend>]` table | Which backend writes. `duckdb` persists; `stdout` prints and opens no store |
 
 **Defaulted** — correct for a standard deployment; override for a non-standard one:
 
 | Key | Default | Meaning |
 | --- | --- | --- |
-| `ingest.stdout` | `false` | Print the stream instead of storing it; no store is opened |
-| `runtime.batch_records` | `500` | Most records one store commit may cover; a backlog of blocks is folded into one commit up to this, and a block is never split |
-| `storage.kind` | `duckdb` | The store backend |
-| `storage.duckdb.path` | `indexer.duckdb` | Path to the store |
+| `sink.duckdb.batch_records` | `500` | Most records one store commit may cover; a backlog of blocks is folded into one commit up to this, and a block is never split |
+| `sink.duckdb.path` | `indexer.duckdb` | Path to the store |
 
 **Optional tables:**
 
 | Key | Meaning |
 | --- | --- |
 | `decode.registry` | Path to the contract registry file, relative to the settings file. Absent means nothing is decoded |
-| `storage.duckdb.settings` | Any other DuckDB setting, passed straight through |
+| `sink.duckdb.settings` | Any other DuckDB setting, passed straight through |
 
 `RUST_LOG` is still read from the environment, because a log filter is not deployment
 configuration.
 
 An unknown key is a startup error naming the line and the key, so a misspelling is
-caught rather than silently leaving a setting at its default. An unknown `storage.kind`
-is likewise an error rather than a silent fallback to the default backend.
+caught rather than silently leaving a setting at its default. An unknown backend is
+likewise an error rather than a silent fallback to another one, and naming two backends at
+once is an error rather than picking one.
 
 ### The contract registry
 
@@ -474,14 +475,16 @@ The store takes settings this file does not restate, passed straight through and
 validated by the engine:
 
 ```toml
-[storage.duckdb.settings]
+[sink.duckdb.settings]
 threads = "4"
 max_memory = "1GB"
 ```
 
-Anything unrecognized is an error from DuckDB naming the setting, so a typo is caught at
-startup rather than silently ignored. Every envelope lands in an append-only `events` table
-with the envelope as JSON beside the columns a query filters on.
+They live under the `DuckDB` table because they are DuckDB's, and no other backend would
+know what to do with them. Anything unrecognized is an error from DuckDB naming the
+setting, so a typo is caught at startup rather than silently ignored. Every envelope lands
+in an append-only `events` table with the envelope as JSON beside the columns a query
+filters on.
 
 Configuration is a typed struct in `src/config.rs`, not a string lookup scattered through
 each layer, so a layer can be constructed in a test with no environment at all.
@@ -550,8 +553,8 @@ Worth reading the output for two things: `amount0` is negative, because the amou
 `bits: 160` while `tick` carries `bits: 24`, because a store needs the declared width to
 pick a column and a width is not recoverable from a number.
 
-To point it at other contracts, capture real input by setting `stdout = true` in the
-`[ingest]` table, which prints the stream instead of storing it, and change the address, chain, ABI, and fixture the example names.
+To point it at other contracts, capture real input by using the `[sink.stdout]`
+backend, which prints the stream instead of storing it, and change the address, chain, ABI, and fixture the example names.
 
 ## Benchmarks
 

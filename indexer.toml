@@ -1,32 +1,29 @@
 # Settings for a standard single-chain deployment.
 #
 # `[ingest]` names the chain to follow, `[decode] registry` names the contracts to decode,
-# and `[storage]` says where it all lands. Ingest and decode run together in one task;
-# storage runs in another, joined by an in-process channel. Every key is documented in
-# `src/config.rs`.
+# and `[sink.<backend>]` says where it all goes. Ingest and decode run together in one
+# task; storage runs in another, joined by an in-process channel. Every key is documented
+# in `src/config.rs`.
 
 [ingest]
 chain = "base"
 http_url = "https://base-rpc.publicnode.com"
 ws_url = "wss://base-rpc.publicnode.com"
-# Print the stream to stdout instead of storing it. No store is opened.
-# stdout = false
 
-[runtime]
-# The most records one store commit may cover. Storage commits each block as it arrives
-# and, when it has fallen behind, folds the waiting blocks into one commit up to this many.
-# batch_records = 500
-
-[storage]
-# The backend to write. `duckdb` is the only kind today; an unknown one is a startup
-# error rather than a silent fallback.
-kind = "duckdb"
-
-[storage.duckdb]
+# Where records go, and by which backend. Required: the table names the backend, so
+# exactly one may be present. `[sink.duckdb]` persists; naming `[sink.stdout]` instead
+# prints the stream and opens no store. An unknown backend is a startup error.
+[sink.duckdb]
 path = "indexer.duckdb"
 
-# Any other DuckDB setting, passed straight through and validated by the engine.
-[storage.duckdb.settings]
+# The most records one store commit may cover. Storage commits each block as it arrives
+# and, when it has fallen behind, folds the waiting blocks into one commit up to this many.
+# A block is never split, so a commit can run past this by up to one block.
+# batch_records = 500
+
+# Any other DuckDB setting, passed straight through and validated by the engine. It lives
+# under this table because it is DuckDB's, and nothing else here would understand it.
+[sink.duckdb.settings]
 threads = "4"
 max_memory = "1GB"
 

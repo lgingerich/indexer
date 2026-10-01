@@ -24,7 +24,7 @@
 //! - **Ingest** follows the chain `[ingest]` names. It is required, so it always runs.
 //! - **Decode** uses the registry `[decode] registry` names. An absent or empty registry
 //!   decodes nothing, which is a legitimate way to run and is said at startup.
-//! - **Storage** is the `[storage]` backend. With `[ingest] stdout = true` no store is
+//! - **The sink** is the `[sink.<backend>]` table. With `[sink.stdout]` no store is
 //!   opened at all: the stream is printed instead.
 //!
 //! # Shutdown
@@ -38,7 +38,7 @@
 use anyhow::{Context as _, Result};
 use tracing::info;
 
-use crate::config::Settings;
+use crate::config::{Settings, Sink};
 use crate::decode::DecodingSink;
 use crate::decode::registry::ContractRegistry;
 use crate::ingest::Ingest;
@@ -83,59 +83,41 @@ impl Pipeline {
     pub(crate) async fn run(self, settings: &Settings) -> Result<()> {
         let Self { ingest, registry } = self;
 
-        if settings.ingest.stdout {
-            return ingest
+        // The settings' backend is the branch, so a backend this build does not have is
+        // already a startup error and each arm here opens exactly what it named.
+        match &settings.sink {
+            Sink::Stdout(_) => ingest
                 .run(DecodingSink::new(registry, StdoutJsonSink::new()))
                 .await
-                .context("ingest stopped");
+                .context("ingest stopped"),
+            Sink::DuckDb(duckdb) => {
+                // Open the store before ingest starts, so a bad path fails at startup
+                // rather than after the first block.
+                let mut store = DuckDbSink::open(duckdb)?;
+
+                let (blocks, receiver) = sink::channel::open();
+                let batch_records = duckdb.batch_records;
+                // `ponytail:` the store's writes block, so this holds one runtime worker
+                // for the length of each flush. Fine on the multi-threaded runtime the
+                // binary uses; a dedicated blocking thread is the upgrade if the store
+                // gets slow enough to starve other tasks.
+                let storage =
+                    tokio::spawn(async move { receiver.drain(&mut store, batch_records).await });
+
+                let ingest = ingest.run(DecodingSink::new(registry, blocks)).await;
+
+                // Ingest's half of the channel is gone by now, so storage drains what is
+                // queued and ends. Its error comes first: if the store died, ingest's
+                // failure is only the failed send.
+                let stored = storage
+                    .await
+                    .context("storage task panicked")?
+                    .context("storage stopped")?;
+                info!(stored, "storage stopped");
+                ingest.context("ingest stopped")
+            }
         }
-
-        // Open the store before ingest starts, so a bad path fails at startup rather than
-        // after the first block.
-        let mut store = connect_store(settings)?;
-        let (blocks, receiver) = sink::channel::open();
-        let batch_records = settings.runtime.batch_records;
-        // `ponytail:` the store's writes block, so this holds one runtime worker for the
-        // length of each flush. Fine on the multi-threaded runtime the binary uses; a
-        // dedicated blocking thread is the upgrade if the store gets slow enough to
-        // starve other tasks.
-        let storage = tokio::spawn(async move { receiver.drain(&mut store, batch_records).await });
-
-        let ingest = ingest.run(DecodingSink::new(registry, blocks)).await;
-
-        // Ingest's half of the channel is gone by now, so storage drains what is queued
-        // and ends. Its error comes first: if the store died, ingest's failure is only the
-        // failed send.
-        let stored = storage
-            .await
-            .context("storage task panicked")?
-            .context("storage stopped")?;
-        info!(stored, "storage stopped");
-        ingest.context("ingest stopped")
     }
-}
-
-/// Opens the store the settings chose.
-///
-/// `[storage] kind` is validated by serde at parse, so an unknown backend is already an
-/// error by the time this runs; `duckdb` is the only kind today. A second backend is a
-/// variant there and a branch here.
-///
-/// # Errors
-///
-/// Returns an error when an engine setting is rejected or the database cannot be opened.
-fn connect_store(settings: &Settings) -> Result<DuckDbSink> {
-    let duckdb = &settings.storage.duckdb;
-    let mut config = duckdb::Config::default();
-    for (key, value) in &duckdb.settings {
-        config = config
-            .with(key, value)
-            .with_context(|| format!("duckdb setting {key:?} was rejected"))?;
-    }
-    let connection = duckdb::Connection::open_with_flags(&duckdb.path, config)
-        .with_context(|| format!("open store at {}", duckdb.path.display()))?;
-    info!(store = %duckdb.path.display(), "storage opened");
-    DuckDbSink::new(connection)
 }
 
 /// Loads the settings at `path` and runs the pipeline they describe.
@@ -152,7 +134,7 @@ pub async fn run(path: &str) -> Result<()> {
         registry = settings
             .registry_path()
             .map_or_else(|| "-".to_owned(), |path| path.display().to_string()),
-        store = %settings.storage.duckdb.path.display(),
+        storage = ?settings.sink,
         "starting"
     );
     Pipeline::from_settings(&settings)?.run(&settings).await
@@ -180,18 +162,20 @@ mod tests {
         format!("{}/registry.toml", env!("CARGO_MANIFEST_DIR"))
     }
 
-    const INGEST: &str = r#"
+    const SETTINGS: &str = r#"
 [ingest]
 chain = "base"
 http_url = "https://example.invalid"
 ws_url = "wss://example.invalid"
+
+[sink.duckdb]
 "#;
 
     /// A configured chain is the pipeline: assembly needs no store and no network, so a
     /// bad setting fails here rather than after a database file has been touched.
     #[test]
     fn a_chain_config_assembles_the_pipeline() {
-        let settings = Settings::from_str(INGEST).expect("settings parse");
+        let settings = Settings::from_str(SETTINGS).expect("settings parse");
         Pipeline::from_settings(&settings).expect("the pipeline builds");
     }
 
@@ -200,7 +184,7 @@ ws_url = "wss://example.invalid"
     #[test]
     fn a_missing_registry_file_is_an_assembly_error() {
         let settings = Settings::from_str(&format!(
-            "{INGEST}\n[decode]\nregistry = \"/nonexistent/registry.toml\"\n"
+            "{SETTINGS}\n[decode]\nregistry = \"/nonexistent/registry.toml\"\n"
         ))
         .expect("settings parse");
         Pipeline::from_settings(&settings).expect_err("the registry cannot be read");
@@ -210,7 +194,7 @@ ws_url = "wss://example.invalid"
     #[test]
     fn the_shipped_registry_assembles() {
         let settings = Settings::from_str(&format!(
-            "{INGEST}\n[decode]\nregistry = {:?}\n",
+            "{SETTINGS}\n[decode]\nregistry = {:?}\n",
             registry()
         ))
         .expect("settings parse");

@@ -16,8 +16,9 @@
 //! - [`duckdb`] — the store, an embedded `DuckDB` database.
 //! - [`stdout`] — newline-delimited JSON, for watching the stream.
 //!
-//! Sinks do not own their engine: the runtime opens and tunes the `DuckDB` connection and
-//! injects it, so client settings live in one place and a sink runs over a test double.
+//! Sinks do not own their engine: a sink takes a connection or opens one behind
+//! [`duckdb::DuckDbSink::open`], and runs over a test double either way, so client
+//! settings live in one place.
 
 pub(crate) mod channel;
 #[cfg(feature = "duckdb")]
@@ -25,7 +26,7 @@ pub mod duckdb;
 pub mod stdout;
 
 #[cfg(feature = "duckdb")]
-pub use duckdb::DuckDbSink;
+pub use duckdb::{DuckDbSettings, DuckDbSink};
 pub use stdout::StdoutJsonSink;
 
 use anyhow::Result;

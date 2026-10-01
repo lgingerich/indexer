@@ -25,7 +25,9 @@
 //! raw stream, and readers deduplicate on `dedupe_key`.
 //!
 //! The sink takes a [`Connection`] the runtime opened (path, settings, extensions,
-//! threads) so the library stays out of the runtime's connection policy. It does
+//! threads) so the library stays out of the runtime's connection policy —
+//! [`DuckDbSink::open`] is that opening, kept here because it is the one place that knows
+//! how `DuckDB` takes its settings. It does
 //! own the table DDL: `new` runs `CREATE TABLE IF NOT EXISTS` once, so a restart
 //! reuses the existing table.
 //!
@@ -36,11 +38,75 @@
 //! `Mutex`; a second process against the same file is the engine's error to report,
 //! not this sink's.
 
+use std::collections::BTreeMap;
+use std::path::PathBuf;
+
 use crate::wire::envelope::Envelope;
 use anyhow::Context as _;
 use duckdb::{Connection, params};
+use serde::Deserialize;
+use tracing::info;
 
 use crate::sink::EnvelopeSink;
+
+/// The `DuckDB` file written when the settings name no path.
+const DEFAULT_PATH: &str = "indexer.duckdb";
+
+/// The most records one commit may cover when the settings name no bound.
+///
+/// Sized above a single block's worth of envelopes, or the fold in
+/// [`ChannelReceiver::drain`](crate::sink::channel::ChannelReceiver::drain) could never
+/// join a backlog and the bound would be inert.
+const DEFAULT_BATCH_RECORDS: usize = 500;
+
+/// `DuckDB`'s settings: the database to write, and the engine settings passed through.
+///
+/// Beside the sink rather than in [`crate::config`] because these are `DuckDB`'s: the
+/// engine settings are opaque keys the engine validates, and a build without the
+/// `duckdb` feature has no use for either. What the *file* may say about `DuckDB` is the
+/// `[sink.duckdb]` table, which [`Storage::DuckDb`](crate::config::Sink::DuckDb)
+/// names.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct DuckDbSettings {
+    /// The `DuckDB` database file to write. Defaults to `indexer.duckdb`.
+    pub path: PathBuf,
+    /// The most records one store commit may cover.
+    ///
+    /// Storage receives one block at a time and commits each as it arrives. When it has
+    /// fallen behind, it folds the blocks already waiting into one commit until this many
+    /// records are reached, so a stalled store catches up in fewer, larger transactions.
+    /// A block is never split, so a commit can run past the bound by up to one block.
+    ///
+    /// The bound only applies to the blocks already waiting, so a single block carrying
+    /// this many envelopes commits on its own no matter what this is set to. Below that,
+    /// a larger value folds more of a backlog into one transaction.
+    pub batch_records: usize,
+    /// Any other `DuckDB` setting, passed straight through.
+    ///
+    /// `DuckDB` accepts dozens of settings and this file does not restate them. Anything
+    /// here reaches [`duckdb::Config::with`], which validates it, so a misspelled key is
+    /// an error from the engine naming the setting rather than a silent no-op. The keys
+    /// and their meanings are listed in `DuckDB`'s
+    /// [configuration overview](https://duckdb.org/docs/stable/configuration/overview).
+    ///
+    /// ```toml
+    /// [sink.duckdb.settings]
+    /// threads = "4"
+    /// max_memory = "1GB"
+    /// ```
+    pub settings: BTreeMap<String, String>,
+}
+
+impl Default for DuckDbSettings {
+    fn default() -> Self {
+        Self {
+            path: PathBuf::from(DEFAULT_PATH),
+            batch_records: DEFAULT_BATCH_RECORDS,
+            settings: BTreeMap::new(),
+        }
+    }
+}
 
 /// DDL for the append-only event table.
 ///
@@ -73,6 +139,30 @@ impl std::fmt::Debug for DuckDbSink {
 }
 
 impl DuckDbSink {
+    /// Opens the database the settings named and returns a sink writing to it.
+    ///
+    /// The path and the engine settings are `DuckDB`'s, so opening lives here rather than
+    /// in the runtime: this is the one place that knows [`duckdb::Config`] is how the
+    /// engine takes its settings, and a test can go through it without a settings file.
+    /// [`new`](Self::new) stays the way to supply a [`Connection`] of your own.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when an engine setting is rejected, the database cannot be
+    /// opened, or the table cannot be created.
+    pub fn open(settings: &DuckDbSettings) -> anyhow::Result<Self> {
+        let mut config = duckdb::Config::default();
+        for (key, value) in &settings.settings {
+            config = config
+                .with(key, value)
+                .with_context(|| format!("duckdb setting {key:?} was rejected"))?;
+        }
+        let connection = Connection::open_with_flags(&settings.path, config)
+            .with_context(|| format!("open store at {}", settings.path.display()))?;
+        info!(store = %settings.path.display(), "storage opened");
+        Self::new(connection)
+    }
+
     /// Takes ownership of `connection` and ensures the `events` table exists.
     ///
     /// The runtime opens the connection with whatever path and settings it needs;
