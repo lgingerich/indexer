@@ -19,8 +19,8 @@
 //! ABI or IDL it trusts. Every dataset field is present and typed, though, so a
 //! consumer that only persists does not have to decode anything.
 //!
-//! An [`Envelope`] carries the [`Event`], the [`ChainId`] it came from, the
-//! [`Envelope::sequence`] the pipeline assigned, and the [`SCHEMA_VERSION`] the
+//! An [`Envelope`] carries the [`Event`], the [`ChainId`] it came from, and the
+//! [`SCHEMA_VERSION`] the
 //! encoder wrote. The version is a field on the envelope rather than a property of
 //! a sink's framing because one of the sinks is a local database: a transport header
 //! survives no hop into `DuckDB`, a file, or a pipe, so a consumer reading those
@@ -207,16 +207,18 @@ impl Decoded {
     /// A key that is stable across redelivery and unique per decoded record.
     ///
     /// Built from the raw log's natural key plus this event's selector, so a re-decode
-    /// of the same log produces the same key and a store upserts rather than
-    /// duplicates. It excludes `sequence` for the same reason every other dataset
-    /// does: a sequence is reassigned by a reorg or a restart.
+    /// of the same log against the same event produces the same key and a store upserts
+    /// rather than duplicates. It carries the block hash for the same reason [`Log`]
+    /// does — a log re-included in a replacement block is a different row — so a
+    /// re-decode of an *orphaned* log keeps its own key instead of colliding with the
+    /// replacement's.
     #[must_use]
     pub fn dedupe_key(&self) -> String {
         format!("{}:{}:decoded", self.source_key(), self.selector)
     }
 
-    /// The raw log's natural key, in the same shape
-    /// [`Log::dedupe_key`] produces: `block:transaction:log_index`.
+    /// The raw log's natural key, in the same shape [`Log::dedupe_key`] produces:
+    /// `block_hash:transaction_hash:log_index`.
     ///
     /// This is the link back to the record the decode read, so a decoded row traces to
     /// the exact raw log it came from.
@@ -224,7 +226,7 @@ impl Decoded {
     pub fn source_key(&self) -> String {
         format!(
             "{}:{}:{}",
-            self.block_number, self.transaction_hash, self.log_index
+            self.block_hash, self.transaction_hash, self.log_index
         )
     }
 }
@@ -283,22 +285,21 @@ impl Event {
             Self::Receipt(receipt) => receipt.dedupe_key(),
             Self::Log(log) => log.dedupe_key(),
             Self::Decoded(decoded) => decoded.dedupe_key(),
-            Self::Reorg(reorg) => format!("{}:{}:reorg", reorg.height, reorg.new_head_hash),
-            Self::Finalized(finalized) => {
-                format!("{}:{}:finalized", finalized.height, finalized.hash)
-            }
+            Self::Reorg(reorg) => format!("{}:reorg", reorg.new_head_hash),
+            Self::Finalized(finalized) => format!("{}:finalized", finalized.hash),
         }
     }
 }
 
 /// A single event plus the metadata the pipeline assigns.
+///
+/// No sequence number: a record's position in the stream is the dataset's own, and
+/// those tuples survive a reorg where a global counter does not. See
+/// [`Event::dedupe_key`] for the identity a consumer deduplicates on.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Envelope {
     /// The chain this event came from.
     pub chain: ChainId,
-    /// Per-chain monotonic position in the published stream. Consumers order by
-    /// this; a reorg rewinds it.
-    pub sequence: u64,
     /// The wire shape's version, written by [`Envelope::new`].
     ///
     /// Defaulted on deserialize, so a line carrying no `v` reads as the current
@@ -316,13 +317,11 @@ const fn schema_version() -> u16 {
 }
 
 impl Envelope {
-    /// Builds an envelope from the chain it came from and the sequence the pipeline
-    /// assigned.
+    /// Builds an envelope from the chain it came from.
     #[must_use]
-    pub const fn new(chain: ChainId, sequence: u64, event: Event) -> Self {
+    pub const fn new(chain: ChainId, event: Event) -> Self {
         Self {
             chain,
-            sequence,
             schema_version: SCHEMA_VERSION,
             event,
         }
@@ -366,6 +365,7 @@ mod tests {
             log_index: 767,
             transaction_hash: TxHash::from([0x2a; 32]),
             block_number: 51_913_794,
+            block_hash: hash(0xd4),
             ..Log::default()
         };
         let decoded = Decoded {
@@ -391,7 +391,6 @@ mod tests {
     fn envelope_serializes_event_fields_flat_with_a_type_tag() {
         let envelope = Envelope::new(
             chain(),
-            4,
             Event::Block(Box::new(Block {
                 number: 5,
                 hash: hash(9),
@@ -402,21 +401,19 @@ mod tests {
         );
         let value = serde_json::to_value(&envelope).expect("envelope serializes");
         assert_eq!(value["type"], "block");
-        assert_eq!(value["sequence"], 4);
         assert_eq!(value["number"], "0x5");
         assert_eq!(value["hash"], format!("0x{}", "09".repeat(32)));
         assert_eq!(value["chain"], "ethereum");
         assert_eq!(value["v"], SCHEMA_VERSION);
     }
 
-    /// The wire object carries exactly the envelope's keys (`chain`, `sequence`)
-    /// plus the event's (`type` and its fields) — nothing else rides along.
-    /// Pinned on `Finalized`, whose two fields make the count exact.
+    /// The wire object carries exactly the envelope's keys (`chain`, `v`) plus the
+    /// event's (`type` and its fields) — nothing else rides along. Pinned on
+    /// `Finalized`, whose two fields make the count exact.
     #[test]
     fn the_wire_object_carries_only_the_envelope_and_event_fields() {
         let envelope = Envelope::new(
             chain(),
-            7,
             Event::Finalized(Finalized {
                 height: 42,
                 hash: hash(0x11),
@@ -426,10 +423,175 @@ mod tests {
         assert_eq!(value["type"], "finalized");
         assert_eq!(value["height"], "0x2a");
         assert_eq!(value["hash"], format!("0x{}", "11".repeat(32)));
-        assert_eq!(value["sequence"], 7);
         assert_eq!(value["chain"], "ethereum");
         assert_eq!(value["v"], SCHEMA_VERSION);
-        assert_eq!(value.as_object().expect("object").len(), 6);
+        assert_eq!(value.as_object().expect("object").len(), 5);
+    }
+
+    /// A log and the same transaction's log in the block that replaced it are
+    /// different rows, so they must not share a key. A reorg puts a transaction back
+    /// into a new block at the same height, in the same transaction, at the same log
+    /// index — height, transaction hash, and log index are all identical. Only the
+    /// block hash tells them apart, and without it a store's upsert would silently
+    /// overwrite one branch's log with the other's.
+    #[test]
+    fn a_log_and_its_replacement_in_a_reorg_do_not_share_a_key() {
+        let orphaned = Log {
+            log_index: 0,
+            transaction_hash: TxHash::from([0x01; 32]),
+            block_number: 100,
+            block_hash: hash(0xaa),
+            ..Log::default()
+        };
+        let mut replacement = orphaned.clone();
+        replacement.block_hash = hash(0xbb);
+
+        assert_ne!(
+            orphaned.dedupe_key(),
+            replacement.dedupe_key(),
+            "a reorg's replacement log must be its own row"
+        );
+        // Everything else about them is identical, which is what makes the block hash
+        // load-bearing rather than redundant.
+        assert_eq!(orphaned.block_number, replacement.block_number);
+        assert_eq!(orphaned.transaction_hash, replacement.transaction_hash);
+        assert_eq!(orphaned.log_index, replacement.log_index);
+    }
+
+    /// The same for a receipt: re-including a transaction yields a second receipt from
+    /// the replacement block, and the two are physically different rows.
+    #[test]
+    fn a_receipt_and_its_replacement_in_a_reorg_do_not_share_a_key() {
+        let orphaned = Receipt {
+            transaction_hash: TxHash::from([0x01; 32]),
+            transaction_index: 0,
+            block_number: 100,
+            block_hash: hash(0xaa),
+            ..Receipt::default()
+        };
+        let mut replacement = orphaned.clone();
+        replacement.block_hash = hash(0xbb);
+
+        assert_ne!(orphaned.dedupe_key(), replacement.dedupe_key());
+    }
+
+    /// A decoded record inherits its log's key, so the same collision cannot reappear
+    /// one layer up — a re-decode of an orphaned log keeps its own row rather than
+    /// landing on the replacement's decode.
+    #[test]
+    fn a_decoded_record_and_its_replacement_in_a_reorg_do_not_share_a_key() {
+        let base = Decoded {
+            name: "Swap".to_owned(),
+            address: Address::from([0xd0; 20]),
+            protocol: "uniswap_v3".to_owned(),
+            selector: hash(0x07),
+            signature: "Swap(address,address,int256)".to_owned(),
+            anonymous: false,
+            transaction_hash: TxHash::from([0x01; 32]),
+            transaction_index: 0,
+            log_index: 0,
+            indexed: Vec::new(),
+            body: Vec::new(),
+            block_number: 100,
+            block_hash: hash(0xaa),
+            block_timestamp: 1_700_000_000,
+        };
+        let mut replacement = base.clone();
+        replacement.block_hash = hash(0xbb);
+
+        assert_ne!(base.dedupe_key(), replacement.dedupe_key());
+        // The link back to the raw log still resolves for both branches.
+        assert_ne!(base.source_key(), replacement.source_key());
+    }
+
+    /// The key is what a store deduplicates on, so its exact shape is a published
+    /// contract. These pin it as a literal, since a test that compares two functions
+    /// against each other cannot catch both drifting the same way.
+    #[test]
+    fn every_dedupe_key_is_the_documented_shape() {
+        let block_hex = "aa".repeat(32);
+        let tx_hex = "bb".repeat(32);
+        let selector_hex = "cc".repeat(32);
+        let block_hash = hash(0xaa);
+        let tx = TxHash::from([0xbb; 32]);
+        let selector = hash(0xcc);
+
+        assert_eq!(
+            Block {
+                number: 100,
+                hash: block_hash,
+                ..Block::default()
+            }
+            .dedupe_key(),
+            format!("0x{block_hex}:block")
+        );
+        assert_eq!(
+            Transaction {
+                block_number: 100,
+                hash: tx,
+                ..Transaction::default()
+            }
+            .dedupe_key(),
+            format!("0x{tx_hex}:tx")
+        );
+        assert_eq!(
+            Receipt {
+                block_number: 100,
+                block_hash,
+                transaction_hash: tx,
+                ..Receipt::default()
+            }
+            .dedupe_key(),
+            format!("0x{block_hex}:0x{tx_hex}:receipt")
+        );
+        assert_eq!(
+            Log {
+                block_number: 100,
+                block_hash,
+                transaction_hash: tx,
+                log_index: 3,
+                ..Log::default()
+            }
+            .dedupe_key(),
+            format!("0x{block_hex}:0x{tx_hex}:3")
+        );
+        assert_eq!(
+            Event::Decoded(Box::new(Decoded {
+                name: "Swap".to_owned(),
+                address: Address::from([0xd0; 20]),
+                protocol: "uniswap_v3".to_owned(),
+                selector,
+                signature: "Swap(address)".to_owned(),
+                anonymous: false,
+                transaction_hash: tx,
+                transaction_index: 0,
+                log_index: 3,
+                indexed: Vec::new(),
+                body: Vec::new(),
+                block_number: 100,
+                block_hash,
+                block_timestamp: 1_700_000_000,
+            }))
+            .dedupe_key(),
+            format!("0x{block_hex}:0x{tx_hex}:3:0x{selector_hex}:decoded")
+        );
+        assert_eq!(
+            Event::Reorg(Reorg {
+                height: 100,
+                new_head_hash: block_hash,
+                orphaned_hashes: vec![hash(0xdd)],
+            })
+            .dedupe_key(),
+            format!("0x{block_hex}:reorg")
+        );
+        assert_eq!(
+            Event::Finalized(Finalized {
+                height: 100,
+                hash: block_hash,
+            })
+            .dedupe_key(),
+            format!("0x{block_hex}:finalized")
+        );
     }
 
     /// The version is stamped on every rendered line, and a line carrying no `v`
@@ -438,7 +600,6 @@ mod tests {
     fn the_schema_version_is_stamped_and_absent_v_parses() {
         let envelope = Envelope::new(
             chain(),
-            7,
             Event::Finalized(Finalized {
                 height: 42,
                 hash: hash(0x11),
@@ -464,7 +625,6 @@ mod tests {
     fn integers_render_as_quantities_not_json_numbers() {
         let envelope = Envelope::new(
             chain(),
-            120,
             Event::Transaction(Box::new(Transaction {
                 hash: TxHash::from([0x11; 32]),
                 nonce: 130_000,
@@ -483,8 +643,6 @@ mod tests {
         assert_eq!(value["max_fee_per_gas"], "0x8");
         assert_eq!(value["chain_id"], "0x1");
         assert_eq!(value["block_number"], "0x18cba80");
-        // The envelope's own sequence is a plain JSON number, not a chain quantity.
-        assert_eq!(value["sequence"], 120);
     }
 
     /// The round trip an envelope takes through a sink and back. `Transaction` and
@@ -564,7 +722,7 @@ mod tests {
         ];
         for event in variants {
             let kind = event.kind();
-            let envelope = Envelope::new(chain(), 0, event);
+            let envelope = Envelope::new(chain(), event);
             let encoded = serde_json::to_string(&envelope).expect("envelope serializes");
             let decoded: Envelope = serde_json::from_str(&encoded)
                 .unwrap_or_else(|error| panic!("{kind} does not round-trip: {error}\n{encoded}"));

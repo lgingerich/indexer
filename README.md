@@ -30,7 +30,7 @@ WebSocket head
 JSON-RPC batch: block + receipts          one request, nothing the node returns is dropped
       │
       ▼
-ordered events, one sequence each
+ordered events, each with its dataset's natural key
       │
       │   block
       │   transaction, receipt, log, decoded, log, …
@@ -83,8 +83,9 @@ the store sees
   block 2' …
 ```
 
-The sequences block 2 used are reclaimed and reused by the reorg marker and by 2'. A
-fork older than the ring is an error rather than an empty retraction.
+A row's key carries the block's hash, so the orphaned block 2 and its replacement 2' are
+different rows rather than one row written twice. A fork older than the ring is an error
+rather than an empty retraction.
 
 ### When the store stalls
 
@@ -133,7 +134,8 @@ src/
 ├── main.rs         the process boundary: logging, the settings path, the exit code
 ├── runtime.rs      assembles the pipeline the settings describe, and runs it
 ├── config.rs       typed settings — layer configuration, not string lookups
-├── wire/           the wire contract: envelope, events, dataset records. Pure data.
+├── wire/           the wire contract: envelope, events, dataset records, and the rows a
+│                   store persists. Pure data.
 ├── ingest/         block sources and the reorg-aware pipeline.
 ├── decode/         the stateless ABI decode transform, its registry, and the sink that applies it.
 └── sink/           where envelopes go: the sink trait, the decode→storage channel, the store, stdout.
@@ -159,9 +161,12 @@ that matters most: `decode` must not depend on `ingest`.
   normalized table — a block references its transactions by hash, a receipt carries
   only the count of its logs — so no field is published twice and a row maps to a
   persistence row. See `src/wire/datasets/evm.rs`.
-- **Ordered events.** Every event gets a per-chain monotonic `sequence`; every
-  dataset exposes a `dedupe_key` derived from its natural key. See
-  `src/wire/envelope.rs`.
+- **A key per event.** Every event exposes a `dedupe_key` derived from its natural key:
+  the hashes that identify the row plus a dataset tag. A key that descends from a block
+  carries the block's *hash*, not its number — so a log in an orphaned block and the same
+  transaction's log in the replacement are different rows, not one row written twice. The
+  height is a column, not part of the key, because it is recoverable and a key that
+  restates it is saying the same thing twice. See `src/wire/envelope.rs`.
 - **A decode stage.** `src/decode` is a stateless transform over an ABI registry, run
   inline by `DecodingSink`. It decodes each registered log against the ABI for its
   `(chain, address)` and stores the decoded record right after the raw log. Everything is
@@ -170,15 +175,17 @@ that matters most: `decode` must not depend on `ingest`.
   logic, so decoding a log again is safe: the same log gives the same record and the same
   `dedupe_key`.
 - **A local store.** The process writes every envelope, raw and decoded, into a local
-  `DuckDB` database: one append-only `events` table.
+  `DuckDB` database: one typed table per dataset, with real columns rather than a JSON
+  blob. What a dataset's columns *are* lives in `src/wire/row.rs`, not in the store, so a
+  second store reuses the mapping instead of re-deriving it.
 - **Finality watermark.** A `finalized` event says a block and everything below
   it are permanent. Its height comes from the node's own `finalized` tag, so each
   chain's rules apply with no confirmation count to tune; on Base it trails the
   tip by about 600 blocks. It is published only when it advances.
 - **Reorg retraction.** Parent-hash linkage is checked on every block. A mismatch
-  publishes a `reorg` event whose `orphaned_hashes` say what was retracted, and
-  reclaims the sequence numbers those blocks had used. The undo window is bounded
-  (128 blocks by default, and finalized blocks are dropped first). See
+  publishes a `reorg` event whose `orphaned_hashes` say which block hashes stopped being
+  canonical, and the replacement branch is published under its own keys. The undo window
+  is bounded (128 blocks by default, and finalized blocks are dropped first). See
   `src/ingest/pipeline.rs`.
 - **NDJSON to stdout.** See `src/sink/stdout.rs`; the `[sink.stdout]` backend prints the
   stream instead of storing it, and opens no store.
@@ -235,18 +242,22 @@ planned   published tip ── fetch the range, in order ── join the live he
 
 ### Reorgs and finality in the store
 
-`reorg` and `finalized` are written into `events` and then ignored. Orphaned blocks
-stay forever, and nothing below the watermark is dropped. Readers are told to dedupe
-on `dedupe_key`, but the table is append-only and unkeyed, so a reorg inserts a
-second row at the same height.
+`reorg` and `finalized` are written into their own tables and then ignored. Orphaned
+blocks stay forever, and nothing below the watermark is dropped. A key that descends
+from a block carries the block hash, so the two branches of a reorg are already
+distinct rows — what is missing is a store that acts on the marker rather than
+recording it.
 
 ```
-today     reorg { orphaned: [3, 2] }  ──▶ another row in `events`
-          finalized { height: 100 }    ──▶ another row in `events`
+today     reorg { orphaned: [3, 2] }  ──▶ a row in `reorgs`, and nothing else changes
+          finalized { height: 100 }    ──▶ a row in `finalized`
 
-planned   reorg      ──▶ delete the rows for those block hashes
+planned   reorg      ──▶ mark the rows for those block hashes no longer canonical
           finalized  ──▶ rows at or below this height are permanent
 ```
+
+Marking rather than deleting, because the same rule has to hold for a data lake, where
+a row cannot be mutated, and for a serving store, where it is an append too.
 
 ### Idempotent writes
 
@@ -258,6 +269,10 @@ today     insert the envelope                     a replay is a second row
 
 planned   upsert on (chain, dedupe_key)           a replay is the same row
 ```
+
+Upsert is a *replay* tool, not a reorg tool. A reorg's two branches have different
+keys by design, so an upsert leaves both rows — which is what the marking rule above
+needs. Reorg handling and idempotent writes are separate pieces of machinery.
 
 ### Re-decode from the store
 
@@ -482,9 +497,12 @@ max_memory = "1GB"
 
 They live under the `DuckDB` table because they are DuckDB's, and no other backend would
 know what to do with them. Anything unrecognized is an error from DuckDB naming the
-setting, so a typo is caught at startup rather than silently ignored. Every envelope lands
-in an append-only `events` table with the envelope as JSON beside the columns a query
-filters on.
+setting, so a typo is caught at startup rather than silently ignored. Every envelope
+lands in its dataset's own typed table — `block`, `transaction`, `receipt`, `log`,
+`decoded`, `reorg`, `finalized` — with real columns rather than a JSON blob, so a
+consumer filters and joins on values. The schema is generated from the row headers in
+`src/wire/row.rs`, so a column added to a dataset appears without anyone editing the
+DDL.
 
 Configuration is a typed struct in `src/config.rs`, not a string lookup scattered through
 each layer, so a layer can be constructed in a test with no environment at all.
@@ -494,7 +512,7 @@ a network.
 ## Event shape
 
 ```json
-{"chain":"base","sequence":18174,"v":1,
+{"chain":"base","v":1,
  "type":"log","log_index":0,"transaction_hash":"0x…","transaction_index":3,
  "address":"0x…","topic0":"0x…","topic1":null,"topic2":null,"topic3":null,
  "data":"0x…","removed":false,"block_number":51883702,"block_hash":"0x…"}
@@ -518,11 +536,16 @@ typed ABI arguments; the type of every argument travels with it, so a consumer c
 rebuild a typed column without reading the ABI. **Control
 signals** — `reorg`, `finalized` — drive a consumer's state machine and carry no
 payload. The line is one flat object: `chain`,
-`sequence`, and the event's fields under its `type` tag. Consumers deduplicate on
-each event's `dedupe_key`, not `sequence`: a sequence can be reused after a reorg or
-a restart, and the key is scoped to the stream. Each dataset's key comes from its
+`v`, and the event's fields under its `type` tag. Consumers deduplicate on
+each event's `dedupe_key`. Each dataset's key comes from its
 natural key, so a transaction and its receipt (both keyed by the transaction hash)
-stay distinct.
+stay distinct — and a key that descends from a block carries the block hash too, so the
+two branches of a reorg are separate rows.
+
+`src/wire/row.rs` renders a dataset as the rows a store persists: the table, its columns
+with their types, and the values in that order. The mapping is one answer for every
+store, so a `ClickHouse` sink and a `DuckDB` one read the same headers and produce
+different DDL rather than each deciding what a log is.
 
 Identity uses `alloy_primitives::{B256, BlockHash, TxHash}`, encoded as lowercase
 `0x` hex, and quantity fields encode as `0x` hex via `alloy-serde`. The wire shape

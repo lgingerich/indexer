@@ -799,7 +799,7 @@ abi = "uniswap_v3_pool"
 
         let applied = Transform::apply(
             &registry,
-            &Envelope::new(ChainId::new("base"), 1, Event::Log(Box::new(log))),
+            &Envelope::new(ChainId::new("base"), Event::Log(Box::new(log))),
         );
         assert!(
             applied.error.is_none(),

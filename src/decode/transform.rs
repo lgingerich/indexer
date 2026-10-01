@@ -26,9 +26,9 @@
 //!    produces no record, but the failure rides on [`Applied::error`] so a caller logs
 //!    it. A miss — no ABI for the address, or no selector on the ABI — is not a failure:
 //!    the raw log is already stored, so a later ABI fix is a re-decode, not a re-fetch.
-//! 2. **Identity is preserved.** A decoded envelope carries the input's `chain` and
-//!    `sequence`, and a record's on-chain identity comes from the raw log, so it traces
-//!    to the exact log it came from. `sequence` is never renumbered.
+//! 2. **Identity is preserved.** A decoded envelope carries the input's `chain`, and a
+//!    record's on-chain identity comes from the raw log, so it traces to the exact log it
+//!    came from. Nothing is renumbered or reassigned.
 //!
 //! [`Decoded`]: crate::wire::envelope::Event::Decoded
 //! [`Decoded::source_key`]: crate::wire::envelope::Decoded::source_key
@@ -59,8 +59,8 @@ pub struct Applied {
 /// Decodes one raw envelope into its decoded record, if it has one.
 ///
 /// Stateless by construction: it holds no registry, no undo ring, and assigns no
-/// sequence numbers, so it cannot disagree with the pipeline about ordering, and
-/// replaying a record produces the same output.
+/// numbers, so it cannot disagree with the pipeline about ordering, and replaying a
+/// record produces the same output.
 pub struct Transform;
 
 impl Transform {
@@ -74,7 +74,7 @@ impl Transform {
             // A log is the only thing an event ABI decodes. A block, transaction, or
             // receipt carries calldata an ABI *could* decode, but this transform does not
             // do that yet.
-            Event::Log(log) => Self::decode(registry, &envelope.chain, envelope.sequence, log),
+            Event::Log(log) => Self::decode(registry, &envelope.chain, log),
             // Nothing to add: a raw dataset with no decoded form, a marker the stream
             // already carries, or a record that is already decoded.
             Event::Block(_)
@@ -95,7 +95,7 @@ impl Transform {
     ///
     /// A registry miss and an ABI that does not declare the log's selector are the same
     /// answer: `None`, which the caller drops.
-    fn decode<R: AbiRegistry>(registry: &R, chain: &ChainId, sequence: u64, log: &Log) -> Applied {
+    fn decode<R: AbiRegistry>(registry: &R, chain: &ChainId, log: &Log) -> Applied {
         let Some(contract) = registry.contract(chain, log.address, log.block_number) else {
             return Applied {
                 output: None,
@@ -132,7 +132,6 @@ impl Transform {
                 Applied {
                     output: Some(Envelope::new(
                         chain.clone(),
-                        sequence,
                         Event::Decoded(Box::new(record)),
                     )),
                     error: None,
@@ -175,7 +174,7 @@ mod tests {
     }
 
     fn envelope(event: Event) -> Envelope {
-        Envelope::new(ChainId::new("base"), 17, event)
+        Envelope::new(ChainId::new("base"), event)
     }
 
     /// A registry that answers for one address on one chain, which is enough to drive
@@ -307,16 +306,17 @@ mod tests {
 
         let decoded = applied.output.expect("a decoded record");
         assert_eq!(decoded.chain, source.chain);
-        assert_eq!(decoded.sequence, source.sequence);
         let Event::Decoded(record) = &decoded.event else {
             panic!("the output must be the decoded record");
         };
         assert_eq!(record.name, "Transfer");
         // The protocol comes from the same lookup that found the ABI.
         assert_eq!(record.protocol, "uniswap_v3_pool");
+        // The key is the log's own, block hash included, so the decode joins back to
+        // the exact log it read.
         assert_eq!(
             record.source_key(),
-            format!("5:{}:3", TxHash::from([0x01; 32]))
+            format!("{}:{}:3", hash(5), TxHash::from([0x01; 32]))
         );
         assert_eq!(record.indexed.len(), 2);
         assert_eq!(record.body.len(), 1);

@@ -6,7 +6,10 @@
 //! stating because they are easy to get wrong:
 //!
 //! - Blocks are requested with full transaction objects, and receipts come from
-//!   `eth_getBlockReceipts`, so nothing the node returns is dropped. Some nodes
+//!   `eth_getBlockReceipts`, so a block is fetched in one round trip rather than
+//!   assembled field by field over many. Every field the datasets below declare is
+//!   carried across; a few the node also returns are not, and each omission is named
+//!   at the projection that makes it. Some nodes
 //!   lack that method (some L2s, pre-Cancun Ethereum); it is answered with
 //!   `-32601` or null, and the source then fetches each receipt with
 //!   `eth_getTransactionReceipt` in batches of `RECEIPT_BATCH_LIMIT`.
@@ -352,10 +355,9 @@ fn decode_events(
         events.push(Event::Receipt(Box::new(decode_receipt(
             receipt, tx_hash, tx_index, number, hash,
         ))));
-        for (log_position, log) in receipt.logs().iter().enumerate() {
+        for log in receipt.logs() {
             events.push(Event::Log(Box::new(log_record(
                 log,
-                log_position as u64,
                 tx_index,
                 number,
                 hash,
@@ -367,6 +369,13 @@ fn decode_events(
 }
 
 /// Flattens a block header and its transaction hashes into the block dataset.
+///
+/// Two header fields the node returns are not carried, because the dataset has no column
+/// for either and a half-present field is worse than an absent one: `mix_hash`, which
+/// post-merge is EIP-4788's `prevRandao`, and the pre-Byzantium `stateRoot` a receipt
+/// may carry instead of a `status` (alloy's `coerce_status` maps that variant to
+/// `true`, so a pre-Byzantium failure would read as a success). A consumer needing them
+/// reads the header and the receipt.
 fn decode_header(block: &AnyRpcBlock, transactions: &[AnyRpcTransaction]) -> Block {
     let header = &block.0.inner.header;
     Block {
@@ -475,28 +484,29 @@ fn decode_receipt(
 
 /// Flattens one RPC log into the log dataset.
 ///
-/// A log's identity is its transaction hash and its index in the block; both are
-/// required for the dataset's `dedupe_key` to mean anything, so a log missing
-/// either is rejected rather than defaulted to zero (which would collide on
-/// dedupe). alloy models them optional only because `eth_getLogs` filters can
-/// omit them; a log nested in a receipt always has them.
+/// A log's identity is its transaction hash and its index in the block, and both are
+/// required for the dataset's `dedupe_key` to mean anything: two logs in the same
+/// transaction at the same index would be one row. So both are **rejected** when absent
+/// rather than defaulted.
 ///
-/// `transaction_index` is the *transaction's* position in the block, passed in by
-/// the caller from the receipt loop. It is deliberately not defaulted to the log's
-/// own index: for the second transaction in a block the two differ, and filing the
-/// log under the wrong transaction index corrupts a downstream join. `log_index` is
-/// the log's position within the receipt, which is the right fallback for it.
+/// alloy models `logIndex` and `transactionIndex` as `Option` because an `eth_getLogs`
+/// filter result can lack block context. That is not this path — every log here is nested
+/// in a receipt fetched for a specific block, where both are present — so the `None` arms
+/// are unreachable in practice, and a node that sent one is describing a log we cannot
+/// place in the chain. Defaulting would be worse than failing: `log_index` in particular
+/// would be filled from the log's position *within its receipt*, which is not the block
+/// index the field means, and the wrong value silently collides on dedupe with a different
+/// log in the same transaction.
 ///
-/// Both defaults are latent: alloy models `logIndex` and `transactionIndex` as
-/// required, so a log missing either fails to deserialize before this runs. They are
-/// the correct values if alloy ever relaxes that.
+/// `transaction_index` is the *transaction's* position in the block, which the caller
+/// already knows from the receipt loop, so it is the same value the log would carry.
 ///
 /// # Errors
 ///
-/// Returns [`SourceError::Malformed`] when the log has no transaction hash.
+/// Returns [`SourceError::Malformed`] when the log has no transaction hash, or no index
+/// within the block.
 fn log_record(
     log: &RpcLog,
-    log_index: u64,
     transaction_index: u64,
     block_number: u64,
     block_hash: B256,
@@ -506,11 +516,17 @@ fn log_record(
     let transaction_hash = log
         .transaction_hash
         .ok_or_else(|| malformed(CONTEXT, "log has no transactionHash"))?;
+    let log_index = log.log_index.ok_or_else(|| {
+        malformed(
+            CONTEXT,
+            "log has no logIndex; it cannot be placed in the block",
+        )
+    })?;
     let topics = log.topics();
     Ok(Log {
-        log_index: log.log_index.unwrap_or(log_index),
+        log_index,
         transaction_hash,
-        transaction_index: log.transaction_index.unwrap_or(transaction_index),
+        transaction_index,
         address: log.address(),
         topic0: topics.first().copied(),
         topic1: topics.get(1).copied(),
@@ -966,8 +982,9 @@ mod tests {
 
     #[test]
     fn a_missing_log_index_is_rejected() {
-        // alloy models `logIndex` as required, so the dataset cannot fall back to
-        // position: a receipt without one is malformed, not a log at index zero.
+        // alloy rejects an absent `logIndex` before this runs, so a log that arrives
+        // without one is already a parse failure; the check is here so the error names
+        // the field rather than surfacing as a deserialize error.
         let mut receipts = receipts();
         for log in receipts[0]["logs"]
             .as_array_mut()
@@ -983,6 +1000,29 @@ mod tests {
         assert!(
             message.contains("eth_getBlockReceipts") && message.contains("logIndex"),
             "{message}"
+        );
+    }
+
+    /// An explicit `null` `logIndex` is the case the old fallback got wrong. alloy
+    /// accepts it and hands over `None`, so the fallback was reachable — and it supplied
+    /// the log's position *within its receipt*, which is not the block index the field
+    /// means. On a block whose second transaction emits a log, the two differ, and the
+    /// wrong value collides on dedupe with a different log.
+    #[test]
+    fn a_null_log_index_is_rejected_rather_than_filled_from_the_receipt() {
+        let mut receipts = receipts();
+        for log in receipts[0]["logs"]
+            .as_array_mut()
+            .expect("logs are an array")
+        {
+            log["logIndex"] = Value::Null;
+        }
+        let error =
+            decode_batch(&batch(&block(), &receipts)).expect_err("a null logIndex must fail");
+        let message = error.to_string();
+        assert!(
+            message.contains("eth_getBlockReceipts") && message.contains("logIndex"),
+            "a log that cannot be placed in the block must not be filed under a guess: {message}"
         );
     }
 

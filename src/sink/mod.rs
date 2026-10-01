@@ -40,7 +40,7 @@ use anyhow::Result;
 
 use crate::wire::envelope::Envelope;
 
-/// Receives envelopes in per-chain sequence order.
+/// Receives envelopes in per-chain order, as the pipeline publishes them.
 ///
 /// The driver holds the sink through an exclusive borrow, so it may buffer across calls
 /// — a rendered row, an open appender, a block awaiting its send — instead of paying the

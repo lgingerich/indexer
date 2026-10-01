@@ -242,13 +242,27 @@ ws_url = "wss://example.invalid"
 
         let stored = storage.await.expect("no panic").expect("storage drains");
         assert_eq!(stored, 2, "the raw log and its decoded record");
-        let kinds: Vec<String> = reader
-            .prepare("SELECT event_type FROM events ORDER BY event_type")
-            .expect("prepare")
-            .query_map([], |row| row.get(0))
-            .expect("query")
-            .collect::<Result<_, _>>()
-            .expect("rows");
-        assert_eq!(kinds, ["decoded", "log"]);
+
+        // One table per dataset: the log is a row of typed columns in `log` and the decode
+        // beside it in `decoded`, not two rows of a shared `events` table.
+        let log_count: i64 = reader
+            .query_row("SELECT count(*) FROM log", [], |row| row.get(0))
+            .expect("count logs");
+        let decoded_count: i64 = reader
+            .query_row("SELECT count(*) FROM decoded", [], |row| row.get(0))
+            .expect("count decoded");
+        assert_eq!((log_count, decoded_count), (1, 1));
+
+        // The decoded row keys back to the raw log it came from.
+        let decoded_key: String = reader
+            .query_row("SELECT dedupe_key FROM decoded", [], |row| row.get(0))
+            .expect("the decoded key");
+        let log_key: String = reader
+            .query_row("SELECT dedupe_key FROM log", [], |row| row.get(0))
+            .expect("the log key");
+        assert!(
+            decoded_key.starts_with(&log_key),
+            "the decoded row must key back to its log: {decoded_key} vs {log_key}"
+        );
     }
 }

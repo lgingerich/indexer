@@ -26,7 +26,7 @@
 //!
 //! `bits` and `size` are plain JSON numbers rather than quantity-encoded, because
 //! they are our own metadata and not a chain field — the same treatment
-//! [`Envelope::sequence`](crate::wire::envelope::Envelope::sequence) gets.
+//! [`SCHEMA_VERSION`](crate::wire::envelope::SCHEMA_VERSION) gets.
 
 use alloy_primitives::{Address, Bytes, I256, U256};
 use serde::{Deserialize, Serialize};

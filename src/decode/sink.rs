@@ -118,15 +118,14 @@ mod tests {
     }
 
     /// A log no registry entry covers: it has no decoded form.
-    fn unregistered_log(sequence: u64) -> Envelope {
+    fn unregistered_log(log_index: u64) -> Envelope {
         Envelope::new(
             ChainId::new("base"),
-            sequence,
             Event::Log(Box::new(Log {
-                log_index: sequence,
+                log_index,
                 transaction_hash: TxHash::from([0x11; 32]),
                 address: Address::from([0xaa; 20]),
-                block_number: 100 + sequence,
+                block_number: 100 + log_index,
                 block_hash: B256::from([0x02; 32]),
                 block_timestamp: 1_700_000_000,
                 ..Log::default()
@@ -135,12 +134,11 @@ mod tests {
     }
 
     /// A control marker: it is already in the stream, so it must be forwarded once.
-    fn finalized(sequence: u64) -> Envelope {
+    fn finalized(height: u64) -> Envelope {
         Envelope::new(
             ChainId::new("base"),
-            sequence,
             Event::Finalized(Finalized {
-                height: sequence,
+                height,
                 hash: B256::from([0x03; 32]),
             }),
         )
@@ -178,7 +176,6 @@ mod tests {
 
         Envelope::new(
             ChainId::new("base"),
-            0,
             Event::Log(Box::new(Log {
                 log_index: 0,
                 transaction_hash: TxHash::from([0x01; 32]),

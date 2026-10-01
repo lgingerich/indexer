@@ -18,13 +18,14 @@
 //! of the stream — wherever the chain happens to be — so a mid-chain start indexes
 //! forward from there instead of refusing.
 //!
-//! Building the stream means three things: a per-chain monotonic sequence number on
-//! every envelope, parent-hash linkage so a reorg surfaces as an [`Event::Reorg`] instead
-//! of silently wrong data, and an [`Event::Finalized`] watermark whenever finality
-//! advances.
+//! Building the stream means two things: parent-hash linkage, so a reorg surfaces as an
+//! [`Event::Reorg`] instead of silently wrong data, and an [`Event::Finalized`]
+//! watermark whenever finality advances.
 //!
-//! Sequences are per event, not per block, so reclaiming them after a reorg means
-//! remembering where each block's run began — what the bounded undo ring stores.
+//! There is no sequence number on the envelope. A record's position is the dataset's
+//! own — `number` for a block, `transaction_index` for a transaction or receipt, then
+//! `log_index` for a log — and those tuples are stable across a reorg, where a global
+//! counter would have to rewind and would then name two different rows the same thing.
 //!
 //! # Coverage
 //!
@@ -52,13 +53,11 @@ use crate::ingest::source::{BlockId, BlockSource, FetchedBlock};
 /// hard ceiling on retraction depth.
 pub(crate) const DEFAULT_UNDO_DEPTH: usize = 128;
 
-/// One block's slice of the published stream.
+/// One block the pipeline still remembers, and so can still retract.
 #[derive(Debug)]
 struct PublishedBlock {
     height: u64,
     hash: B256,
-    /// Sequence of the block's first published event; where a rewind resumes.
-    first_sequence: u64,
 }
 
 /// Drives one source into one sink as an ordered, reorg-aware stream.
@@ -68,7 +67,6 @@ pub struct Pipeline<S, K> {
     sink: K,
     history: VecDeque<PublishedBlock>,
     undo_depth: usize,
-    sequence: u64,
     finalized_height: u64,
 }
 
@@ -83,8 +81,8 @@ impl<S: BlockSource, K: EnvelopeSink> Pipeline<S, K> {
     ///
     /// The ring holds at most `undo_depth` blocks, so a fork at its oldest retracts
     /// exactly that many; a deeper fork is refused rather than partially retracted. A
-    /// depth of zero disables retraction — linkage is still checked, but no sequences
-    /// can be reclaimed.
+    /// depth of zero disables retraction — linkage is still checked, but no block can
+    /// be retracted.
     #[must_use]
     fn with_undo_depth(source: S, sink: K, undo_depth: usize) -> Self {
         Self {
@@ -92,7 +90,6 @@ impl<S: BlockSource, K: EnvelopeSink> Pipeline<S, K> {
             sink,
             history: VecDeque::with_capacity(undo_depth.min(256)),
             undo_depth,
-            sequence: 0,
             finalized_height: 0,
         }
     }
@@ -217,18 +214,13 @@ impl<S: BlockSource, K: EnvelopeSink> Pipeline<S, K> {
             );
         }
 
-        let first_sequence = self.sequence;
         for event in events {
-            let envelope = Envelope::new(self.source.chain().clone(), self.sequence, event);
-            self.sink.publish(envelope).await?;
-            self.sequence += 1;
+            self.sink
+                .publish(Envelope::new(self.source.chain().clone(), event))
+                .await?;
         }
 
-        self.history.push_back(PublishedBlock {
-            height,
-            hash,
-            first_sequence,
-        });
+        self.history.push_back(PublishedBlock { height, hash });
         self.trim_unless_recent(height);
         self.advance_finality(finalized).await?;
         // One flush per block is the batch boundary: every event published above —
@@ -241,7 +233,6 @@ impl<S: BlockSource, K: EnvelopeSink> Pipeline<S, K> {
             chain = %self.source.chain(),
             height,
             finalized_height = self.finalized_height,
-            sequence = self.sequence,
             "published block"
         );
         Ok(())
@@ -257,16 +248,15 @@ impl<S: BlockSource, K: EnvelopeSink> Pipeline<S, K> {
         self.history
             .retain(|block| block.height >= finalized.height);
 
-        let marker = Envelope::new(
-            self.source.chain().clone(),
-            self.sequence,
-            Event::Finalized(Finalized {
-                height: finalized.height,
-                hash: finalized.hash,
-            }),
-        );
-        self.sink.publish(marker).await?;
-        self.sequence += 1;
+        self.sink
+            .publish(Envelope::new(
+                self.source.chain().clone(),
+                Event::Finalized(Finalized {
+                    height: finalized.height,
+                    hash: finalized.hash,
+                }),
+            ))
+            .await?;
         Ok(())
     }
 
@@ -282,7 +272,7 @@ impl<S: BlockSource, K: EnvelopeSink> Pipeline<S, K> {
         actual_parent: B256,
     ) -> anyhow::Result<()> {
         let expected_parent = self.history.back().map(|block| block.hash);
-        let (orphaned_hashes, reclaimed_from) = self.rewind_to(fork);
+        let orphaned_hashes = self.rewind_to(fork);
         // `find_fork` locates `fork` inside the ring, so the rewind must orphan
         // something. Checked on the release path, not with `debug_assert`, because
         // an empty marker here would tell a consumer to retract nothing while the
@@ -291,28 +281,25 @@ impl<S: BlockSource, K: EnvelopeSink> Pipeline<S, K> {
             !orphaned_hashes.is_empty(),
             "a reorg must orphan at least the block at {fork}"
         );
-        self.sequence = reclaimed_from.unwrap_or(self.sequence);
         warn!(
             chain = %self.source.chain(),
             expected = ?expected_parent,
             %actual_parent,
             fork,
             orphaned = orphaned_hashes.len(),
-            sequence = self.sequence,
             "parent hash mismatch; retracted to the fork point and publishing reorg"
         );
 
-        let reorg = Envelope::new(
-            self.source.chain().clone(),
-            self.sequence,
-            Event::Reorg(Reorg {
-                height: fork,
-                new_head_hash,
-                orphaned_hashes,
-            }),
-        );
-        self.sink.publish(reorg).await?;
-        self.sequence += 1;
+        self.sink
+            .publish(Envelope::new(
+                self.source.chain().clone(),
+                Event::Reorg(Reorg {
+                    height: fork,
+                    new_head_hash,
+                    orphaned_hashes,
+                }),
+            ))
+            .await?;
         Ok(())
     }
 
@@ -342,20 +329,19 @@ impl<S: BlockSource, K: EnvelopeSink> Pipeline<S, K> {
 
     /// Drops remembered blocks at or above `height`.
     ///
-    /// Returns the orphaned block hashes, newest first, and the sequence number a reorg
-    /// resumes from.
-    fn rewind_to(&mut self, height: u64) -> (Vec<B256>, Option<u64>) {
+    /// Returns the orphaned block hashes, newest first. Nothing else has to be rewound:
+    /// a record's identity is its own natural key, so a retraction is a statement about
+    /// which block hashes stopped being canonical rather than a number to hand back.
+    fn rewind_to(&mut self, height: u64) -> Vec<B256> {
         let mut orphaned = Vec::new();
-        let mut reclaimed_from = None;
         while let Some(block) = self.history.pop_back() {
             if block.height < height {
                 self.history.push_back(block);
                 break;
             }
             orphaned.push(block.hash);
-            reclaimed_from = Some(block.first_sequence);
         }
-        (orphaned, reclaimed_from)
+        orphaned
     }
 
     /// Keeps the ring bounded without discarding the block just published.
@@ -457,8 +443,28 @@ mod tests {
             self.seen.iter().map(Envelope::kind).collect()
         }
 
-        fn sequences(&self) -> Vec<u64> {
-            self.seen.iter().map(|envelope| envelope.sequence).collect()
+        /// The block number of each dataset envelope, which is what orders the stream.
+        fn block_numbers(&self) -> Vec<u64> {
+            self.seen
+                .iter()
+                .filter_map(|envelope| match &envelope.event {
+                    Event::Block(block) => Some(block.number),
+                    Event::Log(log) => Some(log.block_number),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        /// The block hash of each dataset envelope, in publication order.
+        fn block_hashes(&self) -> Vec<&B256> {
+            self.seen
+                .iter()
+                .filter_map(|envelope| match &envelope.event {
+                    Event::Block(block) => Some(&block.hash),
+                    Event::Log(log) => Some(&log.block_hash),
+                    _ => None,
+                })
+                .collect()
         }
 
         fn reorg_orphans(&self) -> Vec<Vec<B256>> {
@@ -535,7 +541,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn publishes_a_linear_chain_with_contiguous_sequences() {
+    async fn publishes_a_linear_chain_in_order() {
         let mut pipeline = pipeline(128);
         process_all(
             &mut pipeline,
@@ -547,12 +553,11 @@ mod tests {
         .await;
 
         assert_eq!(pipeline.sink.kinds(), ["block", "log", "block", "log"]);
-        assert_eq!(pipeline.sink.sequences(), [0, 1, 2, 3]);
-        assert_eq!(pipeline.sequence, 4);
+        assert_eq!(pipeline.sink.block_numbers(), [1, 1, 2, 2]);
     }
 
     #[tokio::test]
-    async fn depth_one_reorg_retracts_and_reuses_the_reclaimed_sequence() {
+    async fn depth_one_reorg_retracts_the_replaced_block() {
         let mut pipeline = pipeline(128);
         process_all(
             &mut pipeline,
@@ -569,12 +574,11 @@ mod tests {
             pipeline.sink.kinds(),
             ["block", "log", "block", "log", "reorg", "block", "log"]
         );
-        assert_eq!(pipeline.sink.sequences(), [0, 1, 2, 3, 2, 3, 4]);
         assert_eq!(pipeline.sink.reorg_orphans(), vec![vec![hash(2)]]);
     }
 
     #[tokio::test]
-    async fn deep_reorg_retracts_every_block_and_reclaims_their_sequences() {
+    async fn deep_reorg_retracts_every_block_above_the_fork() {
         let mut pipeline = pipeline(128);
         process_all(
             &mut pipeline,
@@ -594,13 +598,26 @@ mod tests {
 
         // Both old blocks 2 and 3 are retracted, newest first.
         assert_eq!(pipeline.sink.reorg_orphans(), vec![vec![hash(3), hash(2)]]);
-        // Block 2's run started at sequence 2, so the reorg and replacement reuse it.
-        assert_eq!(pipeline.sink.sequences(), [0, 1, 2, 3, 4, 5, 2, 3, 4, 5]);
-        assert_eq!(pipeline.sequence, 6);
+        // The replacement carries its own block hash, so a store keying on it writes a
+        // new row rather than overwriting the orphaned one.
+        assert_eq!(
+            pipeline.sink.block_hashes(),
+            [
+                &hash(1),
+                &hash(1),
+                &hash(2),
+                &hash(2),
+                &hash(3),
+                &hash(3),
+                &hash(20),
+                &hash(20),
+                &hash(20),
+            ]
+        );
     }
 
     #[tokio::test]
-    async fn empty_block_publishes_nothing_and_holds_the_sequence() {
+    async fn empty_block_publishes_nothing() {
         let mut pipeline = pipeline(128);
         pipeline
             .process_block(fetched(Vec::new()))
@@ -608,7 +625,6 @@ mod tests {
             .expect("empty block is not an error");
 
         assert!(pipeline.sink.kinds().is_empty());
-        assert_eq!(pipeline.sequence, 0);
     }
 
     #[tokio::test]
@@ -625,7 +641,6 @@ mod tests {
         process_all(&mut pipeline, blocks).await;
 
         assert_eq!(pipeline.history.len(), 2);
-        assert_eq!(pipeline.sequence, 20);
     }
 
     #[tokio::test]
@@ -643,7 +658,6 @@ mod tests {
         .await;
 
         assert_eq!(pipeline.sink.kinds(), ["block", "log", "block", "log"]);
-        assert_eq!(pipeline.sequence, 4);
         assert!(pipeline.sink.reorg_orphans().is_empty());
     }
 
@@ -681,9 +695,7 @@ mod tests {
                 "block", "log", "block", "log", "block", "log", "block", "log", "block", "log"
             ]
         );
-        // The retracted sequences were reused by nothing, so the stream is still
-        // contiguous and the tip is still block 5.
-        assert_eq!(pipeline.sequence, 10);
+        // Nothing was retracted and nothing was published twice, so the tip is still 5.
         assert_eq!(pipeline.history.back().map(|block| block.height), Some(5));
     }
 
@@ -789,7 +801,6 @@ mod tests {
         // Nothing was retracted and nothing was published across the hole.
         assert!(pipeline.sink.reorg_orphans().is_empty());
         assert_eq!(pipeline.sink.kinds(), ["block", "block", "block"]);
-        assert_eq!(pipeline.sequence, 3);
     }
 
     /// A fresh pipeline's first head is wherever the chain is, not genesis: there is no
@@ -930,8 +941,7 @@ mod tests {
 
         // Both heads were followed in order before the subscription ended.
         assert_eq!(pipeline.sink.kinds(), ["block", "block"]);
-        assert_eq!(pipeline.sink.sequences(), [0, 1]);
-        assert_eq!(pipeline.sequence, 2);
+        assert_eq!(pipeline.sink.block_numbers(), [1, 2]);
         // The error names the last height it saw, so a stopped live run is diagnosable.
         assert!(error.to_string().contains('2'), "{error}");
     }

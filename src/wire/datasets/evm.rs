@@ -5,10 +5,26 @@
 //!
 //! | Dataset | RPC source | Natural key |
 //! | --- | --- | --- |
-//! | [`Block`] | `eth_getBlockByNumber` | `(number, hash)` |
+//! | [`Block`] | `eth_getBlockByNumber` | `hash` |
 //! | [`Transaction`] | the block's `transactions` array | `hash` |
-//! | [`Receipt`] | `eth_getBlockReceipts` / `eth_getTransactionReceipt` | `transaction_hash` |
-//! | [`Log`] | a receipt's `logs` array | `(transaction_hash, log_index)` |
+//! | [`Receipt`] | `eth_getBlockReceipts` / `eth_getTransactionReceipt` | `(block_hash, transaction_hash)` |
+//! | [`Log`] | a receipt's `logs` array | `(block_hash, transaction_hash, log_index)` |
+//!
+//! Every key is the hashes that identify the row plus a dataset tag. The block's
+//! **hash**, not its number: a height says where a block sat, the hash says *which*
+//! block sat there, and only the second tells two rows apart. A reorg replaces the block
+//! at a height with a different one, and a transaction re-included in the replacement
+//! produces a log at the same height, in the same transaction, at the same index — so a
+//! key built without the hash would name two physically distinct rows identically.
+//!
+//! `block_number` is deliberately *not* in the key. It is recoverable from the row, and
+//! the block hash identifies the block on its own, so a key carrying both states the
+//! same fact twice. Ordering and partitioning use the `number` column, which is a
+//! number for exactly that purpose; a key is an identity, not a sort prefix.
+//!
+//! [`Transaction`] is the exception on the block hash: a transaction hash commits to
+//! the signed transaction, so it cannot reappear in a different block and the tx hash
+//! alone is already sound.
 //!
 //! Every dataset that outlives its block carries `block_timestamp`, denormalized
 //! from the block header. A store partitions and clusters on time rather than
@@ -118,7 +134,7 @@ impl Block {
     /// A key that is stable across redelivery and unique per canonical block.
     #[must_use]
     pub fn dedupe_key(&self) -> String {
-        format!("{}:{}:block", self.number, self.hash)
+        format!("{}:block", self.hash)
     }
 }
 
@@ -145,7 +161,16 @@ pub struct Transaction {
     /// Gas allocated to this transaction.
     #[serde(with = "alloy_serde::quantity")]
     pub gas: u64,
-    /// Gas price, in wei; `Some` for legacy and EIP-2930 transactions.
+    /// The gas price the node reported, in wei.
+    ///
+    /// Whatever `eth_getBlockByNumber` returned in `gasPrice`, which is `Some` for every
+    /// transaction type — for an EIP-1559 transaction a node reports the price actually
+    /// paid, so this is that transaction's `effective_gas_price` and not the ceiling it
+    /// was signed with. Deliberately the node's own field rather than the consensus
+    /// accessor, which would be `None` for a dynamic-fee type.
+    ///
+    /// `max_fee_per_gas` is the ceiling; this is what was paid. They differ on every
+    /// EIP-1559 transaction.
     #[serde(
         default,
         with = "alloy_serde::quantity::opt",
@@ -205,16 +230,16 @@ impl Transaction {
     /// A key that is stable across redelivery and unique per transaction.
     #[must_use]
     pub fn dedupe_key(&self) -> String {
-        format!("{}:{}:tx", self.block_number, self.hash)
+        format!("{}:tx", self.hash)
     }
 }
 
 /// A transaction receipt, from `eth_getBlockReceipts` or `eth_getTransactionReceipt`.
 ///
-/// Natural key is `transaction_hash`: exactly one receipt exists per transaction, so
-/// a receipt is keyed the same way as its [`Transaction`] and separated by dataset
-/// kind. `logs` are published as their own [`Log`] dataset, so a receipt holds only
-/// the receipt-scalar fields.
+/// Natural key is `(block_hash, transaction_hash)`: exactly one receipt exists per
+/// transaction per block that contains it, so the key separates dataset kinds with a
+/// `:receipt` suffix. `logs` are published as their own [`Log`] dataset, so a receipt
+/// holds only the receipt-scalar fields.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct Receipt {
     /// Hash of the transaction this receipt belongs to.
@@ -272,16 +297,19 @@ pub struct Receipt {
 }
 
 impl Receipt {
-    /// A key that is stable across redelivery and unique per transaction's receipt.
+    /// A key that is stable across redelivery and unique per receipt.
+    ///
+    /// Carries the block hash: a re-included transaction gets a second receipt from the
+    /// replacement block, and the two are different rows.
     #[must_use]
     pub fn dedupe_key(&self) -> String {
-        format!("{}:{}:receipt", self.block_number, self.transaction_hash)
+        format!("{}:{}:receipt", self.block_hash, self.transaction_hash)
     }
 }
 
 /// One log, from a receipt's `logs` array.
 ///
-/// Natural key is `(transaction_hash, log_index)`. Topics are flattened into
+/// Natural key is `(block_hash, transaction_hash, log_index)`. Topics are flattened into
 /// `topic0`..`topic3` so a row is fixed-shape; `topic0` is the event signature.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct Log {
@@ -324,11 +352,14 @@ pub struct Log {
 
 impl Log {
     /// A key that is stable across redelivery and unique per log.
+    ///
+    /// Carries the block hash, so a log in an orphaned block and the same transaction's
+    /// log in the block that replaced it do not share a key.
     #[must_use]
     pub fn dedupe_key(&self) -> String {
         format!(
             "{}:{}:{}",
-            self.block_number, self.transaction_hash, self.log_index
+            self.block_hash, self.transaction_hash, self.log_index
         )
     }
 }

@@ -145,27 +145,34 @@ mod tests {
 
     use super::open;
 
-    fn envelope(sequence: u64) -> Envelope {
+    /// A finalized marker at `height`, which stands in for a block's worth of
+    /// envelopes — the channel carries no field of its own, so a test needs a value to
+    /// tell one envelope from another, and a height is one every dataset has.
+    fn envelope(height: u64) -> Envelope {
         Envelope::new(
             ChainId::new("base"),
-            sequence,
             Event::Finalized(Finalized {
-                height: sequence,
+                height,
                 hash: B256::from([0x11; 32]),
             }),
         )
     }
 
     /// Records what reached it as flushed batches, so a test sees the commit boundaries.
+    ///
+    /// Keyed on [`Event::dedupe_key`] rather than a field the fixture happens to set, so
+    /// publishing some other event kind is recorded rather than panicked on. A fake that
+    /// kills the process is a worse failure report than a wrong assertion, and the
+    /// assertion is what should say so.
     #[derive(Default)]
     struct Batches {
-        open: Vec<u64>,
-        flushed: Vec<Vec<u64>>,
+        open: Vec<String>,
+        flushed: Vec<Vec<String>>,
     }
 
     impl EnvelopeSink for Batches {
         async fn publish(&mut self, envelope: Envelope) -> anyhow::Result<()> {
-            self.open.push(envelope.sequence);
+            self.open.push(envelope.event.dedupe_key());
             Ok(())
         }
 
@@ -175,10 +182,20 @@ mod tests {
         }
     }
 
-    /// Publishes one block of `sequences` and flushes, as the pipeline does.
-    async fn send_block(sink: &mut super::ChannelSink, sequences: std::ops::Range<u64>) {
-        for sequence in sequences {
-            sink.publish(envelope(sequence)).await.expect("publish");
+    /// The keys [`envelope`] produces for these heights, so a test states what it
+    /// expects to arrive without the fake having to unwrap the envelope to find out.
+    fn keys(heights: impl IntoIterator<Item = u64>) -> Vec<String> {
+        heights.into_iter().map(envelope_key).collect()
+    }
+
+    fn envelope_key(height: u64) -> String {
+        envelope(height).event.dedupe_key()
+    }
+
+    /// Publishes one block's worth of markers and flushes, as the pipeline does.
+    async fn send_block(sink: &mut super::ChannelSink, heights: std::ops::Range<u64>) {
+        for height in heights {
+            sink.publish(envelope(height)).await.expect("publish");
         }
         sink.flush().await.expect("flush");
     }
@@ -207,7 +224,7 @@ mod tests {
         let mut store = Batches::default();
         let stored = receiver.drain(&mut store, 100).await.expect("drain");
         assert_eq!(stored, 3);
-        assert_eq!(store.flushed, [[0, 1, 2]]);
+        assert_eq!(store.flushed, [keys(0..3)]);
     }
 
     /// A store that fell behind commits its backlog in one flush, but never splits a
@@ -225,7 +242,7 @@ mod tests {
         let mut store = Batches::default();
         let stored = receiver.drain(&mut store, 4).await.expect("drain");
         assert_eq!(stored, 9);
-        assert_eq!(store.flushed, [vec![0, 1, 2, 3, 4, 5], vec![6, 7, 8]]);
+        assert_eq!(store.flushed, [keys(0..6), keys(6..9)]);
     }
 
     /// The channel is bounded, so a stalled store is felt as a waiting sender rather

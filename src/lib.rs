@@ -24,11 +24,11 @@
 //!
 //! - EVM live heads over WebSocket and full blocks over JSON-RPC (see
 //!   [`ingest::source::EvmSource`]).
-//! - Per-chain sequence numbering, finality tagging, and reorg retraction with a
-//!   bounded undo ring (see [`ingest::pipeline::Pipeline`]).
+//! - Per-chain ordering by each dataset's own natural key, finality tagging, and reorg
+//!   retraction with a bounded undo ring (see [`ingest::pipeline::Pipeline`]).
 //! - Decoding a log against a contract ABI into typed, named arguments, as a
 //!   stateless transform (see [`decode::Transform`]).
-//! - A local `DuckDB` store, behind the `duckdb` feature.
+//! - A local `DuckDB` store of typed per-dataset tables, behind the `duckdb` feature.
 //!
 //! # Not built yet
 //!

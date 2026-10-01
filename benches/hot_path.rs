@@ -178,14 +178,7 @@ fn main() {
 
         let envelopes: Vec<Envelope> = events
             .into_iter()
-            .enumerate()
-            .map(|(index, event)| {
-                Envelope::new(
-                    ChainId::new("ethereum"),
-                    u64::try_from(index).expect("event index fits in u64"),
-                    event,
-                )
-            })
+            .map(|event| Envelope::new(ChainId::new("ethereum"), event))
             .collect();
         let mut samples = Vec::with_capacity(SAMPLES);
         for _ in 0..SAMPLES {
