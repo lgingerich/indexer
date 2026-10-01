@@ -19,6 +19,13 @@ jobs:
       - run: cargo clippy --all-targets --all-features -- -D warnings
       - run: cargo doc --no-deps --all-features
       - run: cargo nextest run --all-targets --all-features
+      # `--all-features` alone only ever exercises the engine's presence. The no-engine
+      # build is the one that can rot: a `duckdb`-only symbol reaching an ungated test
+      # fails to compile, and a fixture naming `[sink.duckdb]` fails to parse, so both
+      # hide until someone runs this. With one optional feature, these two are the only
+      # configurations there are.
+      - run: cargo clippy --no-default-features --all-targets -- -D warnings
+      - run: cargo nextest run --no-default-features --all-targets
       # The modules were once crates, and the compiler enforced that `decode` could not
       # reach into `ingest`. Now it is a convention; this is what keeps it one. See the
       # dependency-direction note in `src/decode/mod.rs`.

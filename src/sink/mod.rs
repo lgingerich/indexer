@@ -20,6 +20,13 @@
 //! [`duckdb::DuckDbSink::open`], and runs over a test double either way, so client
 //! settings live in one place.
 
+/// The bounded channel from decode to storage: the one hop that crosses tasks.
+///
+/// Behind the `duckdb` feature, because its only consumer is the store's writer in
+/// [`runtime`](crate::runtime) — a `stdout` run has no store to stall, so it has no
+/// second task and nothing for the channel to carry. A build without the engine does
+/// not compile a queue it cannot fill.
+#[cfg(feature = "duckdb")]
 pub(crate) mod channel;
 #[cfg(feature = "duckdb")]
 pub mod duckdb;

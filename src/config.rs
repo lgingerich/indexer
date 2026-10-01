@@ -252,9 +252,13 @@ mod tests {
     use std::str::FromStr as _;
 
     use super::{Settings, Sink};
-    use crate::sink::duckdb::DuckDbSettings;
 
     /// The minimum a file needs: a chain, its endpoints, and a store.
+    ///
+    /// `[sink.stdout]` rather than `[sink.duckdb]`, because it is the one backend every
+    /// build has — a build without the `duckdb` feature refuses that table outright, so
+    /// a fixture naming it would fail to parse in exactly the build most of these tests
+    /// are about. The tests that are themselves about `DuckDB` say so in their own input.
     fn minimal() -> &'static str {
         r#"
 [ingest]
@@ -262,7 +266,7 @@ chain = "base"
 http_url = "https://example.invalid"
 ws_url = "wss://example.invalid"
 
-[sink.duckdb]
+[sink.stdout]
 "#
     }
 
@@ -277,6 +281,15 @@ ws_url = "wss://example.invalid"
 "#
     }
 
+    /// The same minimum naming `DuckDB`, for a test that is about that backend.
+    ///
+    /// Feature-gated with the variant it names: without the engine the table is an
+    /// unknown backend by design, so a fixture using it would not parse.
+    #[cfg(feature = "duckdb")]
+    fn duckdb_only() -> String {
+        format!("{}\n[sink.duckdb]\n", ingest_only())
+    }
+
     /// Everything not required takes a default, so a small file runs a standard
     /// deployment without listing the obvious.
     #[test]
@@ -284,8 +297,17 @@ ws_url = "wss://example.invalid"
         let settings = Settings::from_str(minimal()).expect("minimal settings parse");
 
         assert!(settings.decode.registry.is_none(), "nothing is decoded");
-        // Compared against the sink's own defaults, so a retune there cannot leave this
-        // asserting a value the crate no longer uses.
+    }
+
+    /// The store's own defaults, compared against the type's, so a retune there cannot
+    /// leave this asserting a value the crate no longer uses.
+    #[cfg(feature = "duckdb")]
+    #[test]
+    fn a_minimal_file_leaves_the_store_at_its_defaults() {
+        use crate::sink::duckdb::DuckDbSettings;
+
+        let settings = Settings::from_str(&duckdb_only()).expect("minimal settings parse");
+
         let defaults = DuckDbSettings::default();
         let Sink::DuckDb(duckdb) = &settings.sink else {
             panic!("the table names the backend: {settings:?}");
@@ -300,6 +322,10 @@ ws_url = "wss://example.invalid"
 
     /// The shipped `indexer.toml` is an example an operator copies, so it must stay
     /// valid: a moved key would otherwise break the file the README points at.
+    ///
+    /// Gated with the engine, because that file names `[sink.duckdb]` and a build without
+    /// the engine refuses the table by design.
+    #[cfg(feature = "duckdb")]
     #[test]
     fn the_repository_settings_file_parses() {
         Settings::from_str(include_str!("../indexer.toml")).expect("indexer.toml parses");
@@ -308,8 +334,11 @@ ws_url = "wss://example.invalid"
     /// The fixture file yields the values each stage is built from — the endpoints, the
     /// batch, and the resolved registry path — so the seam between the file and the
     /// stages is exercised without a store.
+    #[cfg(feature = "duckdb")]
     #[test]
     fn the_repository_file_yields_the_values_the_stages_are_built_from() {
+        use crate::sink::duckdb::DuckDbSettings;
+
         let settings =
             Settings::from_str(include_str!("../indexer.toml")).expect("indexer.toml parses");
 
@@ -369,7 +398,7 @@ ws_url = "wss://example.invalid"
     /// a process with nothing to do.
     #[test]
     fn a_file_without_ingest_is_an_error() {
-        let error = Settings::from_str("[sink.duckdb]\n")
+        let error = Settings::from_str("[sink.stdout]\n")
             .expect_err("ingest is required")
             .to_string();
         assert!(error.contains("ingest"), "the error names it: {error}");
@@ -419,6 +448,7 @@ ws_url = "wss://example.invalid"
     /// The wording is serde's — an externally tagged enum is a one-key map, so this reads
     /// as an element count rather than a table count. Asserting the span instead: the
     /// error has to point at the first table, which is what a reader needs to see.
+    #[cfg(feature = "duckdb")]
     #[test]
     fn two_sink_backends_are_rejected() {
         let error = Settings::from_str(&format!(
@@ -527,6 +557,7 @@ ws_url = "wss://example.invalid"
     /// `DuckDB`'s engine settings nest under its own table, so a key that only `DuckDB`
     /// understands has nowhere else to sit, and the runtime reads them from the backend
     /// that was named.
+    #[cfg(feature = "duckdb")]
     #[test]
     fn duckdb_engine_settings_nest_under_the_duckdb_table() {
         let settings = Settings::from_str(&format!(
@@ -536,7 +567,7 @@ path = "/tmp/custom.duckdb"
 [sink.duckdb.settings]
 threads = "4"
 "#,
-            minimal()
+            duckdb_only()
         ))
         .expect("settings parse");
 
@@ -548,6 +579,7 @@ threads = "4"
     }
 
     /// Inputs the operator must choose are taken as written, not defaulted.
+    #[cfg(feature = "duckdb")]
     #[test]
     fn explicit_values_win() {
         let settings = Settings::from_str(
