@@ -35,14 +35,87 @@
 use std::collections::VecDeque;
 
 use alloy_primitives::B256;
-use anyhow::bail;
 use futures_util::StreamExt as _;
+use thiserror::Error;
 use tracing::{debug, error, info, warn};
 
-use crate::sink::EnvelopeSink;
+use crate::sink::{EnvelopeSink, SinkError};
 use crate::wire::envelope::{Envelope, Event, Finalized, Reorg};
 
-use crate::ingest::source::{BlockId, BlockSource, FetchedBlock};
+use crate::ingest::source::{BlockId, BlockSource, FetchedBlock, SourceError};
+
+/// Why the pipeline could not keep publishing.
+///
+/// Three of these are coverage breaks and the rest are the layers below failing. They are
+/// separate variants rather than one message because a caller responds differently: a
+/// sink failure is fatal to this run, while a [`PipelineError::HeightGap`] or
+/// [`PipelineError::ForkTooDeep`] says the *chain data* skipped — a reindex, not a retry.
+///
+/// The linkage variants carry both heights so a caller can log the hole without parsing
+/// prose, which is the only thing a string error is good for and the one thing a typed
+/// one should not make it do.
+#[derive(Debug, Error)]
+pub enum PipelineError {
+    /// The head subscription ended. A live indexer should never stop quietly.
+    #[error("head subscription closed after height {last_height}")]
+    SubscriptionClosed {
+        /// The last height the subscription reported, or 0 if it reported none.
+        last_height: u64,
+    },
+    /// A head left a gap on the canonical branch: the tip is `tip` and the head is
+    /// `head`, so heights between them never arrived.
+    ///
+    /// Publishing across it would leave a silent hole, so it is refused instead.
+    #[error("height gap: published tip {tip} -> head {head}")]
+    HeightGap {
+        /// The published tip the head was measured against.
+        tip: u64,
+        /// The height of the head that skipped heights.
+        head: u64,
+    },
+    /// A head left a gap on a *forked* branch: the fork point is `fork` and the head is
+    /// `head`, so its own branch skipped heights.
+    ///
+    /// The same hole as [`Self::HeightGap`], reached through the door the canonical
+    /// check does not cover.
+    #[error("height gap on the forked branch: fork point {fork} -> head {head}")]
+    ForkedHeightGap {
+        /// The fork point the new branch diverged at.
+        fork: u64,
+        /// The height of the head that skipped heights.
+        head: u64,
+    },
+    /// A fork reaches below the undo ring, so no marker can honestly say what was
+    /// orphaned.
+    ///
+    /// `undo_depth` is the ring's size, so a caller can see how far past it the fork
+    /// reached rather than only that it did.
+    #[error("no fork point for head {height} (parent {parent}), deeper than {undo_depth}")]
+    ForkTooDeep {
+        /// The height of the head that could not be linked.
+        height: u64,
+        /// Its parent hash, which the ring no longer holds.
+        parent: B256,
+        /// How many blocks the ring remembered.
+        undo_depth: usize,
+    },
+    /// A reorg retracted nothing, which would publish a marker telling a consumer to
+    /// retract no blocks while the chain has already forked.
+    ///
+    /// A bug rather than a chain condition: `find_fork` located the fork point inside
+    /// the ring, so the rewind must orphan at least the block there.
+    #[error("a reorg must orphan at least the block at {fork}")]
+    EmptyReorg {
+        /// The fork point the rewind should have orphaned from.
+        fork: u64,
+    },
+    /// The source could not be read, or its heads could not be fetched.
+    #[error(transparent)]
+    Source(#[from] SourceError),
+    /// The sink could not accept, render, or deliver an envelope.
+    #[error(transparent)]
+    Sink(#[from] SinkError),
+}
 
 /// The most published blocks the undo ring remembers by default, and so the deepest
 /// reorg it can retract.
@@ -101,8 +174,9 @@ impl<S: BlockSource, K: EnvelopeSink> Pipeline<S, K> {
     /// # Errors
     ///
     /// Returns an error when the subscription, a block fetch, or a publish fails, and
-    /// when the subscription closes — a live indexer should never stop.
-    pub async fn run(&mut self) -> anyhow::Result<()> {
+    /// [`PipelineError::SubscriptionClosed`] when the subscription ends — a live indexer
+    /// should never stop.
+    pub async fn run(&mut self) -> Result<(), PipelineError> {
         let mut heads = self.source.subscribe_heads().await?;
         info!(chain = %self.source.chain(), "subscribed to heads");
 
@@ -113,7 +187,7 @@ impl<S: BlockSource, K: EnvelopeSink> Pipeline<S, K> {
             let block = self.source.fetch_block(head.height).await?;
             self.process_block(block).await?;
         }
-        bail!("head subscription closed after height {last_height}")
+        Err(PipelineError::SubscriptionClosed { last_height })
     }
 
     /// Publishes one block's events, emitting a reorg first if linkage broke and a
@@ -127,7 +201,7 @@ impl<S: BlockSource, K: EnvelopeSink> Pipeline<S, K> {
     /// a fork deeper than the undo ring. Those are coverage breaks, not reorgs, and
     /// cannot be published honestly from here. A *first* head above genesis is not one of
     /// them: it is where the stream starts.
-    pub(crate) async fn process_block(&mut self, block: FetchedBlock) -> anyhow::Result<()> {
+    pub(crate) async fn process_block(&mut self, block: FetchedBlock) -> Result<(), PipelineError> {
         let FetchedBlock { events, finalized } = block;
         let Some((first, _)) = events.split_first() else {
             return Ok(());
@@ -174,10 +248,10 @@ impl<S: BlockSource, K: EnvelopeSink> Pipeline<S, K> {
                 // a gap means a head was missed, which is a coverage hole rather
                 // than a fork, and publishing across it would leave a silent hole.
                 if height != latest + 1 {
-                    bail!(
-                        "height gap: published tip {latest} -> head {height}; \
-                         backfill catches this up, but backfill-to-live handoff is not built"
-                    );
+                    return Err(PipelineError::HeightGap {
+                        tip: latest,
+                        head: height,
+                    });
                 }
             } else if let Some(fork) = self.find_fork(parent_hash) {
                 // The forked branch is held to the same contiguity as the canonical
@@ -185,20 +259,16 @@ impl<S: BlockSource, K: EnvelopeSink> Pipeline<S, K> {
                 // it skips heights of that branch — the same silent hole, reached
                 // through a door the check above never covered.
                 if height != fork {
-                    bail!(
-                        "height gap on the forked branch: fork point {fork} -> head \
-                         {height}; backfill catches this up, but backfill-to-live \
-                         handoff is not built"
-                    );
+                    return Err(PipelineError::ForkedHeightGap { fork, head: height });
                 }
                 // A genuine fork: retract to the fork point, not to the head.
                 self.publish_reorg(fork, hash, parent_hash).await?;
             } else {
-                return Err(anyhow::anyhow!(
-                    "no fork point for head {height} (parent {parent_hash}); the reorg is \
-                     deeper than the {} remembered blocks",
-                    self.undo_depth
-                ));
+                return Err(PipelineError::ForkTooDeep {
+                    height,
+                    parent: parent_hash,
+                    undo_depth: self.undo_depth,
+                });
             }
         } else if height > 1 {
             // A fresh pipeline's first head is wherever the chain is now, not genesis:
@@ -240,7 +310,7 @@ impl<S: BlockSource, K: EnvelopeSink> Pipeline<S, K> {
 
     /// Publishes a watermark if `finalized` is newer than the current one, and drops
     /// ring entries below it, which no reorg can reach.
-    async fn advance_finality(&mut self, finalized: BlockId) -> anyhow::Result<()> {
+    async fn advance_finality(&mut self, finalized: BlockId) -> Result<(), PipelineError> {
         if finalized.height <= self.finalized_height {
             return Ok(());
         }
@@ -265,22 +335,26 @@ impl<S: BlockSource, K: EnvelopeSink> Pipeline<S, K> {
     /// `fork` is the new branch's first block: the first published block that did not
     /// build on `actual_parent`. The marker names that height, so a consumer retracts
     /// every hash at or above it and re-requests from there.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PipelineError::EmptyReorg`] if the rewind orphaned nothing, and
+    /// whatever publishing the marker returns.
     async fn publish_reorg(
         &mut self,
         fork: u64,
         new_head_hash: B256,
         actual_parent: B256,
-    ) -> anyhow::Result<()> {
+    ) -> Result<(), PipelineError> {
         let expected_parent = self.history.back().map(|block| block.hash);
         let orphaned_hashes = self.rewind_to(fork);
         // `find_fork` locates `fork` inside the ring, so the rewind must orphan
         // something. Checked on the release path, not with `debug_assert`, because
         // an empty marker here would tell a consumer to retract nothing while the
         // chain has already forked.
-        anyhow::ensure!(
-            !orphaned_hashes.is_empty(),
-            "a reorg must orphan at least the block at {fork}"
-        );
+        if orphaned_hashes.is_empty() {
+            return Err(PipelineError::EmptyReorg { fork });
+        }
         warn!(
             chain = %self.source.chain(),
             expected = ?expected_parent,
@@ -375,10 +449,10 @@ mod tests {
     use alloy_primitives::{B256, TxHash};
     use futures_util::stream;
 
-    use super::Pipeline;
+    use super::{Pipeline, PipelineError};
     use crate::wire::envelope::{Block, ChainId, Envelope, Event, Log};
 
-    use crate::sink::EnvelopeSink;
+    use crate::sink::{EnvelopeSink, SinkError};
 
     use crate::ingest::source::{BlockId, BlockSource, FetchedBlock, HeadStream, SourceError};
 
@@ -423,9 +497,10 @@ mod tests {
         }
 
         async fn fetch_block(&self, _height: u64) -> Result<FetchedBlock, SourceError> {
-            Err(SourceError::Transport(
-                "tests pass blocks directly".to_owned(),
-            ))
+            Err(SourceError::Malformed {
+                context: "test source".to_owned(),
+                detail: "tests pass blocks directly".to_owned(),
+            })
         }
     }
 
@@ -500,7 +575,7 @@ mod tests {
     }
 
     impl EnvelopeSink for CollectSink {
-        async fn publish(&mut self, envelope: Envelope) -> anyhow::Result<()> {
+        async fn publish(&mut self, envelope: Envelope) -> Result<(), SinkError> {
             self.seen.push(envelope);
             Ok(())
         }
@@ -765,7 +840,10 @@ mod tests {
             .process_block(fetched(vec![block_event(3, hash(3), hash(1))]))
             .await
             .expect_err("a gap must fail");
-        assert!(error.to_string().contains("height gap"), "{error}");
+        assert!(
+            matches!(error, PipelineError::HeightGap { tip: 1, head: 3 }),
+            "a canonical gap must report both heights, not just say 'gap': {error}"
+        );
     }
 
     /// A fork is held to the same contiguity as the canonical branch. Once the fork
@@ -793,10 +871,8 @@ mod tests {
             .await
             .expect_err("a gap on the forked branch must fail");
         assert!(
-            error
-                .to_string()
-                .contains("height gap on the forked branch"),
-            "{error}"
+            matches!(error, PipelineError::ForkedHeightGap { fork: 3, head: 5 }),
+            "a forked gap must be distinguishable from a canonical one: {error}"
         );
         // Nothing was retracted and nothing was published across the hole.
         assert!(pipeline.sink.reorg_orphans().is_empty());
@@ -843,7 +919,19 @@ mod tests {
             .process_block(fetched(vec![block_event(2, hash(20), hash(1))]))
             .await
             .expect_err("a fork older than the ring must fail");
-        assert!(error.to_string().contains("no fork point"), "{error}");
+        // The variant carries the ring's size, so a caller can see how far past it the
+        // fork reached instead of only that it did.
+        assert!(
+            matches!(
+                error,
+                PipelineError::ForkTooDeep {
+                    height: 2,
+                    parent: _,
+                    undo_depth: 2
+                }
+            ),
+            "a fork below the ring must report the depth it exceeded: {error}"
+        );
         assert!(pipeline.sink.reorg_orphans().is_empty());
     }
 
@@ -942,7 +1030,11 @@ mod tests {
         // Both heads were followed in order before the subscription ended.
         assert_eq!(pipeline.sink.kinds(), ["block", "block"]);
         assert_eq!(pipeline.sink.block_numbers(), [1, 2]);
-        // The error names the last height it saw, so a stopped live run is diagnosable.
-        assert!(error.to_string().contains('2'), "{error}");
+        // The variant carries the last height it saw, so a stopped live run is
+        // diagnosable without reading the formatted message.
+        assert!(
+            matches!(error, PipelineError::SubscriptionClosed { last_height: 2 }),
+            "a closed subscription must report where it stopped: {error}"
+        );
     }
 }

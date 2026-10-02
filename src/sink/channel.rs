@@ -26,10 +26,9 @@
 //! because the chain and the store are the record — the store's high-water mark says
 //! where to resume, and the node can serve the blocks after it.
 
-use anyhow::Result;
 use tokio::sync::mpsc;
 
-use crate::sink::EnvelopeSink;
+use crate::sink::{EnvelopeSink, SinkError};
 use crate::wire::envelope::Envelope;
 
 /// How many blocks the channel holds before the sender waits.
@@ -61,12 +60,12 @@ pub(crate) struct ChannelSink {
 }
 
 impl EnvelopeSink for ChannelSink {
-    async fn publish(&mut self, envelope: Envelope) -> Result<()> {
+    async fn publish(&mut self, envelope: Envelope) -> Result<(), SinkError> {
         self.batch.push(envelope);
         Ok(())
     }
 
-    async fn flush(&mut self) -> Result<()> {
+    async fn flush(&mut self) -> Result<(), SinkError> {
         if self.batch.is_empty() {
             return Ok(());
         }
@@ -75,9 +74,15 @@ impl EnvelopeSink for ChannelSink {
         // regrowing from zero.
         let next = Vec::with_capacity(self.batch.len());
         let batch = std::mem::replace(&mut self.batch, next);
-        // Storage has stopped. `SendError` is already an `Error`, so `?` carries it as
-        // is; `runtime` labels it, and reports the store's own error first.
-        self.sender.send(batch).await?;
+        // Storage has stopped. The batch of envelopes inside `SendError` is this
+        // layer's own data and nothing else can use it, so the error is translated to
+        // `StorageClosed` and `Vec<Envelope>` stops appearing in the sink's error type:
+        // a caller matches the variant, and the channel's concrete type stays internal
+        // to this module.
+        self.sender
+            .send(batch)
+            .await
+            .map_err(|_| SinkError::StorageClosed)?;
         Ok(())
     }
 }
@@ -106,7 +111,7 @@ impl ChannelReceiver {
         mut self,
         sink: &mut K,
         max_records: usize,
-    ) -> Result<u64> {
+    ) -> Result<u64, SinkError> {
         let mut stored = 0_u64;
         while let Some(first) = self.receiver.recv().await {
             let mut pending = first.len();
@@ -138,9 +143,8 @@ mod tests {
     use std::time::Duration;
 
     use alloy_primitives::B256;
-    use tokio::sync::mpsc;
 
-    use crate::sink::EnvelopeSink;
+    use crate::sink::{EnvelopeSink, SinkError};
     use crate::wire::envelope::{ChainId, Envelope, Event, Finalized};
 
     use super::open;
@@ -171,12 +175,12 @@ mod tests {
     }
 
     impl EnvelopeSink for Batches {
-        async fn publish(&mut self, envelope: Envelope) -> anyhow::Result<()> {
+        async fn publish(&mut self, envelope: Envelope) -> Result<(), SinkError> {
             self.open.push(envelope.event.dedupe_key());
             Ok(())
         }
 
-        async fn flush(&mut self) -> anyhow::Result<()> {
+        async fn flush(&mut self) -> Result<(), SinkError> {
             self.flushed.push(std::mem::take(&mut self.open));
             Ok(())
         }
@@ -263,18 +267,20 @@ mod tests {
 
     /// A store that has stopped is an error on the sender's next flush, not a silent
     /// drop: ingest must not keep indexing into nothing.
+    ///
+    /// The variant is matched, not the message. This used to assert the error was tokio's
+    /// `SendError<Vec<Envelope>>` by downcasting, which required the error to be a
+    /// type-erased one to downcast at all; matching `StorageClosed` states the contract
+    /// directly and keeps the channel's own types out of the assertion.
     #[tokio::test]
     async fn a_stopped_store_fails_the_next_flush() {
         let (mut sink, receiver) = open();
         drop(receiver);
         sink.publish(envelope(0)).await.expect("publish buffers");
         let error = sink.flush().await.expect_err("nobody is reading");
-        // The error is tokio's, carried through as is: the type, not the wording.
         assert!(
-            error
-                .downcast_ref::<mpsc::error::SendError<Vec<Envelope>>>()
-                .is_some(),
-            "{error}"
+            matches!(error, SinkError::StorageClosed),
+            "a dead store must be reported as such, not as a raw channel error: {error}"
         );
     }
 
@@ -282,20 +288,26 @@ mod tests {
     /// rather than being read as an ended stream.
     #[tokio::test]
     async fn a_failing_sink_ends_the_drain_with_its_error() {
-        struct Broken;
+        /// A sink whose storage is out of space, which is a real store condition and so
+        /// carries the same [`SinkError::Write`] a `stdout` failure would.
+        struct OutOfSpace;
 
-        impl EnvelopeSink for Broken {
-            async fn publish(&mut self, _envelope: Envelope) -> anyhow::Result<()> {
-                anyhow::bail!("disk is full")
+        impl EnvelopeSink for OutOfSpace {
+            async fn publish(&mut self, _envelope: Envelope) -> Result<(), SinkError> {
+                Err(SinkError::Write(std::io::Error::other("disk is full")))
             }
         }
 
         let (mut sink, receiver) = open();
         send_block(&mut sink, 0..1).await;
         let error = receiver
-            .drain(&mut Broken, 100)
+            .drain(&mut OutOfSpace, 100)
             .await
             .expect_err("the sink failed");
+        assert!(
+            matches!(error, SinkError::Write(_)),
+            "the sink's own error must survive the drain, not be reshaped: {error}"
+        );
         assert!(error.to_string().contains("disk is full"), "{error}");
     }
 }

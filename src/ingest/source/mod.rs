@@ -20,6 +20,11 @@ use std::pin::Pin;
 use alloy_primitives::B256;
 use futures_util::Stream;
 use thiserror::Error;
+// The error type and the close code, so [`SourceError`] can carry them typed rather than
+// flattened to a message. Re-exported through `tokio_tungstenite`, which is already a
+// dependency for the EVM source's socket.
+use tokio_tungstenite::tungstenite;
+use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 
 pub mod evm;
 
@@ -69,9 +74,58 @@ pub const METHOD_NOT_FOUND: i64 = -32601;
 /// Failure while talking to a chain data source.
 #[derive(Debug, Error)]
 pub enum SourceError {
-    /// The connection, socket, or HTTP request failed.
-    #[error("transport failure: {0}")]
-    Transport(String),
+    /// An HTTP request failed, carrying `reqwest`'s typed error.
+    ///
+    /// The variant to match when deciding whether to retry: `source.status()` tells a
+    /// rate limit from a 5xx, and `source.is_timeout()` a stall from a refusal. This is
+    /// why the error is not stringified — as a `String` the only thing left to match on
+    /// was the message, so no retry policy could be written against this error at all.
+    #[error("http failure for {method}: {source}")]
+    Http {
+        /// The JSON-RPC method the request carried.
+        method: &'static str,
+        /// `reqwest`'s error, typed.
+        #[source]
+        source: reqwest::Error,
+    },
+    /// A websocket frame failed to send or receive.
+    ///
+    /// Typed for the same reason as [`Self::Http`]: `tungstenite::Error` is `Send + Sync`,
+    /// so there is nothing to gain by flattening it. The case a caller most wants to
+    /// branch on — the peer going away — is [`Self::Closed`] instead, since a closure is
+    /// not a frame error but a normal end of stream.
+    #[error("websocket {context} failed: {source}")]
+    Websocket {
+        /// What was being attempted, `connect` or `subscribe`.
+        context: &'static str,
+        /// `tungstenite`'s error, typed.
+        #[source]
+        source: tungstenite::Error,
+    },
+    /// The peer sent a close frame, ending the head subscription.
+    ///
+    /// Carries the close code, because *how* the peer hung up is the difference between
+    /// a reconnect and a diagnosis. `Normal` and `Away` mean the node finished or is
+    /// restarting and the same socket should be reopened; `Protocol` and `Error` mean it
+    /// rejected something we sent and reconnecting unchanged fails the same way.
+    ///
+    /// The code is the type rather than an `Option`, because a close frame carrying no
+    /// payload is the case RFC 6455 gives its own code — `Status` — and so needs no
+    /// sentinel here. A connection dropped with *no close frame at all* is a different
+    /// thing: it ends the stream without producing an item, and the caller reports that as
+    /// an ended subscription instead.
+    ///
+    /// [`CloseCode::Normal`]: tungstenite::protocol::frame::coding::CloseCode::Normal
+    /// [`CloseCode::Away`]: tungstenite::protocol::frame::coding::CloseCode::Away
+    /// [`CloseCode::Protocol`]: tungstenite::protocol::frame::coding::CloseCode::Protocol
+    /// [`CloseCode::Error`]: tungstenite::protocol::frame::coding::CloseCode::Error
+    /// [`CloseCode::Status`]: tungstenite::protocol::frame::coding::CloseCode::Status
+    #[error("websocket closed ({code})")]
+    Closed {
+        /// The peer's close code, which displays as its RFC 6455 number — `1000` for a
+        /// normal closure.
+        code: CloseCode,
+    },
     /// The node received the request but answered with a JSON-RPC error object.
     ///
     /// The code is kept typed rather than folded into the message, so a caller can
@@ -109,11 +163,54 @@ pub trait BlockSource: Send + Sync {
     ///
     /// # Errors
     ///
-    /// Returns [`SourceError::Transport`] when the request fails,
-    /// [`SourceError::Rpc`] when a call in it was rejected, and
+    /// Returns [`SourceError::Http`] or [`SourceError::Websocket`] when the request or
+    /// socket fails, [`SourceError::Rpc`] when a call in it was rejected, and
     /// [`SourceError::Malformed`] when the response cannot be decoded.
     fn fetch_block(
         &self,
         height: u64,
     ) -> impl Future<Output = Result<FetchedBlock, SourceError>> + Send;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SourceError;
+    use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
+
+    /// A clean shutdown and a protocol error used to be indistinguishable: both ended
+    /// the head stream, and the run reported only that it stopped. The close code is
+    /// what separates "reconnect" from "something is wrong", so it has to survive into
+    /// the error a caller sees.
+    #[test]
+    fn a_close_carries_the_code_that_says_why() {
+        let orderly = SourceError::Closed {
+            code: CloseCode::Normal,
+        };
+        let fault = SourceError::Closed {
+            code: CloseCode::Protocol,
+        };
+
+        assert!(
+            matches!(
+                orderly,
+                SourceError::Closed {
+                    code: CloseCode::Normal
+                }
+            ),
+            "a normal close must stay distinguishable from a protocol error: {orderly}"
+        );
+        assert!(
+            matches!(
+                fault,
+                SourceError::Closed {
+                    code: CloseCode::Protocol
+                }
+            ),
+            "a protocol error must stay distinguishable from a normal close: {fault}"
+        );
+        // The code renders as its RFC 6455 number, so an operator reading the log can
+        // look it up without matching in code.
+        assert_eq!(orderly.to_string(), "websocket closed (1000)");
+        assert_eq!(fault.to_string(), "websocket closed (1002)");
+    }
 }

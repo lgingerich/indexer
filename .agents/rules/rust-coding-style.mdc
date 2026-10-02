@@ -50,10 +50,18 @@ smell. Put the conversion on the type via a standard trait and call that at use 
 
 ## Errors
 
-- Library APIs should expose typed errors (`thiserror`) when callers can act on variants.
-- Use `anyhow` in binaries, examples, tests, and application boundaries, where context
-  matters more than typed guarantees.
-- Don't use `Box<dyn Error>` as a default error strategy.
+- Every error is a typed `thiserror` enum, at every layer including the binary and tests.
+  There is no `anyhow`: a type-erased error can only be handled by matching on its text,
+  which is why it must not be used even where "context matters more than typed
+  guarantees" — a caller still needs to tell a 429 from a timeout from a dead store, and
+  a formatted context string cannot carry that.
+- Library APIs should expose typed errors when callers can act on variants.
+- Prefer `#[from]` over `map_err`; see below for when `map_err` is legitimate.
+- Don't use `Box<dyn Error>`, not even to hold two causes in one variant — split the
+  variant so each cause keeps its own type, which is also what lets a caller recover from
+  one and not the other.
+- Don't use `.context(...)`/`with_context(...)`: it adds a message where a named field
+  belongs. `Setting { key, source }` is both machine-readable and printable.
 - Avoid `panic!()`, `todo!()`, and `unimplemented!()` in production paths.
 
 ### Error layering
@@ -87,7 +95,23 @@ don't matter; the direction and the `#[from]` chain do.
 
 It's legitimate at a boundary when caller-specific data (config key, request ID) must be
 injected into a variant that can't know it, or when `From` is impossible (e.g. bridging to
-`&'static str` in tests, or across crate boundaries with orphan-rule constraints).
+`&'static str` in tests, or across crate boundaries with orphan-rule constraints). Reading
+a file and wrapping it as `Read { path, source }` is the ordinary case, not a smell.
+
+The test that separates the legitimate use from the real one: **does the mapping add
+information, or does it erase it?** Adding the config key or the event selector the
+foreign error cannot know is the point of a typed variant. Calling `.to_string()` on an
+error to fit it into a `String` field takes the only part a caller could have branched on
+away, and leaves a type that can only be read as prose — so if a variant holds a `String`
+where it could hold the concrete `source`, fix it. The typed error is a superset: it
+prints the same text *and* stays matchable.
+
+### Assertions match the variant, not the message
+
+A test that asserts `error.to_string().contains("height gap")` passes on wording and
+fails on a rewording that changed nothing. Once the error is typed, assert the variant and
+its fields — which is also a stronger test, since it pins the heights a gap reported and
+not merely that the word appeared.
 
 ## Async and Concurrency
 

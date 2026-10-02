@@ -198,18 +198,19 @@ impl ContractRegistry {
     ///
     /// # Errors
     ///
-    /// Returns [`RegistryError::RegistryFile`] when the file cannot be read or parsed,
-    /// and otherwise whatever [`Self::load`] returns.
+    /// Returns [`RegistryError::RegistryRead`] when the file cannot be read,
+    /// [`RegistryError::RegistryParse`] when it does not parse, and otherwise whatever
+    /// [`Self::load`] returns.
     pub fn from_file(path: impl AsRef<Path>) -> Result<Self, RegistryError> {
         let path = path.as_ref();
-        let text = std::fs::read_to_string(path).map_err(|source| RegistryError::RegistryFile {
+        let text = std::fs::read_to_string(path).map_err(|source| RegistryError::RegistryRead {
             path: path.display().to_string(),
-            source: Box::new(source),
+            source,
         })?;
         let config: RegistryConfig =
-            toml::from_str(&text).map_err(|source| RegistryError::RegistryFile {
+            toml::from_str(&text).map_err(|source| RegistryError::RegistryParse {
                 path: path.display().to_string(),
-                source: Box::new(source),
+                source,
             })?;
         Self::load(
             &config.abi,
@@ -400,13 +401,27 @@ fn child_address(event: &DecodedEvent, name: &str) -> Option<Address> {
 /// Why the registry could not be loaded.
 #[derive(Debug, thiserror::Error)]
 pub enum RegistryError {
-    /// The registry file could not be read or parsed.
-    #[error("registry file {path}: {source}")]
-    RegistryFile {
+    /// The registry file could not be read.
+    #[error("read registry file {path}: {source}")]
+    RegistryRead {
         /// The path that failed.
         path: String,
-        /// The read or parse error.
-        source: Box<dyn std::error::Error + Send + Sync>,
+        /// The underlying I/O error.
+        source: std::io::Error,
+    },
+    /// The registry file did not parse, or a required value was absent.
+    ///
+    /// Separate from [`Self::RegistryRead`] so both causes keep their own type. They
+    /// shared one `Box<dyn Error>` variant before, which erased them to a string and
+    /// meant a caller that recovers from a missing file — falling back to an empty
+    /// registry — could not tell that from a file that exists but is malformed, which is
+    /// the case that must not be swallowed.
+    #[error("invalid registry file {path}: {source}")]
+    RegistryParse {
+        /// The path that failed.
+        path: String,
+        /// `toml`'s error, which carries the line and column.
+        source: toml::de::Error,
     },
     /// An ABI file could not be read.
     #[error("read {path}: {source}")]

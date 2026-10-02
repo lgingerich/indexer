@@ -44,7 +44,6 @@ alloy-serde = { version = "1.8.3", default-features = false, features = ["std"] 
 alloy-dyn-abi = { version = "1.7.3", default-features = false }
 # `JsonAbi` and its `Event`, the registry's unit of lookup.
 alloy-json-abi = { version = "1.7.3", default-features = false }
-anyhow = "1.0.104"
 # Bundled DuckDB compiles the C++ engine once via duckdb-sys; it is an embedded,
 # single-writer store, used only by the local DuckDB sink (`duckdb` feature).
 duckdb = { version = "1.10505.0", default-features = false, features = ["bundled"], optional = true }

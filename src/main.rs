@@ -42,9 +42,9 @@ async fn main() -> ExitCode {
     match indexer::runtime::run(&path).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
-            // `{error:?}` prints the whole `anyhow` chain, where `{error}` prints only the
-            // outermost context. A stage failure is wrapped in "decode stopped", so the
-            // Display form loses the cause — which is the only part worth having.
+            // `{error:?}` walks the `#[from]` chain, so the log carries every layer that
+            // named the failure — settings, pipeline, store — where `{error}` would print
+            // only the outermost variant's message and lose the cause underneath it.
             error!(error = ?error, "indexer stopped");
             ExitCode::FAILURE
         }

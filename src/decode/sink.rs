@@ -15,12 +15,11 @@
 //! produces no record; the raw log is stored regardless, so a corrected ABI recovers it
 //! by re-decoding rather than re-fetching.
 
-use anyhow::Result;
 use tracing::{debug, warn};
 
 use crate::decode::Transform;
 use crate::decode::registry::ContractRegistry;
-use crate::sink::EnvelopeSink;
+use crate::sink::{EnvelopeSink, SinkError};
 use crate::wire::envelope::Envelope;
 
 /// An [`EnvelopeSink`] that decodes each envelope and forwards both to `inner`.
@@ -53,7 +52,7 @@ impl<K: EnvelopeSink> EnvelopeSink for DecodingSink<K> {
     ///
     /// Returns an error when the inner sink rejects an envelope. A log that fails to
     /// *decode* is not one: it is logged and produces no record.
-    async fn publish(&mut self, envelope: Envelope) -> Result<()> {
+    async fn publish(&mut self, envelope: Envelope) -> Result<(), SinkError> {
         let applied = Transform::apply(&self.registry, &envelope);
         if let Some(error) = applied.error {
             // A log that matched an ABI but did not decode usually means the ABI is the
@@ -76,7 +75,7 @@ impl<K: EnvelopeSink> EnvelopeSink for DecodingSink<K> {
         Ok(())
     }
 
-    async fn flush(&mut self) -> Result<()> {
+    async fn flush(&mut self) -> Result<(), SinkError> {
         self.inner.flush().await
     }
 }
@@ -89,7 +88,7 @@ impl<K: EnvelopeSink> EnvelopeSink for DecodingSink<K> {
 mod tests {
     use alloy_primitives::{Address, B256, TxHash};
 
-    use crate::sink::EnvelopeSink;
+    use crate::sink::{EnvelopeSink, SinkError};
     use crate::wire::envelope::{ChainId, Envelope, Event, Finalized, Log};
 
     use super::DecodingSink;
@@ -102,12 +101,12 @@ mod tests {
     }
 
     impl EnvelopeSink for CollectSink {
-        async fn publish(&mut self, envelope: Envelope) -> anyhow::Result<()> {
+        async fn publish(&mut self, envelope: Envelope) -> Result<(), SinkError> {
             self.seen.push(envelope);
             Ok(())
         }
 
-        async fn flush(&mut self) -> anyhow::Result<()> {
+        async fn flush(&mut self) -> Result<(), SinkError> {
             self.flushes += 1;
             Ok(())
         }

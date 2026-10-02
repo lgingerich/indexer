@@ -38,13 +38,13 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-use anyhow::Context as _;
 use duckdb::Connection;
 use duckdb::types::{ToSql, Value};
 use serde::Deserialize;
+use thiserror::Error;
 use tracing::info;
 
-use crate::sink::EnvelopeSink;
+use crate::sink::{EnvelopeSink, SinkError};
 use crate::wire::envelope::Envelope;
 use crate::wire::row::{ColumnType, ColumnValue, Row, Table, row_for};
 /// The `DuckDB` file written when the settings name no path.
@@ -187,17 +187,25 @@ impl DuckDbSink {
     ///
     /// # Errors
     ///
-    /// Returns an error when an engine setting is rejected, the database cannot be
-    /// opened, or the tables cannot be created.
-    pub fn open(settings: &DuckDbSettings) -> anyhow::Result<Self> {
+    /// Returns [`StoreError::Setting`] when an engine setting is rejected,
+    /// [`StoreError::Open`] when the database cannot be opened, and
+    /// [`StoreError::Schema`] when the tables cannot be created.
+    pub fn open(settings: &DuckDbSettings) -> Result<Self, StoreError> {
         let mut config = duckdb::Config::default();
         for (key, value) in &settings.settings {
             config = config
                 .with(key, value)
-                .with_context(|| format!("duckdb setting {key:?} was rejected"))?;
+                .map_err(|source| StoreError::Setting {
+                    key: key.clone(),
+                    source,
+                })?;
         }
-        let connection = Connection::open_with_flags(&settings.path, config)
-            .with_context(|| format!("open store at {}", settings.path.display()))?;
+        let connection = Connection::open_with_flags(&settings.path, config).map_err(|source| {
+            StoreError::Open {
+                path: settings.path.display().to_string(),
+                source,
+            }
+        })?;
         info!(store = %settings.path.display(), "storage opened");
         Self::new(connection)
     }
@@ -209,12 +217,12 @@ impl DuckDbSink {
     ///
     /// # Errors
     ///
-    /// Returns an error if the tables cannot be created.
-    pub fn new(connection: Connection) -> anyhow::Result<Self> {
+    /// Returns [`StoreError::Schema`] if the tables cannot be created.
+    pub fn new(connection: Connection) -> Result<Self, StoreError> {
         let ddl = Table::ALL.map(create_table).join(";\n") + ";";
         connection
             .execute_batch(&ddl)
-            .context("create dataset tables")?;
+            .map_err(|source| StoreError::Schema { source })?;
         Ok(Self {
             connection,
             batches: Batches::default(),
@@ -222,7 +230,12 @@ impl DuckDbSink {
     }
 
     /// Buffers one envelope as a row in its dataset's table.
-    fn write(&mut self, envelope: &Envelope) -> anyhow::Result<()> {
+    ///
+    /// Returns [`SinkError`], not [`StoreError`], so a row that does not fit its table
+    /// surfaces as [`SinkError::Row`] instead of being laundered through the engine's
+    /// error type. A width mismatch is a defect in this crate's row builders or in the
+    /// envelope, not something `DuckDB` had an opinion about.
+    fn write(&mut self, envelope: &Envelope) -> Result<(), SinkError> {
         let row = row_for(&envelope.chain, &envelope.event)?;
         self.batches.push(row);
         Ok(())
@@ -230,13 +243,78 @@ impl DuckDbSink {
 }
 
 impl EnvelopeSink for DuckDbSink {
-    async fn publish(&mut self, envelope: Envelope) -> anyhow::Result<()> {
+    async fn publish(&mut self, envelope: Envelope) -> Result<(), SinkError> {
         self.write(&envelope)
     }
 
-    async fn flush(&mut self) -> anyhow::Result<()> {
-        self.batches.append_to(&self.connection)
+    async fn flush(&mut self) -> Result<(), SinkError> {
+        self.batches.append_to(&self.connection)?;
+        Ok(())
     }
+}
+
+/// Why the store could not be opened, or could not accept a batch.
+///
+/// The leaf under [`crate::sink::SinkError::Store`], and the reason
+/// the setting key and the store path are fields rather than a formatted message: both
+/// are inputs the caller supplied, and an operator reading a log should be able to match
+/// on the key rather than parse it back out of prose.
+///
+/// Every variant here is a [`duckdb::Error`], which is what keeps this enum narrower than
+/// the layer above it: the engine is the only thing that can fail at these points. A row
+/// that does not fit its table is *not* one of them — that is
+/// [`crate::sink::SinkError::Row`], raised before the engine is involved at all.
+///
+/// The engine's error is carried rather than stringified, so the `#[error]` output reads
+/// the same as a formatted message would while staying matchable by a caller.
+#[derive(Debug, Error)]
+pub enum StoreError {
+    /// The engine refused one of the settings the file passed through.
+    #[error("duckdb setting {key:?} was rejected: {source}")]
+    Setting {
+        /// The setting as written in `[sink.duckdb.settings]`.
+        key: String,
+        /// The engine's own reason.
+        source: duckdb::Error,
+    },
+    /// The database file could not be opened.
+    #[error("open store at {path}: {source}")]
+    Open {
+        /// The path as written in `[sink.duckdb]`.
+        path: String,
+        /// The engine's own reason.
+        source: duckdb::Error,
+    },
+    /// The dataset tables could not be created.
+    #[error("create dataset tables: {source}")]
+    Schema {
+        /// The engine's own reason.
+        source: duckdb::Error,
+    },
+    /// An appender could not be opened for a table.
+    #[error("open appender for {table}: {source}")]
+    Appender {
+        /// Which table's appender failed to open.
+        table: &'static str,
+        /// The engine's own reason.
+        source: duckdb::Error,
+    },
+    /// A row could not be appended.
+    #[error("append a {table} row: {source}")]
+    Append {
+        /// Which table rejected the row.
+        table: &'static str,
+        /// The engine's own reason.
+        source: duckdb::Error,
+    },
+    /// A batch could not be committed.
+    #[error("flush {table}: {source}")]
+    Commit {
+        /// Which table's commit failed.
+        table: &'static str,
+        /// The engine's own reason.
+        source: duckdb::Error,
+    },
 }
 
 /// Renders a row's values as the appender's parameters.
@@ -272,7 +350,7 @@ impl Batches {
     /// Returns an error if an appender cannot be opened, a row appended, or a batch
     /// committed. The buffer is cleared only once every table has been written, so a
     /// failure part-way leaves the rows buffered rather than losing them.
-    fn append_to(&mut self, connection: &Connection) -> anyhow::Result<()> {
+    fn append_to(&mut self, connection: &Connection) -> Result<(), StoreError> {
         for table in Table::ALL {
             let rows: Vec<&Row> = self
                 .rows
@@ -282,9 +360,13 @@ impl Batches {
             if rows.is_empty() {
                 continue;
             }
-            let mut appender = connection
-                .appender(table.name())
-                .with_context(|| format!("open appender for {table}"))?;
+            let mut appender =
+                connection
+                    .appender(table.name())
+                    .map_err(|source| StoreError::Appender {
+                        table: table.name(),
+                        source,
+                    })?;
             for row in rows {
                 // `block` is wider than the appender's fixed-size row impls cover, so the
                 // row goes in as a slice of trait objects — the shape the `duckdb` crate
@@ -294,9 +376,15 @@ impl Batches {
                     params.iter().map(|value| value as &dyn ToSql).collect();
                 appender
                     .append_row(borrowed.as_slice())
-                    .with_context(|| format!("append a {table} row"))?;
+                    .map_err(|source| StoreError::Append {
+                        table: table.name(),
+                        source,
+                    })?;
             }
-            appender.flush().with_context(|| format!("flush {table}"))?;
+            appender.flush().map_err(|source| StoreError::Commit {
+                table: table.name(),
+                source,
+            })?;
         }
         self.rows.clear();
         Ok(())

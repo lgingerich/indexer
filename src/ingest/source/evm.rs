@@ -39,7 +39,9 @@ use futures_util::{SinkExt as _, StreamExt};
 use serde::Deserialize;
 use serde_json::json;
 use serde_json::value::RawValue;
-use tokio_tungstenite::{connect_async, tungstenite::Message};
+use tokio_tungstenite::connect_async;
+use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 
 use super::{BlockId, BlockSource, FetchedBlock, HeadStream, METHOD_NOT_FOUND, SourceError};
 use crate::wire::datasets::evm::{Block, Log, Receipt, Transaction};
@@ -546,9 +548,13 @@ impl BlockSource for EvmSource {
     }
 
     async fn subscribe_heads(&self) -> Result<HeadStream, SourceError> {
-        let (mut socket, _response) = connect_async(self.ws_url.as_str())
-            .await
-            .map_err(|error| SourceError::Transport(error.to_string()))?;
+        let (mut socket, _response) =
+            connect_async(self.ws_url.as_str())
+                .await
+                .map_err(|source| SourceError::Websocket {
+                    context: "connect",
+                    source,
+                })?;
         let request = json!({
             "jsonrpc": "2.0",
             "id": 1,
@@ -558,14 +564,26 @@ impl BlockSource for EvmSource {
         socket
             .send(Message::text(request.to_string()))
             .await
-            .map_err(|error| SourceError::Transport(error.to_string()))?;
+            .map_err(|source| SourceError::Websocket {
+                context: "subscribe",
+                source,
+            })?;
 
+        // The close code is what separates an orderly shutdown from a protocol error, so a
+        // `Close` frame is reported rather than swallowed: swallowed, both ended the run
+        // as a plain "no more heads". Ping, pong, binary, and raw frames carry no head,
+        // so they stay ignored — the socket answers pings itself.
         let heads = socket.filter_map(|frame| async move {
             match frame {
                 Ok(Message::Text(text)) => decode_head_frame(&text),
-                // Ping/Pong/Binary/Close carry no head; the socket handles pings.
+                Ok(Message::Close(frame)) => Some(Err(SourceError::Closed {
+                    code: frame.map_or(CloseCode::Status, |frame| frame.code),
+                })),
                 Ok(_) => None,
-                Err(error) => Some(Err(SourceError::Transport(error.to_string()))),
+                Err(source) => Some(Err(SourceError::Websocket {
+                    context: "read frame",
+                    source,
+                })),
             }
         });
         Ok(Box::pin(heads) as HeadStream)
@@ -586,18 +604,31 @@ impl BlockSource for EvmSource {
 
 impl EvmSource {
     /// POSTs one JSON-RPC request body and returns the response bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SourceError::Http`] when the request, the status check, or the body read
+    /// fails. The error stays `reqwest`'s own, so a caller can read `status()` and
+    /// `is_timeout()` off it and write a retry policy — which it could not do when this
+    /// flattened the error to a message.
     async fn post(&self, body: &serde_json::Value) -> Result<Vec<u8>, SourceError> {
-        let transport = |error: reqwest::Error| SourceError::Transport(error.to_string());
+        const BATCH: &str = "json-rpc batch";
         self.client
             .post(self.http_url.as_str())
             .json(body)
             .send()
             .await
             .and_then(reqwest::Response::error_for_status)
-            .map_err(transport)?
+            .map_err(|source| SourceError::Http {
+                method: BATCH,
+                source,
+            })?
             .bytes()
             .await
-            .map_err(transport)
+            .map_err(|source| SourceError::Http {
+                method: BATCH,
+                source,
+            })
             .map(|bytes| bytes.to_vec())
     }
 

@@ -36,9 +36,10 @@ pub mod stdout;
 pub use duckdb::{DuckDbSettings, DuckDbSink};
 pub use stdout::{StdoutJsonSink, StdoutSettings};
 
-use anyhow::Result;
+use thiserror::Error;
 
 use crate::wire::envelope::Envelope;
+use crate::wire::row::RowError;
 
 /// Receives envelopes in per-chain order, as the pipeline publishes them.
 ///
@@ -59,7 +60,8 @@ pub trait EnvelopeSink: Send {
     ///
     /// Returns an error if the envelope cannot be accepted. The caller stops rather
     /// than skipping it.
-    fn publish(&mut self, envelope: Envelope) -> impl Future<Output = Result<()>> + Send;
+    fn publish(&mut self, envelope: Envelope)
+    -> impl Future<Output = Result<(), SinkError>> + Send;
 
     /// Ends the batch: hands everything published since the last flush onward, as one.
     ///
@@ -67,7 +69,46 @@ pub trait EnvelopeSink: Send {
     ///
     /// Returns an error if the buffered envelopes cannot be delivered. The caller stops
     /// rather than continuing past a lost batch.
-    fn flush(&mut self) -> impl Future<Output = Result<()>> + Send {
+    fn flush(&mut self) -> impl Future<Output = Result<(), SinkError>> + Send {
         async { Ok(()) }
     }
+}
+
+/// Why a sink could not accept, render, or deliver an envelope.
+///
+/// The layer's own error, and the reason [`EnvelopeSink`] is typed rather than generic:
+/// every sink that implements the trait has to say what can go wrong, so a caller can
+/// branch on it instead of reading a string. The variants that matter are structural
+/// rather than textual — a caller distinguishes a dead store from a failed HTTP status
+/// from a malformed row by matching, not by formatting.
+///
+/// Leaf errors arrive through `#[from]`, so a sink propagates them with `?` rather than
+/// wrapping them in a message: [`duckdb::StoreError`], [`RowError`], and `serde_json`'s
+/// and `std::io`'s own errors each name their cause better than this layer could.
+#[derive(Debug, Error)]
+pub enum SinkError {
+    /// The store this sink writes to has stopped, so the batch cannot be delivered.
+    ///
+    /// Distinct from a *failed* store: nothing went wrong, the destination is simply
+    /// gone. A channel sink reports this when the receiving half was dropped.
+    #[error("storage has stopped, so the batch cannot be delivered")]
+    StorageClosed,
+    /// The envelope could not be rendered as a row.
+    ///
+    /// Transparent, because [`RowError`] already names the table and both widths.
+    #[error(transparent)]
+    Row(#[from] RowError),
+    /// Rendering the envelope for a transport failed.
+    #[error("serialize envelope: {0}")]
+    Serialize(#[from] serde_json::Error),
+    /// Writing the rendered envelope failed.
+    #[error("write envelope: {0}")]
+    Write(#[from] std::io::Error),
+    /// A store rejected the write, or could not be opened.
+    ///
+    /// Transparent, so the store's own variants — the setting it refused, the path it
+    /// could not open — survive to the caller instead of being flattened to a string.
+    #[cfg(feature = "duckdb")]
+    #[error(transparent)]
+    Store(#[from] duckdb::StoreError),
 }

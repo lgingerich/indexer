@@ -35,14 +35,65 @@
 //! reported ahead of ingest's, since a dead store is the cause and a failed send the
 //! symptom.
 
-use anyhow::{Context as _, Result};
+use thiserror::Error;
 use tracing::info;
 
-use crate::config::{Settings, Sink};
+use crate::config::{Settings, SettingsError, Sink};
 use crate::decode::DecodingSink;
-use crate::decode::registry::ContractRegistry;
+use crate::decode::registry::{ContractRegistry, RegistryError};
 use crate::ingest::Ingest;
-use crate::sink::{self, DuckDbSink, StdoutJsonSink};
+use crate::ingest::pipeline::PipelineError;
+#[cfg(feature = "duckdb")]
+use crate::sink::duckdb::StoreError;
+use crate::sink::{self, DuckDbSink, SinkError, StdoutJsonSink};
+
+/// Why the indexer stopped.
+///
+/// The top of the chain and the only place the layers meet, so each variant names *which*
+/// part stopped rather than restating what went wrong: the cause is already typed one
+/// level down and travels intact inside the variant. That is what makes `{error:?}` worth
+/// printing at the process boundary — it walks the `#[from]` chain and shows every layer,
+/// where a single string would have shown only the outermost.
+///
+/// The assembly failures are kept apart from the runtime ones on purpose. A bad endpoint
+/// or an unreadable registry is fixed by editing a file and restarting; a pipeline failure
+/// is what a running indexer reports when it stops. Collapsing them would leave a caller
+/// unable to tell "this deployment never started" from "this run died".
+#[derive(Debug, Error)]
+pub enum RuntimeError {
+    /// The settings could not be read or parsed.
+    #[error("settings could not be loaded: {0}")]
+    Settings(#[from] SettingsError),
+    /// An ingest endpoint the settings named was not usable, so the pipeline could not be
+    /// assembled.
+    #[error("ingest could not be configured: {0}")]
+    Configure(#[from] crate::ingest::run::IngestError),
+    /// The registry could not be loaded, so nothing would have decoded.
+    #[error("contract registry could not be loaded: {0}")]
+    Registry(#[from] RegistryError),
+    /// The store could not be opened, so there was nowhere to write.
+    #[cfg(feature = "duckdb")]
+    #[error("storage could not be opened: {0}")]
+    OpenStore(#[from] StoreError),
+    /// Ingest stopped: a source failed, a sink refused an envelope, or the head
+    /// subscription ended.
+    #[error("ingest stopped: {0}")]
+    Ingest(#[from] PipelineError),
+    /// Storage stopped. Reported ahead of ingest's error, because a dead store is the
+    /// cause there and the failed send is only the symptom.
+    #[error("storage stopped: {0}")]
+    Storage(#[from] SinkError),
+    /// The storage task panicked instead of returning an error, so nothing below it
+    /// ever ran to explain why.
+    ///
+    /// Its own variant because `JoinError` says the task died, not that the store
+    /// failed, and a panic in a writer is a different bug from a rejected write.
+    #[error("storage task panicked: {source}")]
+    StorageTaskPanicked {
+        /// `tokio`'s join error, which carries the panic payload.
+        source: tokio::task::JoinError,
+    },
+}
 
 /// The pipeline the settings describe: the parts, built and ready.
 #[derive(Debug)]
@@ -59,9 +110,9 @@ impl Pipeline {
     ///
     /// # Errors
     ///
-    /// Returns an error when the registry cannot be read or an ingest endpoint is
-    /// missing.
-    pub(crate) fn from_settings(settings: &Settings) -> Result<Self> {
+    /// Returns [`RuntimeError::Configure`] when an ingest endpoint is unusable and
+    /// [`RuntimeError::Registry`] when the registry cannot be read.
+    pub(crate) fn from_settings(settings: &Settings) -> Result<Self, RuntimeError> {
         let ingest = Ingest::builder(&settings.ingest.chain)
             .http_url(&settings.ingest.http_url)
             .ws_url(&settings.ingest.ws_url)
@@ -77,19 +128,19 @@ impl Pipeline {
     ///
     /// # Errors
     ///
-    /// Returns an error when the store cannot be opened, or when a part fails. The
-    /// part's own error is carried with it, because "storage stopped" says nothing about
-    /// why.
-    pub(crate) async fn run(self, settings: &Settings) -> Result<()> {
+    /// Returns [`RuntimeError::OpenStore`] when the store cannot be opened, and
+    /// [`RuntimeError::Ingest`] or [`RuntimeError::Storage`] when a part fails. Each
+    /// carries that part's own error, because "storage stopped" says nothing about why.
+    pub(crate) async fn run(self, settings: &Settings) -> Result<(), RuntimeError> {
         let Self { ingest, registry } = self;
 
         // The settings' backend is the branch, so a backend this build does not have is
         // already a startup error and each arm here opens exactly what it named.
         match &settings.sink {
-            Sink::Stdout(_) => ingest
+            Sink::Stdout(_) => Ok(ingest
                 .run(DecodingSink::new(registry, StdoutJsonSink::new()))
                 .await
-                .context("ingest stopped"),
+                .map_err(RuntimeError::Ingest)?),
             Sink::DuckDb(duckdb) => {
                 // Open the store before ingest starts, so a bad path fails at startup
                 // rather than after the first block.
@@ -109,12 +160,17 @@ impl Pipeline {
                 // Ingest's half of the channel is gone by now, so storage drains what is
                 // queued and ends. Its error comes first: if the store died, ingest's
                 // failure is only the failed send.
+                //
+                // A panicked task is `JoinError`, which is neither a store nor an
+                // ingest failure — it is the store's writer dying outside its own error
+                // path (an unwrap on a row width, say), so it gets its own variant
+                // rather than being folded into `Storage`.
                 let stored = storage
                     .await
-                    .context("storage task panicked")?
-                    .context("storage stopped")?;
+                    .map_err(|source| RuntimeError::StorageTaskPanicked { source })?
+                    .map_err(RuntimeError::Storage)?;
                 info!(stored, "storage stopped");
-                ingest.context("ingest stopped")
+                ingest.map_err(RuntimeError::Ingest)
             }
         }
     }
@@ -124,9 +180,10 @@ impl Pipeline {
 ///
 /// # Errors
 ///
-/// Returns an error when the settings cannot be read, or the pipeline cannot be built or
-/// run.
-pub async fn run(path: &str) -> Result<()> {
+/// Returns [`RuntimeError`] naming whichever layer stopped: the settings if they could
+/// not be read, the pipeline if it could not be assembled, and otherwise the part that
+/// failed while running.
+pub async fn run(path: &str) -> Result<(), RuntimeError> {
     let settings = Settings::from_file(path)?;
     info!(
         settings = path,

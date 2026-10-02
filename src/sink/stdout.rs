@@ -9,7 +9,7 @@ use crate::wire::envelope::Envelope;
 use serde::Deserialize;
 use tokio::io::AsyncWriteExt as _;
 
-use crate::sink::EnvelopeSink;
+use crate::sink::{EnvelopeSink, SinkError};
 
 /// `[sink.stdout]` takes no settings, and this is the type that says so.
 ///
@@ -38,7 +38,7 @@ impl StdoutJsonSink {
 }
 
 impl EnvelopeSink for StdoutJsonSink {
-    async fn publish(&mut self, envelope: Envelope) -> anyhow::Result<()> {
+    async fn publish(&mut self, envelope: Envelope) -> Result<(), SinkError> {
         // The same encoding the store keeps as its `envelope` column, so a consumer of
         // the pipe and a reader of the store see the same bytes.
         let mut line = serde_json::to_string(&envelope)?;
