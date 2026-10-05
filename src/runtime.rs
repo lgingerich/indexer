@@ -40,7 +40,7 @@ use tracing::info;
 
 use crate::config::{Settings, SettingsError, Sink};
 use crate::decode::DecodingSink;
-use crate::decode::registry::{ContractRegistry, RegistryError};
+use crate::decode::{ContractRegistry, RegistryError};
 use crate::ingest::Ingest;
 use crate::ingest::pipeline::PipelineError;
 use crate::sink::{self, DuckDbSink, SinkError, StdoutJsonSink};
@@ -210,7 +210,7 @@ mod tests {
 
     use crate::config::Settings;
     use crate::decode::DecodingSink;
-    use crate::decode::registry::{AbiEntry, ContractEntry, ContractRegistry, RegistryConfig};
+    use crate::decode::{AbiEntry, ContractEntry, ContractRegistry, RegistryConfig};
     use crate::ingest::pipeline::PipelineError;
     use crate::sink::duckdb::StoreError;
     use crate::sink::{self, DuckDbSink, EnvelopeSink as _, SinkError};
@@ -307,8 +307,10 @@ ws_url = "wss://example.invalid"
                     chain: "base".to_owned(),
                     address: POOL.to_owned(),
                     abi: "uniswap_v3_pool".to_owned(),
+                    protocol: "uniswap_v3".to_owned(),
+                    from_block: 0,
+                    to_block: None,
                 }],
-                ..RegistryConfig::default()
             },
             ".",
         )

@@ -27,7 +27,7 @@
 //! - Per-chain ordering by each dataset's own natural key, finality tagging, and reorg
 //!   retraction with a bounded undo ring (see [`ingest::Machine`]).
 //! - Decoding a log against a contract ABI into typed, named arguments, as a
-//!   stateless transform (see [`decode::Transform`]).
+//!   stateless transform (see [`decode::Decoder`]).
 //! - A local `DuckDB` store of typed per-dataset tables, behind the `duckdb` feature.
 //!
 //! # Not built yet

@@ -50,7 +50,7 @@ use alloy_primitives::{Address, B64, B256, BlockHash, Bloom, Bytes, TxHash, U256
 use alloy_rpc_types_eth::{AccessList, SignedAuthorization};
 use serde::{Deserialize, Serialize};
 
-use crate::wire::typed::TypedValue;
+use crate::wire::typed::{AbiType, TypedValue};
 
 /// Block header and metadata, from `eth_getBlockByNumber`.
 ///
@@ -388,20 +388,20 @@ pub fn log_key(block_hash: B256, transaction_hash: TxHash, log_index: u64) -> St
     format!("{block_hash}:{transaction_hash}:{log_index}")
 }
 
-/// One decoded event argument: its ABI name, and its typed value.
+/// One decoded event argument: its ABI position, name, declared type, and value.
 ///
-/// The name is not decoration. A decoded record is usually read to build a typed
-/// column — `amount0` becoming `token_sold_amount_raw` — and a positional argument
-/// would force that mapping to hardcode an index, which breaks silently when an ABI
-/// revision reorders or inserts a parameter. The name is what makes the value
-/// addressable rather than merely typed.
-///
-/// This is the wire equivalent of a decoder's own `params` map, kept as a sequence
-/// so argument order is preserved while the name travels with the value.
+/// Names may be empty or repeated, so `position` is the unambiguous identity within
+/// the complete event input list, before splitting indexed and body arguments.
+/// The declared type preserves array element types even for empty arrays, and tuple
+/// component names and types independently of whether the value is an indexed hash.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DecodedArg {
-    /// The parameter name from the ABI, for example `amount0`.
+    /// Zero-based position in the complete event input list.
+    pub position: usize,
+    /// The parameter name from the ABI, for example `amount0`; may be empty.
     pub name: String,
-    /// The value, with its Solidity type.
+    /// The declared ABI type, including recursive tuple component metadata.
+    pub abi_type: AbiType,
+    /// The decoded value, or an opaque hash when an indexed value is not recoverable.
     pub value: TypedValue,
 }

@@ -15,9 +15,9 @@
 //!   not records of a chain. They carry no verbatim payload and exist to drive a
 //!   consumer's state machine, so they are defined here.
 //!
-//! Decoding is deliberately out of scope here, so a consumer decodes with whatever
-//! ABI or IDL it trusts. Every dataset field is present and typed, though, so a
-//! consumer that only persists does not have to decode anything.
+//! The decode stage can publish typed interpretations alongside raw logs. Consumers
+//! may also replay the raw datasets against an ABI or IDL they trust. Every dataset
+//! field is present and typed, so a consumer that only persists need not decode.
 //!
 //! An [`Envelope`] carries the [`Event`], the [`ChainId`] it came from, and the
 //! [`SCHEMA_VERSION`] the
@@ -55,7 +55,7 @@ use alloy_primitives::{Address, B256, TxHash};
 use serde::{Deserialize, Serialize};
 
 pub use crate::wire::datasets::evm::{Block, DecodedArg, Log, Receipt, Transaction, log_key};
-pub use crate::wire::typed::TypedValue;
+pub use crate::wire::typed::{AbiComponent, AbiType, TypedValue};
 
 /// The version of the envelope's wire shape.
 ///
@@ -146,6 +146,11 @@ pub struct Finalized {
 /// that record rather than a re-fetch from a node.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Decoded {
+    /// The identity of the ABI interpretation used to decode this log.
+    ///
+    /// A different ABI identity produces a separate append-only decoded row even
+    /// when the raw log and event selector are unchanged.
+    pub abi_id: B256,
     /// The event name from the ABI, for example `Transfer`.
     pub name: String,
     /// The contract that emitted the log.
@@ -189,9 +194,9 @@ pub struct Decoded {
     /// The log's position in its block.
     #[serde(with = "alloy_serde::quantity")]
     pub log_index: u64,
-    /// The indexed arguments, in ABI order, each carrying its name.
+    /// The indexed arguments, in ABI order, with original positions and declared types.
     pub indexed: Vec<DecodedArg>,
-    /// The non-indexed arguments, in ABI order, each carrying its name.
+    /// The non-indexed arguments, in ABI order, with original positions and declared types.
     pub body: Vec<DecodedArg>,
     /// Height of the block containing this log.
     #[serde(with = "alloy_serde::quantity")]
@@ -206,15 +211,19 @@ pub struct Decoded {
 impl Decoded {
     /// A key that is stable across redelivery and unique per decoded record.
     ///
-    /// Built from the raw log's natural key plus this event's selector, so a re-decode
-    /// of the same log against the same event produces the same key and a store upserts
-    /// rather than duplicates. It carries the block hash for the same reason [`Log`]
-    /// does — a log re-included in a replacement block is a different row — so a
-    /// re-decode of an *orphaned* log keeps its own key instead of colliding with the
-    /// replacement's.
+    /// Built from the raw log's natural key, event selector, and ABI identity:
+    /// `block_hash:transaction_hash:log_index:selector:abi_id:decoded`.
+    /// Redelivery of the same interpretation deduplicates, while a later ABI yields
+    /// a separate append-only interpretation. The block hash also keeps an orphaned
+    /// log's interpretation separate from its replacement's.
     #[must_use]
     pub fn dedupe_key(&self) -> String {
-        format!("{}:{}:decoded", self.source_key(), self.selector)
+        format!(
+            "{}:{}:{}:decoded",
+            self.source_key(),
+            self.selector,
+            self.abi_id
+        )
     }
 
     /// The raw log's natural key, in the same shape [`Log::dedupe_key`] produces:
@@ -270,7 +279,8 @@ impl Event {
     /// A key that is stable across redelivery and unique per event.
     ///
     /// Consumer groups deliver at least once, so consumers deduplicate on this. For
-    /// datasets the key is the record's on-chain identity; for control signals it is
+    /// raw datasets the key is the record's on-chain identity; decoded records also
+    /// include the ABI interpretation identity. For control signals it is
     /// the identity of the change they announce. It is scoped to the stream, so it
     /// excludes the chain, and it deliberately excludes `sequence`, which changes if
     /// the indexer restarts and replays from a different point.
@@ -345,8 +355,8 @@ mod tests {
     use alloy_primitives::{Address, B256, TxHash, U256};
 
     use super::{
-        Block, ChainId, Decoded, DecodedArg, Envelope, Event, Finalized, Log, Receipt, Reorg,
-        SCHEMA_VERSION, Transaction, TypedValue,
+        AbiType, Block, ChainId, Decoded, DecodedArg, Envelope, Event, Finalized, Log, Receipt,
+        Reorg, SCHEMA_VERSION, Transaction, TypedValue,
     };
 
     fn chain() -> ChainId {
@@ -358,9 +368,8 @@ mod tests {
     }
 
     /// A decoded record's `source_key` must stay byte-for-byte the raw log's
-    /// `dedupe_key`. The two are built by separate `format!` calls — one here, one on
-    /// [`Log`] — so nothing but this test stops them drifting; if they do, every
-    /// decoded record silently stops joining back to the log it came from.
+    /// `dedupe_key`. Both use the shared `log_key` helper; this test protects the
+    /// join contract if either caller changes.
     #[test]
     fn a_decoded_records_source_key_is_the_raw_logs_dedupe_key() {
         let log = Log {
@@ -374,6 +383,7 @@ mod tests {
             name: "Swap".to_owned(),
             address: Address::from([0xd0; 20]),
             protocol: "uniswap_v3".to_owned(),
+            abi_id: hash(0x08),
             selector: hash(0x07),
             signature: "Swap(address,address,int256,int256,uint160,uint128,int24)".to_owned(),
             anonymous: false,
@@ -387,6 +397,10 @@ mod tests {
             block_timestamp: 1_700_000_000,
         };
         assert_eq!(decoded.source_key(), log.dedupe_key());
+        let mut later_interpretation = decoded.clone();
+        later_interpretation.abi_id = hash(0x09);
+        assert_ne!(decoded.dedupe_key(), later_interpretation.dedupe_key());
+        assert_eq!(decoded.source_key(), later_interpretation.source_key());
     }
 
     #[test]
@@ -486,6 +500,7 @@ mod tests {
             name: "Swap".to_owned(),
             address: Address::from([0xd0; 20]),
             protocol: "uniswap_v3".to_owned(),
+            abi_id: hash(0x08),
             selector: hash(0x07),
             signature: "Swap(address,address,int256)".to_owned(),
             anonymous: false,
@@ -562,6 +577,7 @@ mod tests {
                 name: "Swap".to_owned(),
                 address: Address::from([0xd0; 20]),
                 protocol: "uniswap_v3".to_owned(),
+                abi_id: hash(0x08),
                 selector,
                 signature: "Swap(address)".to_owned(),
                 anonymous: false,
@@ -575,7 +591,10 @@ mod tests {
                 block_timestamp: 1_700_000_000,
             }))
             .dedupe_key(),
-            format!("0x{block_hex}:0x{tx_hex}:3:0x{selector_hex}:decoded")
+            format!(
+                "0x{block_hex}:0x{tx_hex}:3:0x{selector_hex}:0x{}:decoded",
+                "08".repeat(32)
+            )
         );
         assert_eq!(
             Event::Reorg(Reorg {
@@ -689,6 +708,7 @@ mod tests {
                 name: "Transfer".to_owned(),
                 address: Address::from([0x22; 20]),
                 protocol: "erc20".to_owned(),
+                abi_id: hash(0x08),
                 selector: hash(0x07),
                 signature: "Transfer(address,address,uint256)".to_owned(),
                 anonymous: false,
@@ -696,13 +716,23 @@ mod tests {
                 transaction_index: 0,
                 log_index: 1,
                 indexed: vec![DecodedArg {
+                    position: 0,
                     name: "from".to_owned(),
+                    abi_type: AbiType {
+                        kind: "address".to_owned(),
+                        components: Vec::new(),
+                    },
                     value: TypedValue::Address {
                         value: Address::from([0x22; 20]),
                     },
                 }],
                 body: vec![DecodedArg {
+                    position: 2,
                     name: "value".to_owned(),
+                    abi_type: AbiType {
+                        kind: "uint256".to_owned(),
+                        components: Vec::new(),
+                    },
                     value: TypedValue::Uint {
                         value: U256::from(1),
                         bits: 256,

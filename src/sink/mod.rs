@@ -86,6 +86,9 @@ pub trait EnvelopeSink: Send {
 /// `std::io`'s own errors each name their cause better than this layer could.
 #[derive(Debug, Error)]
 pub enum SinkError {
+    /// An internal decoding invariant failed; continuing could publish incorrect data.
+    #[error(transparent)]
+    Decode(#[from] crate::decode::DecodeError),
     /// The store this sink writes to has stopped, so the batch cannot be delivered.
     ///
     /// Distinct from a *failed* store: nothing went wrong, the destination is simply

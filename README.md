@@ -61,12 +61,11 @@ envelope
         ├─ no ABI for (chain, address), or no such event ──▶ the log, nothing added
         ├─ ABI matches, data does not decode ──────────────▶ the log, error logged
         └─ decodes ─────────────────────────────────────────▶ the log, then its decoded record
-                                                               register a discovered contract
-                                                               before the next envelope
 ```
 
-A factory's creation log therefore registers its child before that child's own logs are
-read, in the same pass, with no network call: the child's ABI is already loaded.
+One immutable `Decoder` serves live logs and stored-log replay. The registry selects
+an ABI and protocol by `(chain, address, block)` using predefined half-open block ranges.
+There is no factory discovery, network lookup, or runtime registry mutation.
 
 ### A reorg
 
@@ -138,7 +137,7 @@ src/
 ├── wire/           the wire contract: envelope, events, dataset records, and the rows a
 │                   store persists. Pure data.
 ├── ingest/         block sources and the reorg-aware pipeline.
-├── decode/         the stateless ABI decode transform, its registry, and the sink that applies it.
+├── decode/         the immutable log decoder, historical registry, and live decoding sink.
 └── sink/           where envelopes go: the sink trait, the decode→storage channel, the store, stdout.
 ```
 
@@ -168,13 +167,17 @@ that matters most: `decode` must not depend on `ingest`.
   transaction's log in the replacement are different rows, not one row written twice. The
   height is a column, not part of the key, because it is recoverable and a key that
   restates it is saying the same thing twice. See `src/wire/envelope.rs`.
-- **A decode stage.** `src/decode` is a stateless transform over an ABI registry, run
-  inline by `DecodingSink`. It decodes each registered log against the ABI for its
-  `(chain, address)` and stores the decoded record right after the raw log. Everything is
-  forwarded as it arrived — decode adds records and removes none — so a reorg or finality
-  marker reaches the store exactly once, from ingest. It reimplements no ordering or reorg
-  logic, so decoding a log again is safe: the same log gives the same record and the same
-  `dedupe_key`.
+- **A decode stage.** `src/decode::Decoder` prepares ABI layouts once and decodes each
+  registered log against the ABI for its `(chain, address, block)`, inline in
+  `DecodingSink`. Everything is forwarded as it arrived — decode adds records and removes
+  none — so a reorg or finality marker reaches the store exactly once, from ingest.
+  Decoded records carry the ABI content hash, protocol, and each argument's original
+  position and complete ABI schema. Raw byte strings remain lossless, with readable
+  text only when valid UTF-8.
+- **Stored-log replay.** `DuckDbSink::redecode` reads bounded, ordered pages from the raw
+  `log` table using the same decoder. It appends decoded records without changing raw
+  rows or fetching the chain. Repeated runs deliberately append duplicates; it does not
+  filter orphaned logs, apply reorgs, or deduplicate.
 - **A local store.** The process writes every envelope, raw and decoded, into a local
   `DuckDB` database: one typed table per dataset, with real columns rather than a JSON
   blob. What a dataset's columns *are* lives in `src/wire/row.rs`, not in the store, so a
@@ -209,8 +212,8 @@ orphaned rows, or deduplicate replay. A reorg remains a row the store never acts
 Channel acceptance is not a durable storage checkpoint. The work below closes those gaps.
 
 ```
-idempotent writes ─┬─▶ resume from the store ─▶ re-decode stored logs
-                   └─▶ idempotent historical and startup replay
+idempotent writes ─┬─▶ resume from the store
+                   └─▶ idempotent historical, startup, and stored-log replay
 reorg + finality applied in the store
 streaming aggregation: joins and derived calculations
 Avro as the envelope, inside the process and downstream
@@ -277,17 +280,11 @@ Upsert is a *replay* tool, not a reorg tool. A reorg's two branches have differe
 keys by design, so an upsert leaves both rows — which is what the marking rule above
 needs. Reorg handling and idempotent writes are separate pieces of machinery.
 
-### Re-decode from the store
+### Idempotent stored-log replay
 
-A new or corrected ABI should replay stored raw logs, not re-fetch the chain. That
-only works once raw logs are retained and resume exists, so the replay starts from
-rows already on disk.
-
-```
-today     new ABI ──▶ re-fetch blocks from the node ──▶ decode
-
-planned   new ABI ──▶ read raw logs from the store ──▶ decode ──▶ upsert
-```
+Stored-log replay already works without resume or RPC access. What is not built is
+idempotent replacement or deduplication of its decoded rows: replay is append-only today.
+See [Re-decode retained logs](#re-decode-retained-logs) for the runnable command.
 
 ### Streaming aggregation
 
@@ -405,7 +402,7 @@ settings file is deployment topology (endpoints, paths), while the registry is a
 catalog of contracts that grows on its own schedule. Splitting them keeps a new protocol
 from churning the deployment diff.
 
-The registry file holds three lists, all data:
+The registry file holds two lists, all data:
 
 ```toml
 [[abi]]
@@ -414,45 +411,52 @@ path = "abis/uniswap_v3_pool.json"
 
 [[contract]]
 chain = "base"
-address = "0x1F98431c8aD98523631AE4a59f267346ea31F984"   # V3 factory
-abi = "uniswap_v3_factory"
-
-[[discovery]]
-chain = "base"
-address = "0x1F98431c8aD98523631AE4a59f267346ea31F984"   # the V3 factory
-event = "PoolCreated(address,address,uint24,int24,address)"
-child = "pool"           # the decoded argument holding the new pool address
-abi = "uniswap_v3_pool"  # what the child decodes with, and its protocol tag
+address = "0xd0b53D9277642d899DF5C87A3966A349A798F224"
+abi = "uniswap_v3_pool"
+protocol = "uniswap_v3"
+from_block = 0
+# to_block = 60000000     # optional exclusive bound
 ```
 
 **Why an ABI is named once.** A pool protocol like Uniswap V3 has thousands of pools
-sharing one ABI. The ABI is loaded once and shared; an address is a line.
+sharing one ABI. The ABI is loaded and prepared once, content-addressed by `abi_id`,
+and shared; an address is a registration.
 
-**Discovery.** A pool created at runtime is not in the registry file, so it cannot be a
-`[[contract]]`. A rule closes that: when the factory's creation event decodes, the named
-argument holds the child's address, and the child is registered with the named ABI.
-Registration is deterministic — the child's ABI is already loaded, so no network is
-involved — and a factory emits its creation event before the child emits anything, so a
-sequential pass registers a child before its first log.
+**Historical registrations.** `protocol` is required; `from_block` defaults to zero.
+An omitted `to_block` means no upper bound. Disjoint ranges for one `(chain, address)` support proxy
+upgrades: a historical log always uses its original block's registration. Overlapping
+ranges, invalid bounds, dangling ABI names, and malformed addresses are startup errors.
+ABI paths resolve relative to the registry file, not the working directory.
 
-A protocol that does not put its pools at an address needs no rule: **Uniswap V4's
-`PoolManager` is a single `[[contract]]`**, because a V4 pool is a `bytes32` id (`keccak256`
-of the `PoolKey`), not a deployed contract. The `Initialize` record it emits *is* the pool's
-metadata.
+Registrations are predefined and immutable. Factories do not discover or register child
+contracts during decoding; add each child's registration explicitly. Uniswap V4's
+`PoolManager` is one address registration because logical pools are `bytes32` ids,
+not deployed contracts.
 
-Every decoded record carries `protocol` — the ABI's name — so a consumer can group rows
-without knowing any address.
+Every decoded record carries the registration's explicit `protocol` and the ABI's
+content identity. The protocol is not inferred from an ABI filename.
 
-Two entries claiming one address, a dangling ABI name, a malformed address, and a rule for
-an event its factory's ABI does not declare are each a startup error rather than a silent
-no-op: a registry that decodes less than it was told to looks like a quiet chain.
+### Re-decode retained logs
 
-ABI paths resolve relative to the registry file, not the working directory, so the file
-and its `abis/` directory move together.
+Stop the live writer, then run the example against its retained database:
 
-One ABI per address applies at every height. A proxy that upgrades changes its ABI at a
-height, which this cannot express — the `AbiRegistry` seam is what a table-backed
-registry keyed by `(chain, address, block_range)` replaces.
+```bash
+cargo run --example redecode_logs -- \
+  registry.toml indexer.duckdb base 0xd0b53D9277642d899DF5C87A3966A349A798F224 \
+  50000000 60000000
+```
+
+Arguments are `REGISTRY DB CHAIN ADDRESS FROM_BLOCK [TO_BLOCK_EXCLUSIVE]`; omit the
+last argument for an unbounded upper range. No node or network is needed. The command
+prints the number of decoded rows appended and warns with log identity when raw bytes
+do not match their ABI. Internal decoder or database failures stop replay; pages already
+appended remain stored.
+
+`DuckDbSink::redecode` reads up to 500 typed raw logs per page, ordered by block,
+transaction index, log index, and hash identity. It appends only new decoded rows. Raw
+rows and control markers are untouched, removed/orphaned logs are not filtered, and
+repeated runs append duplicates rather than upsert. The same immutable `Decoder` drives
+this operation and live ingestion.
 
 ### What decode does not do
 
@@ -460,7 +464,7 @@ registry keyed by `(chain, address, block_range)` replaces.
 argument's name and its typed value, straight off the ABI:
 
 ```json
-{"name": "amount0", "value": {"type": "int", "value": "-3180585820646654", "bits": 256}}
+{"name": "amount0", "position": 2, "abi_type": {"kind": "int256"}, "value": {"type": "int", "value": "-3180585820646654", "bits": 256}}
 ```
 
 Turning that into a `dex.trades` row needs three things the decoder does not have:
@@ -570,7 +574,7 @@ cargo run --example decode_logs
 ```
 
 Decodes two real Uniswap V3 swap logs captured from a Base pool, using the same
-`Transform` the decode layer runs. No arguments and no network: the capture and the ABI
+`Decoder` the decode layer runs. No arguments and no network: the capture and the ABI
 are embedded, and each input is printed as its decoded record — which is what the
 pipeline stores beside the raw log.
 

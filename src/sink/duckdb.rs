@@ -38,14 +38,16 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-use duckdb::Connection;
+use alloy_primitives::Address;
 use duckdb::types::{ToSql, Value};
-use serde::Deserialize;
+use duckdb::{Connection, params};
+use serde::{Deserialize, de::DeserializeOwned};
 use thiserror::Error;
-use tracing::info;
+use tracing::{info, warn};
 
+use crate::decode::{DecodeError, Decoder};
 use crate::sink::{EnvelopeSink, SinkError};
-use crate::wire::envelope::Envelope;
+use crate::wire::envelope::{ChainId, Envelope, Event, Log};
 use crate::wire::row::{ColumnType, ColumnValue, Row, Table, row_for};
 /// The `DuckDB` file written when the settings name no path.
 const DEFAULT_PATH: &str = "indexer.duckdb";
@@ -228,6 +230,153 @@ impl DuckDbSink {
             batches: Batches::default(),
         })
     }
+
+    /// Decodes stored raw logs for one address in `[from_block, to_block)`.
+    ///
+    /// Reads at most 500 logs at a time in chain order, including removed and orphaned
+    /// logs. Only decoded rows are appended: raw rows, markers, and buffered live rows
+    /// are untouched. Repeating this operation deliberately appends duplicates.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed error for database failures, malformed stored fields, or an
+    /// internal decoder failure. Bad log bytes are warned and skipped. Already appended
+    /// pages remain stored if a later page fails; this operation is not atomic.
+    pub fn redecode(
+        &mut self,
+        decoder: &Decoder,
+        chain: &ChainId,
+        address: Address,
+        from_block: u64,
+        to_block: Option<u64>,
+    ) -> Result<u64, ReplayError> {
+        let address = format!("{address:#x}");
+        let mut cursor = (0_u64, 0_u64, 0_u64, String::new(), String::new(), 0_i64);
+        let mut started = false;
+        let mut appended = 0;
+        loop {
+            let page = {
+                let mut statement = self.connection.prepare(
+                    "SELECT log_index, transaction_hash, transaction_index, address,
+                            topic0, topic1, topic2, topic3, data, removed,
+                            block_number, block_hash, block_timestamp, rowid
+                     FROM log
+                     WHERE chain = ? AND address = ? AND block_number >= ?
+                       AND (? IS NULL OR block_number < ?)
+                       AND (NOT ? OR
+                            (block_number, transaction_index, log_index, block_hash,
+                             transaction_hash, rowid) > (?, ?, ?, ?, ?, ?))
+                     ORDER BY block_number, transaction_index, log_index, block_hash,
+                              transaction_hash, rowid
+                     LIMIT 500",
+                )?;
+                let mut rows = statement.query(params![
+                    chain.as_str(),
+                    address,
+                    from_block,
+                    to_block,
+                    to_block,
+                    started,
+                    cursor.0,
+                    cursor.1,
+                    cursor.2,
+                    cursor.3,
+                    cursor.4,
+                    cursor.5,
+                ])?;
+                let mut page = Vec::with_capacity(500);
+                while let Some(row) = rows.next()? {
+                    cursor = (
+                        row.get(10)?,
+                        row.get(2)?,
+                        row.get(0)?,
+                        row.get(11)?,
+                        row.get(1)?,
+                        row.get(13)?,
+                    );
+                    page.push(Log {
+                        log_index: row.get(0)?,
+                        transaction_hash: read_hex_column(row, "transaction_hash")?,
+                        transaction_index: row.get(2)?,
+                        address: read_hex_column(row, "address")?,
+                        topic0: read_hex_column(row, "topic0")?,
+                        topic1: read_hex_column(row, "topic1")?,
+                        topic2: read_hex_column(row, "topic2")?,
+                        topic3: read_hex_column(row, "topic3")?,
+                        data: read_hex_column(row, "data")?,
+                        removed: row.get(9)?,
+                        block_number: row.get(10)?,
+                        block_hash: read_hex_column(row, "block_hash")?,
+                        block_timestamp: row.get(12)?,
+                    });
+                }
+                page
+            };
+            if page.is_empty() {
+                return Ok(appended);
+            }
+            started = true;
+            let mut decoded_rows = Batches::default();
+            for log in page {
+                match decoder.decode(chain, &log) {
+                    Ok(Some(record)) => {
+                        decoded_rows.push(row_for(chain, &Event::Decoded(Box::new(record))));
+                    }
+                    Ok(None) => {}
+                    Err(
+                        error @ (DecodeError::Log(_)
+                        | DecodeError::TopicGap
+                        | DecodeError::Value { .. }),
+                    ) => {
+                        warn!(%chain, %address, block_number = log.block_number,
+                            block_hash = %log.block_hash,
+                            transaction_hash = %log.transaction_hash,
+                            log_index = log.log_index, abi_id = ?decoder.abi_id(chain, &log),
+                            selector = ?log.topic0, %error, "stored log decode failed");
+                    }
+                    Err(error) => return Err(error.into()),
+                }
+            }
+            let count = u64::try_from(decoded_rows.len())?;
+            decoded_rows.append_to(&self.connection)?;
+            appended += count;
+        }
+    }
+}
+
+/// Why stored-log replay could not continue.
+#[derive(Debug, Error)]
+pub enum ReplayError {
+    /// Reading the raw log table failed.
+    #[error("read stored logs: {0}")]
+    Read(#[from] duckdb::Error),
+    /// A stored hex field did not match its wire type.
+    #[error("invalid stored log field {column}: {source}")]
+    Field {
+        /// The malformed column.
+        column: &'static str,
+        /// The wire parser's reason.
+        source: serde_json::Error,
+    },
+    /// Appending a decoded page failed.
+    #[error(transparent)]
+    Store(#[from] StoreError),
+    /// An internal decoder invariant failed rather than malformed log bytes.
+    #[error(transparent)]
+    Decode(#[from] DecodeError),
+    /// A page's row count did not fit the returned counter.
+    #[error("decoded page count overflow: {0}")]
+    Count(#[from] std::num::TryFromIntError),
+}
+
+/// Reads hex strings (including nullable topics) through the wire types' parsers.
+fn read_hex_column<T: DeserializeOwned>(
+    row: &duckdb::Row<'_>,
+    column: &'static str,
+) -> Result<T, ReplayError> {
+    let value: Option<String> = row.get(column)?;
+    serde_json::from_value(value.map_or(serde_json::Value::Null, serde_json::Value::String))
+        .map_err(|source| ReplayError::Field { column, source })
 }
 
 impl EnvelopeSink for DuckDbSink {
@@ -497,6 +646,154 @@ mod tests {
             sink.publish(envelope).await.expect("row buffers");
         }
         sink.flush().await.expect("batch flushes");
+    }
+
+    fn historical_replay_setup() -> (crate::decode::Decoder, Box<Log>, u64) {
+        use crate::decode::Decoder;
+        use crate::decode::{AbiEntry, ContractEntry, ContractRegistry, RegistryConfig};
+
+        let fixture: Envelope = serde_json::from_str(
+            include_str!("../../examples/fixtures/uniswap_v3_swaps.ndjson")
+                .lines()
+                .next()
+                .expect("one fixture log"),
+        )
+        .expect("valid fixture envelope");
+        let Event::Log(template) = fixture.event else {
+            panic!("fixture is a log");
+        };
+        // Exercise UBIGINT reads above the signed range and more than one replay page.
+        let start = u64::MAX - 1_000;
+        let registry = ContractRegistry::load(
+            &RegistryConfig {
+                abi: vec![AbiEntry {
+                    name: "pool".to_owned(),
+                    path: concat!(env!("CARGO_MANIFEST_DIR"), "/abis/uniswap_v3_pool.json").into(),
+                }],
+                contract: vec![
+                    ContractEntry {
+                        chain: "base".to_owned(),
+                        address: format!("{:#x}", template.address),
+                        abi: "pool".to_owned(),
+                        protocol: "before_upgrade".to_owned(),
+                        from_block: start + 1,
+                        to_block: Some(start + 251),
+                    },
+                    ContractEntry {
+                        chain: "base".to_owned(),
+                        address: format!("{:#x}", template.address),
+                        abi: "pool".to_owned(),
+                        protocol: "after_upgrade".to_owned(),
+                        from_block: start + 251,
+                        to_block: Some(start + 502),
+                    },
+                ],
+            },
+            ".",
+        )
+        .expect("historical registrations load");
+        (Decoder::new(registry), template, start)
+    }
+
+    #[tokio::test]
+    async fn stored_replay_appends_pages_and_duplicates_using_historical_registrations() {
+        let (decoder, template, start) = historical_replay_setup();
+        let mut sink = sink();
+        for offset in 0..503_u64 {
+            let mut log = (*template).clone();
+            log.block_number = start + offset;
+            log.transaction_index = u64::MAX;
+            log.log_index = u64::MAX;
+            log.removed = offset == 1;
+            let envelope = Envelope::new(chain(), Event::Log(Box::new(log)));
+            sink.publish(envelope.clone())
+                .await
+                .expect("buffer raw log");
+            if offset == 500 {
+                // Exact raw duplicates must not disappear at a keyset page boundary.
+                sink.publish(envelope)
+                    .await
+                    .expect("buffer duplicate raw log");
+            }
+        }
+        let mut malformed = (*template).clone();
+        malformed.block_number = start + 300;
+        malformed.data = alloy_primitives::Bytes::new();
+        sink.publish(Envelope::new(chain(), Event::Log(Box::new(malformed))))
+            .await
+            .expect("buffer malformed log");
+        sink.flush().await.expect("store raw logs");
+        let raw_rows = |sink: &DuckDbSink| {
+            sink.connection
+                .prepare("SELECT CAST(to_json(log) AS VARCHAR) FROM log ORDER BY rowid")
+                .expect("prepare raw snapshot")
+                .query_map([], |row| row.get::<_, String>(0))
+                .expect("query raw snapshot")
+                .collect::<Result<Vec<_>, _>>()
+                .expect("read raw snapshot")
+        };
+        let before = raw_rows(&sink);
+        for run in 1..=2_i64 {
+            assert_eq!(
+                sink.redecode(
+                    &decoder,
+                    &chain(),
+                    template.address,
+                    start + 1,
+                    Some(start + 502)
+                )
+                .expect("replay raw logs"),
+                502
+            );
+            assert_eq!(row_count(&sink, "decoded"), 502 * run);
+            let protocols: (i64, i64) = sink
+                .connection
+                .query_row(
+                    "SELECT count(*) FILTER (WHERE protocol = 'before_upgrade'),
+                        count(*) FILTER (WHERE protocol = 'after_upgrade') FROM decoded",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .expect("historical protocol counts");
+            assert_eq!(protocols, (250 * run, 252 * run));
+            assert_eq!(
+                raw_rows(&sink),
+                before,
+                "replay does not modify raw records"
+            );
+        }
+        assert_eq!(
+            sink.redecode(
+                &decoder,
+                &ChainId::new("ethereum"),
+                template.address,
+                start,
+                None
+            )
+            .expect("other chain"),
+            0
+        );
+        assert_eq!(
+            sink.redecode(&decoder, &chain(), Address::ZERO, start, None)
+                .expect("other address"),
+            0
+        );
+        assert_eq!(
+            sink.redecode(&decoder, &chain(), template.address, start + 502, None)
+                .expect("unregistered historical blocks"),
+            0
+        );
+        assert_eq!(
+            sink.redecode(
+                &decoder,
+                &chain(),
+                template.address,
+                start + 2,
+                Some(start + 2)
+            )
+            .expect("empty range"),
+            0
+        );
     }
 
     /// One event lands in its own table, and nowhere else. The point of dropping the

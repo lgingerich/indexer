@@ -155,7 +155,7 @@ pub enum Sink {
 ///
 /// A table, not an `Option`, because decode always runs: an absent `registry` means an
 /// empty registry and nothing is decoded, which is a legitimate way to run and is said at
-/// startup rather than being silent. See [`crate::decode::registry`] for the file's shape.
+/// startup rather than being silent. See [`crate::decode::RegistryConfig`] for the file's shape.
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct DecodeSettings {

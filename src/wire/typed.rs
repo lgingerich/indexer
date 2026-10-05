@@ -1,10 +1,10 @@
 //! A decoded ABI value: a Solidity value with its type kept.
 //!
 //! Decoding a log is only useful if the result is typed, so [`TypedValue`] is the
-//! published form of one decoded argument: the value plus the ABI type that gives it
-//! meaning. It is structurally the same information a decoder's own value carries,
-//! but expressed here in plain serde terms rather than depending on that decoder's
-//! type — so the published shape does not move when the decoder changes.
+//! published value of one decoded argument. [`AbiType`] separately preserves the
+//! declared type, even for empty arrays and opaque indexed hashes. The published
+//! shape uses plain serde types rather than a decoder's dynamic value model, so it
+//! does not move when the decoder changes.
 //!
 //! # Why widths are carried
 //!
@@ -28,15 +28,65 @@
 //! they are our own metadata and not a chain field — the same treatment
 //! [`SCHEMA_VERSION`](crate::wire::envelope::SCHEMA_VERSION) gets.
 
-use alloy_primitives::{Address, Bytes, I256, U256};
+use alloy_json_abi::{EventParam, Param};
+use alloy_primitives::{Address, B256, Bytes, Function, I256, U256};
 use serde::{Deserialize, Serialize};
+
+/// A declared ABI type, independent of whether its decoded value has elements.
+///
+/// Tuple arrays retain their array suffixes in `kind` and describe their tuple
+/// components recursively, including component names.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AbiType {
+    /// Canonical Solidity spelling from the ABI, for example `uint256[]` or `tuple[2][]`.
+    pub kind: String,
+    /// Tuple components in ABI order; empty for non-tuple types.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub components: Vec<AbiComponent>,
+}
+
+/// One named component of an ABI tuple.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AbiComponent {
+    /// The ABI component name, which may be empty.
+    pub name: String,
+    /// The component's declared type, including any nested tuple components.
+    pub abi_type: AbiType,
+}
+
+impl From<&EventParam> for AbiType {
+    fn from(param: &EventParam) -> Self {
+        Self {
+            kind: param.ty.clone(),
+            components: param.components.iter().map(AbiComponent::from).collect(),
+        }
+    }
+}
+
+impl From<&Param> for AbiType {
+    fn from(param: &Param) -> Self {
+        Self {
+            kind: param.ty.clone(),
+            components: param.components.iter().map(AbiComponent::from).collect(),
+        }
+    }
+}
+
+impl From<&Param> for AbiComponent {
+    fn from(param: &Param) -> Self {
+        Self {
+            name: param.name.clone(),
+            abi_type: AbiType::from(param),
+        }
+    }
+}
 
 /// One decoded ABI value, tagged by its Solidity type.
 ///
 /// A value is always an object with a `type` tag and a `value`, plus the width or
 /// size where the type has one. The variants mirror Solidity's type system rather
-/// than the ABI's encoding, so a consumer can rebuild a typed column from a value
-/// without reading the ABI itself.
+/// than the ABI's encoding. The argument's [`AbiType`] supplies array element types
+/// and tuple component names that a value alone cannot preserve.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum TypedValue {
@@ -76,13 +126,24 @@ pub enum TypedValue {
         /// The value.
         value: Bytes,
     },
-    /// A UTF-8 string. Solidity does not enforce the encoding, so a value that is
-    /// not valid UTF-8 does not survive decoding as one.
+    /// A Solidity string, whose bytes need not be valid UTF-8.
     String {
-        /// The value.
-        value: String,
+        /// The original bytes, preserved losslessly.
+        value: Bytes,
+        /// The UTF-8 text when the original bytes are valid UTF-8; otherwise `None`.
+        text: Option<String>,
     },
-    /// A dynamically-sized array.
+    /// An indexed dynamic or compound argument's opaque topic hash, not its value.
+    IndexedHash {
+        /// The hash carried in the log's topic.
+        value: B256,
+    },
+    /// An external function pointer: a 20-byte address followed by a 4-byte selector.
+    Function {
+        /// The 24-byte function pointer.
+        value: Function,
+    },
+    /// A dynamically-sized array; its declared element type lives in [`AbiType`].
     Array {
         /// The elements, in order.
         value: Vec<Self>,
@@ -92,13 +153,12 @@ pub enum TypedValue {
         /// The elements, in order.
         value: Vec<Self>,
         /// The declared length, which is always the length of `value`.
-        size: u16,
+        size: usize,
     },
     /// A tuple, or a struct, which is a tuple with named components.
     ///
-    /// Component names are not carried: an ABI event's tuple components are
-    /// positional, and the named form only arises from EIP-712 typed data, which
-    /// this pipeline does not decode.
+    /// Component names and declared types live in the argument's [`AbiType`];
+    /// this value carries the components in the same positional order.
     Tuple {
         /// The components, in order.
         value: Vec<Self>,
@@ -111,12 +171,91 @@ pub enum TypedValue {
 // means the fixture or setup is wrong.
 #[expect(clippy::expect_used)]
 mod tests {
-    use alloy_primitives::{Address, Bytes, I256, U256};
+    use alloy_json_abi::EventParam;
+    use alloy_primitives::{Address, B256, Bytes, Function, I256, U256};
 
-    use super::TypedValue;
+    use crate::wire::datasets::evm::DecodedArg;
+
+    use super::{AbiType, TypedValue};
 
     fn address(byte: u8) -> Address {
         Address::from([byte; 20])
+    }
+
+    #[test]
+    fn an_empty_array_preserves_its_recursive_declared_schema() {
+        let param: EventParam = serde_json::from_str(
+            r#"{"name":"items","type":"tuple[2][]","indexed":false,"components":[
+                {"name":"children","type":"tuple[]","components":[
+                    {"name":"amount","type":"uint256"}
+                ]}
+            ]}"#,
+        )
+        .expect("tuple array ABI parses");
+        let argument = DecodedArg {
+            position: 3,
+            name: param.name.clone(),
+            abi_type: AbiType::from(&param),
+            value: TypedValue::Array { value: Vec::new() },
+        };
+        let encoded = serde_json::to_value(&argument).expect("argument serializes");
+        assert_eq!(encoded["position"], 3);
+        assert_eq!(encoded["abi_type"]["kind"], "tuple[2][]");
+        let child = &encoded["abi_type"]["components"][0];
+        assert_eq!(child["name"], "children");
+        assert_eq!(child["abi_type"]["kind"], "tuple[]");
+        let amount = &child["abi_type"]["components"][0];
+        assert_eq!(amount["name"], "amount");
+        assert_eq!(amount["abi_type"], serde_json::json!({"kind": "uint256"}));
+        assert_eq!(encoded["value"]["value"], serde_json::json!([]));
+        assert_eq!(
+            serde_json::from_value::<DecodedArg>(encoded).expect("argument deserializes"),
+            argument
+        );
+    }
+
+    #[test]
+    fn an_indexed_hash_is_distinct_from_decoded_fixed_bytes() {
+        let value = TypedValue::IndexedHash {
+            value: B256::repeat_byte(0x11),
+        };
+        assert_eq!(
+            serde_json::to_value(&value).expect("hash serializes"),
+            serde_json::json!({"type": "indexed_hash", "value": format!("0x{}", "11".repeat(32))})
+        );
+    }
+
+    #[test]
+    fn invalid_utf8_string_bytes_round_trip_without_replacement() {
+        let value = TypedValue::String {
+            value: Bytes::from_static(&[0xff, 0x00, 0x80]),
+            text: None,
+        };
+        let encoded = serde_json::to_string(&value).expect("string serializes");
+        assert_eq!(
+            encoded,
+            r#"{"type":"string","value":"0xff0080","text":null}"#
+        );
+        assert_eq!(
+            serde_json::from_str::<TypedValue>(&encoded).expect("string deserializes"),
+            value
+        );
+    }
+
+    #[test]
+    fn a_function_pointer_keeps_all_twenty_four_bytes() {
+        let value = TypedValue::Function {
+            value: Function::from([0x22; 24]),
+        };
+        let encoded = serde_json::to_value(&value).expect("function serializes");
+        assert_eq!(
+            encoded,
+            serde_json::json!({"type": "function", "value": format!("0x{}", "22".repeat(24))})
+        );
+        assert_eq!(
+            serde_json::from_value::<TypedValue>(encoded).expect("function deserializes"),
+            value
+        );
     }
 
     /// The round trip a value takes through a sink and back. The derive makes this
@@ -146,7 +285,14 @@ mod tests {
                 value: Bytes::from_static(&[0x01, 0x02]),
             },
             TypedValue::String {
-                value: "hello".to_owned(),
+                value: Bytes::from_static(b"hello"),
+                text: Some("hello".to_owned()),
+            },
+            TypedValue::IndexedHash {
+                value: B256::repeat_byte(0x11),
+            },
+            TypedValue::Function {
+                value: Function::from([0x22; 24]),
             },
             TypedValue::Array {
                 value: vec![TypedValue::Bool { value: false }],
@@ -165,7 +311,8 @@ mod tests {
                     },
                     TypedValue::Array {
                         value: vec![TypedValue::String {
-                            value: "nested".to_owned(),
+                            value: Bytes::from_static(b"nested"),
+                            text: Some("nested".to_owned()),
                         }],
                     },
                 ],

@@ -1,672 +1,532 @@
-//! One contract's ABI, and decoding a log against it.
-//!
-//! [`Abi`] owns a parsed ABI indexed by event selector, and turns a log's topics and
-//! data into a [`DecodedEvent`]: the event's name and its named, typed arguments. It
-//! knows nothing about the wire — no chain, no block, no envelope — so the same decoder
-//! drives the pipeline, a batch, or a test.
-//!
-//! # The value model boundary
-//!
-//! Decoding yields alloy's own value types, which cannot be published: they carry no
-//! serde impls, and depending on them would tie the wire format to one decoder. So the
-//! conversion to the wire's [`TypedValue`] is explicit and lives here, the only place in
-//! the crate that knows alloy's dynamic value model. It is total for every variant a
-//! decoded log can produce, and lossless in the direction that matters: re-encoding the
-//! converted value reproduces the bytes that were decoded. A Solidity `function` is the
-//! one type the wire shape does not carry, and it is a decode failure rather than a
-//! silent mangling.
+//! Prepared event ABIs and schema-aware value conversion.
 
 use std::collections::BTreeMap;
 
-use alloy_dyn_abi::{DynSolValue, EventExt as _};
+use alloy_dyn_abi::{DynSolEvent, DynSolType, DynSolValue, Specifier as _};
 use alloy_json_abi::{Event, JsonAbi};
-use alloy_primitives::{B256, Bytes};
+use alloy_primitives::{B256, Bytes, keccak256};
 use thiserror::Error;
 
 use crate::wire::datasets::evm::Log;
 use crate::wire::envelope::DecodedArg;
-use crate::wire::typed::TypedValue;
+use crate::wire::typed::{AbiType, TypedValue};
 
-/// One decoded event: its name and its named, typed arguments.
-///
-/// The decoder's whole output. It carries no chain, block, or transaction — those are
-/// the raw log's, and [`Transform`](crate::decode::Transform) stamps them on when it
-/// assembles the published record.
+/// A decoded event without chain or transaction metadata.
 #[derive(Debug)]
 pub struct DecodedEvent {
-    /// The event name from the ABI, for example `Transfer`.
+    /// ABI event name.
     pub name: String,
-    /// The event selector, `keccak256` of its signature.
+    /// Event signature hash.
     pub selector: B256,
-    /// The event's human-readable signature, for example
-    /// `Transfer(address,address,uint256)`.
+    /// Canonical event signature.
     pub signature: String,
-    /// Whether the ABI declares this event anonymous.
-    pub anonymous: bool,
-    /// The indexed arguments, in ABI order, each carrying its name.
+    /// Indexed arguments with their original positions and declared schemas.
     pub indexed: Vec<DecodedArg>,
-    /// The non-indexed arguments, in ABI order, each carrying its name.
+    /// Non-indexed arguments with their original positions and declared schemas.
     pub body: Vec<DecodedArg>,
 }
 
-/// One loaded contract ABI, able to decode a log against its events.
-///
-/// Indexed by selector at load, because the lookup path must not do I/O and must not
-/// scan: a registry that reads a file, or walks the events, per log is a registry that
-/// stalls the pipeline under load.
+#[derive(Debug, Clone)]
+struct Argument {
+    name: String,
+    position: usize,
+    schema: AbiType,
+    ty: DynSolType,
+}
+
+#[derive(Debug, Clone)]
+struct PreparedEvent {
+    name: String,
+    signature: String,
+    layout: DynSolEvent,
+    indexed: Vec<Argument>,
+    body: Vec<Argument>,
+}
+
+/// Immutable ABI, validated and prepared once before processing logs.
 #[derive(Debug, Clone)]
 pub struct Abi {
-    /// Selector to event, built once so the per-log lookup is a map hit rather than a
-    /// linear scan over the ABI's events.
-    by_selector: BTreeMap<B256, Event>,
+    id: B256,
+    events: BTreeMap<B256, PreparedEvent>,
 }
 
 impl Abi {
-    /// Loads an ABI from its JSON form.
+    /// Parses and prepares all events. Anonymous events are explicitly unsupported.
     ///
     /// # Errors
-    ///
-    /// Returns [`DecodeError::Abi`] if the JSON is not a valid ABI.
-    pub fn from_json(json: &str) -> Result<Self, DecodeError> {
-        let abi: JsonAbi = serde_json::from_str(json).map_err(|error| DecodeError::Abi {
-            detail: error.to_string(),
-        })?;
-        Ok(Self::from(&abi))
+    /// Returns a typed parse/layout error or rejects anonymous and ambiguous events.
+    pub fn from_json(json: &str) -> Result<Self, AbiError> {
+        let abi: JsonAbi = serde_json::from_str(json)?;
+        let mut events = BTreeMap::new();
+        for (event_index, event) in abi.events().enumerate() {
+            if event.anonymous {
+                return Err(AbiError::Anonymous {
+                    event: event.name.clone(),
+                });
+            }
+            let selector = event.selector();
+            let prepared = PreparedEvent::new(event).map_err(|source| AbiError::Layout {
+                event_index,
+                source,
+            })?;
+            if events.insert(selector, prepared).is_some() {
+                return Err(AbiError::DuplicateSelector { selector });
+            }
+        }
+        // Content identity intentionally includes the complete parsed ABI, not its file name.
+        let id = keccak256(serde_json::to_vec(&abi)?);
+        Ok(Self { id, events })
     }
 
-    /// The selector of the event whose signature is `signature`, or `None` if this ABI
-    /// declares no such event.
-    ///
-    /// A discovery rule names its creation event by signature — the form an ABI writes,
-    /// for example `PoolCreated(address,address,uint24,int24,address)` — and this is how
-    /// the rule is resolved to the selector the map is keyed by. The rule is checked
-    /// against the factory's ABI at load, so a rule for an event the factory cannot emit
-    /// is a startup error rather than a rule that silently never fires.
+    /// Content identity of the parsed ABI.
+    #[must_use]
+    pub const fn id(&self) -> B256 {
+        self.id
+    }
+
+    /// Finds a declared event by canonical signature.
     #[must_use]
     pub fn selector(&self, signature: &str) -> Option<B256> {
-        self.by_selector
-            .values()
-            .find(|event| event.signature() == signature)
-            .map(Event::selector)
+        self.events
+            .iter()
+            .find_map(|(selector, event)| (event.signature == signature).then_some(*selector))
     }
 
-    /// Whether the event with `signature` declares an `address` argument named `name`.
-    ///
-    /// A discovery rule names the argument holding a new child's address, so the rule is
-    /// checked here at load: a name the event does not declare, or one that is not an
-    /// `address`, is a rule that could never fire, and refusing it while the registry is
-    /// built beats finding out later as a protocol that quietly stopped decoding. A
-    /// tuple is not an `address` however it is spelled, so a rule cannot name one.
-    #[must_use]
-    pub fn declares_address_arg(&self, signature: &str, name: &str) -> bool {
-        self.by_selector
-            .values()
-            .find(|event| event.signature() == signature)
-            .is_some_and(|event| {
-                event
-                    .inputs
-                    .iter()
-                    .any(|input| input.name == name && input.ty == "address")
-            })
-    }
-
-    /// Decodes a log into a [`DecodedEvent`], if this ABI declares the log's event.
-    ///
-    /// Returns `Ok(None)` when no event in the ABI has the log's selector. That is a
-    /// normal miss, not an error: a contract emits events outside any ABI the consumer
-    /// cares about, and the caller drops the log.
+    /// Decodes a raw log; unknown selectors are ordinary misses.
     ///
     /// # Errors
-    ///
-    /// Returns [`DecodeError::Decode`] when an event *did* match and its data does not
-    /// decode against it. That is worth surfacing rather than skipping: a mismatch
-    /// usually means the ABI is the wrong version for this height, and silently dropping
-    /// the log would hide exactly that.
+    /// Reports malformed topics, layout mismatches, and invalid decoded values.
     pub fn decode_log(&self, log: &Log) -> Result<Option<DecodedEvent>, DecodeError> {
-        // The wire flattens topics into `topic0..topic3`, so they are packed back into
-        // the contiguous list the decoder expects. Topics are contiguous from `topic0`
-        // by construction, so the first gap ends the list.
-        let mut flattened = [log.topic0, log.topic1, log.topic2, log.topic3];
-        let topics: Vec<B256> = flattened.iter_mut().map_while(Option::take).collect();
-        let Some(selector) = topics.first().copied() else {
+        let flattened = [log.topic0, log.topic1, log.topic2, log.topic3];
+        let mut topics = Vec::with_capacity(4);
+        let mut gap = false;
+        for topic in flattened {
+            match topic {
+                Some(topic) if !gap => topics.push(topic),
+                Some(_) => return Err(DecodeError::TopicGap),
+                None => gap = true,
+            }
+        }
+        let Some(selector) = topics.first() else {
             return Ok(None);
         };
-        let Some(event) = self.by_selector.get(&selector) else {
+        let Some(event) = self.events.get(selector) else {
             return Ok(None);
         };
-
         let decoded = event
+            .layout
             .decode_log_parts(topics.iter().copied(), &log.data)
-            .map_err(|error| DecodeError::Decode {
-                selector,
-                detail: error.to_string(),
-            })?;
-
-        // `decode_log_parts` splits the event's inputs into indexed and non-indexed
-        // exactly as the ABI declares them, so the names come from the same split.
-        let (indexed_params, body_params): (Vec<_>, Vec<_>) =
-            event.inputs.iter().partition(|param| param.indexed);
-
+            .map_err(DecodeError::Log)?;
         Ok(Some(DecodedEvent {
             name: event.name.clone(),
-            selector,
-            signature: event.signature(),
-            anonymous: event.anonymous,
-            indexed: typed_args(&indexed_params, &decoded.indexed)?,
-            body: typed_args(&body_params, &decoded.body)?,
+            selector: *selector,
+            signature: event.signature.clone(),
+            indexed: arguments(&event.indexed, &decoded.indexed, true)?,
+            body: arguments(&event.body, &decoded.body, false)?,
         }))
     }
 }
 
-/// Indexes an already-parsed ABI by event selector.
-///
-/// Anonymous events are excluded: they carry no selector in `topic0`, so they cannot
-/// be found by one, and pretending otherwise would match the wrong event on an
-/// unrelated log.
-impl From<&JsonAbi> for Abi {
-    fn from(abi: &JsonAbi) -> Self {
-        let by_selector = abi
-            .events()
-            .filter(|event| !event.anonymous)
-            .map(|event| (event.selector(), event.clone()))
-            .collect();
-        Self { by_selector }
+impl PreparedEvent {
+    fn new(event: &Event) -> Result<Self, alloy_dyn_abi::Error> {
+        let resolved = event.resolve()?;
+        let mut indexed = Vec::new();
+        let mut body = Vec::new();
+        for (position, param) in event.inputs.iter().enumerate() {
+            let ty = param.resolve()?;
+            let argument = Argument {
+                name: param.name.clone(),
+                position,
+                schema: AbiType::from(param),
+                ty,
+            };
+            if param.indexed {
+                indexed.push(argument);
+            } else {
+                body.push(argument);
+            }
+        }
+        let layout = DynSolEvent::new(
+            resolved.topic_0(),
+            resolved.indexed().iter().map(decoding_type).collect(),
+            DynSolType::Tuple(resolved.body().iter().map(decoding_type).collect()),
+        )
+        .ok_or_else(|| alloy_dyn_abi::Error::custom("prepared event layout is invalid"))?;
+        Ok(Self {
+            name: event.name.clone(),
+            signature: event.signature(),
+            layout,
+            indexed,
+            body,
+        })
     }
 }
 
-/// Converts decoded values to named arguments, pairing each with its ABI parameter.
-///
-/// The decoder returns values in ABI order with no names, so the names come from the
-/// event's own input list — the same split the decoder used. A length mismatch means the
-/// decoder disagreed with the ABI about its own shape, which is a bug rather than bad
-/// input, so it is an error rather than a truncation.
-fn typed_args(
-    params: &[&alloy_json_abi::EventParam],
+// Solidity string and bytes have the same ABI layout. Decode strings as bytes so Alloy's
+// lossy UTF-8 conversion cannot alter data; the original schema drives conversion below.
+fn decoding_type(ty: &DynSolType) -> DynSolType {
+    match ty {
+        DynSolType::String => DynSolType::Bytes,
+        // Decode words without coercing malformed booleans or truncating addresses.
+        DynSolType::Bool | DynSolType::Address => DynSolType::Uint(256),
+        DynSolType::Array(inner) => DynSolType::Array(Box::new(decoding_type(inner))),
+        DynSolType::FixedArray(inner, size) => {
+            DynSolType::FixedArray(Box::new(decoding_type(inner)), *size)
+        }
+        DynSolType::Tuple(types) => DynSolType::Tuple(types.iter().map(decoding_type).collect()),
+        _ => ty.clone(),
+    }
+}
+
+fn hashed(ty: &DynSolType) -> bool {
+    matches!(
+        ty,
+        DynSolType::String
+            | DynSolType::Bytes
+            | DynSolType::Array(_)
+            | DynSolType::FixedArray(_, _)
+            | DynSolType::Tuple(_)
+    )
+}
+
+fn arguments(
+    params: &[Argument],
     values: &[DynSolValue],
+    indexed: bool,
 ) -> Result<Vec<DecodedArg>, DecodeError> {
     if params.len() != values.len() {
-        return Err(DecodeError::Shape {
-            decoded: values.len(),
-            declared: params.len(),
-        });
+        return Err(DecodeError::Shape);
     }
     params
         .iter()
         .zip(values)
         .map(|(param, value)| {
+            let value = if indexed && hashed(&param.ty) {
+                let DynSolValue::FixedBytes(value, 32) = value else {
+                    return Err(DecodeError::Shape);
+                };
+                TypedValue::IndexedHash { value: *value }
+            } else {
+                convert(&param.ty, value)?
+            };
             Ok(DecodedArg {
                 name: param.name.clone(),
-                value: TypedValue::try_from(value)?,
+                position: param.position,
+                abi_type: param.schema.clone(),
+                value,
             })
         })
         .collect()
 }
 
-impl TryFrom<&DynSolValue> for TypedValue {
-    type Error = DecodeError;
-
-    /// Converts one decoded value to its published form.
-    ///
-    /// Re-encoding the result reproduces the bytes that were decoded, so the trim of a
-    /// `FixedBytes` to its declared size is lossless.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`DecodeError::Unsupported`] for a value type the wire shape does not carry
-    /// (only a Solidity `function`), and [`DecodeError::Width`] if a declared width or
-    /// size exceeds a `u16`, which no real ABI can produce.
-    fn try_from(decoded: &DynSolValue) -> Result<Self, Self::Error> {
-        let typed = match decoded {
-            DynSolValue::Bool(value) => Self::Bool { value: *value },
-            DynSolValue::Int(value, bits) => Self::Int {
+fn convert(ty: &DynSolType, value: &DynSolValue) -> Result<TypedValue, DecodeError> {
+    Ok(match (ty, value) {
+        (DynSolType::Bool, DynSolValue::Uint(value, _)) => {
+            if *value > alloy_primitives::U256::from(1) {
+                return Err(DecodeError::Value {
+                    kind: "boolean must be zero or one",
+                });
+            }
+            TypedValue::Bool {
+                value: !value.is_zero(),
+            }
+        }
+        (DynSolType::Address, DynSolValue::Uint(value, _)) => {
+            if value.bit_len() > 160 {
+                return Err(DecodeError::Value {
+                    kind: "address exceeds 160 bits",
+                });
+            }
+            TypedValue::Address {
+                value: alloy_primitives::Address::from_word(B256::from(value.to_be_bytes::<32>())),
+            }
+        }
+        (DynSolType::Function, DynSolValue::Function(value)) => {
+            TypedValue::Function { value: *value }
+        }
+        (DynSolType::Uint(bits), DynSolValue::Uint(value, _)) if valid_bits(*bits) => {
+            if value.bit_len() > *bits {
+                return Err(DecodeError::Value {
+                    kind: "unsigned integer exceeds declared width",
+                });
+            }
+            TypedValue::Uint {
                 value: *value,
-                bits: width("int bits", *bits)?,
-            },
-            DynSolValue::Uint(value, bits) => Self::Uint {
+                bits: width(*bits)?,
+            }
+        }
+        (DynSolType::Int(bits), DynSolValue::Int(value, _)) if valid_bits(*bits) => {
+            if *bits < 256 {
+                let shifted = value.asr(*bits - 1);
+                if shifted != alloy_primitives::I256::ZERO
+                    && shifted != alloy_primitives::I256::MINUS_ONE
+                {
+                    return Err(DecodeError::Value {
+                        kind: "signed integer exceeds declared width",
+                    });
+                }
+            }
+            TypedValue::Int {
                 value: *value,
-                bits: width("uint bits", *bits)?,
-            },
-            DynSolValue::FixedBytes(word, size) => Self::FixedBytes {
-                // The decoded word is right-padded, so the declared size is what says how
-                // much of it is the value.
-                value: Bytes::copy_from_slice(word.as_slice().get(..*size).unwrap_or(&[])),
-                size: width("fixed bytes size", *size)?,
-            },
-            DynSolValue::Address(value) => Self::Address { value: *value },
-            DynSolValue::Bytes(value) => Self::Bytes {
-                value: Bytes::from(value.clone()),
-            },
-            DynSolValue::String(value) => Self::String {
-                value: value.clone(),
-            },
-            DynSolValue::Array(values) => Self::Array {
-                value: convert_all(values)?,
-            },
-            DynSolValue::FixedArray(values) => Self::FixedArray {
-                value: convert_all(values)?,
-                size: width("fixed array size", values.len())?,
-            },
-            // A tuple is positional in an event, so there are no component names to carry
-            // even when the ABI declares a struct.
-            DynSolValue::Tuple(values) => Self::Tuple {
-                value: convert_all(values)?,
-            },
-            DynSolValue::Function(_) => return Err(DecodeError::Unsupported("function type")),
-        };
-        Ok(typed)
-    }
+                bits: width(*bits)?,
+            }
+        }
+        (DynSolType::FixedBytes(size), DynSolValue::FixedBytes(value, _)) => {
+            TypedValue::FixedBytes {
+                value: Bytes::copy_from_slice(
+                    value.as_slice().get(..*size).ok_or(DecodeError::Shape)?,
+                ),
+                size: width(*size)?,
+            }
+        }
+        (DynSolType::Bytes, DynSolValue::Bytes(value)) => TypedValue::Bytes {
+            value: Bytes::copy_from_slice(value),
+        },
+        (DynSolType::String, DynSolValue::Bytes(value)) => TypedValue::String {
+            value: Bytes::copy_from_slice(value),
+            text: std::str::from_utf8(value).ok().map(str::to_owned),
+        },
+        (DynSolType::Array(inner), DynSolValue::Array(values)) => TypedValue::Array {
+            value: values
+                .iter()
+                .map(|value| convert(inner, value))
+                .collect::<Result<_, _>>()?,
+        },
+        (DynSolType::FixedArray(inner, size), DynSolValue::FixedArray(values))
+            if *size == values.len() =>
+        {
+            TypedValue::FixedArray {
+                value: values
+                    .iter()
+                    .map(|value| convert(inner, value))
+                    .collect::<Result<_, _>>()?,
+                size: *size,
+            }
+        }
+        (DynSolType::Tuple(types), DynSolValue::Tuple(values)) if types.len() == values.len() => {
+            TypedValue::Tuple {
+                value: types
+                    .iter()
+                    .zip(values)
+                    .map(|(ty, value)| convert(ty, value))
+                    .collect::<Result<_, _>>()?,
+            }
+        }
+        _ => return Err(DecodeError::Shape),
+    })
 }
 
-/// Converts a sequence of decoded values, so the recursive arms stay one line.
-fn convert_all(values: &[DynSolValue]) -> Result<Vec<TypedValue>, DecodeError> {
-    values.iter().map(TypedValue::try_from).collect()
+fn valid_bits(bits: usize) -> bool {
+    (8..=256).contains(&bits) && bits.is_multiple_of(8)
 }
 
-/// Narrows a decoder-supplied `usize` to the `u16` the wire shape carries.
-fn width(kind: &'static str, value: usize) -> Result<u16, DecodeError> {
-    u16::try_from(value).map_err(|_| DecodeError::Width { kind, value })
+fn width(value: usize) -> Result<u16, DecodeError> {
+    u16::try_from(value).map_err(|_| DecodeError::Shape)
 }
 
-/// Why a log could not be decoded.
-///
-/// One type for the whole stage: loading an ABI, decoding a log against it, and
-/// converting the result to the wire shape all fail for the same reason — the bytes and
-/// the ABI disagree — so a caller that stops at any of them wants the same explanation.
+/// Failures while loading and preparing an ABI, before any logs are processed.
+#[derive(Debug, Error)]
+pub enum AbiError {
+    /// ABI JSON parse or serialization error.
+    #[error("invalid ABI JSON: {0}")]
+    Json(#[from] serde_json::Error),
+    /// Event type preparation failed.
+    #[error("invalid ABI event at index {event_index}: {source}")]
+    Layout {
+        /// Zero-based event index in the parsed ABI's event iteration order.
+        event_index: usize,
+        /// Concrete type resolution error.
+        source: alloy_dyn_abi::Error,
+    },
+    /// Anonymous events cannot be selected unambiguously.
+    #[error("anonymous event {event} is unsupported")]
+    Anonymous {
+        /// Unsupported event name.
+        event: String,
+    },
+    /// Two layouts claim the same event selector.
+    #[error("multiple event layouts for selector {selector}")]
+    DuplicateSelector {
+        /// Ambiguous selector.
+        selector: B256,
+    },
+}
+
+/// Failures while decoding a log against an already prepared ABI.
+/// Log and registration context belongs to the caller, not the reusable codec error.
 #[derive(Debug, Error)]
 pub enum DecodeError {
-    /// The ABI could not be loaded.
-    #[error("invalid ABI: {detail}")]
-    Abi {
-        /// What was wrong with it.
-        detail: String,
-    },
-    /// An event matched the log's selector but the data did not decode against it.
-    #[error("log {selector} does not decode against its ABI: {detail}")]
-    Decode {
-        /// The event selector that matched.
-        selector: B256,
-        /// The decoder's own explanation.
-        detail: String,
-    },
-    /// The decoder returned a different number of values than the ABI declares.
-    #[error("ABI declares {declared} arguments but {decoded} were decoded")]
-    Shape {
-        /// How many values the decoder produced.
-        decoded: usize,
-        /// How many the ABI declares.
-        declared: usize,
-    },
-    /// A decoded value is a type the wire shape does not carry.
-    ///
-    /// Only a Solidity `function` type reaches this.
-    #[error("unsupported ABI value: {0}")]
-    Unsupported(&'static str),
-    /// A declared width or size did not fit the wire field that carries it.
-    #[error("{kind} {value} does not fit a u16")]
-    Width {
-        /// Which width or size, for the message.
+    /// Raw log does not match the prepared layout.
+    #[error("log does not match its event layout: {0}")]
+    Log(#[from] alloy_dyn_abi::Error),
+    /// Topics must be contiguous.
+    #[error("log topics contain a gap")]
+    TopicGap,
+    /// Decoder result disagrees with the prepared schema: an internal invariant failure.
+    #[error("decoded value shape disagrees with prepared ABI schema")]
+    Shape,
+    /// A decoded value violates its declared type.
+    #[error("invalid ABI value: {kind}")]
+    Value {
+        /// Violated constraint.
         kind: &'static str,
-        /// The offending value.
-        value: usize,
     },
 }
 
 #[cfg(test)]
-// The crate denies `expect`/`unwrap` to keep production paths honest; tests are allowed
-// them per the repository test style, since a failed expectation there means the fixture
-// or setup is wrong.
 #[expect(clippy::expect_used)]
 mod tests {
-    use alloy_dyn_abi::DynSolValue;
-    use alloy_primitives::{Address, B256, I256, U256};
+    use super::*;
+    use alloy_primitives::U256;
 
-    use super::{Abi, DecodeError};
-    use crate::wire::datasets::evm::Log;
-    use crate::wire::typed::TypedValue;
-
-    /// A log whose fields the tests set, defaulting the rest.
-    fn log(topic0: Option<B256>, indexed: [Option<B256>; 3], data: Vec<u8>) -> Log {
-        let [topic1, topic2, topic3] = indexed;
-        Log {
-            log_index: 3,
-            transaction_hash: alloy_primitives::TxHash::from([0x01; 32]),
-            address: Address::from([0xaa; 20]),
-            topic0,
-            topic1,
-            topic2,
-            topic3,
-            data: data.into(),
-            block_number: 5,
+    fn decode(abi: &str, values: &[DynSolValue], indexed: Option<B256>) -> DecodedEvent {
+        let abi = Abi::from_json(abi).expect("valid ABI");
+        let selector = *abi.events.keys().next().expect("event");
+        abi.decode_log(&Log {
+            topic0: Some(selector),
+            topic1: indexed,
+            data: DynSolValue::Tuple(values.to_vec())
+                .abi_encode_params()
+                .into(),
             ..Log::default()
-        }
+        })
+        .expect("decode")
+        .expect("match")
     }
 
-    /// A 32-byte word holding an address in its low 20 bytes.
-    fn address_word(address: Address) -> B256 {
-        let mut word = [0u8; 32];
-        word[12..].copy_from_slice(address.as_slice());
-        B256::from(word)
-    }
-
-    /// A 32-byte big-endian word holding `value`, the form an ABI integer takes.
-    fn word(value: u64) -> B256 {
-        let mut word = [0u8; 32];
-        word[24..].copy_from_slice(&value.to_be_bytes());
-        B256::from(word)
-    }
-
-    /// A fixed-bytes word as the decoder produces it: the first `size` bytes are the
-    /// value and the rest are zero padding to a word.
-    fn padded(first: &[u8]) -> B256 {
-        let mut word = B256::ZERO;
-        word.get_mut(..first.len())
-            .expect("fixture fits in a word")
-            .copy_from_slice(first);
-        word
-    }
-
-    fn round_trip(decoded: &DynSolValue) -> TypedValue {
-        TypedValue::try_from(decoded).expect("value converts")
-    }
-
-    /// The canonical ERC-20 event, as an ABI JSON would spell it.
-    const ERC20: &str = r#"[{
-        "type": "event",
-        "name": "Transfer",
-        "anonymous": false,
-        "inputs": [
-            {"name": "from", "type": "address", "indexed": true},
-            {"name": "to", "type": "address", "indexed": true},
-            {"name": "value", "type": "uint256", "indexed": false}
-        ]
-    }]"#;
-
-    /// The happy path: a real log decodes into named, typed arguments.
     #[test]
-    fn a_transfer_log_decodes_into_typed_arguments() {
-        let abi = Abi::from_json(ERC20).expect("ABI loads");
-        // keccak256("Transfer(address,address,uint256)")
-        let selector: B256 = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
-            .parse()
-            .expect("selector parses");
-        let value = U256::from(1_000_000_000_000_000_000u64).to_be_bytes::<32>();
-        let decoded = abi
-            .decode_log(&log(
-                Some(selector),
-                [
-                    Some(address_word(Address::from([0x11; 20]))),
-                    Some(address_word(Address::from([0x22; 20]))),
-                    None,
-                ],
-                value.to_vec(),
-            ))
-            .expect("log decodes")
-            .expect("an event matched");
-
-        assert_eq!(decoded.name, "Transfer");
-        assert_eq!(decoded.signature, "Transfer(address,address,uint256)");
-        assert_eq!(decoded.indexed.len(), 2);
-        assert_eq!(decoded.body.len(), 1);
-        // Each argument carries the ABI's own name, so a store can address it rather
-        // than count positions.
+    fn invalid_utf8_and_nested_strings_remain_bytes() {
+        let result = decode(
+            r#"[{"type":"event","name":"Text","anonymous":false,"inputs":[{"name":"s","type":"string[]","indexed":false}]}]"#,
+            &[DynSolValue::Array(vec![
+                DynSolValue::Bytes(vec![0xff]),
+                DynSolValue::Bytes(b"hello".to_vec()),
+            ])],
+            None,
+        );
+        let TypedValue::Array { value } = &result.body[0].value else {
+            panic!("array");
+        };
         assert_eq!(
-            decoded.indexed.first().map(|arg| arg.name.as_str()),
-            Some("from")
+            value[0],
+            TypedValue::String {
+                value: Bytes::from_static(&[0xff]),
+                text: None
+            }
         );
         assert_eq!(
-            decoded.body.first().map(|arg| &arg.value),
-            Some(&TypedValue::Uint {
-                value: U256::from(1_000_000_000_000_000_000u64),
-                bits: 256,
-            })
-        );
-    }
-
-    /// A log whose selector the ABI does not declare is a miss, not an error: the
-    /// transform drops it rather than failing the batch.
-    #[test]
-    fn an_unknown_selector_is_a_miss_not_an_error() {
-        let abi = Abi::from_json(ERC20).expect("ABI loads");
-        assert!(
-            abi.decode_log(&log(
-                Some(B256::from([0x99; 32])),
-                [None, None, None],
-                Vec::new()
-            ))
-            .expect("a miss is not an error")
-            .is_none()
-        );
-    }
-
-    /// A log with no topics at all, which is legal for an anonymous event, is also a
-    /// miss rather than a panic.
-    #[test]
-    fn a_log_with_no_topics_is_a_miss() {
-        let abi = Abi::from_json(ERC20).expect("ABI loads");
-        assert!(
-            abi.decode_log(&log(None, [None, None, None], Vec::new()))
-                .expect("a miss is not an error")
-                .is_none()
-        );
-    }
-
-    /// A selector that matches but data that is too short to decode is an error,
-    /// because the likely cause is an ABI from the wrong block range and hiding it
-    /// would publish the wrong contract's values.
-    #[test]
-    fn a_selector_that_matches_with_undecodable_data_is_an_error() {
-        let abi = Abi::from_json(ERC20).expect("ABI loads");
-        let selector: B256 = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
-            .parse()
-            .expect("selector parses");
-        // Half a word where the event declares a `uint256`.
-        assert!(matches!(
-            abi.decode_log(&log(Some(selector), [None, None, None], vec![0u8; 16])),
-            Err(DecodeError::Decode { .. })
-        ));
-    }
-
-    /// An ABI that is not JSON fails loudly at load, not at first decode.
-    #[test]
-    fn malformed_abi_json_is_rejected_at_load() {
-        assert!(matches!(
-            Abi::from_json("not an abi"),
-            Err(DecodeError::Abi { .. })
-        ));
-    }
-
-    /// A real Uniswap V3 `Swap` log: the `int256` amounts are signed, the pool's
-    /// `uint160` price is read at 160 bits, and the trailing `int24` tick is not
-    /// silently widened.
-    ///
-    /// Every other test here builds its own bytes, so they would all still pass if the
-    /// decoder agreed with itself about a layout the chain does not use. This one pins
-    /// the layout to the chain.
-    #[test]
-    fn a_real_uniswap_v3_swap_log_decodes_with_signed_amounts() {
-        let abi = Abi::from_json(include_str!("../../abis/uniswap_v3_pool.json"))
-            .expect("the pool ABI loads");
-        let topic0: B256 = "0xc42079f94a6350d7e6235f29174924f928cc2ac818eb64fed8004e115fbcca67"
-            .parse()
-            .expect("selector parses");
-        let topic1: B256 = "0x0000000000000000000000006ff5693b99212da76ad316178a184ab56d299b43"
-            .parse()
-            .expect("topic parses");
-        let data = alloy_primitives::hex::decode(
-            "fffffffffffffffffffffffffffffffffffffffffffffffffff4b34627fb9302\
-             0000000000000000000000000000000000000000000000000000000000830544\
-             00000000000000000000000000000000000000000003678007a6bbf505d858fa\
-             00000000000000000000000000000000000000000000000012fb062ae6731f9d\
-             fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffcfd3b",
-        )
-        .expect("fixture is valid hex");
-
-        let mut source = log(Some(topic0), [Some(topic1), Some(topic1), None], data);
-        source.topic3 = None;
-        let decoded = abi
-            .decode_log(&source)
-            .expect("the log decodes")
-            .expect("the ABI declares Swap");
-
-        let names: Vec<&str> = decoded
-            .indexed
-            .iter()
-            .chain(&decoded.body)
-            .map(|arg| arg.name.as_str())
-            .collect();
-        assert_eq!(
-            names,
-            [
-                "sender",
-                "recipient",
-                "amount0",
-                "amount1",
-                "sqrtPriceX96",
-                "liquidity",
-                "tick"
-            ]
-        );
-        // `amount0` is negative: this swap sold token0, and reading the two's complement
-        // word as unsigned would produce 1.15e77 instead.
-        assert_eq!(
-            decoded.body.first().map(|arg| &arg.value),
-            Some(&TypedValue::Int {
-                value: I256::try_from(-3_180_585_820_646_654_i64).expect("fits"),
-                bits: 256,
-            })
-        );
-        // `sqrtPriceX96` is `uint160`, not `uint256`: a widened column would be wrong.
-        assert!(matches!(
-            decoded.body.get(2).map(|arg| &arg.value),
-            Some(TypedValue::Uint { bits: 160, .. })
-        ));
-        // `tick` is `int24`, and the decoded value carries that width.
-        assert!(matches!(
-            decoded.body.get(4).map(|arg| &arg.value),
-            Some(TypedValue::Int { bits: 24, .. })
-        ));
-    }
-
-    /// The canonical Uniswap V4 `PoolManager` ABI declares `Initialize` and decodes its
-    /// flat layout: topics carry `id`, `currency0`, `currency1`; the rest is `data`.
-    ///
-    /// V4 pools have no address — the pool is the `bytes32` `id`, a hash of the
-    /// `PoolKey`. The selector is derived from the ABI rather than pinned, so a typo in
-    /// the signature fails here instead of silently never matching a real log.
-    #[test]
-    fn the_uniswap_v4_pool_manager_abi_declares_and_decodes_initialize() {
-        const SIGNATURE: &str =
-            "Initialize(bytes32,address,address,uint24,int24,address,uint160,int24)";
-        let abi = Abi::from_json(include_str!("../../abis/uniswap_v4_pool_manager.json"))
-            .expect("the PoolManager ABI loads");
-        let selector = abi.selector(SIGNATURE).expect("declares Initialize");
-
-        let mut data = Vec::new();
-        data.extend_from_slice(word(3_000).as_slice()); // fee: uint24
-        data.extend_from_slice(word(60).as_slice()); // tickSpacing: int24
-        data.extend_from_slice(word(0).as_slice()); // hooks: address(0)
-        data.extend_from_slice(word(1_000_000).as_slice()); // sqrtPriceX96: uint160
-        data.extend_from_slice(word(0).as_slice()); // tick: int24
-        let decoded = abi
-            .decode_log(&log(
-                Some(selector),
-                [
-                    Some(B256::from([0x22; 32])),
-                    Some(B256::from([0x33; 32])),
-                    Some(B256::from([0x44; 32])),
-                ],
-                data,
-            ))
-            .expect("the log decodes")
-            .expect("the ABI declares Initialize");
-
-        assert_eq!(decoded.name, "Initialize");
-        let names: Vec<&str> = decoded
-            .indexed
-            .iter()
-            .chain(&decoded.body)
-            .map(|arg| arg.name.as_str())
-            .collect();
-        assert_eq!(
-            names,
-            [
-                "id",
-                "currency0",
-                "currency1",
-                "fee",
-                "tickSpacing",
-                "hooks",
-                "sqrtPriceX96",
-                "tick"
-            ]
-        );
-    }
-
-    /// A nested value keeps its width at every level, because a width is not recoverable
-    /// from a value and losing it would collapse a `uint8` and a `uint256` into the same
-    /// column.
-    #[test]
-    fn widths_survive_at_every_level() {
-        let decoded = DynSolValue::Tuple(vec![
-            DynSolValue::Uint(U256::from(1), 8),
-            DynSolValue::Array(vec![
-                DynSolValue::Int(I256::MINUS_ONE, 256),
-                DynSolValue::Int(I256::ZERO, 32),
-            ]),
-            DynSolValue::FixedArray(vec![DynSolValue::Uint(U256::from(2), 64)]),
-        ]);
-        assert_eq!(
-            round_trip(&decoded),
-            TypedValue::Tuple {
-                value: vec![
-                    TypedValue::Uint {
-                        value: U256::from(1),
-                        bits: 8,
-                    },
-                    TypedValue::Array {
-                        value: vec![
-                            TypedValue::Int {
-                                value: I256::MINUS_ONE,
-                                bits: 256,
-                            },
-                            TypedValue::Int {
-                                value: I256::ZERO,
-                                bits: 32,
-                            },
-                        ],
-                    },
-                    TypedValue::FixedArray {
-                        value: vec![TypedValue::Uint {
-                            value: U256::from(2),
-                            bits: 64,
-                        }],
-                        size: 1,
-                    },
-                ],
+            value[1],
+            TypedValue::String {
+                value: Bytes::from_static(b"hello"),
+                text: Some("hello".into())
             }
         );
     }
 
-    /// `FixedBytes` carries only its declared bytes, not the zero padding to a word, so
-    /// a `bytes4` is four bytes on the wire and not thirty-two. Re-encoding pads it back,
-    /// which is what keeps the value lossless despite the trim.
     #[test]
-    fn fixed_bytes_carries_only_its_declared_size() {
-        let typed = round_trip(&DynSolValue::FixedBytes(padded(&[0xab; 4]), 4));
-        let TypedValue::FixedBytes { value, size } = typed else {
-            panic!("a fixed-bytes value must convert to fixed bytes");
-        };
-        assert_eq!(size, 4);
-        assert_eq!(value.as_ref(), &[0xab; 4]);
+    fn schema_preserves_empty_arrays_tuple_names_and_original_positions() {
+        let result = decode(
+            r#"[{"type":"event","name":"Data","anonymous":false,"inputs":[{"name":"id","type":"bytes32","indexed":true},{"name":"entries","type":"tuple[]","indexed":false,"components":[{"name":"owner","type":"address"}]}]}]"#,
+            &[DynSolValue::Array(vec![])],
+            Some(B256::ZERO),
+        );
+        assert_eq!(result.body[0].position, 1);
+        assert_eq!(result.body[0].abi_type.kind, "tuple[]");
+        assert_eq!(result.body[0].abi_type.components[0].name, "owner");
+        assert_eq!(
+            result.body[0].abi_type.components[0].abi_type.kind,
+            "address"
+        );
+        assert!(matches!(
+            result.indexed[0].value,
+            TypedValue::FixedBytes { .. }
+        ));
     }
 
-    /// A Solidity `function` is the one type the wire shape does not carry, so it fails
-    /// loudly rather than being coerced into something it is not.
     #[test]
-    fn a_function_type_is_refused_rather_than_mangled() {
+    fn indexed_strings_are_hashes_not_values() {
+        let hash = keccak256("text");
+        let result = decode(
+            r#"[{"type":"event","name":"Text","anonymous":false,"inputs":[{"name":"s","type":"string","indexed":true}]}]"#,
+            &[],
+            Some(hash),
+        );
+        assert_eq!(
+            result.indexed[0].value,
+            TypedValue::IndexedHash { value: hash }
+        );
+        assert_eq!(result.indexed[0].abi_type.kind, "string");
+    }
+
+    #[test]
+    fn functions_decode_and_invalid_integer_widths_fail() {
+        let result = decode(
+            r#"[{"type":"event","name":"Callback","anonymous":false,"inputs":[{"name":"f","type":"function","indexed":false}]}]"#,
+            &[DynSolValue::Function(alloy_primitives::Function::ZERO)],
+            None,
+        );
+        assert!(matches!(result.body[0].value, TypedValue::Function { .. }));
         assert!(matches!(
-            TypedValue::try_from(&DynSolValue::Function(alloy_primitives::Function::ZERO)),
-            Err(DecodeError::Unsupported("function type"))
+            convert(&DynSolType::Uint(8), &DynSolValue::Uint(U256::from(256), 8)),
+            Err(DecodeError::Value { .. })
+        ));
+    }
+
+    #[test]
+    fn startup_rejects_anonymous_and_impossible_topic_layouts() {
+        assert!(matches!(
+            Abi::from_json(r#"[{"type":"event","name":"Hidden","anonymous":true,"inputs":[]}]"#),
+            Err(AbiError::Anonymous { .. })
+        ));
+        assert!(matches!(
+            Abi::from_json(
+                r#"[{"type":"event","name":"TooMany","anonymous":false,"inputs":[{"name":"a","type":"uint256","indexed":true},{"name":"b","type":"uint256","indexed":true},{"name":"c","type":"uint256","indexed":true},{"name":"d","type":"uint256","indexed":true}]}]"#
+            ),
+            Err(AbiError::Layout { .. })
+        ));
+    }
+
+    #[test]
+    fn signed_widths_and_scalar_constraints_are_checked() {
+        use alloy_primitives::{I256, U256};
+        assert!(convert(&DynSolType::Int(8), &DynSolValue::Int(I256::MINUS_ONE, 8)).is_ok());
+        assert!(
+            convert(
+                &DynSolType::Int(8),
+                &DynSolValue::Int(I256::try_from(128).expect("integer"), 8)
+            )
+            .is_err()
+        );
+        assert!(
+            convert(
+                &DynSolType::Int(8),
+                &DynSolValue::Int(I256::try_from(-129).expect("integer"), 8)
+            )
+            .is_err()
+        );
+        assert!(convert(&DynSolType::Bool, &DynSolValue::Uint(U256::from(2), 256)).is_err());
+        assert!(convert(&DynSolType::Address, &DynSolValue::Uint(U256::MAX, 256)).is_err());
+    }
+
+    #[test]
+    fn actual_swap_fixture_decodes() {
+        let abi =
+            Abi::from_json(include_str!("../../abis/uniswap_v3_pool.json")).expect("pool ABI");
+        let source: crate::wire::envelope::Envelope = serde_json::from_str(
+            include_str!("../../examples/fixtures/uniswap_v3_swaps.ndjson")
+                .lines()
+                .next()
+                .expect("fixture"),
+        )
+        .expect("envelope");
+        let crate::wire::envelope::Event::Log(log) = source.event else {
+            panic!("log");
+        };
+        let decoded = abi.decode_log(&log).expect("decode").expect("match");
+        assert_eq!(decoded.name, "Swap");
+        assert!(matches!(
+            decoded.body[0].value,
+            TypedValue::Int { bits: 256, .. }
         ));
     }
 }

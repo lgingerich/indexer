@@ -206,6 +206,7 @@ fn decoded() -> Envelope {
         address: CONTRACT,
         // From the registry entry that matched, not from the ABI.
         protocol: "uniswap_v3".to_owned(),
+        abi_id: hash(0x08),
         selector: hash(0x07),
         signature: "Swap(address,address,int256,int256,uint160,uint128,int24)".to_owned(),
         anonymous: false,
@@ -306,8 +307,21 @@ fn topic(address: Address) -> B256 {
 }
 
 fn decoded_arg(name: &str, value: TypedValue) -> DecodedArg {
+    let (position, kind) = match name {
+        "sender" => (0, "address"),
+        "recipient" => (1, "address"),
+        "amount0" => (2, "int256"),
+        "sqrtPriceX96" => (4, "uint160"),
+        "tick" => (6, "int24"),
+        _ => unreachable!("fixture argument"),
+    };
     DecodedArg {
         name: name.to_owned(),
+        position,
+        abi_type: indexer::wire::typed::AbiType {
+            kind: kind.to_owned(),
+            components: Vec::new(),
+        },
         value,
     }
 }

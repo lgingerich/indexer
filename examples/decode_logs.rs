@@ -5,7 +5,7 @@
 //! ```
 //!
 //! It reads two real `Swap` logs captured from a Uniswap V3 pool on Base, embeds the
-//! pool's ABI, and runs the same [`Transform`] the decode stage runs in production. For
+//! pool's ABI, and runs the same [`Decoder`] the decode stage runs in production. For
 //! each input it prints the decoded record, which is what the pipeline stores beside the
 //! raw log; a raw dataset has no decoded form, so it produces none.
 //!
@@ -51,8 +51,8 @@
 
 use std::process::ExitCode;
 
-use indexer::decode::Transform;
-use indexer::decode::registry::{AbiEntry, ContractEntry, ContractRegistry, RegistryConfig};
+use indexer::decode::Decoder;
+use indexer::decode::{AbiEntry, ContractEntry, ContractRegistry, RegistryConfig};
 use indexer::wire::envelope::Envelope;
 
 /// The pool these logs came from, and the address its ABI is registered against.
@@ -84,13 +84,16 @@ fn main() -> ExitCode {
                 chain: CHAIN.to_owned(),
                 address: POOL.to_owned(),
                 abi: "uniswap_v3_pool".to_owned(),
+                protocol: "uniswap_v3".to_owned(),
+                from_block: 0,
+                to_block: None,
             }],
-            ..RegistryConfig::default()
         },
         ".",
     )
     .expect("the registry loads");
 
+    let decoder = Decoder::new(registry);
     let mut decoded_count = 0_usize;
     for (number, line) in SWAPS.lines().enumerate() {
         if line.trim().is_empty() {
@@ -98,20 +101,24 @@ fn main() -> ExitCode {
         }
         let envelope: Envelope =
             serde_json::from_str(line).expect("the fixture is a published envelope");
-        let applied = Transform::apply(&registry, &envelope);
-        if let Some(error) = applied.error {
-            eprintln!("line {}: {error}", number + 1);
-        }
-        if let Some(out) = applied.output {
-            if matches!(out.event, indexer::wire::envelope::Event::Decoded(_)) {
+        let indexer::wire::envelope::Event::Log(log) = &envelope.event else {
+            continue;
+        };
+        match decoder.decode(&envelope.chain, log) {
+            Ok(Some(record)) => {
                 decoded_count += 1;
+                let out = Envelope::new(
+                    envelope.chain,
+                    indexer::wire::envelope::Event::Decoded(Box::new(record)),
+                );
+                println!(
+                    "{}",
+                    serde_json::to_string(&out).expect("envelope serializes")
+                );
             }
-            println!(
-                "{}",
-                serde_json::to_string(&out).expect("envelope serializes")
-            );
+            Ok(None) => eprintln!("line {}: no registered event", number + 1),
+            Err(error) => eprintln!("line {}: {error}", number + 1),
         }
-        eprintln!("line {}: decoded", number + 1);
     }
 
     eprintln!("{decoded_count} swaps decoded into their records");

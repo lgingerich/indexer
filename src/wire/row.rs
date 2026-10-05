@@ -712,17 +712,18 @@ fn log_cells(l: &Log) -> Columns {
 ///
 /// The two documents hold what varies per event — the indexed and non-indexed arguments —
 /// while everything that identifies the row is a typed column: a store can key, join,
-/// filter, and partition on `protocol`, `address`, `selector`, `block_hash`,
+/// filter, and partition on `protocol`, `address`, `selector`, `abi_id`, `block_hash`,
 /// `block_timestamp`, and `log_index` without parsing the record. The argument *values*
 /// still vary in type per event, so they stay documents; the identity does not, and keeping
 /// it locked in a document would force every query back through JSON.
-const DECODED_CELLS: [(Column, fn(&Decoded) -> ColumnValue); 14] = [
+const DECODED_CELLS: [(Column, fn(&Decoded) -> ColumnValue); 15] = [
     (Column::text("name"), |d| ColumnValue::Text(d.name.clone())),
     (Column::text("address"), |d| ColumnValue::hex(d.address)),
     (Column::text("protocol"), |d| {
         ColumnValue::Text(d.protocol.clone())
     }),
     (Column::text("selector"), |d| ColumnValue::hex(d.selector)),
+    (Column::text("abi_id"), |d| ColumnValue::hex(d.abi_id)),
     (Column::text("signature"), |d| {
         ColumnValue::Text(d.signature.clone())
     }),
@@ -861,6 +862,7 @@ mod tests {
                 name: "Swap".to_owned(),
                 address: Address::from([0xd0; 20]),
                 protocol: "uniswap_v3".to_owned(),
+                abi_id: hash(0x08),
                 selector: hash(0x07),
                 signature: "Swap(address)".to_owned(),
                 anonymous: false,
@@ -1079,6 +1081,7 @@ mod tests {
             name: "Swap".to_owned(),
             address: Address::from([0xd0; 20]),
             protocol: "uniswap_v3".to_owned(),
+            abi_id: hash(0x08),
             selector: hash(0x07),
             signature: "Swap(address)".to_owned(),
             anonymous: false,
@@ -1095,6 +1098,7 @@ mod tests {
         let row = row_for(&chain(), &event);
 
         assert_eq!(row.text("protocol"), "uniswap_v3");
+        assert_eq!(row.text("abi_id"), format!("{:#x}", decoded.abi_id));
         assert_eq!(row.text("address"), format!("{:#x}", decoded.address));
         assert_eq!(row.text("block_hash"), format!("{:#x}", decoded.block_hash));
         assert_eq!(row.value("log_index"), &ColumnValue::Uint(7));
