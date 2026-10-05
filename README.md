@@ -63,7 +63,7 @@ envelope
         └─ decodes ─────────────────────────────────────────▶ the log, then its decoded record
 ```
 
-One immutable `Decoder` serves live logs and stored-log replay. The registry selects
+An immutable `Decoder` decodes logs during ingestion. The registry selects
 an ABI and protocol by `(chain, address, block)` using predefined half-open block ranges.
 There is no factory discovery, network lookup, or runtime registry mutation.
 
@@ -174,10 +174,6 @@ that matters most: `decode` must not depend on `ingest`.
   Decoded records carry the ABI content hash, protocol, and each argument's original
   position and complete ABI schema. Raw byte strings remain lossless, with readable
   text only when valid UTF-8.
-- **Stored-log replay.** `DuckDbSink::redecode` reads bounded, ordered pages from the raw
-  `log` table using the same decoder. It appends decoded records without changing raw
-  rows or fetching the chain. Repeated runs deliberately append duplicates; it does not
-  filter orphaned logs, apply reorgs, or deduplicate.
 - **A local store.** The process writes every envelope, raw and decoded, into a local
   `DuckDB` database: one typed table per dataset, with real columns rather than a JSON
   blob. What a dataset's columns *are* lives in `src/wire/row.rs`, not in the store, so a
@@ -217,6 +213,8 @@ idempotent writes ─┬─▶ resume from the store
 reorg + finality applied in the store
 streaming aggregation: joins and derived calculations
 Avro as the envelope, inside the process and downstream
+selective datasets and RPC features: logs, blocks, transactions; logs by contract address
+attempt historical data → decoder pipeline → storage
 ```
 
 ### Resume from the store
@@ -280,11 +278,10 @@ Upsert is a *replay* tool, not a reorg tool. A reorg's two branches have differe
 keys by design, so an upsert leaves both rows — which is what the marking rule above
 needs. Reorg handling and idempotent writes are separate pieces of machinery.
 
-### Idempotent stored-log replay
+### Stored-log replay
 
-Stored-log replay already works without resume or RPC access. What is not built is
-idempotent replacement or deduplication of its decoded rows: replay is append-only today.
-See [Re-decode retained logs](#re-decode-retained-logs) for the runnable command.
+Re-decoding retained raw logs is not implemented. A future replay path would also need
+idempotent replacement or deduplication of decoded rows.
 
 ### Streaming aggregation
 
@@ -311,8 +308,18 @@ today     Envelope ── JSON ──▶ stdout, the `events.envelope` column, d
 planned   Envelope ── Avro ──▶ the same hops, one schema for all of them
 ```
 
-Also not built, and not on the path above: mempool ingestion, filtered
-subscriptions, and a Parquet archive.
+### Selective datasets and RPC features
+
+Choose which datasets to index — logs, blocks, transactions — rather than enabling
+all of them together. Fetch and subscribe only to the RPC features those datasets
+need, with contract-address filters for log subscriptions.
+
+### Historical data through the decoder
+
+Attempt to route historical data through the decoder pipeline before storage, so
+backfill can write both raw events and decoded records rather than bypassing decode.
+
+Also not built, and not on the path above: mempool ingestion and a Parquet archive.
 
 ## Run it
 
@@ -435,28 +442,6 @@ not deployed contracts.
 
 Every decoded record carries the registration's explicit `protocol` and the ABI's
 content identity. The protocol is not inferred from an ABI filename.
-
-### Re-decode retained logs
-
-Stop the live writer, then run the example against its retained database:
-
-```bash
-cargo run --example redecode_logs -- \
-  registry.toml indexer.duckdb base 0xd0b53D9277642d899DF5C87A3966A349A798F224 \
-  50000000 60000000
-```
-
-Arguments are `REGISTRY DB CHAIN ADDRESS FROM_BLOCK [TO_BLOCK_EXCLUSIVE]`; omit the
-last argument for an unbounded upper range. No node or network is needed. The command
-prints the number of decoded rows appended and warns with log identity when raw bytes
-do not match their ABI. Internal decoder or database failures stop replay; pages already
-appended remain stored.
-
-`DuckDbSink::redecode` reads up to 500 typed raw logs per page, ordered by block,
-transaction index, log index, and hash identity. It appends only new decoded rows. Raw
-rows and control markers are untouched, removed/orphaned logs are not filtered, and
-repeated runs append duplicates rather than upsert. The same immutable `Decoder` drives
-this operation and live ingestion.
 
 ### What decode does not do
 

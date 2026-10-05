@@ -2,7 +2,7 @@
 //!
 //! ABIs are validated and prepared at startup. The registry selects an ABI by chain,
 //! address and original block height; protocol identity is separate from ABI identity.
-//! [`Decoder`] is shared by live ingestion and append-only stored-log replay.
+//! [`Decoder`] decodes logs during ingestion.
 //!
 //! [`DecodingSink`] runs before the storage channel and forwards raw records regardless
 //! of ordinary decode failures. Dynamic discovery, automatic ABI resolution, within-block

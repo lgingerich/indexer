@@ -1,4 +1,4 @@
-//! The same immutable log decoder drives live ingestion and stored-log replay.
+//! Immutable log decoding for ingestion.
 
 use crate::decode::{ContractRegistry, DecodeError};
 use crate::wire::envelope::{ChainId, Decoded, Log};

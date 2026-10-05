@@ -38,16 +38,14 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-use alloy_primitives::Address;
-use duckdb::types::{ToSql, Value};
-use duckdb::{Connection, params};
-use serde::{Deserialize, de::DeserializeOwned};
+use duckdb::types::{ToSql, ToSqlOutput, ValueRef};
+use duckdb::{Connection, appender_params_from_iter};
+use serde::Deserialize;
 use thiserror::Error;
-use tracing::{info, warn};
+use tracing::info;
 
-use crate::decode::{DecodeError, Decoder};
 use crate::sink::{EnvelopeSink, SinkError};
-use crate::wire::envelope::{ChainId, Envelope, Event, Log};
+use crate::wire::envelope::Envelope;
 use crate::wire::row::{ColumnType, ColumnValue, Row, Table, row_for};
 /// The `DuckDB` file written when the settings name no path.
 const DEFAULT_PATH: &str = "indexer.duckdb";
@@ -64,7 +62,7 @@ const DEFAULT_BATCH_RECORDS: usize = 500;
 /// Beside the sink rather than in [`crate::config`] because these are `DuckDB`'s: the
 /// engine settings are opaque keys the engine validates, and a build without the
 /// `duckdb` feature has no use for either. What the *file* may say about `DuckDB` is the
-/// `[sink.duckdb]` table, which [`Storage::DuckDb`](crate::config::Sink::DuckDb)
+/// `[sink.duckdb]` table, which [`Sink::DuckDb`](crate::config::Sink::DuckDb)
 /// names.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields, default)]
@@ -147,34 +145,34 @@ fn create_table(table: Table) -> String {
     format!("CREATE TABLE IF NOT EXISTS {} ({columns})", table.name())
 }
 
-/// Renders a row's values as the appender's parameters.
-///
-/// The only `duckdb::types::Value` construction in the file, so the mapping from the
-/// neutral enum to the engine's is one function rather than one per column.
-fn sql_value(value: &ColumnValue) -> Value {
-    match value {
-        ColumnValue::Null => Value::Null,
-        ColumnValue::Uint(number) => Value::from(*number),
-        // A `Document` is stored as the JSON text it already is, so it lands in the same
-        // `VARCHAR` a `Text` does while its column is still typed `JSON`.
-        ColumnValue::Text(text) => Value::Text(text.clone()),
-        ColumnValue::Bool(flag) => Value::Boolean(*flag),
-        ColumnValue::Document(json) => Value::Text(json.clone()),
+// The engine conversion belongs at this boundary; text and JSON borrow the buffered
+// row rather than cloning its strings for every append.
+impl ToSql for ColumnValue {
+    fn to_sql(&self) -> duckdb::Result<ToSqlOutput<'_>> {
+        Ok(ToSqlOutput::Borrowed(match self {
+            Self::Null => ValueRef::Null,
+            Self::Uint(number) => ValueRef::UBigInt(*number),
+            Self::Text(text) | Self::Document(text) => ValueRef::Text(text.as_bytes()),
+            Self::Bool(flag) => ValueRef::Boolean(*flag),
+        }))
     }
 }
 
-/// Appends envelopes to a local `DuckDB` database, one batch per [`flush`].
+/// Appends envelopes to a local `DuckDB` database, one atomic batch per [`flush`].
+///
+/// Rows stay buffered until commit succeeds. Failed batches roll back and remain
+/// buffered; successful flushes preserve duplicates rather than deduplicating keys.
 ///
 /// [`flush`]: EnvelopeSink::flush
 pub struct DuckDbSink {
     connection: Connection,
-    batches: Batches,
+    rows: Vec<Row>,
 }
 
 impl std::fmt::Debug for DuckDbSink {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DuckDbSink")
-            .field("buffered", &self.batches.len())
+            .field("buffered", &self.rows.len())
             .finish_non_exhaustive()
     }
 }
@@ -214,8 +212,8 @@ impl DuckDbSink {
 
     /// Takes ownership of `connection` and ensures every table exists.
     ///
-    /// The runtime opens the connection with whatever path and settings it needs; the
-    /// library owns only the schema.
+    /// Use this when supplying an existing connection rather than settings to [`open`](Self::open).
+    /// Existing tables are reused, not migrated or validated against the current schema.
     ///
     /// # Errors
     ///
@@ -227,166 +225,19 @@ impl DuckDbSink {
             .map_err(|source| StoreError::Schema { source })?;
         Ok(Self {
             connection,
-            batches: Batches::default(),
+            rows: Vec::new(),
         })
     }
-
-    /// Decodes stored raw logs for one address in `[from_block, to_block)`.
-    ///
-    /// Reads at most 500 logs at a time in chain order, including removed and orphaned
-    /// logs. Only decoded rows are appended: raw rows, markers, and buffered live rows
-    /// are untouched. Repeating this operation deliberately appends duplicates.
-    ///
-    /// # Errors
-    ///
-    /// Returns a typed error for database failures, malformed stored fields, or an
-    /// internal decoder failure. Bad log bytes are warned and skipped. Already appended
-    /// pages remain stored if a later page fails; this operation is not atomic.
-    pub fn redecode(
-        &mut self,
-        decoder: &Decoder,
-        chain: &ChainId,
-        address: Address,
-        from_block: u64,
-        to_block: Option<u64>,
-    ) -> Result<u64, ReplayError> {
-        let address = format!("{address:#x}");
-        let mut cursor = (0_u64, 0_u64, 0_u64, String::new(), String::new(), 0_i64);
-        let mut started = false;
-        let mut appended = 0;
-        loop {
-            let page = {
-                let mut statement = self.connection.prepare(
-                    "SELECT log_index, transaction_hash, transaction_index, address,
-                            topic0, topic1, topic2, topic3, data, removed,
-                            block_number, block_hash, block_timestamp, rowid
-                     FROM log
-                     WHERE chain = ? AND address = ? AND block_number >= ?
-                       AND (? IS NULL OR block_number < ?)
-                       AND (NOT ? OR
-                            (block_number, transaction_index, log_index, block_hash,
-                             transaction_hash, rowid) > (?, ?, ?, ?, ?, ?))
-                     ORDER BY block_number, transaction_index, log_index, block_hash,
-                              transaction_hash, rowid
-                     LIMIT 500",
-                )?;
-                let mut rows = statement.query(params![
-                    chain.as_str(),
-                    address,
-                    from_block,
-                    to_block,
-                    to_block,
-                    started,
-                    cursor.0,
-                    cursor.1,
-                    cursor.2,
-                    cursor.3,
-                    cursor.4,
-                    cursor.5,
-                ])?;
-                let mut page = Vec::with_capacity(500);
-                while let Some(row) = rows.next()? {
-                    cursor = (
-                        row.get(10)?,
-                        row.get(2)?,
-                        row.get(0)?,
-                        row.get(11)?,
-                        row.get(1)?,
-                        row.get(13)?,
-                    );
-                    page.push(Log {
-                        log_index: row.get(0)?,
-                        transaction_hash: read_hex_column(row, "transaction_hash")?,
-                        transaction_index: row.get(2)?,
-                        address: read_hex_column(row, "address")?,
-                        topic0: read_hex_column(row, "topic0")?,
-                        topic1: read_hex_column(row, "topic1")?,
-                        topic2: read_hex_column(row, "topic2")?,
-                        topic3: read_hex_column(row, "topic3")?,
-                        data: read_hex_column(row, "data")?,
-                        removed: row.get(9)?,
-                        block_number: row.get(10)?,
-                        block_hash: read_hex_column(row, "block_hash")?,
-                        block_timestamp: row.get(12)?,
-                    });
-                }
-                page
-            };
-            if page.is_empty() {
-                return Ok(appended);
-            }
-            started = true;
-            let mut decoded_rows = Batches::default();
-            for log in page {
-                match decoder.decode(chain, &log) {
-                    Ok(Some(record)) => {
-                        decoded_rows.push(row_for(chain, &Event::Decoded(Box::new(record))));
-                    }
-                    Ok(None) => {}
-                    Err(
-                        error @ (DecodeError::Log(_)
-                        | DecodeError::TopicGap
-                        | DecodeError::Value { .. }),
-                    ) => {
-                        warn!(%chain, %address, block_number = log.block_number,
-                            block_hash = %log.block_hash,
-                            transaction_hash = %log.transaction_hash,
-                            log_index = log.log_index, abi_id = ?decoder.abi_id(chain, &log),
-                            selector = ?log.topic0, %error, "stored log decode failed");
-                    }
-                    Err(error) => return Err(error.into()),
-                }
-            }
-            let count = u64::try_from(decoded_rows.len())?;
-            decoded_rows.append_to(&self.connection)?;
-            appended += count;
-        }
-    }
-}
-
-/// Why stored-log replay could not continue.
-#[derive(Debug, Error)]
-pub enum ReplayError {
-    /// Reading the raw log table failed.
-    #[error("read stored logs: {0}")]
-    Read(#[from] duckdb::Error),
-    /// A stored hex field did not match its wire type.
-    #[error("invalid stored log field {column}: {source}")]
-    Field {
-        /// The malformed column.
-        column: &'static str,
-        /// The wire parser's reason.
-        source: serde_json::Error,
-    },
-    /// Appending a decoded page failed.
-    #[error(transparent)]
-    Store(#[from] StoreError),
-    /// An internal decoder invariant failed rather than malformed log bytes.
-    #[error(transparent)]
-    Decode(#[from] DecodeError),
-    /// A page's row count did not fit the returned counter.
-    #[error("decoded page count overflow: {0}")]
-    Count(#[from] std::num::TryFromIntError),
-}
-
-/// Reads hex strings (including nullable topics) through the wire types' parsers.
-fn read_hex_column<T: DeserializeOwned>(
-    row: &duckdb::Row<'_>,
-    column: &'static str,
-) -> Result<T, ReplayError> {
-    let value: Option<String> = row.get(column)?;
-    serde_json::from_value(value.map_or(serde_json::Value::Null, serde_json::Value::String))
-        .map_err(|source| ReplayError::Field { column, source })
 }
 
 impl EnvelopeSink for DuckDbSink {
     async fn publish(&mut self, envelope: Envelope) -> Result<(), SinkError> {
-        self.batches.push(row_for(&envelope.chain, &envelope.event));
+        self.rows.push(row_for(&envelope.chain, &envelope.event));
         Ok(())
     }
 
     async fn flush(&mut self) -> Result<(), SinkError> {
-        self.batches.append_to(&self.connection)?;
+        self.write_batch()?;
         Ok(())
     }
 }
@@ -443,92 +294,82 @@ pub enum StoreError {
         /// The engine's own reason.
         source: duckdb::Error,
     },
-    /// A batch could not be committed.
+    /// A table's buffered appends could not be flushed into the transaction.
     #[error("flush {table}: {source}")]
-    Commit {
-        /// Which table's commit failed.
+    Flush {
+        /// Which table's flush failed.
         table: &'static str,
+        /// The engine's own reason.
+        source: duckdb::Error,
+    },
+    /// A batch transaction could not be started.
+    #[error("begin store transaction: {source}")]
+    Begin {
+        /// The engine's own reason.
+        source: duckdb::Error,
+    },
+    /// A batch transaction could not be committed.
+    #[error("commit store transaction: {source}")]
+    Commit {
         /// The engine's own reason.
         source: duckdb::Error,
     },
 }
 
-/// Renders a row's values as the appender's parameters.
-///
-/// The only `duckdb::types::Value` construction in the file, so the mapping from the
-/// neutral enum to the engine's is one function rather than one per column. Rendered per
-/// flush rather than per publish, because a buffered row is the neutral one until the
-/// commit that has to hand the engine its own type.
-fn sql_params(row: &Row) -> Vec<Value> {
-    row.values().iter().map(sql_value).collect()
-}
-
-/// The rows buffered for one flush, grouped by the table they belong to.
-///
-/// One list rather than one per table: grouping happens at the flush, because a store's
-/// batching is a property of the commit and sorting on every publish would pay for
-/// something only the flush needs. A block with no transactions then still opens no
-/// appender for `transaction`.
-#[derive(Debug, Default)]
-struct Batches {
-    rows: Vec<Row>,
-}
-
-impl Batches {
-    fn push(&mut self, row: Row) {
-        self.rows.push(row);
-    }
-
-    /// Writes every row, table by table, then clears the buffer.
+impl DuckDbSink {
+    /// Writes every table in one transaction, then clears the buffer after commit.
     ///
     /// # Errors
     ///
-    /// Returns an error if an appender cannot be opened, a row appended, or a batch
-    /// committed. The buffer is cleared only once every table has been written, so a
-    /// failure part-way leaves the rows buffered rather than losing them.
-    fn append_to(&mut self, connection: &Connection) -> Result<(), StoreError> {
+    /// Returns an error if the transaction or an appender fails. On failure the
+    /// transaction rolls back and the whole batch stays buffered for a retry.
+    fn write_batch(&mut self) -> Result<(), StoreError> {
+        if self.rows.is_empty() {
+            return Ok(());
+        }
+        let transaction = self
+            .connection
+            .transaction()
+            .map_err(|source| StoreError::Begin { source })?;
+        // ponytail: seven fixed tables mean seven linear scans, with no grouping buffer.
+        // Group at publish time only if the table count or profiling warrants it.
         for table in Table::ALL {
-            let rows: Vec<&Row> = self
+            let mut rows = self
                 .rows
                 .iter()
                 .filter(|row| row.table() == table)
-                .collect();
-            if rows.is_empty() {
+                .peekable();
+            if rows.peek().is_none() {
                 continue;
             }
             let mut appender =
-                connection
+                transaction
                     .appender(table.name())
                     .map_err(|source| StoreError::Appender {
                         table: table.name(),
                         source,
                     })?;
             for row in rows {
-                // `block` is wider than the appender's fixed-size row impls cover, so the
-                // row goes in as a slice of trait objects — the shape the `duckdb` crate
-                // documents for a wide table.
-                let params = sql_params(row);
-                let borrowed: Vec<&dyn ToSql> =
-                    params.iter().map(|value| value as &dyn ToSql).collect();
+                // Iterator parameters also support tables wider than 32 columns.
                 appender
-                    .append_row(borrowed.as_slice())
+                    .append_row(appender_params_from_iter(row.values()))
                     .map_err(|source| StoreError::Append {
                         table: table.name(),
                         source,
                     })?;
             }
-            appender.flush().map_err(|source| StoreError::Commit {
+            // Flush errors must be observed; Drop cannot report them. The appender
+            // drops before commit (and before rollback on an error).
+            appender.flush().map_err(|source| StoreError::Flush {
                 table: table.name(),
                 source,
             })?;
         }
+        transaction
+            .commit()
+            .map_err(|source| StoreError::Commit { source })?;
         self.rows.clear();
         Ok(())
-    }
-
-    /// The total rows buffered.
-    fn len(&self) -> usize {
-        self.rows.len()
     }
 }
 
@@ -646,154 +487,6 @@ mod tests {
             sink.publish(envelope).await.expect("row buffers");
         }
         sink.flush().await.expect("batch flushes");
-    }
-
-    fn historical_replay_setup() -> (crate::decode::Decoder, Box<Log>, u64) {
-        use crate::decode::Decoder;
-        use crate::decode::{AbiEntry, ContractEntry, ContractRegistry, RegistryConfig};
-
-        let fixture: Envelope = serde_json::from_str(
-            include_str!("../../examples/fixtures/uniswap_v3_swaps.ndjson")
-                .lines()
-                .next()
-                .expect("one fixture log"),
-        )
-        .expect("valid fixture envelope");
-        let Event::Log(template) = fixture.event else {
-            panic!("fixture is a log");
-        };
-        // Exercise UBIGINT reads above the signed range and more than one replay page.
-        let start = u64::MAX - 1_000;
-        let registry = ContractRegistry::load(
-            &RegistryConfig {
-                abi: vec![AbiEntry {
-                    name: "pool".to_owned(),
-                    path: concat!(env!("CARGO_MANIFEST_DIR"), "/abis/uniswap_v3_pool.json").into(),
-                }],
-                contract: vec![
-                    ContractEntry {
-                        chain: "base".to_owned(),
-                        address: format!("{:#x}", template.address),
-                        abi: "pool".to_owned(),
-                        protocol: "before_upgrade".to_owned(),
-                        from_block: start + 1,
-                        to_block: Some(start + 251),
-                    },
-                    ContractEntry {
-                        chain: "base".to_owned(),
-                        address: format!("{:#x}", template.address),
-                        abi: "pool".to_owned(),
-                        protocol: "after_upgrade".to_owned(),
-                        from_block: start + 251,
-                        to_block: Some(start + 502),
-                    },
-                ],
-            },
-            ".",
-        )
-        .expect("historical registrations load");
-        (Decoder::new(registry), template, start)
-    }
-
-    #[tokio::test]
-    async fn stored_replay_appends_pages_and_duplicates_using_historical_registrations() {
-        let (decoder, template, start) = historical_replay_setup();
-        let mut sink = sink();
-        for offset in 0..503_u64 {
-            let mut log = (*template).clone();
-            log.block_number = start + offset;
-            log.transaction_index = u64::MAX;
-            log.log_index = u64::MAX;
-            log.removed = offset == 1;
-            let envelope = Envelope::new(chain(), Event::Log(Box::new(log)));
-            sink.publish(envelope.clone())
-                .await
-                .expect("buffer raw log");
-            if offset == 500 {
-                // Exact raw duplicates must not disappear at a keyset page boundary.
-                sink.publish(envelope)
-                    .await
-                    .expect("buffer duplicate raw log");
-            }
-        }
-        let mut malformed = (*template).clone();
-        malformed.block_number = start + 300;
-        malformed.data = alloy_primitives::Bytes::new();
-        sink.publish(Envelope::new(chain(), Event::Log(Box::new(malformed))))
-            .await
-            .expect("buffer malformed log");
-        sink.flush().await.expect("store raw logs");
-        let raw_rows = |sink: &DuckDbSink| {
-            sink.connection
-                .prepare("SELECT CAST(to_json(log) AS VARCHAR) FROM log ORDER BY rowid")
-                .expect("prepare raw snapshot")
-                .query_map([], |row| row.get::<_, String>(0))
-                .expect("query raw snapshot")
-                .collect::<Result<Vec<_>, _>>()
-                .expect("read raw snapshot")
-        };
-        let before = raw_rows(&sink);
-        for run in 1..=2_i64 {
-            assert_eq!(
-                sink.redecode(
-                    &decoder,
-                    &chain(),
-                    template.address,
-                    start + 1,
-                    Some(start + 502)
-                )
-                .expect("replay raw logs"),
-                502
-            );
-            assert_eq!(row_count(&sink, "decoded"), 502 * run);
-            let protocols: (i64, i64) = sink
-                .connection
-                .query_row(
-                    "SELECT count(*) FILTER (WHERE protocol = 'before_upgrade'),
-                        count(*) FILTER (WHERE protocol = 'after_upgrade') FROM decoded",
-                    [],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
-                )
-                .expect("historical protocol counts");
-            assert_eq!(protocols, (250 * run, 252 * run));
-            assert_eq!(
-                raw_rows(&sink),
-                before,
-                "replay does not modify raw records"
-            );
-        }
-        assert_eq!(
-            sink.redecode(
-                &decoder,
-                &ChainId::new("ethereum"),
-                template.address,
-                start,
-                None
-            )
-            .expect("other chain"),
-            0
-        );
-        assert_eq!(
-            sink.redecode(&decoder, &chain(), Address::ZERO, start, None)
-                .expect("other address"),
-            0
-        );
-        assert_eq!(
-            sink.redecode(&decoder, &chain(), template.address, start + 502, None)
-                .expect("unregistered historical blocks"),
-            0
-        );
-        assert_eq!(
-            sink.redecode(
-                &decoder,
-                &chain(),
-                template.address,
-                start + 2,
-                Some(start + 2)
-            )
-            .expect("empty range"),
-            0
-        );
     }
 
     /// One event lands in its own table, and nowhere else. The point of dropping the
@@ -969,12 +662,94 @@ mod tests {
         for envelope in every_kind() {
             sink.publish(envelope).await.expect("row buffers");
         }
-        assert_eq!(sink.batches.len(), 6, "buffered but not written");
+        assert_eq!(sink.rows.len(), 6, "buffered but not written");
         assert_eq!(row_count(&sink, "log"), 0);
 
         sink.flush().await.expect("batch flushes");
-        assert_eq!(sink.batches.len(), 0, "the buffers are cleared");
+        assert_eq!(sink.rows.len(), 0, "the buffers are cleared");
         assert_eq!(row_count(&sink, "log"), 1);
+    }
+
+    #[tokio::test]
+    async fn a_late_table_failure_rolls_back_and_a_retry_writes_each_row_once() {
+        let mut sink = sink();
+        for envelope in every_kind() {
+            sink.publish(envelope).await.expect("row buffers");
+        }
+        sink.connection
+            .execute_batch("DROP TABLE finalized")
+            .expect("remove the last table in the batch");
+
+        assert!(matches!(
+            sink.flush().await,
+            Err(crate::sink::SinkError::Store(super::StoreError::Appender {
+                table: "finalized",
+                ..
+            }))
+        ));
+        assert_eq!(sink.rows.len(), 6, "failed batch stays buffered");
+        for table in Table::ALL
+            .into_iter()
+            .filter(|table| *table != Table::Finalized)
+        {
+            assert_eq!(row_count(&sink, table.name()), 0, "{table} rolls back");
+        }
+
+        sink.connection
+            .execute_batch(&super::create_table(Table::Finalized))
+            .expect("restore the missing table");
+        sink.flush()
+            .await
+            .expect("retry commits the original batch");
+        sink.flush().await.expect("empty flush is a no-op");
+        assert_eq!(sink.rows.len(), 0);
+        for table in Table::ALL {
+            assert_eq!(
+                row_count(&sink, table.name()),
+                i64::from(table != Table::Decoded)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_deferred_constraint_failure_keeps_the_batch_and_rolls_back() {
+        let mut sink = sink();
+        let constrained = super::create_table(Table::Finalized)
+            .replace("height UBIGINT", "height UBIGINT CHECK (height < 1)");
+        sink.connection
+            .execute_batch(&format!("DROP TABLE finalized; {constrained}"))
+            .expect("constrain the finality table");
+        for height in 0..2 {
+            sink.publish(Envelope::new(
+                chain(),
+                Event::Finalized(Finalized {
+                    height,
+                    hash: hash(0x11),
+                }),
+            ))
+            .await
+            .expect("row buffers");
+        }
+
+        assert!(matches!(
+            sink.flush().await,
+            Err(crate::sink::SinkError::Store(super::StoreError::Flush {
+                table: "finalized",
+                ..
+            }))
+        ));
+        assert_eq!(row_count(&sink, "finalized"), 0);
+        assert_eq!(sink.rows.len(), 2);
+
+        sink.connection
+            .execute_batch(&format!(
+                "DROP TABLE finalized; {}",
+                super::create_table(Table::Finalized)
+            ))
+            .expect("remove the constraint");
+        sink.flush().await.expect("retry the whole batch");
+        assert_eq!(row_count(&sink, "finalized"), 2);
+        assert_eq!(sink.rows.len(), 0);
     }
 
     /// A batch of several rows lands in one flush.
