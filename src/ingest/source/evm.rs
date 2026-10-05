@@ -89,7 +89,6 @@ impl EvmSource {
 /// A block's identity fields, enough for a `newHeads` notification or the
 /// finalized block; every other header field is ignored.
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
 struct RpcBlockId {
     // A quantity on the wire; alloy's `quantity` handles the `0x` hex form and
     // rejects anything else. `B256`'s own `Deserialize` parses the hash.
@@ -98,11 +97,11 @@ struct RpcBlockId {
     hash: B256,
 }
 
-impl RpcBlockId {
-    fn into_block_id(self) -> BlockId {
-        BlockId {
-            height: self.number,
-            hash: self.hash,
+impl From<RpcBlockId> for BlockId {
+    fn from(block: RpcBlockId) -> Self {
+        Self {
+            height: block.number,
+            hash: block.hash,
         }
     }
 }
@@ -129,12 +128,16 @@ fn malformed(context: &str, detail: impl fmt::Display) -> SourceError {
     }
 }
 
+fn invalid_json(context: &'static str, source: serde_json::Error) -> SourceError {
+    SourceError::Json { context, source }
+}
+
 /// Parses a response body as one response or a batch, borrowing each payload.
 fn parse_envelope<'a>(
-    context: &str,
+    context: &'static str,
     body: &'a [u8],
 ) -> Result<BorrowedResponsePacket<'a>, SourceError> {
-    serde_json::from_slice(body).map_err(|error| malformed(context, error))
+    serde_json::from_slice(body).map_err(|source| invalid_json(context, source))
 }
 
 /// Pulls one id's result out of a batch response.
@@ -176,22 +179,22 @@ fn take_result<'a>(
 fn decode_block_id(header: &RawValue) -> Result<BlockId, SourceError> {
     const CONTEXT: &str = "finalized block";
     let block: RpcBlockId =
-        serde_json::from_str(header.get()).map_err(|error| malformed(CONTEXT, error))?;
-    Ok(block.into_block_id())
+        serde_json::from_str(header.get()).map_err(|source| invalid_json(CONTEXT, source))?;
+    Ok(block.into())
 }
 
 /// Decodes one WebSocket frame into a head, when the frame is a head notification.
 fn decode_head_frame(text: &str) -> Option<Result<BlockId, SourceError>> {
     let message: SubscriptionMessage = match serde_json::from_str(text) {
         Ok(message) => message,
-        Err(error) => return Some(Err(malformed("websocket frame", error))),
+        Err(error) => return Some(Err(invalid_json("websocket frame", error))),
     };
     if message.method.as_deref() != Some("eth_subscription") {
         // The subscription confirmation and any other notification land here.
         return None;
     }
     let head = message.params.and_then(|params| params.result)?;
-    Some(Ok(head.into_block_id()))
+    Some(Ok(head.into()))
 }
 
 /// The three results one batched block request carries, still in alloy's RPC types
@@ -224,8 +227,9 @@ pub struct RpcBatch {
 ///
 /// # Errors
 ///
-/// Returns [`SourceError::Rpc`] when the node answered a call with an error, and
-/// [`SourceError::Malformed`] when the body is not a usable batch.
+/// Returns [`SourceError::Rpc`] when the node answered a call with an error,
+/// [`SourceError::Json`] when a payload does not decode, and [`SourceError::Malformed`]
+/// when the body is not a usable batch.
 pub fn parse_batch(body: &[u8]) -> Result<RpcBatch, SourceError> {
     const BLOCK: &str = "eth_getBlockByNumber";
     const RECEIPTS: &str = "eth_getBlockReceipts";
@@ -236,12 +240,12 @@ pub fn parse_batch(body: &[u8]) -> Result<RpcBatch, SourceError> {
     let block_result =
         take_result(responses, 1, BLOCK)?.ok_or_else(|| malformed(BLOCK, "result was null"))?;
     let block: AnyRpcBlock =
-        serde_json::from_str(block_result.get()).map_err(|error| malformed(BLOCK, error))?;
+        serde_json::from_str(block_result.get()).map_err(|source| invalid_json(BLOCK, source))?;
 
     let receipts = match take_result(responses, 2, RECEIPTS) {
-        Ok(Some(result)) => {
-            Some(serde_json::from_str(result.get()).map_err(|error| malformed(RECEIPTS, error))?)
-        }
+        Ok(Some(result)) => Some(
+            serde_json::from_str(result.get()).map_err(|source| invalid_json(RECEIPTS, source))?,
+        ),
         // An unsupported method is reported as `METHOD_NOT_FOUND`, and some nodes
         // answer with a null result instead; both mean the caller fetches per
         // transaction.
@@ -612,24 +616,14 @@ impl EvmSource {
     /// `is_timeout()` off it and write a retry policy — which it could not do when this
     /// flattened the error to a message.
     async fn post(&self, body: &serde_json::Value) -> Result<Vec<u8>, SourceError> {
-        const BATCH: &str = "json-rpc batch";
-        self.client
+        let response = self
+            .client
             .post(self.http_url.as_str())
             .json(body)
             .send()
             .await
-            .and_then(reqwest::Response::error_for_status)
-            .map_err(|source| SourceError::Http {
-                method: BATCH,
-                source,
-            })?
-            .bytes()
-            .await
-            .map_err(|source| SourceError::Http {
-                method: BATCH,
-                source,
-            })
-            .map(|bytes| bytes.to_vec())
+            .and_then(reqwest::Response::error_for_status)?;
+        Ok(response.bytes().await?.to_vec())
     }
 
     /// Fetches the block's receipts one transaction at a time, in index order.
@@ -676,7 +670,7 @@ impl EvmSource {
                     .ok_or_else(|| malformed(RECEIPT, "result was null"))?;
                 receipts.push(
                     serde_json::from_str(result.get())
-                        .map_err(|error| malformed(RECEIPT, error))?,
+                        .map_err(|source| invalid_json(RECEIPT, source))?,
                 );
             }
         }
@@ -1065,8 +1059,16 @@ mod tests {
             .expect("block is an object")
             .remove("hash");
         let error = decode_batch(&batch(&block, &receipts())).expect_err("missing hash must fail");
-        let message = error.to_string();
-        assert!(message.contains("eth_getBlockByNumber"), "{message}");
+        assert!(
+            matches!(
+                error,
+                super::SourceError::Json {
+                    context: "eth_getBlockByNumber",
+                    ..
+                }
+            ),
+            "{error}"
+        );
     }
 
     #[test]

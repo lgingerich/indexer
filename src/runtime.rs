@@ -43,7 +43,6 @@ use crate::decode::DecodingSink;
 use crate::decode::registry::{ContractRegistry, RegistryError};
 use crate::ingest::Ingest;
 use crate::ingest::pipeline::PipelineError;
-use crate::ingest::run::IngestError;
 use crate::sink::{self, DuckDbSink, SinkError, StdoutJsonSink};
 
 /// Why the indexer stopped.
@@ -54,19 +53,15 @@ use crate::sink::{self, DuckDbSink, SinkError, StdoutJsonSink};
 /// printing at the process boundary — it walks the `#[from]` chain and shows every layer,
 /// where a single string would have shown only the outermost.
 ///
-/// The assembly failures are kept apart from the runtime ones on purpose. A bad endpoint
-/// or an unreadable registry is fixed by editing a file and restarting; a pipeline failure
-/// is what a running indexer reports when it stops. Collapsing them would leave a caller
-/// unable to tell "this deployment never started" from "this run died".
+/// The assembly failures are kept apart from the runtime ones on purpose. A bad settings
+/// file or an unreadable registry is fixed by editing a file and restarting; a pipeline
+/// failure is what a running indexer reports when it stops. Collapsing them would leave a
+/// caller unable to tell "this deployment never started" from "this run died".
 #[derive(Debug, Error)]
 pub enum RuntimeError {
     /// The settings could not be read or parsed.
     #[error("settings could not be loaded: {0}")]
     Settings(#[from] SettingsError),
-    /// An ingest endpoint the settings named was not usable, so the pipeline could not be
-    /// assembled.
-    #[error("ingest could not be configured: {0}")]
-    Configure(#[from] IngestError),
     /// The registry could not be loaded, so nothing would have decoded.
     #[error("contract registry could not be loaded: {0}")]
     Registry(#[from] RegistryError),
@@ -105,18 +100,18 @@ pub(crate) struct Pipeline {
 impl Pipeline {
     /// Assembles the pipeline the settings describe.
     ///
-    /// Opens nothing: the store is connected in [`Pipeline::run`], so building fails on a
-    /// bad registry or endpoint without touching a database file.
+    /// Opens nothing: the store is connected in [`Pipeline::run`], so building fails on an
+    /// unreadable registry without touching a database file.
     ///
     /// # Errors
     ///
-    /// Returns [`RuntimeError::Configure`] when an ingest endpoint is unusable and
-    /// [`RuntimeError::Registry`] when the registry cannot be read.
+    /// Returns [`RuntimeError::Registry`] when the registry cannot be read.
     pub(crate) fn from_settings(settings: &Settings) -> Result<Self, RuntimeError> {
-        let ingest = Ingest::builder(&settings.ingest.chain)
-            .http_url(&settings.ingest.http_url)
-            .ws_url(&settings.ingest.ws_url)
-            .build()?;
+        let ingest = Ingest::new(
+            &settings.ingest.chain,
+            &settings.ingest.http_url,
+            &settings.ingest.ws_url,
+        );
         let registry = settings.registry_path().map_or_else(
             || Ok(ContractRegistry::default()),
             ContractRegistry::from_file,

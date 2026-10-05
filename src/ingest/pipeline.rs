@@ -144,25 +144,17 @@ pub struct Pipeline<S, K> {
 }
 
 impl<S: BlockSource, K: EnvelopeSink> Pipeline<S, K> {
-    /// Builds a pipeline with `DEFAULT_UNDO_DEPTH` blocks of history.
+    /// Builds a pipeline that retracts up to [`DEFAULT_UNDO_DEPTH`] published blocks.
+    ///
+    /// The ring holds at most that many blocks, so a fork at its oldest retracts
+    /// exactly that many; a deeper fork is refused rather than partially retracted.
     #[must_use]
     pub fn new(source: S, sink: K) -> Self {
-        Self::with_undo_depth(source, sink, DEFAULT_UNDO_DEPTH)
-    }
-
-    /// Builds a pipeline that retracts up to `undo_depth` published blocks.
-    ///
-    /// The ring holds at most `undo_depth` blocks, so a fork at its oldest retracts
-    /// exactly that many; a deeper fork is refused rather than partially retracted. A
-    /// depth of zero disables retraction — linkage is still checked, but no block can
-    /// be retracted.
-    #[must_use]
-    fn with_undo_depth(source: S, sink: K, undo_depth: usize) -> Self {
         Self {
             source,
             sink,
-            history: VecDeque::with_capacity(undo_depth.min(256)),
-            undo_depth,
+            history: VecDeque::with_capacity(DEFAULT_UNDO_DEPTH),
+            undo_depth: DEFAULT_UNDO_DEPTH,
             finalized_height: 0,
         }
     }
@@ -449,7 +441,7 @@ mod tests {
     use alloy_primitives::{B256, TxHash};
     use futures_util::stream;
 
-    use super::{Pipeline, PipelineError};
+    use super::{DEFAULT_UNDO_DEPTH, Pipeline, PipelineError};
     use crate::wire::envelope::{Block, ChainId, Envelope, Event, Log};
 
     use crate::sink::{EnvelopeSink, SinkError};
@@ -581,11 +573,11 @@ mod tests {
         }
     }
 
-    fn pipeline(undo_depth: usize) -> Pipeline<FakeSource, CollectSink> {
+    fn pipeline() -> Pipeline<FakeSource, CollectSink> {
         let source = FakeSource {
             chain: ChainId::new("ethereum"),
         };
-        Pipeline::with_undo_depth(source, CollectSink::default(), undo_depth)
+        Pipeline::new(source, CollectSink::default())
     }
 
     fn fetched_at(events: Vec<Event>, finalized_height: u64) -> FetchedBlock {
@@ -617,7 +609,7 @@ mod tests {
 
     #[tokio::test]
     async fn publishes_a_linear_chain_in_order() {
-        let mut pipeline = pipeline(128);
+        let mut pipeline = pipeline();
         process_all(
             &mut pipeline,
             vec![
@@ -633,7 +625,7 @@ mod tests {
 
     #[tokio::test]
     async fn depth_one_reorg_retracts_the_replaced_block() {
-        let mut pipeline = pipeline(128);
+        let mut pipeline = pipeline();
         process_all(
             &mut pipeline,
             vec![
@@ -654,7 +646,7 @@ mod tests {
 
     #[tokio::test]
     async fn deep_reorg_retracts_every_block_above_the_fork() {
-        let mut pipeline = pipeline(128);
+        let mut pipeline = pipeline();
         process_all(
             &mut pipeline,
             vec![
@@ -693,7 +685,7 @@ mod tests {
 
     #[tokio::test]
     async fn empty_block_publishes_nothing() {
-        let mut pipeline = pipeline(128);
+        let mut pipeline = pipeline();
         pipeline
             .process_block(fetched(Vec::new()))
             .await
@@ -704,8 +696,10 @@ mod tests {
 
     #[tokio::test]
     async fn undo_ring_stays_bounded_across_many_blocks() {
-        let mut pipeline = pipeline(2);
-        let blocks = (1..=10u8)
+        let mut pipeline = pipeline();
+        let past_the_ring =
+            u8::try_from(DEFAULT_UNDO_DEPTH + 1).expect("the default depth fits a fixture hash");
+        let blocks = (1..=past_the_ring)
             .map(|height| {
                 vec![
                     block_event(u64::from(height), hash(height), hash(height - 1)),
@@ -715,12 +709,12 @@ mod tests {
             .collect();
         process_all(&mut pipeline, blocks).await;
 
-        assert_eq!(pipeline.history.len(), 2);
+        assert_eq!(pipeline.history.len(), DEFAULT_UNDO_DEPTH);
     }
 
     #[tokio::test]
     async fn a_reannounced_tip_is_not_a_reorg() {
-        let mut pipeline = pipeline(128);
+        let mut pipeline = pipeline();
         process_all(
             &mut pipeline,
             vec![
@@ -743,7 +737,7 @@ mod tests {
     /// reorged, and the marker named block 3 as canonical *and* as orphaned at once.
     #[tokio::test]
     async fn a_reannounced_head_below_the_tip_is_not_a_reorg() {
-        let mut pipeline = pipeline(128);
+        let mut pipeline = pipeline();
         process_all(
             &mut pipeline,
             vec![
@@ -780,7 +774,7 @@ mod tests {
     /// declared canonical.
     #[tokio::test]
     async fn a_reorg_marker_never_orphans_the_head_it_names() {
-        let mut pipeline = pipeline(128);
+        let mut pipeline = pipeline();
         process_all(
             &mut pipeline,
             vec![
@@ -809,7 +803,7 @@ mod tests {
     /// and the ring trim that rides on it.
     #[tokio::test]
     async fn a_reannounced_head_still_advances_finality() {
-        let mut pipeline = pipeline(128);
+        let mut pipeline = pipeline();
         process_all(
             &mut pipeline,
             vec![
@@ -831,7 +825,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_height_gap_is_a_coverage_error_not_a_silent_hole() {
-        let mut pipeline = pipeline(128);
+        let mut pipeline = pipeline();
         process_all(&mut pipeline, vec![vec![block_event(1, hash(1), hash(0))]]).await;
 
         // Head 3 chains from the published block 1, so it links to the tip but skips
@@ -853,7 +847,7 @@ mod tests {
     /// the one door that skipped the check.
     #[tokio::test]
     async fn a_fork_that_skips_heights_is_a_coverage_error_not_a_silent_hole() {
-        let mut pipeline = pipeline(128);
+        let mut pipeline = pipeline();
         process_all(
             &mut pipeline,
             vec![
@@ -884,7 +878,7 @@ mod tests {
     /// operator's trade, not an error, so the block is published and the stream follows.
     #[tokio::test]
     async fn a_first_head_above_genesis_starts_the_stream() {
-        let mut pipeline = pipeline(128);
+        let mut pipeline = pipeline();
         process_all(
             &mut pipeline,
             vec![
@@ -901,18 +895,21 @@ mod tests {
 
     #[tokio::test]
     async fn a_reorg_deeper_than_the_ring_is_an_error_not_an_empty_marker() {
-        // The ring holds only the last two blocks, so a fork below them cannot be
-        // located and retracted.
-        let mut pipeline = pipeline(2);
-        process_all(
-            &mut pipeline,
-            vec![
-                vec![block_event(1, hash(1), hash(0))],
-                vec![block_event(2, hash(2), hash(1))],
-                vec![block_event(3, hash(3), hash(2))],
-            ],
-        )
-        .await;
+        // One block past the ring drops the oldest, so a fork under that block cannot
+        // be located and retracted.
+        let mut pipeline = pipeline();
+        let past_the_ring =
+            u8::try_from(DEFAULT_UNDO_DEPTH + 1).expect("the default depth fits a fixture hash");
+        let blocks = (1..=past_the_ring)
+            .map(|height| {
+                vec![block_event(
+                    u64::from(height),
+                    hash(height),
+                    hash(height - 1),
+                )]
+            })
+            .collect();
+        process_all(&mut pipeline, blocks).await;
 
         // A new head building on block 1 forks below the remembered range.
         let error = pipeline
@@ -927,7 +924,7 @@ mod tests {
                 PipelineError::ForkTooDeep {
                     height: 2,
                     parent: _,
-                    undo_depth: 2
+                    undo_depth: DEFAULT_UNDO_DEPTH
                 }
             ),
             "a fork below the ring must report the depth it exceeded: {error}"
@@ -937,7 +934,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_reorg_names_the_fork_point_as_its_height() {
-        let mut pipeline = pipeline(128);
+        let mut pipeline = pipeline();
         process_all(
             &mut pipeline,
             vec![
@@ -956,7 +953,7 @@ mod tests {
 
     #[tokio::test]
     async fn finality_watermark_publishes_once_per_advance_and_trims_the_ring() {
-        let mut pipeline = pipeline(128);
+        let mut pipeline = pipeline();
         for (height, finalized) in (1..=4u8).zip([0, 2, 2, 3]) {
             let events = vec![block_event(
                 u64::from(height),

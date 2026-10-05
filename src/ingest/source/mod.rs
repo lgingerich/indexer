@@ -76,27 +76,25 @@ pub const METHOD_NOT_FOUND: i64 = -32601;
 pub enum SourceError {
     /// An HTTP request failed, carrying `reqwest`'s typed error.
     ///
-    /// The variant to match when deciding whether to retry: `source.status()` tells a
-    /// rate limit from a 5xx, and `source.is_timeout()` a stall from a refusal. This is
-    /// why the error is not stringified — as a `String` the only thing left to match on
-    /// was the message, so no retry policy could be written against this error at all.
-    #[error("http failure for {method}: {source}")]
-    Http {
-        /// The JSON-RPC method the request carried.
-        method: &'static str,
-        /// `reqwest`'s error, typed.
-        #[source]
-        source: reqwest::Error,
-    },
+    /// The variant to match when deciding whether to retry: [`reqwest::Error::status`]
+    /// tells a rate limit from a 5xx, and [`reqwest::Error::is_timeout`] a stall from a
+    /// refusal. This is why the error is not stringified — as a `String` the only thing
+    /// left to match on was the message, so no retry policy could be written against
+    /// this error at all.
+    #[error("http failure: {0}")]
+    Http(#[from] reqwest::Error),
     /// A websocket frame failed to send or receive.
     ///
     /// Typed for the same reason as [`Self::Http`]: `tungstenite::Error` is `Send + Sync`,
     /// so there is nothing to gain by flattening it. The case a caller most wants to
     /// branch on — the peer going away — is [`Self::Closed`] instead, since a closure is
     /// not a frame error but a normal end of stream.
+    ///
+    /// `context` is set at the call (`connect`, `subscribe`, `read frame`), so this is
+    /// not `#[from]` — a `From<tungstenite::Error>` would have to drop which attempt failed.
     #[error("websocket {context} failed: {source}")]
     Websocket {
-        /// What was being attempted, `connect` or `subscribe`.
+        /// What was being attempted, `connect`, `subscribe`, or `read frame`.
         context: &'static str,
         /// `tungstenite`'s error, typed.
         #[source]
@@ -141,7 +139,22 @@ pub enum SourceError {
         /// The node's error message.
         message: String,
     },
+    /// A payload was not JSON of the shape being decoded.
+    ///
+    /// `context` names which payload failed, which [`serde_json::Error`] cannot know, so
+    /// this is not `#[from]`.
+    #[error("malformed data from {context}: {source}")]
+    Json {
+        /// What was being parsed, for example a method name.
+        context: &'static str,
+        /// `serde_json`'s error, typed.
+        #[source]
+        source: serde_json::Error,
+    },
     /// The source responded, but the payload was not usable.
+    ///
+    /// Distinct from [`Self::Json`]: the body parsed, and then failed a check this
+    /// source owns (a null result, a log with no index, a receipt from another block).
     #[error("malformed data from {context}: {detail}")]
     Malformed {
         /// What was being parsed, for example a method name.
@@ -163,9 +176,9 @@ pub trait BlockSource: Send + Sync {
     ///
     /// # Errors
     ///
-    /// Returns [`SourceError::Http`] or [`SourceError::Websocket`] when the request or
-    /// socket fails, [`SourceError::Rpc`] when a call in it was rejected, and
-    /// [`SourceError::Malformed`] when the response cannot be decoded.
+    /// Returns [`SourceError::Http`] when the request fails, [`SourceError::Rpc`] when a
+    /// call in it was rejected, and [`SourceError::Json`] or [`SourceError::Malformed`]
+    /// when the response cannot be decoded.
     fn fetch_block(
         &self,
         height: u64,
