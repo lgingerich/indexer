@@ -228,23 +228,12 @@ impl DuckDbSink {
             batches: Batches::default(),
         })
     }
-
-    /// Buffers one envelope as a row in its dataset's table.
-    ///
-    /// Returns [`SinkError`], not [`StoreError`], so a row that does not fit its table
-    /// surfaces as [`SinkError::Row`] instead of being laundered through the engine's
-    /// error type. A width mismatch is a defect in this crate's row builders or in the
-    /// envelope, not something `DuckDB` had an opinion about.
-    fn write(&mut self, envelope: &Envelope) -> Result<(), SinkError> {
-        let row = row_for(&envelope.chain, &envelope.event)?;
-        self.batches.push(row);
-        Ok(())
-    }
 }
 
 impl EnvelopeSink for DuckDbSink {
     async fn publish(&mut self, envelope: Envelope) -> Result<(), SinkError> {
-        self.write(&envelope)
+        self.batches.push(row_for(&envelope.chain, &envelope.event));
+        Ok(())
     }
 
     async fn flush(&mut self) -> Result<(), SinkError> {
@@ -261,9 +250,7 @@ impl EnvelopeSink for DuckDbSink {
 /// on the key rather than parse it back out of prose.
 ///
 /// Every variant here is a [`duckdb::Error`], which is what keeps this enum narrower than
-/// the layer above it: the engine is the only thing that can fail at these points. A row
-/// that does not fit its table is *not* one of them — that is
-/// [`crate::sink::SinkError::Row`], raised before the engine is involved at all.
+/// the layer above it: the engine is the only thing that can fail at these points.
 ///
 /// The engine's error is carried rather than stringified, so the `#[error]` output reads
 /// the same as a formatted message would while staying matchable by a caller.
@@ -740,7 +727,7 @@ mod tests {
             ..Log::default()
         };
         let event = Event::Log(Box::new(log));
-        let row = row_for(&chain(), &event).expect("a log row");
+        let row = row_for(&chain(), &event);
 
         assert_eq!(row.table(), Table::Log);
         assert_eq!(row.chain(), "base");

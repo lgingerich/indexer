@@ -10,18 +10,19 @@
 //! with only what is genuinely its own: the DDL, the mapping from these types to its own,
 //! and the commit.
 //!
-//! # A row is a header and its values
+//! # A table is declared once
 //!
-//! [`Row`] pairs a [`Table`] with its columns and the values that line up with them
-//! positionally. The pairing is the contract, and it is enforced once in [`Row::new`]
-//! rather than trusted: the compiler cannot count a `vec!` against a header, so a
-//! mismatch is a construction error instead of a row nobody notices.
+//! A table is a header of [`Column`]s and, per row, one [`ColumnValue`] per column. The
+//! two are declared *together*, as one `(Column, fn(&Dataset) -> ColumnValue)` entry per
+//! field in a per-table cell table, so a column and its value cannot be reordered,
+//! renamed, or dropped independently: there is no second positional list for them to
+//! drift against, and [`Row`]'s width is the number of cells.
 //!
-//! The column *type* is part of the header, not a parallel list, for the same reason — a
-//! name and a type are one fact about a column, and splitting them is how a schema and its
-//! data come to disagree. Each store maps [`ColumnType`] to its own vocabulary; a
-//! `ClickHouse` sink and a `DuckDB` one would both read the same headers and produce
-//! different DDL, which is the point.
+//! The column *type* is part of each cell, not a parallel list, because a name and a type
+//! are one fact about a column and splitting them is how a schema and its data come to
+//! disagree. Each store maps [`ColumnType`] to its own vocabulary; a `ClickHouse` sink and
+//! a `DuckDB` one would both read the same headers and produce different DDL, which is
+//! the point.
 //!
 //! # Why these types
 //!
@@ -69,7 +70,7 @@ pub enum Table {
     Receipt,
     /// Logs, one row per log.
     Log,
-    /// Decoded event records, whose arguments ride as a document.
+    /// Decoded event records, whose arguments ride as documents.
     Decoded,
     /// Reorg markers: which block hashes stopped being canonical.
     Reorg,
@@ -111,19 +112,22 @@ impl Table {
 
     /// This table's columns, in order, each with the type it stores.
     ///
-    /// Every header ends with [`COMMON_COLUMNS`]; a test checks that, so a table cannot
-    /// quietly become unkeyable.
+    /// The header and the rows are two views of one declaration: the columns come from the
+    /// same cell table [`row_for`] builds each row from, so a store's DDL cannot disagree
+    /// with the rows it is asked to hold. Every header ends with [`COMMON_COLUMNS`].
     #[must_use]
-    pub const fn columns(self) -> &'static [Column] {
-        match self {
-            Self::Block => BLOCK_COLUMNS,
-            Self::Transaction => TRANSACTION_COLUMNS,
-            Self::Receipt => RECEIPT_COLUMNS,
-            Self::Log => LOG_COLUMNS,
-            Self::Decoded => DECODED_COLUMNS,
-            Self::Reorg => REORG_COLUMNS,
-            Self::Finalized => FINALIZED_COLUMNS,
-        }
+    pub fn columns(self) -> Vec<Column> {
+        let mut columns = match self {
+            Self::Block => cells_columns(&BLOCK_CELLS),
+            Self::Transaction => cells_columns(&TRANSACTION_CELLS),
+            Self::Receipt => cells_columns(&RECEIPT_CELLS),
+            Self::Log => cells_columns(&LOG_CELLS),
+            Self::Decoded => cells_columns(&DECODED_CELLS),
+            Self::Reorg => cells_columns(&REORG_CELLS),
+            Self::Finalized => cells_columns(&FINALIZED_CELLS),
+        };
+        columns.extend(COMMON_COLUMNS);
+        columns
     }
 }
 
@@ -131,6 +135,14 @@ impl fmt::Display for Table {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.name())
     }
+}
+
+/// The columns of a cell table, in order.
+///
+/// Shared by every per-table arm of [`Table::columns`], so the header is derived from the
+/// same cells the row is.
+fn cells_columns<C>(cells: &[(Column, C)]) -> Vec<Column> {
+    cells.iter().map(|(column, _)| *column).collect()
 }
 
 /// One column of a table: its name and what it stores.
@@ -212,7 +224,8 @@ pub enum ColumnType {
 ///
 /// `chain` because one store may hold several chains and a key is scoped to its chain;
 /// `dedupe_key` because that is the row's identity — the value a store deduplicates and
-/// upserts on.
+/// upserts on. Both the header ([`Table::columns`]) and the row ([`row_for`]) take them
+/// from here, so the two cannot name them differently.
 pub const COMMON_COLUMNS: [Column; 2] = [Column::text("chain"), Column::text("dedupe_key")];
 
 /// One value in a row.
@@ -309,56 +322,30 @@ impl ColumnValue {
     }
 }
 
-/// Renders any serializable value as JSON, with a total fallback.
+/// Renders any serializable value as JSON.
 ///
 /// The values rendered here are plain data — hashes, lists, ABI values — so a failure is
-/// not reachable. This is the one place that says so, rather than a `to_string` followed
-/// by an `unwrap` at each of the twenty call sites that would otherwise need one.
+/// not reachable. It panics rather than falling back to a `"null"` document: a document is
+/// the row asserting the value is present, so a fallback would persist a value that says it
+/// is empty, which is a lie a store keeps. Failing here is loud and loses nothing.
 fn json<T: serde::Serialize>(value: &T) -> String {
-    serde_json::to_string(value).unwrap_or_else(|_| String::from("null"))
+    serde_json::to_string(value)
+        .unwrap_or_else(|error| panic!("a row value is plain data and must serialize: {error}"))
 }
 
-/// One row's worth of a dataset: the table, and the values in its column order.
+/// One table's columns, each paired with the value that fills it for this row.
+///
+/// A single list is the whole point: a table is declared once, as this, rather than as a
+/// header and a positional value list that [`Row`] has to check against it. The length is
+/// the row's width, so the two cannot disagree.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Row {
-    table: Table,
-    values: Vec<ColumnValue>,
-}
+struct Columns(Vec<(Column, ColumnValue)>);
 
 impl Row {
-    /// Builds a row for `table`, taking the values in [`Table::columns`] order.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if `values` does not have one entry per column.
-    pub fn new(table: Table, values: Vec<ColumnValue>) -> Result<Self, RowError> {
-        let columns = table.columns().len();
-        if values.len() != columns {
-            return Err(RowError::Width {
-                table,
-                columns,
-                values: values.len(),
-            });
-        }
-        Ok(Self { table, values })
-    }
-
     /// Which table this row belongs to.
     #[must_use]
     pub const fn table(&self) -> Table {
         self.table
-    }
-
-    /// This table's columns, in the order [`values`](Self::values) are given.
-    #[must_use]
-    pub fn columns(&self) -> &'static [Column] {
-        self.table.columns()
-    }
-
-    /// The values, in [`columns`](Self::columns) order.
-    #[must_use]
-    pub fn values(&self) -> &[ColumnValue] {
-        &self.values
     }
 
     /// The value in the named column.
@@ -370,8 +357,7 @@ impl Row {
     #[must_use]
     pub fn value(&self, column: &str) -> &ColumnValue {
         let index = self
-            .table
-            .columns()
+            .columns
             .iter()
             .position(|col| col.name == column)
             .unwrap_or_else(|| panic!("{column} is a column of the {} table", self.table));
@@ -404,298 +390,419 @@ impl Row {
     }
 }
 
-/// A row that does not match its own table's columns.
-#[derive(Debug, thiserror::Error)]
-pub enum RowError {
-    /// The values and the columns disagree on how many there are.
-    #[error("the {table} table has {columns} columns but the row has {values} values")]
-    Width {
-        /// The table the row was for.
-        table: Table,
-        /// How many columns the table declares.
-        columns: usize,
-        /// How many values were given.
-        values: usize,
-    },
-}
-
 /// Renders an event as the row a store persists.
 ///
 /// Every event has exactly one row, a control signal included — a reorg carries only what
 /// the signal says, but it is still a row, so a store has no variant to handle and no
 /// event that is silently dropped.
 ///
-/// # Errors
-///
-/// Returns an error if a row's values do not match its table's columns, which the
-/// constants here make unreachable and which is therefore the check that keeps them
-/// honest.
-pub fn row_for(chain: &ChainId, event: &Event) -> Result<Row, RowError> {
-    let common = || {
-        vec![
-            ColumnValue::Text(chain.as_str().to_owned()),
-            ColumnValue::Text(event.dedupe_key()),
-        ]
+/// Total: the row is built from the table's own cell list, so it is always as wide as the
+/// table and there is no width to check. A store appends it and cannot be handed a row
+/// that does not fit.
+#[must_use]
+pub fn row_for(chain: &ChainId, event: &Event) -> Row {
+    let (table, cells) = match event {
+        Event::Block(b) => (Table::Block, block_cells(b)),
+        Event::Transaction(t) => (Table::Transaction, transaction_cells(t)),
+        Event::Receipt(r) => (Table::Receipt, receipt_cells(r)),
+        Event::Log(l) => (Table::Log, log_cells(l)),
+        Event::Decoded(d) => (Table::Decoded, decoded_cells(d)),
+        Event::Reorg(r) => (Table::Reorg, reorg_cells(r)),
+        Event::Finalized(f) => (Table::Finalized, finalized_cells(f)),
     };
-    let build = |table: Table, mut values: Vec<ColumnValue>| {
-        values.extend(common());
-        Row::new(table, values)
-    };
+    Row::new(table, cells.with_common(chain, &event.dedupe_key()))
+}
 
-    match event {
-        Event::Block(b) => build(Table::Block, block_values(b)),
-        Event::Transaction(t) => build(Table::Transaction, transaction_values(t)),
-        Event::Receipt(r) => build(Table::Receipt, receipt_values(r)),
-        Event::Log(l) => build(Table::Log, log_values(l)),
-        Event::Reorg(r) => build(Table::Reorg, reorg_values(r)),
-        Event::Finalized(f) => build(Table::Finalized, finalized_values(f)),
-        Event::Decoded(d) => build(Table::Decoded, decoded_values(d)),
+/// One row's worth of a dataset: the table, its columns, and the values that line up with
+/// them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Row {
+    table: Table,
+    columns: Vec<Column>,
+    values: Vec<ColumnValue>,
+}
+
+impl Row {
+    /// Builds a row from its table's cells, splitting them into the header and the values.
+    fn new(table: Table, cells: Columns) -> Self {
+        let (columns, values) = cells.0.into_iter().unzip();
+        Self {
+            table,
+            columns,
+            values,
+        }
+    }
+
+    /// This table's columns, in the order [`values`](Self::values) are given.
+    #[must_use]
+    pub fn columns(&self) -> &[Column] {
+        &self.columns
+    }
+
+    /// The values, in [`columns`](Self::columns) order.
+    #[must_use]
+    pub fn values(&self) -> &[ColumnValue] {
+        &self.values
     }
 }
 
-/// The `block` table.
-const BLOCK_COLUMNS: &[Column] = &[
-    Column::uint("number"),
-    Column::text("hash"),
-    Column::text("parent_hash"),
-    Column::uint("timestamp"),
-    Column::text("nonce"),
-    Column::text("ommers_hash"),
-    Column::text("transactions_root"),
-    Column::text("state_root"),
-    Column::text("receipts_root"),
-    Column::text("withdrawals_root"),
-    Column::text("logs_bloom"),
-    Column::text("miner"),
-    Column::text("difficulty"),
-    Column::text("total_difficulty"),
-    Column::text("size"),
-    Column::text("extra_data"),
-    Column::uint("gas_limit"),
-    Column::uint("gas_used"),
-    Column::uint("transaction_count"),
-    Column::uint("base_fee_per_gas"),
-    Column::uint("blob_gas_used"),
-    Column::uint("excess_blob_gas"),
-    Column::text("parent_beacon_block_root"),
-    Column::document("ommers"),
-    Column::document("transaction_hashes"),
-    COMMON_COLUMNS[0],
-    COMMON_COLUMNS[1],
-];
-
-fn block_values(b: &Block) -> Vec<ColumnValue> {
-    vec![
-        ColumnValue::Uint(b.number),
-        ColumnValue::hex(b.hash),
-        ColumnValue::hex(b.parent_hash),
-        ColumnValue::Uint(b.timestamp),
-        ColumnValue::hex(b.nonce),
-        ColumnValue::hex(b.ommers_hash),
-        ColumnValue::hex(b.transactions_root),
-        ColumnValue::hex(b.state_root),
-        ColumnValue::hex(b.receipts_root),
-        ColumnValue::some(b.withdrawals_root, ColumnValue::hex),
-        ColumnValue::hex(b.logs_bloom),
-        ColumnValue::hex(b.miner),
-        ColumnValue::u256(b.difficulty),
-        ColumnValue::some(b.total_difficulty, ColumnValue::u256),
-        ColumnValue::some(b.size, ColumnValue::u256),
-        ColumnValue::bytes(&b.extra_data),
-        ColumnValue::Uint(b.gas_limit),
-        ColumnValue::Uint(b.gas_used),
-        ColumnValue::Uint(b.transaction_count),
-        ColumnValue::some(b.base_fee_per_gas, ColumnValue::Uint),
-        ColumnValue::some(b.blob_gas_used, ColumnValue::Uint),
-        ColumnValue::some(b.excess_blob_gas, ColumnValue::Uint),
-        ColumnValue::some(b.parent_beacon_block_root, ColumnValue::hex),
-        ColumnValue::hex_list(&b.ommers),
-        ColumnValue::hex_list(&b.transaction_hashes),
-    ]
+impl Columns {
+    /// Appends the two columns every table ends with, for this row.
+    ///
+    /// Takes the names from [`COMMON_COLUMNS`] so the header ([`Table::columns`]) and the
+    /// row cannot disagree on them.
+    fn with_common(mut self, chain: &ChainId, key: &str) -> Self {
+        let values = [
+            ColumnValue::Text(chain.as_str().to_owned()),
+            ColumnValue::Text(key.to_owned()),
+        ];
+        self.0.extend(COMMON_COLUMNS.into_iter().zip(values));
+        self
+    }
 }
 
-/// The `transaction` table.
-const TRANSACTION_COLUMNS: &[Column] = &[
-    Column::text("hash"),
-    Column::uint("nonce"),
-    Column::uint("transaction_index"),
-    Column::text("from_address"),
-    Column::text("to_address"),
-    Column::text("value"),
-    Column::uint("gas"),
-    Column::text("gas_price"),
-    Column::text("max_fee_per_gas"),
-    Column::text("max_priority_fee_per_gas"),
-    Column::text("max_fee_per_blob_gas"),
-    Column::text("input"),
-    Column::uint("transaction_type"),
-    Column::uint("chain_id"),
-    Column::document("access_list"),
-    Column::document("blob_versioned_hashes"),
-    Column::document("authorization_list"),
-    Column::uint("block_timestamp"),
-    Column::uint("block_number"),
-    Column::text("block_hash"),
-    COMMON_COLUMNS[0],
-    COMMON_COLUMNS[1],
+/// The `block` table, as one cell per column.
+const BLOCK_CELLS: [(Column, fn(&Block) -> ColumnValue); 25] = [
+    (Column::uint("number"), |b| ColumnValue::Uint(b.number)),
+    (Column::text("hash"), |b| ColumnValue::hex(b.hash)),
+    (Column::text("parent_hash"), |b| {
+        ColumnValue::hex(b.parent_hash)
+    }),
+    (Column::uint("timestamp"), |b| {
+        ColumnValue::Uint(b.timestamp)
+    }),
+    (Column::text("nonce"), |b| ColumnValue::hex(b.nonce)),
+    (Column::text("ommers_hash"), |b| {
+        ColumnValue::hex(b.ommers_hash)
+    }),
+    (Column::text("transactions_root"), |b| {
+        ColumnValue::hex(b.transactions_root)
+    }),
+    (Column::text("state_root"), |b| {
+        ColumnValue::hex(b.state_root)
+    }),
+    (Column::text("receipts_root"), |b| {
+        ColumnValue::hex(b.receipts_root)
+    }),
+    (Column::text("withdrawals_root"), |b| {
+        ColumnValue::some(b.withdrawals_root, ColumnValue::hex)
+    }),
+    (Column::text("logs_bloom"), |b| {
+        ColumnValue::hex(b.logs_bloom)
+    }),
+    (Column::text("miner"), |b| ColumnValue::hex(b.miner)),
+    (Column::text("difficulty"), |b| {
+        ColumnValue::u256(b.difficulty)
+    }),
+    (Column::text("total_difficulty"), |b| {
+        ColumnValue::some(b.total_difficulty, ColumnValue::u256)
+    }),
+    (Column::text("size"), |b| {
+        ColumnValue::some(b.size, ColumnValue::u256)
+    }),
+    (Column::text("extra_data"), |b| {
+        ColumnValue::bytes(&b.extra_data)
+    }),
+    (Column::uint("gas_limit"), |b| {
+        ColumnValue::Uint(b.gas_limit)
+    }),
+    (Column::uint("gas_used"), |b| ColumnValue::Uint(b.gas_used)),
+    (Column::uint("transaction_count"), |b| {
+        ColumnValue::Uint(b.transaction_count)
+    }),
+    (Column::uint("base_fee_per_gas"), |b| {
+        ColumnValue::some(b.base_fee_per_gas, ColumnValue::Uint)
+    }),
+    (Column::uint("blob_gas_used"), |b| {
+        ColumnValue::some(b.blob_gas_used, ColumnValue::Uint)
+    }),
+    (Column::uint("excess_blob_gas"), |b| {
+        ColumnValue::some(b.excess_blob_gas, ColumnValue::Uint)
+    }),
+    (Column::text("parent_beacon_block_root"), |b| {
+        ColumnValue::some(b.parent_beacon_block_root, ColumnValue::hex)
+    }),
+    (Column::document("ommers"), |b| {
+        ColumnValue::hex_list(&b.ommers)
+    }),
+    (Column::document("transaction_hashes"), |b| {
+        ColumnValue::hex_list(&b.transaction_hashes)
+    }),
 ];
 
-fn transaction_values(t: &Transaction) -> Vec<ColumnValue> {
-    vec![
-        ColumnValue::hex(t.hash),
-        ColumnValue::Uint(t.nonce),
-        ColumnValue::Uint(t.transaction_index),
-        ColumnValue::hex(t.from),
-        ColumnValue::some(t.to, ColumnValue::hex),
-        ColumnValue::u256(t.value),
-        ColumnValue::Uint(t.gas),
-        ColumnValue::some(t.gas_price, ColumnValue::wei),
-        ColumnValue::wei(t.max_fee_per_gas),
-        ColumnValue::some(t.max_priority_fee_per_gas, ColumnValue::wei),
-        ColumnValue::some(t.max_fee_per_blob_gas, ColumnValue::wei),
-        ColumnValue::bytes(&t.input),
-        ColumnValue::Uint(u64::from(t.transaction_type)),
-        ColumnValue::some(t.chain_id, ColumnValue::Uint),
-        ColumnValue::optional_document(&t.access_list),
-        ColumnValue::optional_document(&t.blob_versioned_hashes),
-        ColumnValue::optional_document(&t.authorization_list),
-        ColumnValue::Uint(t.block_timestamp),
-        ColumnValue::Uint(t.block_number),
-        ColumnValue::hex(t.block_hash),
-    ]
+/// Builds the `block` table's cells for one block.
+fn block_cells(b: &Block) -> Columns {
+    Columns(
+        BLOCK_CELLS
+            .iter()
+            .map(|(column, render)| (*column, render(b)))
+            .collect(),
+    )
 }
 
-/// The `receipt` table.
-const RECEIPT_COLUMNS: &[Column] = &[
-    Column::text("transaction_hash"),
-    Column::uint("transaction_index"),
-    Column::text("from_address"),
-    Column::text("to_address"),
-    Column::boolean("status"),
-    Column::uint("transaction_type"),
-    Column::uint("gas_used"),
-    Column::uint("cumulative_gas_used"),
-    Column::text("effective_gas_price"),
-    Column::text("contract_address"),
-    Column::text("logs_bloom"),
-    Column::uint("blob_gas_used"),
-    Column::text("blob_gas_price"),
-    Column::uint("log_count"),
-    Column::uint("block_number"),
-    Column::text("block_hash"),
-    COMMON_COLUMNS[0],
-    COMMON_COLUMNS[1],
+/// The `transaction` table, as one cell per column.
+const TRANSACTION_CELLS: [(Column, fn(&Transaction) -> ColumnValue); 20] = [
+    (Column::text("hash"), |t| ColumnValue::hex(t.hash)),
+    (Column::uint("nonce"), |t| ColumnValue::Uint(t.nonce)),
+    (Column::uint("transaction_index"), |t| {
+        ColumnValue::Uint(t.transaction_index)
+    }),
+    (Column::text("from_address"), |t| ColumnValue::hex(t.from)),
+    (Column::text("to_address"), |t| {
+        ColumnValue::some(t.to, ColumnValue::hex)
+    }),
+    (Column::text("value"), |t| ColumnValue::u256(t.value)),
+    (Column::uint("gas"), |t| ColumnValue::Uint(t.gas)),
+    (Column::text("gas_price"), |t| {
+        ColumnValue::some(t.gas_price, ColumnValue::wei)
+    }),
+    (Column::text("max_fee_per_gas"), |t| {
+        ColumnValue::some(t.max_fee_per_gas, ColumnValue::wei)
+    }),
+    (Column::text("max_priority_fee_per_gas"), |t| {
+        ColumnValue::some(t.max_priority_fee_per_gas, ColumnValue::wei)
+    }),
+    (Column::text("max_fee_per_blob_gas"), |t| {
+        ColumnValue::some(t.max_fee_per_blob_gas, ColumnValue::wei)
+    }),
+    (Column::text("input"), |t| ColumnValue::bytes(&t.input)),
+    (Column::uint("transaction_type"), |t| {
+        ColumnValue::Uint(u64::from(t.transaction_type))
+    }),
+    (Column::uint("chain_id"), |t| {
+        ColumnValue::some(t.chain_id, ColumnValue::Uint)
+    }),
+    (Column::document("access_list"), |t| {
+        ColumnValue::optional_document(&t.access_list)
+    }),
+    (Column::document("blob_versioned_hashes"), |t| {
+        ColumnValue::optional_document(&t.blob_versioned_hashes)
+    }),
+    (Column::document("authorization_list"), |t| {
+        ColumnValue::optional_document(&t.authorization_list)
+    }),
+    (Column::uint("block_timestamp"), |t| {
+        ColumnValue::Uint(t.block_timestamp)
+    }),
+    (Column::uint("block_number"), |t| {
+        ColumnValue::Uint(t.block_number)
+    }),
+    (Column::text("block_hash"), |t| {
+        ColumnValue::hex(t.block_hash)
+    }),
 ];
 
-fn receipt_values(r: &Receipt) -> Vec<ColumnValue> {
-    vec![
-        ColumnValue::hex(r.transaction_hash),
-        ColumnValue::Uint(r.transaction_index),
-        ColumnValue::hex(r.from),
-        ColumnValue::some(r.to, ColumnValue::hex),
-        ColumnValue::Bool(r.status),
-        ColumnValue::Uint(u64::from(r.transaction_type)),
-        ColumnValue::Uint(r.gas_used),
-        ColumnValue::Uint(r.cumulative_gas_used),
-        ColumnValue::wei(r.effective_gas_price),
-        ColumnValue::some(r.contract_address, ColumnValue::hex),
-        ColumnValue::hex(r.logs_bloom),
-        ColumnValue::some(r.blob_gas_used, ColumnValue::Uint),
-        ColumnValue::some(r.blob_gas_price, ColumnValue::wei),
-        ColumnValue::Uint(r.log_count),
-        ColumnValue::Uint(r.block_number),
-        ColumnValue::hex(r.block_hash),
-    ]
+/// Builds the `transaction` table's cells for one transaction.
+fn transaction_cells(t: &Transaction) -> Columns {
+    Columns(
+        TRANSACTION_CELLS
+            .iter()
+            .map(|(column, render)| (*column, render(t)))
+            .collect(),
+    )
 }
 
-/// The `log` table.
-const LOG_COLUMNS: &[Column] = &[
-    Column::uint("log_index"),
-    Column::text("transaction_hash"),
-    Column::uint("transaction_index"),
-    Column::text("address"),
-    Column::text("topic0"),
-    Column::text("topic1"),
-    Column::text("topic2"),
-    Column::text("topic3"),
-    Column::text("data"),
-    Column::boolean("removed"),
-    Column::uint("block_number"),
-    Column::text("block_hash"),
-    Column::uint("block_timestamp"),
-    COMMON_COLUMNS[0],
-    COMMON_COLUMNS[1],
+/// The `receipt` table, as one cell per column.
+const RECEIPT_CELLS: [(Column, fn(&Receipt) -> ColumnValue); 17] = [
+    (Column::text("transaction_hash"), |r| {
+        ColumnValue::hex(r.transaction_hash)
+    }),
+    (Column::uint("transaction_index"), |r| {
+        ColumnValue::Uint(r.transaction_index)
+    }),
+    (Column::text("from_address"), |r| ColumnValue::hex(r.from)),
+    (Column::text("to_address"), |r| {
+        ColumnValue::some(r.to, ColumnValue::hex)
+    }),
+    (Column::boolean("status"), |r| ColumnValue::Bool(r.status)),
+    (Column::uint("transaction_type"), |r| {
+        ColumnValue::Uint(u64::from(r.transaction_type))
+    }),
+    (Column::uint("gas_used"), |r| ColumnValue::Uint(r.gas_used)),
+    (Column::uint("cumulative_gas_used"), |r| {
+        ColumnValue::Uint(r.cumulative_gas_used)
+    }),
+    (Column::text("effective_gas_price"), |r| {
+        ColumnValue::wei(r.effective_gas_price)
+    }),
+    (Column::text("contract_address"), |r| {
+        ColumnValue::some(r.contract_address, ColumnValue::hex)
+    }),
+    (Column::text("logs_bloom"), |r| {
+        ColumnValue::hex(r.logs_bloom)
+    }),
+    (Column::uint("blob_gas_used"), |r| {
+        ColumnValue::some(r.blob_gas_used, ColumnValue::Uint)
+    }),
+    (Column::text("blob_gas_price"), |r| {
+        ColumnValue::some(r.blob_gas_price, ColumnValue::wei)
+    }),
+    (Column::uint("log_count"), |r| {
+        ColumnValue::Uint(r.log_count)
+    }),
+    (Column::uint("block_timestamp"), |r| {
+        ColumnValue::Uint(r.block_timestamp)
+    }),
+    (Column::uint("block_number"), |r| {
+        ColumnValue::Uint(r.block_number)
+    }),
+    (Column::text("block_hash"), |r| {
+        ColumnValue::hex(r.block_hash)
+    }),
 ];
 
-fn log_values(l: &Log) -> Vec<ColumnValue> {
-    vec![
-        ColumnValue::Uint(l.log_index),
-        ColumnValue::hex(l.transaction_hash),
-        ColumnValue::Uint(l.transaction_index),
-        ColumnValue::hex(l.address),
-        ColumnValue::some(l.topic0, ColumnValue::hex),
-        ColumnValue::some(l.topic1, ColumnValue::hex),
-        ColumnValue::some(l.topic2, ColumnValue::hex),
-        ColumnValue::some(l.topic3, ColumnValue::hex),
-        ColumnValue::bytes(&l.data),
-        ColumnValue::Bool(l.removed),
-        ColumnValue::Uint(l.block_number),
-        ColumnValue::hex(l.block_hash),
-        ColumnValue::Uint(l.block_timestamp),
-    ]
+/// Builds the `receipt` table's cells for one receipt.
+fn receipt_cells(r: &Receipt) -> Columns {
+    Columns(
+        RECEIPT_CELLS
+            .iter()
+            .map(|(column, render)| (*column, render(r)))
+            .collect(),
+    )
 }
 
-/// The `reorg` table.
+/// The `log` table, as one cell per column.
+const LOG_CELLS: [(Column, fn(&Log) -> ColumnValue); 13] = [
+    (Column::uint("log_index"), |l| {
+        ColumnValue::Uint(l.log_index)
+    }),
+    (Column::text("transaction_hash"), |l| {
+        ColumnValue::hex(l.transaction_hash)
+    }),
+    (Column::uint("transaction_index"), |l| {
+        ColumnValue::Uint(l.transaction_index)
+    }),
+    (Column::text("address"), |l| ColumnValue::hex(l.address)),
+    (Column::text("topic0"), |l| {
+        ColumnValue::some(l.topic0, ColumnValue::hex)
+    }),
+    (Column::text("topic1"), |l| {
+        ColumnValue::some(l.topic1, ColumnValue::hex)
+    }),
+    (Column::text("topic2"), |l| {
+        ColumnValue::some(l.topic2, ColumnValue::hex)
+    }),
+    (Column::text("topic3"), |l| {
+        ColumnValue::some(l.topic3, ColumnValue::hex)
+    }),
+    (Column::text("data"), |l| ColumnValue::bytes(&l.data)),
+    (Column::boolean("removed"), |l| ColumnValue::Bool(l.removed)),
+    (Column::uint("block_number"), |l| {
+        ColumnValue::Uint(l.block_number)
+    }),
+    (Column::text("block_hash"), |l| {
+        ColumnValue::hex(l.block_hash)
+    }),
+    (Column::uint("block_timestamp"), |l| {
+        ColumnValue::Uint(l.block_timestamp)
+    }),
+];
+
+/// Builds the `log` table's cells for one log.
+fn log_cells(l: &Log) -> Columns {
+    Columns(
+        LOG_CELLS
+            .iter()
+            .map(|(column, render)| (*column, render(l)))
+            .collect(),
+    )
+}
+
+/// The `decoded` table, as one cell per column.
+///
+/// The two documents hold what varies per event — the indexed and non-indexed arguments —
+/// while everything that identifies the row is a typed column: a store can key, join,
+/// filter, and partition on `protocol`, `address`, `selector`, `block_hash`,
+/// `block_timestamp`, and `log_index` without parsing the record. The argument *values*
+/// still vary in type per event, so they stay documents; the identity does not, and keeping
+/// it locked in a document would force every query back through JSON.
+const DECODED_CELLS: [(Column, fn(&Decoded) -> ColumnValue); 14] = [
+    (Column::text("name"), |d| ColumnValue::Text(d.name.clone())),
+    (Column::text("address"), |d| ColumnValue::hex(d.address)),
+    (Column::text("protocol"), |d| {
+        ColumnValue::Text(d.protocol.clone())
+    }),
+    (Column::text("selector"), |d| ColumnValue::hex(d.selector)),
+    (Column::text("signature"), |d| {
+        ColumnValue::Text(d.signature.clone())
+    }),
+    (Column::boolean("anonymous"), |d| {
+        ColumnValue::Bool(d.anonymous)
+    }),
+    (Column::text("transaction_hash"), |d| {
+        ColumnValue::hex(d.transaction_hash)
+    }),
+    (Column::uint("transaction_index"), |d| {
+        ColumnValue::Uint(d.transaction_index)
+    }),
+    (Column::uint("log_index"), |d| {
+        ColumnValue::Uint(d.log_index)
+    }),
+    (Column::document("indexed"), |d| {
+        ColumnValue::document(&d.indexed)
+    }),
+    (Column::document("body"), |d| ColumnValue::document(&d.body)),
+    (Column::uint("block_number"), |d| {
+        ColumnValue::Uint(d.block_number)
+    }),
+    (Column::text("block_hash"), |d| {
+        ColumnValue::hex(d.block_hash)
+    }),
+    (Column::uint("block_timestamp"), |d| {
+        ColumnValue::Uint(d.block_timestamp)
+    }),
+];
+
+/// Builds the `decoded` table's cells for one decoded record.
+fn decoded_cells(d: &Decoded) -> Columns {
+    Columns(
+        DECODED_CELLS
+            .iter()
+            .map(|(column, render)| (*column, render(d)))
+            .collect(),
+    )
+}
+
+/// The `reorg` table, as one cell per column.
 ///
 /// `orphaned_hashes` is a document rather than a set of rows, and it is the one event
 /// where the list *is* the payload: it names every block hash that stopped being
 /// canonical. The count is small and known only at read time, so a list column beats a
 /// child table a consumer has to join to answer "is this block canonical yet?".
-const REORG_COLUMNS: &[Column] = &[
-    Column::uint("height"),
-    Column::text("new_head_hash"),
-    Column::document("orphaned_hashes"),
-    COMMON_COLUMNS[0],
-    COMMON_COLUMNS[1],
+const REORG_CELLS: [(Column, fn(&Reorg) -> ColumnValue); 3] = [
+    (Column::uint("height"), |r| ColumnValue::Uint(r.height)),
+    (Column::text("new_head_hash"), |r| {
+        ColumnValue::hex(r.new_head_hash)
+    }),
+    (Column::document("orphaned_hashes"), |r| {
+        ColumnValue::hex_list(&r.orphaned_hashes)
+    }),
 ];
 
-fn reorg_values(r: &Reorg) -> Vec<ColumnValue> {
-    vec![
-        ColumnValue::Uint(r.height),
-        ColumnValue::hex(r.new_head_hash),
-        ColumnValue::hex_list(&r.orphaned_hashes),
-    ]
+/// Builds the `reorg` table's cells for one reorg.
+fn reorg_cells(r: &Reorg) -> Columns {
+    Columns(
+        REORG_CELLS
+            .iter()
+            .map(|(column, render)| (*column, render(r)))
+            .collect(),
+    )
 }
 
-/// The `finalized` table.
-const FINALIZED_COLUMNS: &[Column] = &[
-    Column::uint("height"),
-    Column::text("hash"),
-    COMMON_COLUMNS[0],
-    COMMON_COLUMNS[1],
+/// The `finalized` table, as one cell per column.
+const FINALIZED_CELLS: [(Column, fn(&Finalized) -> ColumnValue); 2] = [
+    (Column::uint("height"), |f| ColumnValue::Uint(f.height)),
+    (Column::text("hash"), |f| ColumnValue::hex(f.hash)),
 ];
 
-fn finalized_values(f: &Finalized) -> Vec<ColumnValue> {
-    vec![ColumnValue::Uint(f.height), ColumnValue::hex(f.hash)]
-}
-
-/// The `decoded` table.
-///
-/// One `record` column, and that is the whole reason this table is different: a decoded
-/// record's arguments vary per event, so `amount0` may be a `uint256` on one event and an
-/// `address` on another, and there is no fixed column set to lift. The identity columns
-/// are still typed, so a store can key and join on this row without reading the record.
-///
-/// Not a reason to drop the dataset — an unstored decoded row is data loss — so the row
-/// exists and the flattening is what waits.
-const DECODED_COLUMNS: &[Column] = &[
-    Column::document("record"),
-    COMMON_COLUMNS[0],
-    COMMON_COLUMNS[1],
-];
-
-fn decoded_values(d: &Decoded) -> Vec<ColumnValue> {
-    vec![ColumnValue::document(&d)]
+/// Builds the `finalized` table's cells for one watermark.
+fn finalized_cells(f: &Finalized) -> Columns {
+    Columns(
+        FINALIZED_CELLS
+            .iter()
+            .map(|(column, render)| (*column, render(f)))
+            .collect(),
+    )
 }
 
 #[cfg(test)]
@@ -710,7 +817,7 @@ mod tests {
         Block, ChainId, Decoded, Event, Finalized, Log, Receipt, Reorg, Transaction,
     };
 
-    use super::{COMMON_COLUMNS, ColumnType, ColumnValue, Row, Table, row_for};
+    use super::{COMMON_COLUMNS, ColumnType, ColumnValue, Table, row_for};
 
     fn hash(byte: u8) -> B256 {
         B256::from([byte; 32])
@@ -785,22 +892,11 @@ mod tests {
         let events = every_kind();
         assert_eq!(events.len(), Table::ALL.len(), "one fixture per table");
         for event in &events {
-            let row = row_for(&chain(), event).expect("every event renders");
+            let row = row_for(&chain(), event);
             assert_eq!(row.values().len(), row.columns().len());
             assert_eq!(row.chain(), "ethereum");
             assert_eq!(row.dedupe_key(), event.dedupe_key());
         }
-    }
-
-    /// The positional contract is enforced once, here, so a column added to a header
-    /// without a value cannot compile into a row nobody notices.
-    #[test]
-    fn a_row_whose_values_do_not_match_its_header_is_an_error() {
-        let short = Row::new(Table::Finalized, vec![ColumnValue::Uint(1)]);
-        assert!(
-            short.is_err(),
-            "one value against a four-column table must not build"
-        );
     }
 
     /// Every table ends with the two common columns, so a store can key and partition any
@@ -826,7 +922,7 @@ mod tests {
     fn every_value_matches_its_declared_column_type() {
         let chain = ChainId::new("ethereum");
         for event in every_kind() {
-            let row = row_for(&chain, &event).expect("every event renders");
+            let row = row_for(&chain, &event);
             let columns = row.columns();
             for (column, value) in columns.iter().zip(row.values()) {
                 let compatible = match column.kind {
@@ -868,8 +964,8 @@ mod tests {
             (Table::Receipt, "effective_gas_price"),
             (Table::Receipt, "blob_gas_price"),
         ] {
-            let column = table
-                .columns()
+            let columns = table.columns();
+            let column = columns
                 .iter()
                 .find(|column| column.name == price)
                 .unwrap_or_else(|| panic!("the {table} table has a {price} column"));
@@ -894,8 +990,8 @@ mod tests {
             (Table::Log, "log_index"),
             (Table::Log, "transaction_index"),
         ] {
-            let column = table
-                .columns()
+            let columns = table.columns();
+            let column = columns
                 .iter()
                 .find(|column| column.name == amount)
                 .unwrap_or_else(|| panic!("the {table} table has an {amount} column"));
@@ -919,7 +1015,7 @@ mod tests {
             ..Transaction::default()
         };
         let event = Event::Transaction(Box::new(transaction));
-        let row = row_for(&chain(), &event).expect("a transaction row");
+        let row = row_for(&chain(), &event);
         let columns = row.columns().to_vec();
         let index = columns
             .iter()
@@ -942,7 +1038,7 @@ mod tests {
             hash: hash(0x01),
             ..Block::default()
         };
-        let row = row_for(&chain(), &Event::Block(Box::new(block))).expect("a block row");
+        let row = row_for(&chain(), &Event::Block(Box::new(block)));
         let columns = row.columns().to_vec();
         let index = columns
             .iter()
@@ -950,6 +1046,19 @@ mod tests {
             .expect("the column exists");
         assert_eq!(row.values()[index], ColumnValue::Null);
         assert_ne!(row.values()[index], ColumnValue::Uint(0));
+    }
+
+    /// An absent maximum fee is null, not zero: a legacy transaction carries no cap, and a
+    /// consumer must be able to tell that from a transaction that capped its fee at zero.
+    #[test]
+    fn an_absent_max_fee_is_null_and_not_zero() {
+        let transaction = Transaction {
+            max_fee_per_gas: None,
+            ..Transaction::default()
+        };
+        let event = Event::Transaction(Box::new(transaction));
+        let row = row_for(&chain(), &event);
+        assert_eq!(row.value("max_fee_per_gas"), &ColumnValue::Null);
     }
 
     /// A hash renders as the `0x` hex a node sends, so a value in a typed column compares
@@ -960,6 +1069,42 @@ mod tests {
             ColumnValue::hex(hash(0xaa)),
             ColumnValue::Text(format!("0x{}", "aa".repeat(32)))
         );
+    }
+
+    /// The decoded row's identity is typed columns, not a document a consumer has to parse
+    /// to key or join on.
+    #[test]
+    fn a_decoded_row_keys_and_joins_on_typed_columns() {
+        let decoded = Decoded {
+            name: "Swap".to_owned(),
+            address: Address::from([0xd0; 20]),
+            protocol: "uniswap_v3".to_owned(),
+            selector: hash(0x07),
+            signature: "Swap(address)".to_owned(),
+            anonymous: false,
+            transaction_hash: TxHash::from([0x11; 32]),
+            transaction_index: 3,
+            log_index: 7,
+            indexed: Vec::new(),
+            body: Vec::new(),
+            block_number: 100,
+            block_hash: hash(0x01),
+            block_timestamp: 1_700_000_000,
+        };
+        let event = Event::Decoded(Box::new(decoded.clone()));
+        let row = row_for(&chain(), &event);
+
+        assert_eq!(row.text("protocol"), "uniswap_v3");
+        assert_eq!(row.text("address"), format!("{:#x}", decoded.address));
+        assert_eq!(row.text("block_hash"), format!("{:#x}", decoded.block_hash));
+        assert_eq!(row.value("log_index"), &ColumnValue::Uint(7));
+        assert_eq!(
+            row.value("block_timestamp"),
+            &ColumnValue::Uint(1_700_000_000)
+        );
+        // The variable arguments stay documents.
+        assert!(matches!(row.value("indexed"), ColumnValue::Document(_)));
+        assert!(matches!(row.value("body"), ColumnValue::Document(_)));
     }
 
     /// The two branches of a reorg are separate rows, keyed differently — which is the
@@ -976,8 +1121,8 @@ mod tests {
         let mut replacement = orphaned.clone();
         replacement.block_hash = hash(0xbb);
 
-        let a = row_for(&chain(), &Event::Log(Box::new(orphaned))).expect("a row");
-        let b = row_for(&chain(), &Event::Log(Box::new(replacement))).expect("a row");
+        let a = row_for(&chain(), &Event::Log(Box::new(orphaned)));
+        let b = row_for(&chain(), &Event::Log(Box::new(replacement)));
         assert_ne!(a.dedupe_key(), b.dedupe_key());
     }
 }

@@ -141,7 +141,7 @@ fn transaction() -> Envelope {
         to: Some(CONTRACT),
         value: U256::from(10u64.pow(18)),
         gas: 45_000,
-        max_fee_per_gas: 2_000_000_000,
+        max_fee_per_gas: Some(2_000_000_000),
         max_priority_fee_per_gas: Some(1_000_000_000),
         input: Bytes::from_static(&[0x01, 0x02, 0x03]),
         // 0 legacy, 1 access list, 2 dynamic fee, 3 blob, 4 set-code. Not an enum:
@@ -170,6 +170,7 @@ fn receipt() -> Envelope {
         contract_address: None,
         logs_bloom: Bloom::ZERO,
         log_count: 1,
+        block_timestamp: TIMESTAMP,
         block_number: BLOCK_NUMBER,
         block_hash: BLOCK_HASH,
         ..Receipt::default()

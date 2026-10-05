@@ -359,7 +359,12 @@ fn decode_events(
             hash,
         ))));
         events.push(Event::Receipt(Box::new(decode_receipt(
-            receipt, tx_hash, tx_index, number, hash,
+            receipt,
+            tx_hash,
+            tx_index,
+            number,
+            hash,
+            block.0.inner.header.inner.timestamp,
         ))));
         for log in receipt.logs() {
             events.push(Event::Log(Box::new(log_record(
@@ -437,13 +442,12 @@ fn decode_transaction(
         to: ConsensusTransaction::to(transaction),
         value: ConsensusTransaction::value(transaction),
         gas: ConsensusTransaction::gas_limit(transaction),
-        // `gas_price`/`max_fee_per_gas` exist on both `Transaction` and
-        // `TransactionResponse` for an RPC transaction; the RPC one is correct.
-        // `max_fee_per_gas` is `Some` for dynamic-fee types and `None` for legacy,
-        // where the consensus accessor saturates to the gas price instead.
+        // `gas_price` is the node's reported paid price, not the consensus accessor,
+        // which is `None` for a dynamic-fee type. `max_fee_per_gas` is the cap the
+        // transaction actually carries, if any; the consensus accessor is not used for
+        // it because it fabricates one for a type that has none.
         gas_price: TransactionResponse::gas_price(transaction),
-        max_fee_per_gas: TransactionResponse::max_fee_per_gas(transaction)
-            .unwrap_or_else(|| ConsensusTransaction::max_fee_per_gas(transaction)),
+        max_fee_per_gas: known_max_fee_per_gas(transaction),
         max_priority_fee_per_gas: ConsensusTransaction::max_priority_fee_per_gas(transaction),
         max_fee_per_blob_gas: ConsensusTransaction::max_fee_per_blob_gas(transaction),
         input: ConsensusTransaction::input(transaction).clone(),
@@ -460,6 +464,29 @@ fn decode_transaction(
     }
 }
 
+/// The maximum fee per gas a transaction actually carries, if it carries one.
+///
+/// `None` for a legacy or EIP-2930 transaction, which has no cap, and for a
+/// chain-specific type the node gives none — an OP-stack deposit (`0x7e`), say. Both
+/// distinctions matter, so neither is defaulted: the consensus `max_fee_per_gas`
+/// accessor saturates to the gas price for a legacy transaction and to zero for an
+/// unknown envelope, and storing either would be a cap the chain never had.
+///
+/// A known envelope answers through the RPC accessor, which already returns `None` for
+/// a type below 2. An unknown one is read from the fields the catch-all captured, the
+/// same place [`AnyRpcTransaction`] keeps an OP deposit's `gasPrice`.
+fn known_max_fee_per_gas(transaction: &AnyRpcTransaction) -> Option<u128> {
+    if transaction.0.inner.inner.is_unknown() {
+        return transaction
+            .0
+            .other
+            .get_deserialized::<alloy_primitives::U128>("maxFeePerGas")
+            .and_then(Result::ok)
+            .map(|fee| fee.to());
+    }
+    TransactionResponse::max_fee_per_gas(transaction)
+}
+
 /// Flattens one RPC receipt into the receipt dataset, without its logs.
 fn decode_receipt(
     receipt: &AnyTransactionReceipt,
@@ -467,6 +494,7 @@ fn decode_receipt(
     tx_index: u64,
     block_number: u64,
     block_hash: B256,
+    block_timestamp: u64,
 ) -> Receipt {
     Receipt {
         transaction_hash,
@@ -483,6 +511,7 @@ fn decode_receipt(
         blob_gas_used: receipt.blob_gas_used,
         blob_gas_price: receipt.blob_gas_price,
         log_count: receipt.logs().len() as u64,
+        block_timestamp,
         block_number,
         block_hash,
     }

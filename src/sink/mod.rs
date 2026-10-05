@@ -39,7 +39,6 @@ pub use stdout::{StdoutJsonSink, StdoutSettings};
 use thiserror::Error;
 
 use crate::wire::envelope::Envelope;
-use crate::wire::row::RowError;
 
 /// Receives envelopes in per-chain order, as the pipeline publishes them.
 ///
@@ -83,8 +82,8 @@ pub trait EnvelopeSink: Send {
 /// from a malformed row by matching, not by formatting.
 ///
 /// Leaf errors arrive through `#[from]`, so a sink propagates them with `?` rather than
-/// wrapping them in a message: [`duckdb::StoreError`], [`RowError`], and `serde_json`'s
-/// and `std::io`'s own errors each name their cause better than this layer could.
+/// wrapping them in a message: [`duckdb::StoreError`] and `serde_json`'s and
+/// `std::io`'s own errors each name their cause better than this layer could.
 #[derive(Debug, Error)]
 pub enum SinkError {
     /// The store this sink writes to has stopped, so the batch cannot be delivered.
@@ -93,11 +92,6 @@ pub enum SinkError {
     /// gone. A channel sink reports this when the receiving half was dropped.
     #[error("storage has stopped, so the batch cannot be delivered")]
     StorageClosed,
-    /// The envelope could not be rendered as a row.
-    ///
-    /// Transparent, because [`RowError`] already names the table and both widths.
-    #[error(transparent)]
-    Row(#[from] RowError),
     /// Rendering the envelope for a transport failed.
     #[error("serialize envelope: {0}")]
     Serialize(#[from] serde_json::Error),

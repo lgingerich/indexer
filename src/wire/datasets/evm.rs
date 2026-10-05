@@ -22,9 +22,11 @@
 //! same fact twice. Ordering and partitioning use the `number` column, which is a
 //! number for exactly that purpose; a key is an identity, not a sort prefix.
 //!
-//! [`Transaction`] is the exception on the block hash: a transaction hash commits to
-//! the signed transaction, so it cannot reappear in a different block and the tx hash
-//! alone is already sound.
+//! [`Transaction`] is the one dataset still keyed by the transaction hash alone. That
+//! is a known gap rather than a fact: a reorg can re-include a signed transaction in a
+//! replacement block, and its inclusion fields then differ. The key stays on the hash
+//! until reorg handling for downstream stores is decided, so the mechanism is not
+//! settled here ahead of that decision.
 //!
 //! Every dataset that outlives its block carries `block_timestamp`, denormalized
 //! from the block header. A store partitions and clusters on time rather than
@@ -52,10 +54,9 @@ use crate::wire::typed::TypedValue;
 
 /// Block header and metadata, from `eth_getBlockByNumber`.
 ///
-/// Natural key is `(number, hash)`: the number locates the block in the chain, the
-/// hash pins which block that number held, so a reorg yields a new row at the same
-/// number. `transaction_hashes` is the block's transactions in order, referenced by
-/// key rather than embedded.
+/// Natural key is `hash`: the hash pins which block held a number, so a reorg yields a
+/// new row at the same number. `transaction_hashes` is the block's transactions in
+/// order, referenced by key rather than embedded.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct Block {
     /// Height of the chain, in blocks.
@@ -140,8 +141,7 @@ impl Block {
 
 /// One transaction, from its block's `transactions` array.
 ///
-/// Natural key is `hash`. Receipt-only fields are denormalized onto this row where
-/// a store wants one table per transaction instead of joining the [`Receipt`].
+/// Natural key is `hash`.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct Transaction {
     /// Unique identifier of this transaction.
@@ -178,8 +178,17 @@ pub struct Transaction {
     )]
     pub gas_price: Option<u128>,
     /// Maximum fee per gas, in wei; EIP-1559.
-    #[serde(with = "alloy_serde::quantity")]
-    pub max_fee_per_gas: u128,
+    ///
+    /// `None` when the transaction carries no such cap — a legacy or EIP-2930
+    /// transaction, or a chain-specific type the node does not give one. The field is
+    /// absent rather than defaulted, so a consumer can tell "no cap" from a real cap of
+    /// zero; [`Transaction::gas_price`] is the price actually paid either way.
+    #[serde(
+        default,
+        with = "alloy_serde::quantity::opt",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub max_fee_per_gas: Option<u128>,
     /// Maximum priority fee per gas, in wei; EIP-1559.
     #[serde(
         default,
@@ -289,6 +298,14 @@ pub struct Receipt {
     /// Number of logs emitted by this transaction.
     #[serde(with = "alloy_serde::quantity")]
     pub log_count: u64,
+    /// Timestamp of the block containing this receipt's transaction, denormalized from
+    /// its header.
+    ///
+    /// Carried on every dataset that outlives its block, because a store partitions
+    /// and clusters on time rather than height, and reaching it otherwise means
+    /// joining back to a [`Block`] that may not be in the same batch.
+    #[serde(with = "alloy_serde::quantity")]
+    pub block_timestamp: u64,
     /// Height of the block containing this receipt's transaction.
     #[serde(with = "alloy_serde::quantity")]
     pub block_number: u64,
@@ -357,11 +374,18 @@ impl Log {
     /// log in the block that replaced it do not share a key.
     #[must_use]
     pub fn dedupe_key(&self) -> String {
-        format!(
-            "{}:{}:{}",
-            self.block_hash, self.transaction_hash, self.log_index
-        )
+        log_key(self.block_hash, self.transaction_hash, self.log_index)
     }
+}
+
+/// The natural key of a log: `block_hash:transaction_hash:log_index`.
+///
+/// One function rather than a `format!` on [`Log`] and another on
+/// [`Decoded::source_key`](crate::wire::envelope::Decoded::source_key): the two must be
+/// byte-identical for a decoded record to join its raw log, and separate literals drift.
+#[must_use]
+pub fn log_key(block_hash: B256, transaction_hash: TxHash, log_index: u64) -> String {
+    format!("{block_hash}:{transaction_hash}:{log_index}")
 }
 
 /// One decoded event argument: its ABI name, and its typed value.

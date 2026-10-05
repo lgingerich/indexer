@@ -54,7 +54,7 @@ use std::fmt;
 use alloy_primitives::{Address, B256, TxHash};
 use serde::{Deserialize, Serialize};
 
-pub use crate::wire::datasets::evm::{Block, DecodedArg, Log, Receipt, Transaction};
+pub use crate::wire::datasets::evm::{Block, DecodedArg, Log, Receipt, Transaction, log_key};
 pub use crate::wire::typed::TypedValue;
 
 /// The version of the envelope's wire shape.
@@ -224,10 +224,7 @@ impl Decoded {
     /// the exact raw log it came from.
     #[must_use]
     pub fn source_key(&self) -> String {
-        format!(
-            "{}:{}:{}",
-            self.block_hash, self.transaction_hash, self.log_index
-        )
+        log_key(self.block_hash, self.transaction_hash, self.log_index)
     }
 }
 
@@ -302,8 +299,8 @@ pub struct Envelope {
     pub chain: ChainId,
     /// The wire shape's version, written by [`Envelope::new`].
     ///
-    /// Defaulted on deserialize, so a line carrying no `v` reads as the current
-    /// shape rather than failing.
+    /// Defaulted on deserialize to the first shape, so a line carrying no `v` reads as
+    /// the shape that predates the field rather than failing or claiming to be current.
     #[serde(default = "schema_version", rename = "v")]
     pub schema_version: u16,
     /// The event itself.
@@ -311,9 +308,14 @@ pub struct Envelope {
     pub event: Event,
 }
 
-/// The [`SCHEMA_VERSION`] as a serde default, for a line carrying no `v` field.
+/// The version an envelope with no `v` field is read as.
+///
+/// A line with no `v` predates the field, so it is the first shape: `1`. Defaulting to
+/// [`SCHEMA_VERSION`] instead would read an unversioned line as the current shape, which
+/// is the case the field exists to distinguish — a reader must not mistake an old line
+/// for a new one after the number is bumped.
 const fn schema_version() -> u16 {
-    SCHEMA_VERSION
+    1
 }
 
 impl Envelope {
@@ -595,9 +597,9 @@ mod tests {
     }
 
     /// The version is stamped on every rendered line, and a line carrying no `v`
-    /// reads back as the current shape rather than failing.
+    /// reads back as the first shape rather than failing or claiming to be current.
     #[test]
-    fn the_schema_version_is_stamped_and_absent_v_parses() {
+    fn the_schema_version_is_stamped_and_absent_v_reads_as_the_first_shape() {
         let envelope = Envelope::new(
             chain(),
             Event::Finalized(Finalized {
@@ -609,10 +611,10 @@ mod tests {
         assert_eq!(value["v"], SCHEMA_VERSION);
 
         // A line from a producer that predates the `v` field: no `v`, everything else
-        // as it is.
+        // as it is. It is read as version 1, the shape that introduced the field.
         value.as_object_mut().expect("object").remove("v");
         let decoded: Envelope = serde_json::from_value(value).expect("line without `v` parses");
-        assert_eq!(decoded.schema_version, SCHEMA_VERSION);
+        assert_eq!(decoded.schema_version, 1);
         assert_eq!(decoded, envelope);
     }
 
@@ -630,7 +632,7 @@ mod tests {
                 nonce: 130_000,
                 gas: 454_000,
                 gas_price: Some(7),
-                max_fee_per_gas: 8,
+                max_fee_per_gas: Some(8),
                 chain_id: Some(1),
                 block_number: 26_000_000,
                 ..Transaction::default()
@@ -663,7 +665,7 @@ mod tests {
                 hash: TxHash::from([0x11; 32]),
                 from: Address::from([0x22; 20]),
                 gas_price: Some(u128::MAX),
-                max_fee_per_gas: u128::MAX,
+                max_fee_per_gas: Some(u128::MAX),
                 max_priority_fee_per_gas: Some(u128::MAX),
                 max_fee_per_blob_gas: Some(u128::MAX),
                 block_number: 5,
