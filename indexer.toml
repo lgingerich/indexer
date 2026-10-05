@@ -13,8 +13,9 @@ ws_url = "wss://base-rpc.publicnode.com"
 # Where records go, and by which backend. Required: the table names the backend, so
 # exactly one may be present. `[sink.duckdb]` persists; naming `[sink.stdout]` instead
 # prints the stream and opens no store. An unknown backend is a startup error.
-[sink.duckdb]
-path = "indexer.duckdb"
+[sink.stdout]
+# [sink.duckdb]
+# path = "indexer.duckdb"
 
 # The most records one store commit may cover. Storage commits each block as it arrives
 # and, when it has fallen behind, folds the waiting blocks into one commit up to this many.

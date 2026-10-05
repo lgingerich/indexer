@@ -71,21 +71,7 @@ impl Abi {
         let abi: JsonAbi = serde_json::from_str(json).map_err(|error| DecodeError::Abi {
             detail: error.to_string(),
         })?;
-        Ok(Self::from_abi(&abi))
-    }
-
-    /// Indexes an already-parsed ABI by event selector.
-    ///
-    /// Anonymous events are excluded: they carry no selector in `topic0`, so they cannot
-    /// be found by one, and pretending otherwise would match the wrong event on an
-    /// unrelated log.
-    fn from_abi(abi: &JsonAbi) -> Self {
-        let by_selector = abi
-            .events()
-            .filter(|event| !event.anonymous)
-            .map(|event| (event.selector(), event.clone()))
-            .collect();
-        Self { by_selector }
+        Ok(Self::from(&abi))
     }
 
     /// The selector of the event whose signature is `signature`, or `None` if this ABI
@@ -152,6 +138,22 @@ impl Abi {
     }
 }
 
+/// Indexes an already-parsed ABI by event selector.
+///
+/// Anonymous events are excluded: they carry no selector in `topic0`, so they cannot
+/// be found by one, and pretending otherwise would match the wrong event on an
+/// unrelated log.
+impl From<&JsonAbi> for Abi {
+    fn from(abi: &JsonAbi) -> Self {
+        let by_selector = abi
+            .events()
+            .filter(|event| !event.anonymous)
+            .map(|event| (event.selector(), event.clone()))
+            .collect();
+        Self { by_selector }
+    }
+}
+
 /// Converts decoded values to named arguments, pairing each with its ABI parameter.
 ///
 /// The decoder returns values in ABI order with no names, so the names come from the
@@ -174,66 +176,70 @@ fn typed_args(
         .map(|(param, value)| {
             Ok(DecodedArg {
                 name: param.name.clone(),
-                value: value_to_typed(value)?,
+                value: TypedValue::try_from(value)?,
             })
         })
         .collect()
 }
 
-/// Converts one decoded value to its published form.
-///
-/// Re-encoding the result reproduces the bytes that were decoded, so the trim of a
-/// `FixedBytes` to its declared size is lossless.
-///
-/// # Errors
-///
-/// Returns [`DecodeError::Unsupported`] for a value type the wire shape does not carry
-/// (only a Solidity `function`), and [`DecodeError::Width`] if a declared width or
-/// size exceeds a `u16`, which no real ABI can produce.
-fn value_to_typed(decoded: &DynSolValue) -> Result<TypedValue, DecodeError> {
-    let typed = match decoded {
-        DynSolValue::Bool(value) => TypedValue::Bool { value: *value },
-        DynSolValue::Int(value, bits) => TypedValue::Int {
-            value: *value,
-            bits: width("int bits", *bits)?,
-        },
-        DynSolValue::Uint(value, bits) => TypedValue::Uint {
-            value: *value,
-            bits: width("uint bits", *bits)?,
-        },
-        DynSolValue::FixedBytes(word, size) => TypedValue::FixedBytes {
-            // The decoded word is right-padded, so the declared size is what says how
-            // much of it is the value.
-            value: Bytes::copy_from_slice(word.as_slice().get(..*size).unwrap_or(&[])),
-            size: width("fixed bytes size", *size)?,
-        },
-        DynSolValue::Address(value) => TypedValue::Address { value: *value },
-        DynSolValue::Bytes(value) => TypedValue::Bytes {
-            value: Bytes::from(value.clone()),
-        },
-        DynSolValue::String(value) => TypedValue::String {
-            value: value.clone(),
-        },
-        DynSolValue::Array(values) => TypedValue::Array {
-            value: convert_all(values)?,
-        },
-        DynSolValue::FixedArray(values) => TypedValue::FixedArray {
-            value: convert_all(values)?,
-            size: width("fixed array size", values.len())?,
-        },
-        // A tuple is positional in an event, so there are no component names to carry
-        // even when the ABI declares a struct.
-        DynSolValue::Tuple(values) => TypedValue::Tuple {
-            value: convert_all(values)?,
-        },
-        DynSolValue::Function(_) => return Err(DecodeError::Unsupported("function type")),
-    };
-    Ok(typed)
+impl TryFrom<&DynSolValue> for TypedValue {
+    type Error = DecodeError;
+
+    /// Converts one decoded value to its published form.
+    ///
+    /// Re-encoding the result reproduces the bytes that were decoded, so the trim of a
+    /// `FixedBytes` to its declared size is lossless.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DecodeError::Unsupported`] for a value type the wire shape does not carry
+    /// (only a Solidity `function`), and [`DecodeError::Width`] if a declared width or
+    /// size exceeds a `u16`, which no real ABI can produce.
+    fn try_from(decoded: &DynSolValue) -> Result<Self, Self::Error> {
+        let typed = match decoded {
+            DynSolValue::Bool(value) => Self::Bool { value: *value },
+            DynSolValue::Int(value, bits) => Self::Int {
+                value: *value,
+                bits: width("int bits", *bits)?,
+            },
+            DynSolValue::Uint(value, bits) => Self::Uint {
+                value: *value,
+                bits: width("uint bits", *bits)?,
+            },
+            DynSolValue::FixedBytes(word, size) => Self::FixedBytes {
+                // The decoded word is right-padded, so the declared size is what says how
+                // much of it is the value.
+                value: Bytes::copy_from_slice(word.as_slice().get(..*size).unwrap_or(&[])),
+                size: width("fixed bytes size", *size)?,
+            },
+            DynSolValue::Address(value) => Self::Address { value: *value },
+            DynSolValue::Bytes(value) => Self::Bytes {
+                value: Bytes::from(value.clone()),
+            },
+            DynSolValue::String(value) => Self::String {
+                value: value.clone(),
+            },
+            DynSolValue::Array(values) => Self::Array {
+                value: convert_all(values)?,
+            },
+            DynSolValue::FixedArray(values) => Self::FixedArray {
+                value: convert_all(values)?,
+                size: width("fixed array size", values.len())?,
+            },
+            // A tuple is positional in an event, so there are no component names to carry
+            // even when the ABI declares a struct.
+            DynSolValue::Tuple(values) => Self::Tuple {
+                value: convert_all(values)?,
+            },
+            DynSolValue::Function(_) => return Err(DecodeError::Unsupported("function type")),
+        };
+        Ok(typed)
+    }
 }
 
 /// Converts a sequence of decoded values, so the recursive arms stay one line.
 fn convert_all(values: &[DynSolValue]) -> Result<Vec<TypedValue>, DecodeError> {
-    values.iter().map(value_to_typed).collect()
+    values.iter().map(TypedValue::try_from).collect()
 }
 
 /// Narrows a decoder-supplied `usize` to the `u16` the wire shape carries.
@@ -294,7 +300,7 @@ mod tests {
     use alloy_dyn_abi::DynSolValue;
     use alloy_primitives::{Address, B256, I256, U256};
 
-    use super::{Abi, DecodeError, value_to_typed};
+    use super::{Abi, DecodeError};
     use crate::wire::datasets::evm::Log;
     use crate::wire::typed::TypedValue;
 
@@ -340,7 +346,7 @@ mod tests {
     }
 
     fn round_trip(decoded: &DynSolValue) -> TypedValue {
-        value_to_typed(decoded).expect("value converts")
+        TypedValue::try_from(decoded).expect("value converts")
     }
 
     /// The canonical ERC-20 event, as an ABI JSON would spell it.
@@ -639,7 +645,7 @@ mod tests {
     #[test]
     fn a_function_type_is_refused_rather_than_mangled() {
         assert!(matches!(
-            value_to_typed(&DynSolValue::Function(alloy_primitives::Function::ZERO)),
+            TypedValue::try_from(&DynSolValue::Function(alloy_primitives::Function::ZERO)),
             Err(DecodeError::Unsupported("function type"))
         ));
     }

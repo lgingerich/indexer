@@ -38,25 +38,27 @@ use crate::wire::envelope::Envelope;
 /// crash. Not a setting; if a deployment needs more headroom the store is too slow.
 const CAPACITY: usize = 32;
 
-/// Opens the channel: the sending half decode publishes into, and the receiving half
-/// storage drains.
-#[must_use]
-pub(crate) fn open() -> (ChannelSink, ChannelReceiver) {
-    let (sender, receiver) = mpsc::channel(CAPACITY);
-    (
-        ChannelSink {
-            sender,
-            batch: Vec::new(),
-        },
-        ChannelReceiver { receiver },
-    )
-}
-
 /// The sending half: buffers a block's envelopes and sends them on flush.
 #[derive(Debug)]
 pub(crate) struct ChannelSink {
     sender: mpsc::Sender<Vec<Envelope>>,
     batch: Vec<Envelope>,
+}
+
+impl ChannelSink {
+    /// Creates the channel: this sending half, which decode publishes into, and the
+    /// receiving half storage drains.
+    #[must_use]
+    pub(crate) fn new() -> (Self, ChannelReceiver) {
+        let (sender, receiver) = mpsc::channel(CAPACITY);
+        (
+            Self {
+                sender,
+                batch: Vec::new(),
+            },
+            ChannelReceiver { receiver },
+        )
+    }
 }
 
 impl EnvelopeSink for ChannelSink {
@@ -147,7 +149,7 @@ mod tests {
     use crate::sink::{EnvelopeSink, SinkError};
     use crate::wire::envelope::{ChainId, Envelope, Event, Finalized};
 
-    use super::open;
+    use super::ChannelSink;
 
     /// A finalized marker at `height`, which stands in for a block's worth of
     /// envelopes — the channel carries no field of its own, so a test needs a value to
@@ -197,7 +199,7 @@ mod tests {
     }
 
     /// Publishes one block's worth of markers and flushes, as the pipeline does.
-    async fn send_block(sink: &mut super::ChannelSink, heights: std::ops::Range<u64>) {
+    async fn send_block(sink: &mut ChannelSink, heights: std::ops::Range<u64>) {
         for height in heights {
             sink.publish(envelope(height)).await.expect("publish");
         }
@@ -208,7 +210,7 @@ mod tests {
     /// in order: the flush is the block boundary.
     #[tokio::test]
     async fn a_block_crosses_whole_and_only_on_flush() {
-        let (mut sink, receiver) = open();
+        let (mut sink, receiver) = ChannelSink::new();
         sink.publish(envelope(0)).await.expect("publish");
         sink.publish(envelope(1)).await.expect("publish");
         assert!(
@@ -222,7 +224,7 @@ mod tests {
             "an unflushed block must not reach storage"
         );
 
-        let (mut sink, receiver) = open();
+        let (mut sink, receiver) = ChannelSink::new();
         send_block(&mut sink, 0..3).await;
         drop(sink);
         let mut store = Batches::default();
@@ -235,7 +237,7 @@ mod tests {
     /// block: the bound is checked between blocks.
     #[tokio::test]
     async fn a_backlog_shares_a_flush_and_blocks_are_never_split() {
-        let (mut sink, receiver) = open();
+        let (mut sink, receiver) = ChannelSink::new();
         send_block(&mut sink, 0..3).await;
         send_block(&mut sink, 3..6).await;
         send_block(&mut sink, 6..9).await;
@@ -253,7 +255,7 @@ mod tests {
     /// than as unbounded growth or dropped blocks.
     #[tokio::test]
     async fn a_full_channel_blocks_the_sender() {
-        let (mut sink, _parked) = open();
+        let (mut sink, _parked) = ChannelSink::new();
         let sent = tokio::time::timeout(Duration::from_secs(2), async {
             let mut sequence = 0;
             loop {
@@ -274,7 +276,7 @@ mod tests {
     /// directly and keeps the channel's own types out of the assertion.
     #[tokio::test]
     async fn a_stopped_store_fails_the_next_flush() {
-        let (mut sink, receiver) = open();
+        let (mut sink, receiver) = ChannelSink::new();
         drop(receiver);
         sink.publish(envelope(0)).await.expect("publish buffers");
         let error = sink.flush().await.expect_err("nobody is reading");
@@ -298,7 +300,7 @@ mod tests {
             }
         }
 
-        let (mut sink, receiver) = open();
+        let (mut sink, receiver) = ChannelSink::new();
         send_block(&mut sink, 0..1).await;
         let error = receiver
             .drain(&mut OutOfSpace, 100)

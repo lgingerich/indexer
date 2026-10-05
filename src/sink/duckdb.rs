@@ -101,7 +101,7 @@ impl Default for DuckDbSettings {
         Self {
             path: PathBuf::from(DEFAULT_PATH),
             batch_records: DEFAULT_BATCH_RECORDS,
-            settings: BTreeMap::new(),
+            settings: BTreeMap::default(),
         }
     }
 }

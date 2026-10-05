@@ -143,7 +143,7 @@ impl Pipeline {
                 // rather than after the first block.
                 let mut store = DuckDbSink::open(duckdb)?;
 
-                let (blocks, receiver) = sink::channel::open();
+                let (blocks, receiver) = sink::channel::ChannelSink::new();
                 let batch_records = duckdb.batch_records;
                 // `ponytail:` the store's writes block, so this holds one runtime worker
                 // for the length of each flush. Fine on the multi-threaded runtime the
@@ -324,7 +324,7 @@ ws_url = "wss://example.invalid"
         let connection = duckdb::Connection::open_in_memory().expect("open in-memory DuckDB");
         let reader = connection.try_clone().expect("a second handle");
         let mut store = DuckDbSink::new(connection).expect("create events table");
-        let (blocks, receiver) = sink::channel::open();
+        let (blocks, receiver) = sink::channel::ChannelSink::new();
         let storage = tokio::spawn(async move { receiver.drain(&mut store, 500).await });
 
         let mut decoding = DecodingSink::new(registry, blocks);
