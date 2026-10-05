@@ -52,7 +52,7 @@
 use std::process::ExitCode;
 
 use indexer::decode::Transform;
-use indexer::decode::registry::{AbiEntry, ContractEntry, ContractRegistry};
+use indexer::decode::registry::{AbiEntry, ContractEntry, ContractRegistry, RegistryConfig};
 use indexer::wire::envelope::Envelope;
 
 /// The pool these logs came from, and the address its ABI is registered against.
@@ -72,19 +72,21 @@ fn main() -> ExitCode {
     // The real registry, built the way the settings file builds it, so the example
     // exercises the same path the pipeline does rather than a stub.
     let registry = ContractRegistry::load(
-        &[AbiEntry {
-            name: "uniswap_v3_pool".to_owned(),
-            path: std::path::PathBuf::from(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/abis/uniswap_v3_pool.json"
-            )),
-        }],
-        &[ContractEntry {
-            chain: CHAIN.to_owned(),
-            address: POOL.to_owned(),
-            abi: "uniswap_v3_pool".to_owned(),
-        }],
-        &[],
+        &RegistryConfig {
+            abi: vec![AbiEntry {
+                name: "uniswap_v3_pool".to_owned(),
+                path: std::path::PathBuf::from(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/abis/uniswap_v3_pool.json"
+                )),
+            }],
+            contract: vec![ContractEntry {
+                chain: CHAIN.to_owned(),
+                address: POOL.to_owned(),
+                abi: "uniswap_v3_pool".to_owned(),
+            }],
+            ..RegistryConfig::default()
+        },
         ".",
     )
     .expect("the registry loads");

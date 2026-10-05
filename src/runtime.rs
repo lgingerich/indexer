@@ -43,8 +43,7 @@ use crate::decode::DecodingSink;
 use crate::decode::registry::{ContractRegistry, RegistryError};
 use crate::ingest::Ingest;
 use crate::ingest::pipeline::PipelineError;
-#[cfg(feature = "duckdb")]
-use crate::sink::duckdb::StoreError;
+use crate::ingest::run::IngestError;
 use crate::sink::{self, DuckDbSink, SinkError, StdoutJsonSink};
 
 /// Why the indexer stopped.
@@ -67,14 +66,14 @@ pub enum RuntimeError {
     /// An ingest endpoint the settings named was not usable, so the pipeline could not be
     /// assembled.
     #[error("ingest could not be configured: {0}")]
-    Configure(#[from] crate::ingest::run::IngestError),
+    Configure(#[from] IngestError),
     /// The registry could not be loaded, so nothing would have decoded.
     #[error("contract registry could not be loaded: {0}")]
     Registry(#[from] RegistryError),
     /// The store could not be opened, so there was nowhere to write.
     #[cfg(feature = "duckdb")]
     #[error("storage could not be opened: {0}")]
-    OpenStore(#[from] StoreError),
+    OpenStore(#[from] sink::duckdb::StoreError),
     /// Ingest stopped: a source failed, a sink refused an envelope, or the head
     /// subscription ended.
     #[error("ingest stopped: {0}")]
@@ -208,7 +207,7 @@ mod tests {
 
     use crate::config::Settings;
     use crate::decode::DecodingSink;
-    use crate::decode::registry::{AbiEntry, ContractEntry, ContractRegistry};
+    use crate::decode::registry::{AbiEntry, ContractEntry, ContractRegistry, RegistryConfig};
     use crate::sink::{self, DuckDbSink, EnvelopeSink as _};
     use crate::wire::envelope::Envelope;
 
@@ -266,16 +265,18 @@ ws_url = "wss://example.invalid"
     async fn a_block_lands_in_the_store_raw_and_decoded_together() {
         const POOL: &str = "0xd0b53D9277642d899DF5C87A3966A349A798F224";
         let registry = ContractRegistry::load(
-            &[AbiEntry {
-                name: "uniswap_v3_pool".to_owned(),
-                path: concat!(env!("CARGO_MANIFEST_DIR"), "/abis/uniswap_v3_pool.json").into(),
-            }],
-            &[ContractEntry {
-                chain: "base".to_owned(),
-                address: POOL.to_owned(),
-                abi: "uniswap_v3_pool".to_owned(),
-            }],
-            &[],
+            &RegistryConfig {
+                abi: vec![AbiEntry {
+                    name: "uniswap_v3_pool".to_owned(),
+                    path: concat!(env!("CARGO_MANIFEST_DIR"), "/abis/uniswap_v3_pool.json").into(),
+                }],
+                contract: vec![ContractEntry {
+                    chain: "base".to_owned(),
+                    address: POOL.to_owned(),
+                    abi: "uniswap_v3_pool".to_owned(),
+                }],
+                ..RegistryConfig::default()
+            },
             ".",
         )
         .expect("the registry loads");

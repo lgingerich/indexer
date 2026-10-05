@@ -69,7 +69,8 @@ use crate::wire::envelope::ChainId;
 pub struct AbiEntry {
     /// The name to reference it by, for example `uniswap_v3_pool`.
     pub name: String,
-    /// The ABI file, relative to the settings file's directory.
+    /// The ABI file, relative to the directory [`ContractRegistry::load`] resolves against.
+    /// [`ContractRegistry::from_file`] passes the registry file's own directory.
     pub path: PathBuf,
 }
 
@@ -212,20 +213,14 @@ impl ContractRegistry {
                 path: path.display().to_string(),
                 source,
             })?;
-        Self::load(
-            &config.abi,
-            &config.contract,
-            &config.discovery,
-            path.parent().unwrap_or_else(|| Path::new(".")),
-        )
+        Self::load(&config, path.parent().unwrap_or_else(|| Path::new(".")))
     }
 
-    /// Loads the ABIs, the static contracts, and the discovery rules.
+    /// Builds a registry from an already-parsed [`RegistryConfig`].
     ///
-    /// Prefer [`Self::from_file`]; this is the in-memory form, for a caller that has the
-    /// lists already. `base` is the directory relative ABI paths resolve against: a path
-    /// in a registry file reads as relative to that file, not to the process's working
-    /// directory.
+    /// `base` is the directory relative ABI paths resolve against. [`Self::from_file`]
+    /// passes the registry file's directory; a caller that already holds the config
+    /// passes the directory those paths were written against.
     ///
     /// # Errors
     ///
@@ -235,12 +230,7 @@ impl ContractRegistry {
     /// an event its factory's ABI does not declare. Each is a startup error rather than a
     /// silent no-op: a registry that decodes less than it was told to is a wrong answer
     /// that looks like a quiet chain.
-    pub fn load(
-        abis: &[AbiEntry],
-        contracts: &[ContractEntry],
-        discoveries: &[DiscoveryEntry],
-        base: impl AsRef<Path>,
-    ) -> Result<Self, RegistryError> {
+    pub fn load(config: &RegistryConfig, base: impl AsRef<Path>) -> Result<Self, RegistryError> {
         let base = base.as_ref();
         let mut registry = Self::default();
 
@@ -249,8 +239,8 @@ impl ContractRegistry {
         // registry retains one `Arc<Abi>` per address and drops the map. A duplicate name
         // is refused rather than last-wins, because every other registry mistake is a
         // startup error and a name is a reference, not an address.
-        let mut by_name: HashMap<String, Arc<Abi>> = HashMap::with_capacity(abis.len());
-        for entry in abis {
+        let mut by_name: HashMap<String, Arc<Abi>> = HashMap::with_capacity(config.abi.len());
+        for entry in &config.abi {
             let path = base.join(&entry.path);
             let json = std::fs::read_to_string(&path).map_err(|source| RegistryError::AbiFile {
                 path: path.display().to_string(),
@@ -275,7 +265,7 @@ impl ContractRegistry {
                 })
         };
 
-        for contract in contracts {
+        for contract in &config.contract {
             let address = parse_address(&contract.chain, &contract.address)?;
             let origin = format!("{}.{}", contract.chain, contract.address);
             let abi = abi_named(&contract.abi, &origin)?;
@@ -294,7 +284,7 @@ impl ContractRegistry {
             }
         }
 
-        for discovery in discoveries {
+        for discovery in &config.discovery {
             let address = parse_address(&discovery.chain, &discovery.address)?;
             let origin = format!("{}.{}", discovery.chain, discovery.address);
             let abi = abi_named(&discovery.abi, &origin)?;
@@ -484,7 +474,9 @@ mod tests {
 
     use alloy_primitives::{Address, B256};
 
-    use super::{AbiEntry, ContractEntry, ContractRegistry, Discovery, DiscoveryEntry};
+    use super::{
+        AbiEntry, ContractEntry, ContractRegistry, Discovery, DiscoveryEntry, RegistryConfig,
+    };
     use crate::decode::AbiRegistry as _;
     use crate::decode::abi::Abi;
     use crate::wire::envelope::ChainId;
@@ -536,13 +528,18 @@ mod tests {
         }
     }
 
+    /// Resolves ABI paths against `abis/`. The config is the same [`RegistryConfig`] a file parses into.
+    fn load(config: &RegistryConfig) -> Result<ContractRegistry, super::RegistryError> {
+        ContractRegistry::load(config, abi_dir())
+    }
+
     /// One ABI shared by several addresses: the point of naming an ABI once, since a
     /// protocol like Uniswap V3 has thousands of pools with identical ABIs.
     #[test]
     fn one_abi_serves_many_addresses() {
-        let registry = ContractRegistry::load(
-            &[pool_abi()],
-            &[
+        let registry = load(&RegistryConfig {
+            abi: vec![pool_abi()],
+            contract: vec![
                 contract("base", POOL, "uniswap_v3_pool"),
                 contract(
                     "base",
@@ -551,9 +548,8 @@ mod tests {
                 ),
                 contract("ethereum", POOL, "uniswap_v3_pool"),
             ],
-            &[],
-            abi_dir(),
-        )
+            ..RegistryConfig::default()
+        })
         .expect("the registry loads");
 
         assert_eq!(registry.len(), 3);
@@ -570,12 +566,11 @@ mod tests {
 
     #[test]
     fn an_unknown_abi_name_is_refused() {
-        let result = ContractRegistry::load(
-            &[pool_abi()],
-            &[contract("base", POOL, "nope")],
-            &[],
-            abi_dir(),
-        );
+        let result = load(&RegistryConfig {
+            abi: vec![pool_abi()],
+            contract: vec![contract("base", POOL, "nope")],
+            ..RegistryConfig::default()
+        });
         assert!(result.is_err(), "a dangling ABI reference must be caught");
     }
 
@@ -584,7 +579,10 @@ mod tests {
     /// whichever contract referenced it decoding with the other's ABI.
     #[test]
     fn two_abis_with_one_name_are_refused() {
-        let result = ContractRegistry::load(&[pool_abi(), pool_abi()], &[], &[], abi_dir());
+        let result = load(&RegistryConfig {
+            abi: vec![pool_abi(), pool_abi()],
+            ..RegistryConfig::default()
+        });
         assert!(
             matches!(result, Err(super::RegistryError::DuplicateAbi { .. })),
             "a duplicate ABI name must be caught"
@@ -593,15 +591,14 @@ mod tests {
 
     #[test]
     fn a_duplicate_address_is_refused() {
-        let result = ContractRegistry::load(
-            &[pool_abi()],
-            &[
+        let result = load(&RegistryConfig {
+            abi: vec![pool_abi()],
+            contract: vec![
                 contract("base", POOL, "uniswap_v3_pool"),
                 contract("base", POOL, "uniswap_v3_pool"),
             ],
-            &[],
-            abi_dir(),
-        );
+            ..RegistryConfig::default()
+        });
         assert!(result.is_err(), "one address must decode with one ABI");
     }
 
@@ -609,17 +606,22 @@ mod tests {
     fn a_missing_abi_is_an_error() {
         let mut bad = pool_abi();
         bad.path = std::path::PathBuf::from("nope.json");
-        assert!(ContractRegistry::load(&[bad], &[], &[], abi_dir()).is_err());
+        assert!(
+            load(&RegistryConfig {
+                abi: vec![bad],
+                ..RegistryConfig::default()
+            })
+            .is_err()
+        );
     }
 
     #[test]
     fn a_bad_address_is_refused() {
-        let result = ContractRegistry::load(
-            &[pool_abi()],
-            &[contract("base", "not-an-address", "uniswap_v3_pool")],
-            &[],
-            abi_dir(),
-        );
+        let result = load(&RegistryConfig {
+            abi: vec![pool_abi()],
+            contract: vec![contract("base", "not-an-address", "uniswap_v3_pool")],
+            ..RegistryConfig::default()
+        });
         assert!(result.is_err());
     }
 
@@ -627,18 +629,17 @@ mod tests {
     /// startup error, not a rule that silently never fires.
     #[test]
     fn a_rule_for_an_unknown_event_is_refused() {
-        let registry = ContractRegistry::load(
-            &[pool_abi()],
-            &[contract("base", FACTORY, "uniswap_v3_pool")],
-            &[discovery(
+        let registry = load(&RegistryConfig {
+            abi: vec![pool_abi()],
+            contract: vec![contract("base", FACTORY, "uniswap_v3_pool")],
+            discovery: vec![discovery(
                 "base",
                 FACTORY,
                 "Nope(uint256)",
                 "pool",
                 "uniswap_v3_pool",
             )],
-            abi_dir(),
-        );
+        });
         assert!(
             registry.is_err(),
             "a rule for a missing event must be caught"
@@ -649,7 +650,7 @@ mod tests {
     /// legitimate and the caller says so at startup.
     #[test]
     fn no_entries_is_an_empty_registry() {
-        let registry = ContractRegistry::load(&[], &[], &[], abi_dir()).expect("empty is fine");
+        let registry = load(&RegistryConfig::default()).expect("empty is fine");
         assert!(registry.is_empty());
     }
 
@@ -659,12 +660,11 @@ mod tests {
     /// alone rather than quietly replacing them.
     #[test]
     fn discovery_does_not_override_a_static_registration() {
-        let mut registry = ContractRegistry::load(
-            &[pool_abi(), factory_abi()],
-            &[contract("base", POOL, "uniswap_v3_pool")],
-            &[],
-            abi_dir(),
-        )
+        let mut registry = load(&RegistryConfig {
+            abi: vec![pool_abi(), factory_abi()],
+            contract: vec![contract("base", POOL, "uniswap_v3_pool")],
+            ..RegistryConfig::default()
+        })
         .expect("the registry loads");
         let chain = ChainId::new("base");
         let child: Address = POOL.parse().expect("an address");
@@ -780,18 +780,17 @@ abi = "uniswap_v3_pool"
             .selector(SIGNATURE)
             .expect("declares PoolCreated");
 
-        let mut registry = ContractRegistry::load(
-            &[factory_abi(), pool_abi()],
-            &[contract("base", FACTORY, "uniswap_v3_factory")],
-            &[discovery(
+        let mut registry = load(&RegistryConfig {
+            abi: vec![factory_abi(), pool_abi()],
+            contract: vec![contract("base", FACTORY, "uniswap_v3_factory")],
+            discovery: vec![discovery(
                 "base",
                 FACTORY,
                 SIGNATURE,
                 "pool",
                 "uniswap_v3_pool",
             )],
-            abi_dir(),
-        )
+        })
         .expect("the registry loads");
 
         let child: Address = POOL.parse().expect("a pool address");

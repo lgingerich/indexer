@@ -232,28 +232,30 @@ mod tests {
         let abi_dir = std::path::PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/abis"));
 
         let registry = crate::decode::registry::ContractRegistry::load(
-            &[
-                crate::decode::registry::AbiEntry {
-                    name: "uniswap_v3_factory".to_owned(),
-                    path: "uniswap_v3_factory.json".into(),
-                },
-                crate::decode::registry::AbiEntry {
-                    name: "uniswap_v3_pool".to_owned(),
-                    path: "uniswap_v3_pool.json".into(),
-                },
-            ],
-            &[crate::decode::registry::ContractEntry {
-                chain: "base".to_owned(),
-                address: FACTORY.to_owned(),
-                abi: "uniswap_v3_factory".to_owned(),
-            }],
-            &[crate::decode::registry::DiscoveryEntry {
-                chain: "base".to_owned(),
-                address: FACTORY.to_owned(),
-                event: SIGNATURE.to_owned(),
-                child: "pool".to_owned(),
-                abi: "uniswap_v3_pool".to_owned(),
-            }],
+            &crate::decode::registry::RegistryConfig {
+                abi: vec![
+                    crate::decode::registry::AbiEntry {
+                        name: "uniswap_v3_factory".to_owned(),
+                        path: "uniswap_v3_factory.json".into(),
+                    },
+                    crate::decode::registry::AbiEntry {
+                        name: "uniswap_v3_pool".to_owned(),
+                        path: "uniswap_v3_pool.json".into(),
+                    },
+                ],
+                contract: vec![crate::decode::registry::ContractEntry {
+                    chain: "base".to_owned(),
+                    address: FACTORY.to_owned(),
+                    abi: "uniswap_v3_factory".to_owned(),
+                }],
+                discovery: vec![crate::decode::registry::DiscoveryEntry {
+                    chain: "base".to_owned(),
+                    address: FACTORY.to_owned(),
+                    event: SIGNATURE.to_owned(),
+                    child: "pool".to_owned(),
+                    abi: "uniswap_v3_pool".to_owned(),
+                }],
+            },
             abi_dir,
         )
         .expect("the registry loads");
