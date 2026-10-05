@@ -52,7 +52,7 @@ impl Ingest {
             ws = %self.ws_url,
             "ingest started"
         );
-        let source = EvmSource::new(self.chain, self.http_url, self.ws_url);
+        let source = EvmSource::new(self.chain, self.http_url, self.ws_url)?;
         Machine::new(source, sink).run().await
     }
 }

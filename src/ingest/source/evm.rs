@@ -29,19 +29,16 @@
 use std::fmt;
 
 use alloy_consensus::Transaction as ConsensusTransaction;
-use alloy_json_rpc::{BorrowedResponse, BorrowedResponsePacket, Id, ResponsePayload};
-use alloy_network::TransactionResponse;
+use alloy_json_rpc::RpcError;
 use alloy_network::any::{AnyRpcBlock, AnyRpcTransaction, AnyTransactionReceipt};
 use alloy_network::eip2718::Typed2718 as _;
+use alloy_network::{AnyNetwork, TransactionResponse};
 use alloy_primitives::B256;
+use alloy_provider::{Provider, ProviderBuilder, RootProvider, WsConnect};
 use alloy_rpc_types_eth::Log as RpcLog;
-use futures_util::{SinkExt as _, StreamExt};
+use alloy_transport::TransportError;
+use futures_util::StreamExt;
 use serde::Deserialize;
-use serde_json::json;
-use serde_json::value::RawValue;
-use tokio_tungstenite::connect_async;
-use tokio_tungstenite::tungstenite::Message;
-use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 
 use super::{BlockId, BlockSource, FetchedBlock, HeadStream, METHOD_NOT_FOUND, SourceError};
 use crate::wire::datasets::evm::{Block, Log, Receipt, Transaction};
@@ -58,31 +55,40 @@ const RECEIPT_BATCH_LIMIT: usize = 10;
 #[derive(Debug)]
 pub struct EvmSource {
     chain: ChainId,
-    http_url: String,
     ws_url: String,
-    client: reqwest::Client,
+    provider: RootProvider<AnyNetwork>,
 }
 
 impl EvmSource {
-    /// Builds a source for `chain`.
-    #[must_use]
+    /// Builds a source for `chain` with a ten-second HTTP timeout.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed error if the HTTP endpoint or TLS client cannot be built.
     pub fn new(
         chain: impl Into<ChainId>,
         http_url: impl Into<String>,
         ws_url: impl Into<String>,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, SourceError> {
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .build()?;
+        let url = http_url
+            .into()
+            .parse()
+            .map_err(|source| SourceError::Transport {
+                context: "HTTP endpoint",
+                source: alloy_transport::TransportErrorKind::custom(source),
+            })?;
+        let provider = ProviderBuilder::new()
+            .disable_recommended_fillers()
+            .network::<AnyNetwork>()
+            .connect_reqwest(client, url);
+        Ok(Self {
             chain: chain.into(),
-            http_url: http_url.into(),
             ws_url: ws_url.into(),
-            // A bounded timeout keeps a node that accepts the connection and then
-            // stalls from hanging a fetch forever. `build` only fails on TLS
-            // backend init, in which case the default client is still usable.
-            client: reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(10))
-                .build()
-                .unwrap_or_default(),
-        }
+            provider,
+        })
     }
 }
 
@@ -106,21 +112,6 @@ impl From<RpcBlockId> for BlockId {
     }
 }
 
-/// The subset of a WebSocket frame the source cares about.
-#[derive(Debug, Deserialize)]
-struct SubscriptionMessage {
-    #[serde(default)]
-    method: Option<String>,
-    #[serde(default)]
-    params: Option<SubscriptionParams>,
-}
-
-#[derive(Debug, Deserialize)]
-struct SubscriptionParams {
-    #[serde(default)]
-    result: Option<RpcBlockId>,
-}
-
 fn malformed(context: &str, detail: impl fmt::Display) -> SourceError {
     SourceError::Malformed {
         context: context.to_owned(),
@@ -132,69 +123,8 @@ fn invalid_json(context: &'static str, source: serde_json::Error) -> SourceError
     SourceError::Json { context, source }
 }
 
-/// Parses a response body as one response or a batch, borrowing each payload.
-fn parse_envelope<'a>(
-    context: &'static str,
-    body: &'a [u8],
-) -> Result<BorrowedResponsePacket<'a>, SourceError> {
-    serde_json::from_slice(body).map_err(|source| invalid_json(context, source))
-}
-
-/// Pulls one id's result out of a batch response.
-///
-/// A null result is returned as `Ok(None)` rather than an error, because null has
-/// meaning for some methods: `eth_getBlockReceipts` answers null on nodes and
-/// forks that do not support it, so the caller decides whether that is fatal.
-///
-/// # Errors
-///
-/// Returns [`SourceError::Malformed`] when the batch has no entry for `id`, and
-/// [`SourceError::Rpc`] when the node answered that call with an error.
-fn take_result<'a>(
-    responses: &[BorrowedResponse<'a>],
-    id: u64,
-    method: &str,
-) -> Result<Option<&'a RawValue>, SourceError> {
-    let response = responses
-        .iter()
-        .find(|response| response.id == Id::Number(id))
-        .ok_or_else(|| malformed(method, format!("batch response had no entry with id {id}")))?;
-    match &response.payload {
-        ResponsePayload::Success(raw) => {
-            // `null` (and alloy's `"0x"` sentinel for it) means "no result" for
-            // methods like `eth_getBlockReceipts` on nodes that do not serve it,
-            // so the caller decides whether an absent result is fatal.
-            let absent = raw.get().trim() == "null" || raw.get().trim_matches('"') == "0x";
-            Ok((!absent).then_some(*raw))
-        }
-        ResponsePayload::Failure(error) => Err(SourceError::Rpc {
-            method: method.to_owned(),
-            code: error.code,
-            message: error.message.to_string(),
-        }),
-    }
-}
-
-/// Reads the height and hash out of a block header.
-fn decode_block_id(header: &RawValue) -> Result<BlockId, SourceError> {
-    const CONTEXT: &str = "finalized block";
-    let block: RpcBlockId =
-        serde_json::from_str(header.get()).map_err(|source| invalid_json(CONTEXT, source))?;
-    Ok(block.into())
-}
-
-/// Decodes one WebSocket frame into a head, when the frame is a head notification.
-fn decode_head_frame(text: &str) -> Option<Result<BlockId, SourceError>> {
-    let message: SubscriptionMessage = match serde_json::from_str(text) {
-        Ok(message) => message,
-        Err(error) => return Some(Err(invalid_json("websocket frame", error))),
-    };
-    if message.method.as_deref() != Some("eth_subscription") {
-        // The subscription confirmation and any other notification land here.
-        return None;
-    }
-    let head = message.params.and_then(|params| params.result)?;
-    Some(Ok(head.into()))
+fn transport(context: &'static str, source: TransportError) -> SourceError {
+    SourceError::Transport { context, source }
 }
 
 /// The three results one batched block request carries, still in alloy's RPC types
@@ -205,7 +135,7 @@ fn decode_head_frame(text: &str) -> Option<Result<BlockId, SourceError>> {
 /// retry (`0x6a`) — decode instead of failing the whole block. Everything this
 /// source reads is reachable through the standard `Transaction`/`BlockHeader`
 /// accessors; only the transaction type falls back to a raw `u8`.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct RpcBatch {
     /// The block, from `eth_getBlockByNumber` with full transactions.
     pub block: AnyRpcBlock,
@@ -218,51 +148,6 @@ pub struct RpcBatch {
     pub receipts: Option<Vec<AnyTransactionReceipt>>,
     /// The chain's newest finalized block at request time.
     pub finalized: BlockId,
-}
-
-/// Parses a batch response body into the three results it carries.
-///
-/// The batch holds `eth_getBlockByNumber` with full transactions (id 1),
-/// `eth_getBlockReceipts` (id 2), and the `finalized` block (id 3), in any order.
-///
-/// # Errors
-///
-/// Returns [`SourceError::Rpc`] when the node answered a call with an error,
-/// [`SourceError::Json`] when a payload does not decode, and [`SourceError::Malformed`]
-/// when the body is not a usable batch.
-pub fn parse_batch(body: &[u8]) -> Result<RpcBatch, SourceError> {
-    const BLOCK: &str = "eth_getBlockByNumber";
-    const RECEIPTS: &str = "eth_getBlockReceipts";
-
-    let packet = parse_envelope("rpc batch", body)?;
-    let responses = packet.responses();
-
-    let block_result =
-        take_result(responses, 1, BLOCK)?.ok_or_else(|| malformed(BLOCK, "result was null"))?;
-    let block: AnyRpcBlock =
-        serde_json::from_str(block_result.get()).map_err(|source| invalid_json(BLOCK, source))?;
-
-    let receipts = match take_result(responses, 2, RECEIPTS) {
-        Ok(Some(result)) => Some(
-            serde_json::from_str(result.get()).map_err(|source| invalid_json(RECEIPTS, source))?,
-        ),
-        // An unsupported method is reported as `METHOD_NOT_FOUND`, and some nodes
-        // answer with a null result instead; both mean the caller fetches per
-        // transaction.
-        Err(SourceError::Rpc { code, .. }) if code == METHOD_NOT_FOUND => None,
-        Ok(None) => None,
-        Err(error) => return Err(error),
-    };
-
-    let finalized = decode_block_id(
-        take_result(responses, 3, "finalized block")?
-            .ok_or_else(|| malformed("finalized block", "result was null"))?,
-    )?;
-    Ok(RpcBatch {
-        block,
-        receipts,
-        finalized,
-    })
 }
 
 /// Turns a parsed batch into ordered dataset events and the finality watermark.
@@ -581,50 +466,34 @@ impl BlockSource for EvmSource {
     }
 
     async fn subscribe_heads(&self) -> Result<HeadStream, SourceError> {
-        let (mut socket, _response) =
-            connect_async(self.ws_url.as_str())
-                .await
-                .map_err(|source| SourceError::Websocket {
-                    context: "connect",
-                    source,
-                })?;
-        let request = json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "eth_subscribe",
-            "params": ["newHeads"],
-        });
-        socket
-            .send(Message::text(request.to_string()))
+        // Alloy reconnects and reissues active subscriptions; retries are bounded
+        // per disconnect, rather than hiding an unavailable endpoint forever.
+        let connect = WsConnect::new(self.ws_url.clone())
+            .with_max_retries(3)
+            .with_retry_interval(std::time::Duration::from_secs(1));
+        let provider = ProviderBuilder::new()
+            .disable_recommended_fillers()
+            .network::<AnyNetwork>()
+            .connect_ws(connect)
             .await
-            .map_err(|source| SourceError::Websocket {
-                context: "subscribe",
-                source,
-            })?;
-
-        // The close code is what separates an orderly shutdown from a protocol error, so a
-        // `Close` frame is reported rather than swallowed: swallowed, both ended the run
-        // as a plain "no more heads". Ping, pong, binary, and raw frames carry no head,
-        // so they stay ignored — the socket answers pings itself.
-        let heads = socket.filter_map(|frame| async move {
-            match frame {
-                Ok(Message::Text(text)) => decode_head_frame(&text),
-                Ok(Message::Close(frame)) => Some(Err(SourceError::Closed {
-                    code: frame.map_or(CloseCode::Status, |frame| frame.code),
-                })),
-                Ok(_) => None,
-                Err(source) => Some(Err(SourceError::Websocket {
-                    context: "read frame",
-                    source,
-                })),
-            }
+            .map_err(|source| transport("websocket connect", source))?;
+        // Only identity is needed. Subscribe through Alloy's client so the typed
+        // result stream retains malformed notifications rather than dropping them.
+        let subscription = provider
+            .subscribe::<_, RpcBlockId>(("newHeads",))
+            .await
+            .map_err(|source| transport("eth_subscribe", source))?;
+        let heads = subscription.into_result_stream().map(move |head| {
+            // Keep the client's frontend alive for as long as the stream lives.
+            let _keep_alive = &provider;
+            head.map(BlockId::from)
+                .map_err(|source| invalid_json("newHeads", source))
         });
         Ok(Box::pin(heads) as HeadStream)
     }
 
     async fn fetch_block(&self, height: u64) -> Result<FetchedBlock, SourceError> {
-        let body = self.post_batch(height).await?;
-        let mut batch = parse_batch(&body)?;
+        let mut batch = self.fetch_batch(height).await?;
         // Nodes that do not serve `eth_getBlockReceipts` (some L2s, and pre-Cancun
         // Ethereum) answer it with `METHOD_NOT_FOUND` or null. Fetch the receipts
         // by transaction hash instead, so the block still becomes events.
@@ -638,40 +507,19 @@ impl BlockSource for EvmSource {
         const CONTEXT: &str = "eth_getBlockByNumber(latest)";
         // Hashes only, not full transactions: the caller wants where the chain is, and a
         // full-transaction response is tens of KB on a busy chain for nothing.
-        let body = json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "eth_getBlockByNumber",
-            "params": ["latest", false],
-        });
-        let response = self.post(&body).await?;
-        let packet = parse_envelope(CONTEXT, &response)?;
-        let header = take_result(packet.responses(), 1, CONTEXT)?
-            .ok_or_else(|| malformed(CONTEXT, "result was null"))?;
-        decode_block_id(header)
+        let header: Option<RpcBlockId> = self
+            .provider
+            .client()
+            .request("eth_getBlockByNumber", ("latest", false))
+            .await
+            .map_err(|source| transport(CONTEXT, source))?;
+        header
+            .map(BlockId::from)
+            .ok_or_else(|| malformed(CONTEXT, "result was null"))
     }
 }
 
 impl EvmSource {
-    /// POSTs one JSON-RPC request body and returns the response bytes.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`SourceError::Http`] when the request, the status check, or the body read
-    /// fails. The error stays `reqwest`'s own, so a caller can read `status()` and
-    /// `is_timeout()` off it and write a retry policy — which it could not do when this
-    /// flattened the error to a message.
-    async fn post(&self, body: &serde_json::Value) -> Result<Vec<u8>, SourceError> {
-        let response = self
-            .client
-            .post(self.http_url.as_str())
-            .json(body)
-            .send()
-            .await
-            .and_then(reqwest::Response::error_for_status)?;
-        Ok(response.bytes().await?.to_vec())
-    }
-
     /// Fetches the block's receipts one transaction at a time, in index order.
     ///
     /// The fallback for nodes without `eth_getBlockReceipts`. Many public nodes cap
@@ -696,63 +544,75 @@ impl EvmSource {
 
         let mut receipts = Vec::with_capacity(transactions.len());
         for chunk in transactions.chunks(RECEIPT_BATCH_LIMIT) {
-            let requests: Vec<serde_json::Value> = chunk
-                .iter()
-                .enumerate()
-                .map(|(index, transaction)| {
-                    json!({
-                        "jsonrpc": "2.0",
-                        "id": index + 1,
-                        "method": RECEIPT,
-                        "params": [transaction.tx_hash()],
-                    })
-                })
-                .collect();
-            let body = self.post(&serde_json::Value::Array(requests)).await?;
-            let packet = parse_envelope(RECEIPT, &body)?;
-            // Match by id so order is the block's, whatever order the node replies in.
-            for index in 0..chunk.len() {
-                let result = take_result(packet.responses(), index as u64 + 1, RECEIPT)?
-                    .ok_or_else(|| malformed(RECEIPT, "result was null"))?;
+            let mut batch = alloy_rpc_client::BatchRequest::new(self.provider.client());
+            let mut calls = Vec::with_capacity(chunk.len());
+            for transaction in chunk {
+                calls.push(
+                    batch
+                        .add_call::<_, Option<AnyTransactionReceipt>>(
+                            RECEIPT,
+                            &(transaction.tx_hash(),),
+                        )
+                        .map_err(|source| transport(RECEIPT, source))?,
+                );
+            }
+            batch
+                .send()
+                .await
+                .map_err(|source| transport(RECEIPT, source))?;
+            // Alloy correlates IDs; awaiting in request order preserves block order.
+            for call in calls {
                 receipts.push(
-                    serde_json::from_str(result.get())
-                        .map_err(|source| invalid_json(RECEIPT, source))?,
+                    call.await
+                        .map_err(|source| transport(RECEIPT, source))?
+                        .ok_or_else(|| malformed(RECEIPT, "result was null"))?,
                 );
             }
         }
         Ok(receipts)
     }
 
-    /// Sends the batched block request and returns the raw response body.
-    ///
-    /// This is the only I/O in a block fetch; parsing and projection are pure and
-    /// separate, so the shape of a fetch is visible in [`EvmSource::fetch_block`].
-    async fn post_batch(&self, height: u64) -> Result<Vec<u8>, SourceError> {
-        let tag = format!("0x{height:x}");
-        let batch = json!([
-            {
-                "jsonrpc": "2.0",
-                "id": 1,
-                "method": "eth_getBlockByNumber",
-                "params": [tag, true],
-            },
-            {
-                "jsonrpc": "2.0",
-                "id": 2,
-                "method": "eth_getBlockReceipts",
-                "params": [tag],
-            },
-            // ponytail: fetches the finalized header with every block, which also
-            // carries its transaction-hash list (tens of KB on a busy chain). If that
-            // shows up in latency, poll `finalized` on a timer instead.
-            {
-                "jsonrpc": "2.0",
-                "id": 3,
-                "method": "eth_getBlockByNumber",
-                "params": ["finalized", false],
-            },
-        ]);
-        self.post(&batch).await
+    /// Fetches full transactions, block receipts, and finality in one HTTP batch.
+    async fn fetch_batch(&self, height: u64) -> Result<RpcBatch, SourceError> {
+        const BLOCK: &str = "eth_getBlockByNumber";
+        const RECEIPTS: &str = "eth_getBlockReceipts";
+        let tag = alloy_rpc_types_eth::BlockNumberOrTag::Number(height);
+        // In 1.8.3 Provider::client() returns RpcClientInner; new_batch() is
+        // only on RpcClient. This is its identical BatchRequest constructor.
+        let mut batch = alloy_rpc_client::BatchRequest::new(self.provider.client());
+        let block = batch
+            .add_call::<_, Option<AnyRpcBlock>>(BLOCK, &(tag, true))
+            .map_err(|source| transport(BLOCK, source))?;
+        let receipts = batch
+            .add_call::<_, Option<Vec<AnyTransactionReceipt>>>(RECEIPTS, &(tag,))
+            .map_err(|source| transport(RECEIPTS, source))?;
+        // ponytail: finality carries the transaction-hash list too. Poll the
+        // finalized tag on a timer if its bandwidth becomes material.
+        let finalized = batch
+            .add_call::<_, Option<RpcBlockId>>(BLOCK, &("finalized", false))
+            .map_err(|source| transport("finalized block", source))?;
+        batch
+            .send()
+            .await
+            .map_err(|source| transport("rpc batch", source))?;
+        let block = block
+            .await
+            .map_err(|source| transport(BLOCK, source))?
+            .ok_or_else(|| malformed(BLOCK, "result was null"))?;
+        let receipts = match receipts.await {
+            Ok(receipts) => receipts,
+            Err(RpcError::ErrorResp(error)) if error.code == METHOD_NOT_FOUND => None,
+            Err(source) => return Err(transport(RECEIPTS, source)),
+        };
+        let finalized = finalized
+            .await
+            .map_err(|source| transport("finalized block", source))?
+            .ok_or_else(|| malformed("finalized block", "result was null"))?;
+        Ok(RpcBatch {
+            block,
+            receipts,
+            finalized: finalized.into(),
+        })
     }
 }
 
@@ -773,14 +633,263 @@ mod tests {
     use alloy_primitives::{Address, B256};
     use serde_json::{Value, json};
 
-    use super::{decode_block, decode_head_frame, parse_batch};
+    use super::{EvmSource, RpcBatch, decode_block};
+    use crate::ingest::source::{BlockSource, SourceError};
     use crate::wire::envelope::Event;
 
-    /// Runs the full parse-and-project path, as production does.
-    fn decode_batch(
-        body: &[u8],
-    ) -> Result<crate::ingest::source::FetchedBlock, super::SourceError> {
-        decode_block(parse_batch(body)?)
+    /// A real HTTP boundary: inspect requests and return replies in reverse order.
+    fn rpc_server(
+        requests: usize,
+        mut reply: impl FnMut(&Value) -> Value + Send + 'static,
+    ) -> (String, std::thread::JoinHandle<Vec<Value>>) {
+        use std::io::{Read as _, Write as _};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind RPC server");
+        let url = format!("http://{}", listener.local_addr().expect("server address"));
+        let task = std::thread::spawn(move || {
+            let mut observed = Vec::new();
+            for _ in 0..requests {
+                let (mut socket, _) = listener.accept().expect("accept RPC");
+                socket
+                    .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                    .expect("read deadline");
+                let mut bytes = Vec::new();
+                let mut byte = [0];
+                while !bytes.ends_with(b"\r\n\r\n") {
+                    socket.read_exact(&mut byte).expect("HTTP header");
+                    bytes.push(byte[0]);
+                }
+                let headers = std::str::from_utf8(&bytes).expect("HTTP headers");
+                let length: usize = headers
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse().expect("length"))
+                    })
+                    .expect("content length");
+                let mut body = vec![0; length];
+                socket.read_exact(&mut body).expect("RPC body");
+                let request: Value = serde_json::from_slice(&body).expect("RPC JSON");
+                let response = reply(&request).to_string();
+                write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}", response.len()).expect("RPC response");
+                observed.push(request);
+            }
+            observed
+        });
+        (url, task)
+    }
+
+    fn primary_reply(request: &Value, block: &Value, receipts: &Value) -> Value {
+        let calls = request.as_array().expect("primary request must be a batch");
+        assert_eq!(calls.len(), 3);
+        assert_eq!(calls[0]["params"], json!(["0x112a880", true]));
+        assert_eq!(calls[1]["method"], "eth_getBlockReceipts");
+        assert_eq!(calls[1]["params"], json!(["0x112a880"]));
+        assert_eq!(calls[2]["params"], json!(["finalized", false]));
+        json!([
+            {"jsonrpc": "2.0", "id": calls[2]["id"], "result": {"number": "0x10", "hash": hash(0xf0)}},
+            {"jsonrpc": "2.0", "id": calls[1]["id"], "result": receipts},
+            {"jsonrpc": "2.0", "id": calls[0]["id"], "result": block},
+        ])
+    }
+
+    #[tokio::test]
+    async fn primary_fetch_is_one_three_call_batch_with_reversed_responses() {
+        let (url, server) = rpc_server(1, |request| primary_reply(request, &block(), &receipts()));
+        let source = EvmSource::new("ethereum", url, "ws://unused").expect("source");
+        let fetched = source.fetch_block(18_000_000).await.expect("fetch");
+        assert_eq!(fetched.events.len(), 7);
+        assert_eq!(fetched.finalized.height, 16);
+        assert_eq!(server.join().expect("server").len(), 1);
+    }
+
+    #[tokio::test]
+    async fn receipt_fallback_batches_21_transactions_as_10_10_1() {
+        for unsupported in [false, true] {
+            let mut block = block();
+            let template = block["transactions"][0].clone();
+            let mut receipt = receipts()[0].clone();
+            receipt["logs"] = json!([]);
+            block["transactions"] = Value::Array(
+                (0..21_u8)
+                    .map(|index| {
+                        let mut transaction = template.clone();
+                        transaction["hash"] = json!(hash(index));
+                        transaction["transactionIndex"] = json!(format!("0x{index:x}"));
+                        transaction
+                    })
+                    .collect(),
+            );
+            let (url, server) = rpc_server(4, move |request| {
+                let calls = request.as_array().expect("batch");
+                if calls[0]["method"] == "eth_getBlockByNumber" {
+                    let mut response = primary_reply(request, &block, &Value::Null);
+                    if unsupported {
+                        response[1]
+                            .as_object_mut()
+                            .expect("response")
+                            .remove("result");
+                        response[1]["error"] = json!({"code": -32601, "message": "unsupported"});
+                    }
+                    response
+                } else {
+                    Value::Array(
+                        calls
+                            .iter()
+                            .rev()
+                            .map(|call| {
+                                assert_eq!(call["method"], "eth_getTransactionReceipt");
+                                let hash = call["params"][0].as_str().expect("hash");
+                                let index = u8::from_str_radix(&hash[2..4], 16).expect("index");
+                                let mut receipt = receipt.clone();
+                                receipt["transactionHash"] = json!(hash);
+                                receipt["transactionIndex"] = json!(format!("0x{index:x}"));
+                                json!({"jsonrpc": "2.0", "id": call["id"], "result": receipt})
+                            })
+                            .collect(),
+                    )
+                }
+            });
+            let source = EvmSource::new("base", url, "ws://unused").expect("source");
+            let fetched = source
+                .fetch_block(18_000_000)
+                .await
+                .expect("fallback fetch");
+            assert_eq!(fetched.events.len(), 43);
+            let observed = server.join().expect("server");
+            assert_eq!(
+                observed
+                    .iter()
+                    .map(|batch| batch.as_array().expect("batch").len())
+                    .collect::<Vec<_>>(),
+                [3, 10, 10, 1]
+            );
+            for (index, event) in fetched.events.iter().skip(1).step_by(2).enumerate() {
+                let Event::Transaction(transaction) = event else {
+                    panic!("transaction");
+                };
+                assert_eq!(transaction.transaction_index, index as u64);
+                assert_eq!(
+                    transaction.hash,
+                    B256::repeat_byte(u8::try_from(index).expect("index"))
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn rpc_and_decode_errors_remain_typed_and_do_not_trigger_fallback() {
+        for malformed in [false, true] {
+            let (url, server) = rpc_server(1, move |request| {
+                let mut response = primary_reply(request, &block(), &receipts());
+                if malformed {
+                    response[0]["result"]["number"] = json!("not a quantity");
+                } else {
+                    response[1]
+                        .as_object_mut()
+                        .expect("response")
+                        .remove("result");
+                    response[1]["error"] = json!({"code": -32000, "message": "internal"});
+                }
+                response
+            });
+            let source = EvmSource::new("ethereum", url, "ws://unused").expect("source");
+            let error = source.fetch_block(18_000_000).await.expect_err("must fail");
+            if malformed {
+                assert!(matches!(
+                    error,
+                    SourceError::Transport {
+                        context: "finalized block",
+                        source: alloy_json_rpc::RpcError::DeserError { .. }
+                    }
+                ));
+            } else {
+                assert!(
+                    matches!(error, SourceError::Transport { context: "eth_getBlockReceipts", source: alloy_json_rpc::RpcError::ErrorResp(ref payload) } if payload.code == -32000)
+                );
+            }
+            server.join().expect("server");
+        }
+    }
+
+    #[tokio::test]
+    async fn head_stream_retains_provider_decode_errors_and_resubscribes() {
+        use futures_util::{SinkExt as _, StreamExt as _};
+        use tokio_tungstenite::tungstenite::Message;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("WS bind");
+        let url = format!("ws://{}", listener.local_addr().expect("WS address"));
+        let (release, done) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            for index in 0..2 {
+                let (socket, _) = listener.accept().await.expect("WS accept");
+                let mut socket = tokio_tungstenite::accept_async(socket)
+                    .await
+                    .expect("WS handshake");
+                let request = socket
+                    .next()
+                    .await
+                    .expect("subscribe frame")
+                    .expect("subscribe read");
+                let request: Value =
+                    serde_json::from_str(request.to_text().expect("text")).expect("subscribe JSON");
+                assert_eq!(request["method"], "eth_subscribe");
+                assert_eq!(request["params"], json!(["newHeads"]));
+                let id = format!("0x{:064x}", index + 1);
+                socket
+                    .send(Message::text(
+                        json!({"jsonrpc": "2.0", "id": request["id"], "result": id}).to_string(),
+                    ))
+                    .await
+                    .expect("subscribe reply");
+                if index == 0 {
+                    socket.send(Message::text(json!({"jsonrpc": "2.0", "method": "eth_subscription", "params": {"subscription": id, "result": {"number": "invalid", "hash": hash(1)}}}).to_string())).await.expect("malformed head");
+                }
+                socket.send(Message::text(json!({"jsonrpc": "2.0", "method": "eth_subscription", "params": {"subscription": id, "result": {"number": format!("0x{:x}", index + 16), "hash": hash(1)}}}).to_string())).await.expect("head");
+                if index == 0 {
+                    socket.close(None).await.expect("close for reconnect");
+                } else {
+                    done.await.expect("hold connection until consumed");
+                    break;
+                }
+            }
+        });
+        let source = EvmSource::new("ethereum", "http://unused", url).expect("source");
+        let mut heads = source.subscribe_heads().await.expect("subscribe");
+        drop(source);
+        let consume = async {
+            assert!(matches!(
+                heads.next().await.expect("decode error"),
+                Err(SourceError::Json {
+                    context: "newHeads",
+                    ..
+                })
+            ));
+            assert_eq!(
+                heads
+                    .next()
+                    .await
+                    .expect("head")
+                    .expect("valid head")
+                    .height,
+                16
+            );
+            assert_eq!(
+                heads
+                    .next()
+                    .await
+                    .expect("resubscribed head")
+                    .expect("valid head")
+                    .height,
+                17
+            );
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(10), consume)
+            .await
+            .expect("head/reconnect deadline");
+        release.send(()).expect("release server");
+        server.await.expect("server");
     }
 
     fn hash(byte: u8) -> String {
@@ -885,36 +994,21 @@ mod tests {
         ])
     }
 
-    /// A batch body as the node returns it: responses out of request order.
-    fn batch(block: &Value, receipts: &Value) -> Vec<u8> {
-        json!([
-            {"jsonrpc": "2.0", "id": 3, "result": {
-                "number": "0x112a840", "hash": hash(0xf0), "parentHash": hash(0xef),
-            }},
-            {"jsonrpc": "2.0", "id": 2, "result": receipts},
-            {"jsonrpc": "2.0", "id": 1, "result": block},
-        ])
-        .to_string()
-        .into_bytes()
-    }
-
-    #[test]
-    fn finalized_number_must_be_a_quantity() {
-        // The `finalized` header's number is a JSON-RPC quantity. Alloy's decoder
-        // rejects anything that is not `0x` hex, including bare hex and overflow.
-        let body = json!([
-            {"jsonrpc": "2.0", "id": 1, "result": block()},
-            {"jsonrpc": "2.0", "id": 2, "result": receipts()},
-            {"jsonrpc": "2.0", "id": 3, "result": {"number": "ff", "hash": hash(0xf0)}},
-        ])
-        .to_string();
-        let error = parse_batch(body.as_bytes()).expect_err("bare hex must fail");
-        assert!(error.to_string().contains("finalized block"), "{error}");
+    /// The typed projection input; RPC behavior is tested through the source below.
+    fn batch(block: &Value, receipts: &Value) -> RpcBatch {
+        RpcBatch {
+            block: serde_json::from_value(block.clone()).expect("block fixture"),
+            receipts: Some(serde_json::from_value(receipts.clone()).expect("receipt fixture")),
+            finalized: super::BlockId {
+                height: 17_999_936,
+                hash: B256::repeat_byte(0xf0),
+            },
+        }
     }
 
     #[test]
     fn events_are_block_then_each_transaction_followed_by_its_receipt_and_logs() {
-        let fetched = decode_batch(&batch(&block(), &receipts())).expect("batch decodes");
+        let fetched = decode_block(batch(&block(), &receipts())).expect("batch decodes");
         let kinds: Vec<&str> = fetched.events.iter().map(Event::kind).collect();
         assert_eq!(
             kinds,
@@ -943,7 +1037,7 @@ mod tests {
 
     #[test]
     fn datasets_carry_their_fields_and_reference_children_by_key() {
-        let fetched = decode_batch(&batch(&block(), &receipts())).expect("batch decodes");
+        let fetched = decode_block(batch(&block(), &receipts())).expect("batch decodes");
 
         let Event::Block(block) = &fetched.events[0] else {
             panic!("first event must be the block marker");
@@ -1005,7 +1099,7 @@ mod tests {
 
     #[test]
     fn topics_past_three_are_dropped_and_data_is_kept_verbatim() {
-        let fetched = decode_batch(&batch(&block(), &receipts())).expect("batch decodes");
+        let fetched = decode_block(batch(&block(), &receipts())).expect("batch decodes");
         let Event::Log(first) = &fetched.events[3] else {
             panic!("fourth event must be a log");
         };
@@ -1023,7 +1117,7 @@ mod tests {
 
     #[test]
     fn finalized_block_comes_from_the_batch() {
-        let fetched = decode_batch(&batch(&block(), &receipts())).expect("batch decodes");
+        let fetched = decode_block(batch(&block(), &receipts())).expect("batch decodes");
         assert_eq!(fetched.finalized.height, 17_999_936);
         assert_eq!(fetched.finalized.hash, B256::from([0xf0; 32]));
     }
@@ -1032,7 +1126,7 @@ mod tests {
     fn receipts_from_another_block_are_rejected() {
         let mut receipts = receipts();
         receipts[1]["blockHash"] = json!(hash(0xcd));
-        let error = decode_batch(&batch(&block(), &receipts)).expect_err("fork mismatch must fail");
+        let error = decode_block(batch(&block(), &receipts)).expect_err("fork mismatch must fail");
         assert!(error.to_string().contains("reorganised"), "{error}");
     }
 
@@ -1043,19 +1137,16 @@ mod tests {
             .as_array_mut()
             .expect("receipts are an array")
             .pop();
-        let error =
-            decode_batch(&batch(&block(), &receipts)).expect_err("count mismatch must fail");
+        let error = decode_block(batch(&block(), &receipts)).expect_err("count mismatch must fail");
         assert!(
             error.to_string().contains("1 receipts for 2 transactions"),
             "{error}"
         );
     }
 
-    #[test]
-    fn a_missing_log_index_is_rejected() {
-        // alloy rejects an absent `logIndex` before this runs, so a log that arrives
-        // without one is already a parse failure; the check is here so the error names
-        // the field rather than surfacing as a deserialize error.
+    #[tokio::test]
+    async fn a_missing_log_index_is_rejected() {
+        // Alloy rejects an absent logIndex at the RPC decode boundary.
         let mut receipts = receipts();
         for log in receipts[0]["logs"]
             .as_array_mut()
@@ -1065,13 +1156,22 @@ mod tests {
                 .expect("log is an object")
                 .remove("logIndex");
         }
-        let error =
-            decode_batch(&batch(&block(), &receipts)).expect_err("missing logIndex must fail");
-        let message = error.to_string();
-        assert!(
-            message.contains("eth_getBlockReceipts") && message.contains("logIndex"),
-            "{message}"
-        );
+        let (url, server) = rpc_server(1, move |request| {
+            primary_reply(request, &block(), &receipts)
+        });
+        let source = EvmSource::new("ethereum", url, "ws://unused").expect("source");
+        let error = source
+            .fetch_block(18_000_000)
+            .await
+            .expect_err("missing logIndex");
+        assert!(matches!(
+            error,
+            SourceError::Transport {
+                context: "eth_getBlockReceipts",
+                source: alloy_json_rpc::RpcError::DeserError { .. }
+            }
+        ));
+        server.join().expect("server");
     }
 
     /// An explicit `null` `logIndex` is the case the old fallback got wrong. alloy
@@ -1089,7 +1189,7 @@ mod tests {
             log["logIndex"] = Value::Null;
         }
         let error =
-            decode_batch(&batch(&block(), &receipts)).expect_err("a null logIndex must fail");
+            decode_block(batch(&block(), &receipts)).expect_err("a null logIndex must fail");
         let message = error.to_string();
         assert!(
             message.contains("eth_getBlockReceipts") && message.contains("logIndex"),
@@ -1097,113 +1197,11 @@ mod tests {
         );
     }
 
-    #[test]
-    fn missing_block_field_reports_its_context() {
-        let mut block = block();
-        block
-            .as_object_mut()
-            .expect("block is an object")
-            .remove("hash");
-        let error = decode_batch(&batch(&block, &receipts())).expect_err("missing hash must fail");
-        assert!(
-            matches!(
-                error,
-                super::SourceError::Json {
-                    context: "eth_getBlockByNumber",
-                    ..
-                }
-            ),
-            "{error}"
-        );
-    }
-
-    #[test]
-    fn node_error_in_the_batch_is_an_rpc_error() {
-        let body = json!([
-            {"jsonrpc": "2.0", "id": 1, "error": {"code": -32000, "message": "header not found"}},
-        ])
-        .to_string();
-        let error = decode_batch(body.as_bytes()).expect_err("node error must fail");
-        // The code and method are carried structurally, not folded into the message.
-        assert!(
-            matches!(
-                &error,
-                crate::ingest::source::SourceError::Rpc { code: -32000, method, .. }
-                    if method == "eth_getBlockByNumber"
-            ),
-            "{error}"
-        );
-        assert!(error.to_string().contains("header not found"), "{error}");
-    }
-
-    /// A node without `eth_getBlockReceipts` answers `-32601`. The batch carries the
-    /// block and its transaction hashes — the exact input the per-transaction fallback
-    /// needs — and the rest of the batch survives, so one unsupported method does not
-    /// poison finalized.
-    #[test]
-    fn unsupported_receipts_method_leaves_the_rest_of_the_batch_usable() {
-        let body = json!([
-            {"jsonrpc": "2.0", "id": 1, "result": block()},
-            {"jsonrpc": "2.0", "id": 2, "error": {"code": -32601, "message": "method not found"}},
-            {"jsonrpc": "2.0", "id": 3, "result": {"number": "0x10", "hash": hash(0xf0)}},
-        ])
-        .to_string();
-        let batch = parse_batch(body.as_bytes()).expect("batch parses without receipts");
-        assert!(batch.receipts.is_none());
-        // The fallback reads these hashes to fetch each receipt by transaction.
-        let hashes: Vec<B256> = batch
-            .block
-            .0
-            .inner
-            .transactions
-            .as_transactions()
-            .expect("full transactions")
-            .iter()
-            .map(alloy_network::TransactionResponse::tx_hash)
-            .collect();
-        assert_eq!(
-            hashes,
-            vec![
-                hash(0x11).parse::<B256>().expect("hash"),
-                hash(0x22).parse::<B256>().expect("hash"),
-            ]
-        );
-        assert_eq!(batch.finalized.height, 16, "finalized must still parse");
-    }
-
-    /// A `null` result (rather than an error) also means the caller must fall back.
-    #[test]
-    fn null_receipts_result_leaves_receipts_absent() {
-        let body = json!([
-            {"jsonrpc": "2.0", "id": 1, "result": block()},
-            {"jsonrpc": "2.0", "id": 2, "result": null},
-            {"jsonrpc": "2.0", "id": 3, "result": {"number": "0x10", "hash": hash(0xf0)}},
-        ])
-        .to_string();
-        let batch = parse_batch(body.as_bytes()).expect("batch parses without receipts");
-        assert!(batch.receipts.is_none());
-        assert_eq!(batch.finalized.height, 16);
-    }
-
-    /// Only `-32601` means "method unsupported". Any other receipts error is a real
-    /// transport failure and must not be silently downgraded to the fallback.
-    #[test]
-    fn other_receipts_errors_are_not_treated_as_unsupported() {
-        let body = json!([
-            {"jsonrpc": "2.0", "id": 1, "result": block()},
-            {"jsonrpc": "2.0", "id": 2, "error": {"code": -32000, "message": "internal error"}},
-            {"jsonrpc": "2.0", "id": 3, "result": {"number": "0x10", "hash": hash(0xf0)}},
-        ])
-        .to_string();
-        let error = parse_batch(body.as_bytes()).expect_err("a real error must propagate");
-        assert!(error.to_string().contains("internal error"), "{error}");
-    }
-
     /// The decode boundary requires receipts: a caller that forgets the fallback
     /// gets a clear error rather than a block of transaction events with no receipts.
     #[test]
     fn decode_block_requires_receipts() {
-        let batch = super::RpcBatch {
+        let batch = RpcBatch {
             block: serde_json::from_value(block()).expect("block parses"),
             receipts: None,
             finalized: crate::ingest::source::BlockId {
@@ -1218,29 +1216,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn subscription_confirmation_is_not_a_head() {
-        let confirmation = r#"{"jsonrpc":"2.0","id":1,"result":"0xsub"}"#;
-        assert!(decode_head_frame(confirmation).is_none());
-    }
-
-    #[test]
-    fn head_notification_decodes() {
-        // A real `newHeads` notification carries far more than identity; the extra
-        // fields are ignored.
-        let frame = r#"{"jsonrpc":"2.0","method":"eth_subscription","params":{"result":{
-            "number":"0x10",
-            "hash":"0x0000000000000000000000000000000000000000000000000000000000000001",
-            "parentHash":"0x0000000000000000000000000000000000000000000000000000000000000002",
-            "timestamp":"0x6530a1b0"
-        }}}"#;
-        let head = decode_head_frame(frame)
-            .expect("frame is a head")
-            .expect("head decodes");
-        assert_eq!(head.height, 16);
-        assert_eq!(head.hash, B256::with_last_byte(1));
-    }
-
     /// An OP-stack block carrying a deposit transaction (`type: 0x7e`), which
     /// Ethereum-only types reject outright; the fixture is trimmed from a real Base
     /// block.
@@ -1249,8 +1224,8 @@ mod tests {
     /// envelope cannot represent `0x7e`, so this fails unless the catch-all
     /// (`AnyTxEnvelope::Unknown`) path handles it. The field checks confirm the
     /// common fields are projected for the unknown type.
-    #[test]
-    fn non_ethereum_transaction_type_decodes_and_keeps_its_type() {
+    #[tokio::test]
+    async fn non_ethereum_transaction_type_decodes_and_keeps_its_type() {
         let deposit = json!({
             "hash": hash(0x11), "blockHash": hash(0xab), "blockNumber": "0x112a880",
             "transactionIndex": "0x0", "from": address(0xf0), "to": address(0xf1),
@@ -1270,7 +1245,13 @@ mod tests {
         receipts[0]["type"] = json!("0x7e");
         receipts[0]["logs"] = json!([]);
 
-        let fetched = decode_batch(&batch(&block, &receipts)).expect("OP deposit block decodes");
+        let (url, server) = rpc_server(1, move |request| primary_reply(request, &block, &receipts));
+        let source = EvmSource::new("base", url, "ws://unused").expect("source");
+        let fetched = source
+            .fetch_block(18_000_000)
+            .await
+            .expect("OP deposit block decodes");
+        server.join().expect("server");
         assert_eq!(fetched.events.len(), 3, "block, transaction, receipt");
 
         let Event::Transaction(transaction) = &fetched.events[1] else {
@@ -1300,7 +1281,7 @@ mod tests {
                 .expect("log is an object")
                 .remove("transactionHash");
         }
-        let error = decode_batch(&batch(&block(), &receipts))
+        let error = decode_block(batch(&block(), &receipts))
             .expect_err("a log without an identity must fail");
         let message = error.to_string();
         assert!(

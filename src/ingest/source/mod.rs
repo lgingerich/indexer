@@ -20,14 +20,8 @@ use std::pin::Pin;
 use alloy_primitives::B256;
 use futures_util::Stream;
 use thiserror::Error;
-// The error type and the close code, so [`SourceError`] can carry them typed rather than
-// flattened to a message. Re-exported through `tokio_tungstenite`, which is already a
-// dependency for the EVM source's socket.
-use tokio_tungstenite::tungstenite;
-use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 
 pub mod evm;
-
 pub use evm::EvmSource;
 
 use crate::wire::envelope::{ChainId, Event};
@@ -62,7 +56,7 @@ pub struct FetchedBlock {
     pub finalized: BlockId,
 }
 
-/// A stream of live head notifications. Ends when the connection does.
+/// Live heads, including decode errors; ends after transport recovery is exhausted.
 pub type HeadStream = Pin<Box<dyn Stream<Item = Result<BlockId, SourceError>> + Send>>;
 
 /// The JSON-RPC code for a method the node does not serve.
@@ -71,95 +65,36 @@ pub type HeadStream = Pin<Box<dyn Stream<Item = Result<BlockId, SourceError>> + 
 /// Ethereum answer `eth_getBlockReceipts` with this code, and some answer `null`.
 pub const METHOD_NOT_FOUND: i64 = -32601;
 
-/// Failure while talking to a chain data source.
+/// Failure while constructing or talking to a chain data source.
 #[derive(Debug, Error)]
 pub enum SourceError {
-    /// An HTTP request failed, carrying `reqwest`'s typed error.
-    ///
-    /// The variant to match when deciding whether to retry: [`reqwest::Error::status`]
-    /// tells a rate limit from a 5xx, and [`reqwest::Error::is_timeout`] a stall from a
-    /// refusal. This is why the error is not stringified — as a `String` the only thing
-    /// left to match on was the message, so no retry policy could be written against
-    /// this error at all.
-    #[error("http failure: {0}")]
+    /// HTTP client construction failed.
+    #[error("http client failure: {0}")]
     Http(#[from] reqwest::Error),
-    /// A websocket frame failed to send or receive.
-    ///
-    /// Typed for the same reason as [`Self::Http`]: `tungstenite::Error` is `Send + Sync`,
-    /// so there is nothing to gain by flattening it. The case a caller most wants to
-    /// branch on — the peer going away — is [`Self::Closed`] instead, since a closure is
-    /// not a frame error but a normal end of stream.
-    ///
-    /// `context` is set at the call (`connect`, `subscribe`, `read frame`), so this is
-    /// not `#[from]` — a `From<tungstenite::Error>` would have to drop which attempt failed.
-    #[error("websocket {context} failed: {source}")]
-    Websocket {
-        /// What was being attempted, `connect`, `subscribe`, or `read frame`.
+    /// Alloy's typed RPC, decoding, or transport error at the named boundary.
+    #[error("{context} failed: {source}")]
+    Transport {
+        /// The method or connection being attempted.
         context: &'static str,
-        /// `tungstenite`'s error, typed.
+        /// The typed error, including node error payloads and HTTP status codes.
         #[source]
-        source: tungstenite::Error,
+        source: alloy_transport::TransportError,
     },
-    /// The peer sent a close frame, ending the head subscription.
-    ///
-    /// Carries the close code, because *how* the peer hung up is the difference between
-    /// a reconnect and a diagnosis. `Normal` and `Away` mean the node finished or is
-    /// restarting and the same socket should be reopened; `Protocol` and `Error` mean it
-    /// rejected something we sent and reconnecting unchanged fails the same way.
-    ///
-    /// The code is the type rather than an `Option`, because a close frame carrying no
-    /// payload is the case RFC 6455 gives its own code — `Status` — and so needs no
-    /// sentinel here. A connection dropped with *no close frame at all* is a different
-    /// thing: it ends the stream without producing an item, and the caller reports that as
-    /// an ended subscription instead.
-    ///
-    /// [`CloseCode::Normal`]: tungstenite::protocol::frame::coding::CloseCode::Normal
-    /// [`CloseCode::Away`]: tungstenite::protocol::frame::coding::CloseCode::Away
-    /// [`CloseCode::Protocol`]: tungstenite::protocol::frame::coding::CloseCode::Protocol
-    /// [`CloseCode::Error`]: tungstenite::protocol::frame::coding::CloseCode::Error
-    /// [`CloseCode::Status`]: tungstenite::protocol::frame::coding::CloseCode::Status
-    #[error("websocket closed ({code})")]
-    Closed {
-        /// The peer's close code, which displays as its RFC 6455 number — `1000` for a
-        /// normal closure.
-        code: CloseCode,
-    },
-    /// The node received the request but answered with a JSON-RPC error object.
-    ///
-    /// The code is kept typed rather than folded into the message, so a caller can
-    /// branch on it (an unsupported method is [`METHOD_NOT_FOUND`]).
-    ///
-    /// [`METHOD_NOT_FOUND`]: crate::ingest::source::METHOD_NOT_FOUND
-    #[error("{method} returned error {code}: {message}")]
-    Rpc {
-        /// The method the node rejected.
-        method: String,
-        /// The node's JSON-RPC error code.
-        code: i64,
-        /// The node's error message.
-        message: String,
-    },
-    /// A payload was not JSON of the shape being decoded.
-    ///
-    /// `context` names which payload failed, which [`serde_json::Error`] cannot know, so
-    /// this is not `#[from]`.
+    /// A subscription notification could not be decoded.
     #[error("malformed data from {context}: {source}")]
     Json {
-        /// What was being parsed, for example a method name.
+        /// What was being parsed.
         context: &'static str,
-        /// `serde_json`'s error, typed.
+        /// The decoding error.
         #[source]
         source: serde_json::Error,
     },
-    /// The source responded, but the payload was not usable.
-    ///
-    /// Distinct from [`Self::Json`]: the body parsed, and then failed a check this
-    /// source owns (a null result, a log with no index, a receipt from another block).
+    /// A decoded response violates a source invariant.
     #[error("malformed data from {context}: {detail}")]
     Malformed {
-        /// What was being parsed, for example a method name.
+        /// What was being parsed.
         context: String,
-        /// Why the payload could not be used.
+        /// Which invariant failed.
         detail: String,
     },
 }
@@ -176,9 +111,7 @@ pub trait BlockSource: Send + Sync {
     ///
     /// # Errors
     ///
-    /// Returns [`SourceError::Http`] when the request fails, [`SourceError::Rpc`] when a
-    /// call in it was rejected, and [`SourceError::Json`] or [`SourceError::Malformed`]
-    /// when the response cannot be decoded.
+    /// Returns a typed transport error or a violated projection invariant.
     fn fetch_block(
         &self,
         height: u64,
@@ -193,50 +126,6 @@ pub trait BlockSource: Send + Sync {
     ///
     /// # Errors
     ///
-    /// Returns [`SourceError::Http`] when the request fails, and [`SourceError::Rpc`] or
-    /// [`SourceError::Json`] when the node's answer cannot be read.
+    /// Returns a typed transport error or an absent head.
     fn current_head(&self) -> impl Future<Output = Result<BlockId, SourceError>> + Send;
-}
-
-#[cfg(test)]
-mod tests {
-    use super::SourceError;
-    use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
-
-    /// A clean shutdown and a protocol error used to be indistinguishable: both ended
-    /// the head stream, and the run reported only that it stopped. The close code is
-    /// what separates "reconnect" from "something is wrong", so it has to survive into
-    /// the error a caller sees.
-    #[test]
-    fn a_close_carries_the_code_that_says_why() {
-        let orderly = SourceError::Closed {
-            code: CloseCode::Normal,
-        };
-        let fault = SourceError::Closed {
-            code: CloseCode::Protocol,
-        };
-
-        assert!(
-            matches!(
-                orderly,
-                SourceError::Closed {
-                    code: CloseCode::Normal
-                }
-            ),
-            "a normal close must stay distinguishable from a protocol error: {orderly}"
-        );
-        assert!(
-            matches!(
-                fault,
-                SourceError::Closed {
-                    code: CloseCode::Protocol
-                }
-            ),
-            "a protocol error must stay distinguishable from a normal close: {fault}"
-        );
-        // The code renders as its RFC 6455 number, so an operator reading the log can
-        // look it up without matching in code.
-        assert_eq!(orderly.to_string(), "websocket closed (1000)");
-        assert_eq!(fault.to_string(), "websocket closed (1002)");
-    }
 }

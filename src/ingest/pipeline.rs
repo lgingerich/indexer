@@ -312,9 +312,10 @@ impl<S, K> Machine<S, K> {
 impl<S: BlockSource, K: EnvelopeSink> Machine<S, K> {
     /// Drives finalized startup, catch-up, and live indexing.
     ///
-    /// Catches up sequentially before waiting for the next head hint. Source errors
-    /// propagate without retries. The socket is not polled during fetches or delivery;
-    /// prolonged backpressure may disconnect it.
+    /// Catches up sequentially before waiting for a head hint or a 30-second fallback
+    /// wake-up. Notifications are hints, not a replay log: HTTP reconciliation fills
+    /// gaps and resolves reorgs after subscription recovery. Source errors still
+    /// propagate without retries; the source owns connection maintenance.
     ///
     /// # Errors
     /// Consumes this instance. An error or cancellation drops its source, sink, and
@@ -324,11 +325,12 @@ impl<S: BlockSource, K: EnvelopeSink> Machine<S, K> {
         let mut heads = self.source.subscribe_heads().await?;
         loop {
             while self.step().await? {}
-            match heads.next().await {
-                Some(head) => {
-                    head?;
-                }
-                None => return Err(PipelineError::SubscriptionClosed),
+            tokio::select! {
+                head = heads.next() => match head {
+                    Some(head) => { head?; }
+                    None => return Err(PipelineError::SubscriptionClosed),
+                },
+                () = tokio::time::sleep(std::time::Duration::from_secs(30)) => {}
             }
         }
     }
@@ -733,8 +735,9 @@ mod tests {
         async fn fetch_block(&self, height: u64) -> Result<FetchedBlock, SourceError> {
             let data = &self.data;
             if data.fail_once.swap(false, Ordering::Relaxed) {
-                return Err(SourceError::Closed {
-                    code: tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode::Away,
+                return Err(SourceError::Malformed {
+                    context: "test".into(),
+                    detail: "injected source failure".into(),
                 });
             }
             let Some(&(id, parent)) = data.blocks.get(&height) else {
@@ -858,6 +861,130 @@ mod tests {
                 .iter()
                 .any(|e| matches!(e, Event::Reorg(_)))
         );
+    }
+
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicU64;
+
+    struct LiveSource {
+        source: Source,
+        head: Arc<AtomicU64>,
+        forked: Arc<AtomicBool>,
+        hints: std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<BlockId>>>,
+    }
+    impl BlockSource for LiveSource {
+        fn chain(&self) -> &ChainId {
+            self.source.chain()
+        }
+        async fn subscribe_heads(&self) -> Result<HeadStream, SourceError> {
+            let hints = self
+                .hints
+                .lock()
+                .expect("hints lock")
+                .take()
+                .expect("subscribe once");
+            Ok(Box::pin(stream::unfold(hints, |mut hints| async move {
+                hints.recv().await.map(|hint| (Ok(hint), hints))
+            })))
+        }
+        async fn current_head(&self) -> Result<BlockId, SourceError> {
+            let height = self.head.load(Ordering::Relaxed);
+            let replacement = self.forked.load(Ordering::Relaxed) && height >= 3;
+            Ok(BlockId {
+                height,
+                hash: hash(height + if replacement { 100 } else { 0 }),
+            })
+        }
+        async fn fetch_block(&self, height: u64) -> Result<FetchedBlock, SourceError> {
+            let mut block = self.source.fetch_block(height).await?;
+            if self.forked.load(Ordering::Relaxed) && height >= 3 {
+                let Event::Block(marker) = &mut block.events[0] else {
+                    unreachable!()
+                };
+                marker.hash = hash(height + 100);
+                marker.parent_hash = hash(if height == 3 { 2 } else { height + 99 });
+            }
+            Ok(block)
+        }
+    }
+    struct LiveSink(tokio::sync::mpsc::UnboundedSender<Event>);
+    impl EnvelopeSink for LiveSink {
+        async fn publish(&mut self, envelope: Envelope) -> Result<(), SinkError> {
+            self.0
+                .send(envelope.event)
+                .map_err(|_| SinkError::StorageClosed)
+        }
+        async fn flush(&mut self) -> Result<(), SinkError> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn silent_subscription_reconciles_gaps_and_reorgs_without_duplicate_stale_hints() {
+        let recovery = async {
+            let head = Arc::new(AtomicU64::new(2));
+            let forked = Arc::new(AtomicBool::new(false));
+            let (hints, hint_stream) = tokio::sync::mpsc::unbounded_channel();
+            let (events, mut received) = tokio::sync::mpsc::unbounded_channel();
+            let source = LiveSource {
+                source: Source::linear(6, 1),
+                head: Arc::clone(&head),
+                forked: Arc::clone(&forked),
+                hints: std::sync::Mutex::new(Some(hint_stream)),
+            };
+            let run = tokio::spawn(Machine::new(source, LiveSink(events)).run());
+            for expected in [1, 2] {
+                loop {
+                    if let Event::Block(block) = received.recv().await.expect("startup event") {
+                        assert_eq!(block.number, expected);
+                        break;
+                    }
+                }
+            }
+            // No new head hint arrives during the outage: the timer must discover the gap.
+            head.store(6, Ordering::Relaxed);
+            tokio::time::advance(std::time::Duration::from_secs(30)).await;
+            for expected in 3..=6 {
+                let Event::Block(block) = received.recv().await.expect("catch-up event") else {
+                    panic!("ordinary gap must not emit a reorg or another finality marker");
+                };
+                assert_eq!(block.number, expected);
+            }
+            // A second silent period spans a fork, not just a height gap.
+            forked.store(true, Ordering::Relaxed);
+            tokio::time::advance(std::time::Duration::from_secs(30)).await;
+            let Event::Reorg(reorg) = received.recv().await.expect("reorg marker") else {
+                panic!("the old suffix must be retracted before replacement blocks");
+            };
+            assert_eq!(reorg.orphaned_hashes, [hash(6), hash(5), hash(4), hash(3)]);
+            for expected in 3..=6 {
+                let Event::Block(block) = received.recv().await.expect("replacement event") else {
+                    panic!("replacement blocks must follow the reorg marker");
+                };
+                assert_eq!(block.number, expected);
+                assert_eq!(block.hash, hash(expected + 100));
+            }
+            for _ in 0..2 {
+                hints
+                    .send(BlockId {
+                        height: 2,
+                        hash: hash(2),
+                    })
+                    .expect("stale hint");
+            }
+            drop(hints);
+            assert!(matches!(
+                run.await.expect("driver task"),
+                Err(PipelineError::SubscriptionClosed)
+            ));
+            assert!(
+                received.try_recv().is_err(),
+                "stale hints must not duplicate output"
+            );
+        };
+        tokio::time::timeout(std::time::Duration::from_mins(2), recovery)
+            .await
+            .expect("silent recovery must converge within four fallback intervals");
     }
 
     #[tokio::test]
@@ -1075,7 +1202,7 @@ mod tests {
         source.data.fail_once.store(true, Ordering::Relaxed);
         assert!(matches!(
             Machine::new(source, Sink::default()).run().await,
-            Err(PipelineError::Source(SourceError::Closed { .. }))
+            Err(PipelineError::Source(SourceError::Malformed { .. }))
         ));
     }
 

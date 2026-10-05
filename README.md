@@ -236,9 +236,12 @@ committed finalized identity and reconciling the stored suffix before replay.
 ### Backfill, and the handoff to live
 
 Ingestion supports finalized historical backfill and sequential catch-up to live heads.
-What remains is durable, idempotent replay against the store. The source subscription
-is not polled during fetches or sink delivery, so prolonged backpressure can disconnect
-it; the error propagates rather than automatically reconnecting.
+What remains is durable, idempotent replay against the store. Alloy maintains the
+WebSocket connection independently of fetches and sink delivery, and reconnects and
+resubscribes with bounded retries. Notifications are wake-up hints, not a replay log:
+HTTP reconciliation fills gaps and resolves reorgs, with a 30-second fallback wake-up
+when the subscription is silent. HTTP failures and exhausted subscription recovery
+remain terminal; reconnecting does not restore history after a process restart.
 
 ### Reorgs and finality in the store
 
@@ -585,14 +588,17 @@ backend, which prints the stream instead of storing it, and change the address, 
 cargo bench
 ```
 
-`benches/hot_path.rs` measures the CPU work between socket and sink — decoding
-the node's batch response and serialising envelopes — since end-to-end latency is dominated by the
+`benches/hot_path.rs` measures typed block/receipt projection and envelope
+serialisation. Alloy's transport and JSON-RPC decoding are not included; typed inputs
+are prepared outside the timed projection. End-to-end latency is dominated by the
 network and is not reproducible off-line. It is hand-rolled and dependency-free so
 it can report percentiles rather than means, and it calls `std::hint::black_box`
 explicitly because that is the only way to stop `lto` and `codegen-units = 1` from
 deleting the work being measured.
 
-Measured on an Apple Silicon laptop, release profile, ~1,000 samples each:
+Historical measurements of the previous parse-and-project benchmark on an Apple
+Silicon laptop, release profile, ~1,000 samples each (not comparable to the current
+projection-only timing):
 
 | Workload | response | events | decode p50 | decode p99 | serialise p50 |
 | --- | --- | --- | --- | --- | --- |

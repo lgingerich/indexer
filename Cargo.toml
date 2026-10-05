@@ -24,10 +24,11 @@ duckdb = ["dep:duckdb"]
 
 [dependencies]
 alloy-consensus = "1.8.3"
-# The JSON-RPC envelope and error types (`Response`/`ResponsePacket`/`ErrorPayload`).
-# alloy-network already pulls this in, but its `Response`/`ErrorPayload` are what
-# model a batch and let the source branch on an error's code instead of its text.
+# Typed RPC errors preserve the node's error payload and method-not-found code.
 alloy-json-rpc = "1.8.3"
+alloy-provider = { version = "=1.8.3", default-features = false, features = ["reqwest", "reqwest-native-tls", "ws"] }
+alloy-transport = "=1.8.3"
+alloy-rpc-client = { version = "=1.8.3", default-features = false }
 # `any` types (`AnyRpcBlock`/`AnyRpcTransaction`) are alloy's catch-all for networks
 # whose transaction types fall outside Ethereum's 0-4: an OP-stack deposit (`0x7e`)
 # or Arbitrum retry (`0x6a`) otherwise fails the whole block. See `ingest::source`.
@@ -58,11 +59,14 @@ thiserror = "2.0.21"
 # an error rather than a silently ignored typo.
 toml = { version = "1.1.6", features = ["parse"] }
 tokio = { version = "1.53.1", features = ["io-std", "io-util", "macros", "rt-multi-thread", "signal", "sync", "time"] }
-tokio-tungstenite = { version = "0.30.0", default-features = false, features = ["connect", "native-tls"] }
+# Alloy 1.8.3 uses tungstenite 0.28 and enables rustls. Unifying native-tls
+# makes tungstenite prefer platform TLS while retaining Alloy's required features.
+tokio-tungstenite = { version = "0.28", default-features = false, features = ["connect", "native-tls"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", default-features = false, features = ["env-filter", "fmt", "json"] }
 
 [dev-dependencies]
+tokio = { version = "1.53.1", features = ["test-util"] }
 
 [[bench]]
 name = "hot_path"

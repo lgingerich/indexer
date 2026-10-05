@@ -1,9 +1,9 @@
-//! Microbenchmarks for the hot path: block decode and event serialisation.
+//! Microbenchmarks for the hot path: dataset projection and event serialisation.
 //!
-//! End-to-end latency is dominated by the network and is not reproducible in a
-//! benchmark, but the CPU work between the socket and the sink is: decoding the
-//! node's response into events, and rendering each event to JSON. Those are the
-//! two things that scale with chain activity, so they are what this measures.
+//! Alloy owns RPC response decoding. This measures projection of its typed block
+//! and receipts into events, and rendering each event to JSON. Fixture creation
+//! and cloning stay outside the timed projection, so no duplicate RPC parser is
+//! needed.
 //!
 //! Run with `cargo bench`. The harness is hand-rolled and dependency-free so it
 //! can report percentiles rather than means, which is the number that matters for
@@ -14,18 +14,10 @@
 use std::hint::black_box;
 use std::time::{Duration, Instant};
 
-use indexer::ingest::source::FetchedBlock;
-use indexer::ingest::source::evm::{decode_block, parse_batch};
+use indexer::ingest::source::BlockId;
+use indexer::ingest::source::evm::{RpcBatch, decode_block};
 use indexer::wire::envelope::{ChainId, Envelope};
 use serde_json::json;
-
-/// The full production decode path: parse the batch, then project it to records.
-///
-/// Mirrors `EvmSource::fetch_block` minus the network, so the benchmark measures
-/// the same work a live block costs between socket and sink.
-fn decode(body: &[u8]) -> Result<FetchedBlock, indexer::ingest::source::SourceError> {
-    decode_block(parse_batch(body)?)
-}
 
 /// Timed samples collected per benchmark.
 const SAMPLES: usize = 1_000;
@@ -61,15 +53,12 @@ fn report(label: &str, samples: &mut [Duration], unit: &str) {
     }
 }
 
-/// Builds a batch body shaped like the node's response to [`EvmSource`]'s
-/// request: a block with full transactions, its receipts, and the finalized block.
+/// Builds typed input for [`decode_block`]: full transactions, receipts, and finality.
 ///
 /// Synthetic rather than captured so the benchmark can scale the input, and so the
 /// repository does not carry a multi-megabyte fixture. The field names and value
 /// shapes match what a node returns, including a typical EIP-1559 transaction.
-///
-/// [`EvmSource`]: indexer::source::EvmSource
-fn synthetic_batch(tx_count: usize, logs_per_tx: usize) -> Vec<u8> {
+fn synthetic_batch(tx_count: usize, logs_per_tx: usize) -> RpcBatch {
     let block_hash = format!("0x{:064x}", 0xabc);
     let tx_hash = |i: usize| format!("0x{i:064x}");
     let transactions: Vec<serde_json::Value> = (0..tx_count)
@@ -114,8 +103,7 @@ fn synthetic_batch(tx_count: usize, logs_per_tx: usize) -> Vec<u8> {
                 "logs": logs,
             })        })
         .collect();
-    json!([
-        {"jsonrpc": "2.0", "id": 1, "result": {
+    let block = json!({
             "number": "0x112a880",
             "hash": block_hash,
             "parentHash": format!("0x{:064x}", 0xdef),
@@ -134,16 +122,15 @@ fn synthetic_batch(tx_count: usize, logs_per_tx: usize) -> Vec<u8> {
             "baseFeePerGas": "0x4c4b40",
             "logsBloom": format!("0x{}", "0".repeat(512)),
             "transactions": transactions,
-        }},
-        {"jsonrpc": "2.0", "id": 2, "result": receipts},
-        {"jsonrpc": "2.0", "id": 3, "result": {
-            "number": "0x112a840",
-            "hash": format!("0x{:064x}", 0xf0),
-            "parentHash": format!("0x{:064x}", 0xef),
-        }},
-    ])
-    .to_string()
-    .into_bytes()
+    });
+    RpcBatch {
+        block: serde_json::from_value(block).expect("block fixture"),
+        receipts: Some(serde_json::from_value(json!(receipts)).expect("receipt fixture")),
+        finalized: BlockId {
+            height: 17_999_936,
+            hash: alloy_primitives::B256::with_last_byte(0xf0),
+        },
+    }
 }
 
 fn main() {
@@ -152,7 +139,7 @@ fn main() {
         // One event per thing: the block, then each transaction, its receipt, and
         // its logs.
         let expected = 1 + tx_count * (2 + logs_per_tx);
-        let events = decode(black_box(&body))
+        let events = decode_block(body.clone())
             .expect("benchmark fixture decodes")
             .events;
         assert_eq!(
@@ -162,16 +149,14 @@ fn main() {
         );
         let mut samples = Vec::with_capacity(SAMPLES);
         for _ in 0..SAMPLES {
+            let input = body.clone();
             let start = Instant::now();
-            let decoded = decode(black_box(&body)).expect("benchmark fixture decodes");
+            let decoded = decode_block(black_box(input)).expect("benchmark fixture decodes");
             samples.push(start.elapsed());
             black_box(&decoded);
         }
         report(
-            &format!(
-                "decode_batch  txs={tx_count} logs/tx={logs_per_tx} events={expected} body={}KiB",
-                body.len() / 1024
-            ),
+            &format!("project_block txs={tx_count} logs/tx={logs_per_tx} events={expected}"),
             &mut samples,
             "block",
         );
