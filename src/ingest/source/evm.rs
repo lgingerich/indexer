@@ -633,6 +633,23 @@ impl BlockSource for EvmSource {
         }
         decode_block(batch)
     }
+
+    async fn current_head(&self) -> Result<BlockId, SourceError> {
+        const CONTEXT: &str = "eth_getBlockByNumber(latest)";
+        // Hashes only, not full transactions: the caller wants where the chain is, and a
+        // full-transaction response is tens of KB on a busy chain for nothing.
+        let body = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "eth_getBlockByNumber",
+            "params": ["latest", false],
+        });
+        let response = self.post(&body).await?;
+        let packet = parse_envelope(CONTEXT, &response)?;
+        let header = take_result(packet.responses(), 1, CONTEXT)?
+            .ok_or_else(|| malformed(CONTEXT, "result was null"))?;
+        decode_block_id(header)
+    }
 }
 
 impl EvmSource {

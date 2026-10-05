@@ -25,7 +25,7 @@
 //! - EVM live heads over WebSocket and full blocks over JSON-RPC (see
 //!   [`ingest::source::EvmSource`]).
 //! - Per-chain ordering by each dataset's own natural key, finality tagging, and reorg
-//!   retraction with a bounded undo ring (see [`ingest::pipeline::Pipeline`]).
+//!   retraction with a bounded undo ring (see [`ingest::Machine`]).
 //! - Decoding a log against a contract ABI into typed, named arguments, as a
 //!   stateless transform (see [`decode::Transform`]).
 //! - A local `DuckDB` store of typed per-dataset tables, behind the `duckdb` feature.
@@ -34,7 +34,8 @@
 //!
 //! Resuming from the store's high-water mark after a restart, and rebuilding the undo
 //! ring from it — the channel is not durable, so a crash loses what is in flight and the
-//! store is what says where to pick up. Also backfill and the backfill-to-live handoff,
+//! store is what says where to pick up. Finalized backfill and live catch-up are supported,
+//! but replay is not idempotent and prior-run orphaned rows are not reconciled. Also
 //! mempool, aggregation and windowing, filtered subscriptions, derived state, and the
 //! Parquet archiver.
 

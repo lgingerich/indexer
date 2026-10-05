@@ -183,6 +183,19 @@ pub trait BlockSource: Send + Sync {
         &self,
         height: u64,
     ) -> impl Future<Output = Result<FetchedBlock, SourceError>> + Send;
+
+    /// The chain's head as it is right now, fetched on demand.
+    ///
+    /// The live path hears about heads through [`BlockSource::subscribe_heads`], but a
+    /// backfill runs for a long time and needs to ask where the chain has got to. Without
+    /// this it would aim at a fixed height set when it started, and chase a target that no
+    /// longer exists.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SourceError::Http`] when the request fails, and [`SourceError::Rpc`] or
+    /// [`SourceError::Json`] when the node's answer cannot be read.
+    fn current_head(&self) -> impl Future<Output = Result<BlockId, SourceError>> + Send;
 }
 
 #[cfg(test)]

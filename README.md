@@ -70,8 +70,9 @@ read, in the same pass, with no network call: the child's ABI is already loaded.
 
 ### A reorg
 
-Parent-hash linkage is checked on every head, against the last 128 published blocks
-(finalized ones are dropped first, since nothing can reorg them).
+Height and parent-hash linkage are checked before publishing each block. Ingestion
+retains the unfinalized tail plus a finalized linkage anchor, with a fixed 4,096-block
+memory budget; insufficient capacity is an error rather than silent eviction.
 
 ```
 published     1 ─── 2 ─── 3
@@ -119,7 +120,7 @@ chain (replayable) ──▶ in flight on the channel ──▶ committed in Duc
 
 The channel holds no durable log. The chain is the record upstream and the store is
 the record downstream, so a restart should continue from the last committed height.
-That resume is not built: a restart begins again at the live tip. See
+That resume is not built: a restart replays from the node's current finalized anchor. See
 [Not built yet](#not-built-yet).
 
 ## Layout
@@ -185,8 +186,12 @@ that matters most: `decode` must not depend on `ingest`.
 - **Reorg retraction.** Parent-hash linkage is checked on every block. A mismatch
   publishes a `reorg` event whose `orphaned_hashes` say which block hashes stopped being
   canonical, and the replacement branch is published under its own keys. The undo window
-  is bounded (128 blocks by default, and finalized blocks are dropped first). See
-  `src/ingest/pipeline.rs`.
+  retains the full unfinalized tail up to a fixed 4,096-block budget, and finalized
+  entries are discarded except for one linkage anchor. See `src/ingest/pipeline_v2.rs`.
+- **Finalized backfill and catch-up.** The library can index earlier finalized history;
+  production starts at the source-finalized anchor and catches up before following live
+  notifications. Gaps are fetched forward, and forks are validated before retraction.
+  Source failures propagate without automatic retries.
 - **NDJSON to stdout.** See `src/sink/stdout.rs`; the `[sink.stdout]` backend prints the
   stream instead of storing it, and opens no store.
 - **A local `DuckDB` store**, behind the `duckdb` feature (on by default). Embedded and
@@ -198,14 +203,14 @@ anywhere, so `cargo run` alone runs the pipeline.
 
 ## Not built yet
 
-The process follows the live tip and appends every envelope. A restart begins at the
-tip again, a reorg is a row the store never acts on, and a decoded log is a fact with
-no join behind it. The work below is what closes those gaps. The first four are one
-piece of machinery; the last three sit on top of a store that is already correct.
+The process starts at the node's finalized anchor, catches up, and appends every envelope.
+A restart does not restore the last stored finalized checkpoint, remove previous-run
+orphaned rows, or deduplicate replay. A reorg remains a row the store never acts on.
+Channel acceptance is not a durable storage checkpoint. The work below closes those gaps.
 
 ```
 idempotent writes ─┬─▶ resume from the store ─▶ re-decode stored logs
-                   └─▶ backfill ─▶ handoff to live
+                   └─▶ idempotent historical and startup replay
 reorg + finality applied in the store
 streaming aggregation: joins and derived calculations
 Avro as the envelope, inside the process and downstream
@@ -225,20 +230,15 @@ startup
 ```
 
 Without the rebuilt ring, a reorg in the blocks the process no longer remembers
-cannot be retracted. `pipeline.rs` and the channel docs both name this as unbuilt.
+cannot be retracted. The durability TODO in `pipeline_v2.rs` tracks restoring the last
+committed finalized identity and reconciling the stored suffix before replay.
 
 ### Backfill, and the handoff to live
 
-A height gap is a hard error today. `Mode::Backfilling` is entered and then the
-pipeline bails. Resume needs the same path, and so does indexing history instead of
-only whatever the chain does next.
-
-```
-today     published tip ── ✕ gap ✕ ── head          error, nothing fetched
-
-planned   published tip ── fetch the range, in order ── join the live head
-                          no hole, no second copy of a block already stored
-```
+Ingestion supports finalized historical backfill and sequential catch-up to live heads.
+What remains is durable, idempotent replay against the store. The source subscription
+is not polled during fetches or sink delivery, so prolonged backpressure can disconnect
+it; the error propagates rather than automatically reconnecting.
 
 ### Reorgs and finality in the store
 

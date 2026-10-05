@@ -6,7 +6,7 @@
 
 use tracing::info;
 
-use crate::ingest::pipeline::{Pipeline, PipelineError};
+use crate::ingest::pipeline_v2::{Machine, PipelineError};
 use crate::ingest::source::EvmSource;
 use crate::sink::EnvelopeSink;
 
@@ -36,7 +36,9 @@ impl Ingest {
         }
     }
 
-    /// Follows the chain's live tip, publishing through `sink` until it ends.
+    /// Indexes the finalized anchor and unfinalized tail, then follows live heads.
+    ///
+    /// Source failures propagate without retries. Startup does not restore stored history.
     ///
     /// # Errors
     ///
@@ -51,6 +53,6 @@ impl Ingest {
             "ingest started"
         );
         let source = EvmSource::new(self.chain, self.http_url, self.ws_url);
-        Pipeline::new(source, sink).run().await
+        Machine::new(source, sink).run().await
     }
 }
