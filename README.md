@@ -187,7 +187,7 @@ that matters most: `decode` must not depend on `ingest`.
   publishes a `reorg` event whose `orphaned_hashes` say which block hashes stopped being
   canonical, and the replacement branch is published under its own keys. The undo window
   retains the full unfinalized tail up to a fixed 4,096-block budget, and finalized
-  entries are discarded except for one linkage anchor. See `src/ingest/pipeline_v2.rs`.
+  entries are discarded except for one linkage anchor. See `src/ingest/pipeline.rs`.
 - **Finalized backfill and catch-up.** The library can index earlier finalized history;
   production starts at the source-finalized anchor and catches up before following live
   notifications. Gaps are fetched forward, and forks are validated before retraction.
@@ -230,7 +230,7 @@ startup
 ```
 
 Without the rebuilt ring, a reorg in the blocks the process no longer remembers
-cannot be retracted. The durability TODO in `pipeline_v2.rs` tracks restoring the last
+cannot be retracted. The durability TODO in `pipeline.rs` tracks restoring the last
 committed finalized identity and reconciling the stored suffix before replay.
 
 ### Backfill, and the handoff to live

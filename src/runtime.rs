@@ -42,7 +42,7 @@ use crate::config::{Settings, SettingsError, Sink};
 use crate::decode::DecodingSink;
 use crate::decode::registry::{ContractRegistry, RegistryError};
 use crate::ingest::Ingest;
-use crate::ingest::pipeline_v2::PipelineError;
+use crate::ingest::pipeline::PipelineError;
 use crate::sink::{self, DuckDbSink, SinkError, StdoutJsonSink};
 
 /// Why the indexer stopped.
@@ -211,7 +211,7 @@ mod tests {
     use crate::config::Settings;
     use crate::decode::DecodingSink;
     use crate::decode::registry::{AbiEntry, ContractEntry, ContractRegistry, RegistryConfig};
-    use crate::ingest::pipeline_v2::PipelineError;
+    use crate::ingest::pipeline::PipelineError;
     use crate::sink::duckdb::StoreError;
     use crate::sink::{self, DuckDbSink, EnvelopeSink as _, SinkError};
     use crate::wire::envelope::Envelope;

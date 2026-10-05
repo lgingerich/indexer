@@ -6,7 +6,7 @@
 
 use tracing::info;
 
-use crate::ingest::pipeline_v2::{Machine, PipelineError};
+use crate::ingest::pipeline::{Machine, PipelineError};
 use crate::ingest::source::EvmSource;
 use crate::sink::EnvelopeSink;
 
