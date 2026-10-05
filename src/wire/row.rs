@@ -154,38 +154,47 @@ pub struct Column {
     pub name: &'static str,
     /// What the column holds.
     pub kind: ColumnType,
+    /// Whether every row has a value.
+    ///
+    /// A store renders this as `NOT NULL`. It is false only for a cell whose renderer can
+    /// return [`ColumnValue::Null`], which is a fact about that field, not about the engine.
+    pub required: bool,
 }
 
 impl Column {
     /// A text column, the shape of every hash and address.
     const fn text(name: &'static str) -> Self {
-        Self {
-            name,
-            kind: ColumnType::Text,
-        }
+        Self::new(name, ColumnType::Text)
     }
 
     /// An unsigned 64-bit column, for a number, an index, or a gas figure.
     const fn uint(name: &'static str) -> Self {
-        Self {
-            name,
-            kind: ColumnType::Uint,
-        }
+        Self::new(name, ColumnType::Uint)
     }
 
     /// A boolean column.
     const fn boolean(name: &'static str) -> Self {
-        Self {
-            name,
-            kind: ColumnType::Bool,
-        }
+        Self::new(name, ColumnType::Bool)
     }
 
     /// A document column, for a value that does not flatten.
     const fn document(name: &'static str) -> Self {
+        Self::new(name, ColumnType::Document)
+    }
+
+    const fn new(name: &'static str, kind: ColumnType) -> Self {
         Self {
             name,
-            kind: ColumnType::Document,
+            kind,
+            required: true,
+        }
+    }
+
+    /// Marks a column whose renderer can return [`ColumnValue::Null`].
+    const fn optional(self) -> Self {
+        Self {
+            required: false,
+            ..self
         }
     }
 }
@@ -484,7 +493,7 @@ const BLOCK_CELLS: [(Column, fn(&Block) -> ColumnValue); 25] = [
     (Column::text("receipts_root"), |b| {
         ColumnValue::hex(b.receipts_root)
     }),
-    (Column::text("withdrawals_root"), |b| {
+    (Column::text("withdrawals_root").optional(), |b| {
         ColumnValue::some(b.withdrawals_root, ColumnValue::hex)
     }),
     (Column::text("logs_bloom"), |b| {
@@ -494,10 +503,10 @@ const BLOCK_CELLS: [(Column, fn(&Block) -> ColumnValue); 25] = [
     (Column::text("difficulty"), |b| {
         ColumnValue::u256(b.difficulty)
     }),
-    (Column::text("total_difficulty"), |b| {
+    (Column::text("total_difficulty").optional(), |b| {
         ColumnValue::some(b.total_difficulty, ColumnValue::u256)
     }),
-    (Column::text("size"), |b| {
+    (Column::text("size").optional(), |b| {
         ColumnValue::some(b.size, ColumnValue::u256)
     }),
     (Column::text("extra_data"), |b| {
@@ -510,16 +519,16 @@ const BLOCK_CELLS: [(Column, fn(&Block) -> ColumnValue); 25] = [
     (Column::uint("transaction_count"), |b| {
         ColumnValue::Uint(b.transaction_count)
     }),
-    (Column::uint("base_fee_per_gas"), |b| {
+    (Column::uint("base_fee_per_gas").optional(), |b| {
         ColumnValue::some(b.base_fee_per_gas, ColumnValue::Uint)
     }),
-    (Column::uint("blob_gas_used"), |b| {
+    (Column::uint("blob_gas_used").optional(), |b| {
         ColumnValue::some(b.blob_gas_used, ColumnValue::Uint)
     }),
-    (Column::uint("excess_blob_gas"), |b| {
+    (Column::uint("excess_blob_gas").optional(), |b| {
         ColumnValue::some(b.excess_blob_gas, ColumnValue::Uint)
     }),
-    (Column::text("parent_beacon_block_root"), |b| {
+    (Column::text("parent_beacon_block_root").optional(), |b| {
         ColumnValue::some(b.parent_beacon_block_root, ColumnValue::hex)
     }),
     (Column::document("ommers"), |b| {
@@ -548,37 +557,37 @@ const TRANSACTION_CELLS: [(Column, fn(&Transaction) -> ColumnValue); 20] = [
         ColumnValue::Uint(t.transaction_index)
     }),
     (Column::text("from_address"), |t| ColumnValue::hex(t.from)),
-    (Column::text("to_address"), |t| {
+    (Column::text("to_address").optional(), |t| {
         ColumnValue::some(t.to, ColumnValue::hex)
     }),
     (Column::text("value"), |t| ColumnValue::u256(t.value)),
     (Column::uint("gas"), |t| ColumnValue::Uint(t.gas)),
-    (Column::text("gas_price"), |t| {
+    (Column::text("gas_price").optional(), |t| {
         ColumnValue::some(t.gas_price, ColumnValue::wei)
     }),
-    (Column::text("max_fee_per_gas"), |t| {
+    (Column::text("max_fee_per_gas").optional(), |t| {
         ColumnValue::some(t.max_fee_per_gas, ColumnValue::wei)
     }),
-    (Column::text("max_priority_fee_per_gas"), |t| {
+    (Column::text("max_priority_fee_per_gas").optional(), |t| {
         ColumnValue::some(t.max_priority_fee_per_gas, ColumnValue::wei)
     }),
-    (Column::text("max_fee_per_blob_gas"), |t| {
+    (Column::text("max_fee_per_blob_gas").optional(), |t| {
         ColumnValue::some(t.max_fee_per_blob_gas, ColumnValue::wei)
     }),
     (Column::text("input"), |t| ColumnValue::bytes(&t.input)),
     (Column::uint("transaction_type"), |t| {
         ColumnValue::Uint(u64::from(t.transaction_type))
     }),
-    (Column::uint("chain_id"), |t| {
+    (Column::uint("chain_id").optional(), |t| {
         ColumnValue::some(t.chain_id, ColumnValue::Uint)
     }),
-    (Column::document("access_list"), |t| {
+    (Column::document("access_list").optional(), |t| {
         ColumnValue::optional_document(&t.access_list)
     }),
-    (Column::document("blob_versioned_hashes"), |t| {
+    (Column::document("blob_versioned_hashes").optional(), |t| {
         ColumnValue::optional_document(&t.blob_versioned_hashes)
     }),
-    (Column::document("authorization_list"), |t| {
+    (Column::document("authorization_list").optional(), |t| {
         ColumnValue::optional_document(&t.authorization_list)
     }),
     (Column::uint("block_timestamp"), |t| {
@@ -611,7 +620,7 @@ const RECEIPT_CELLS: [(Column, fn(&Receipt) -> ColumnValue); 17] = [
         ColumnValue::Uint(r.transaction_index)
     }),
     (Column::text("from_address"), |r| ColumnValue::hex(r.from)),
-    (Column::text("to_address"), |r| {
+    (Column::text("to_address").optional(), |r| {
         ColumnValue::some(r.to, ColumnValue::hex)
     }),
     (Column::boolean("status"), |r| ColumnValue::Bool(r.status)),
@@ -625,16 +634,16 @@ const RECEIPT_CELLS: [(Column, fn(&Receipt) -> ColumnValue); 17] = [
     (Column::text("effective_gas_price"), |r| {
         ColumnValue::wei(r.effective_gas_price)
     }),
-    (Column::text("contract_address"), |r| {
+    (Column::text("contract_address").optional(), |r| {
         ColumnValue::some(r.contract_address, ColumnValue::hex)
     }),
     (Column::text("logs_bloom"), |r| {
         ColumnValue::hex(r.logs_bloom)
     }),
-    (Column::uint("blob_gas_used"), |r| {
+    (Column::uint("blob_gas_used").optional(), |r| {
         ColumnValue::some(r.blob_gas_used, ColumnValue::Uint)
     }),
-    (Column::text("blob_gas_price"), |r| {
+    (Column::text("blob_gas_price").optional(), |r| {
         ColumnValue::some(r.blob_gas_price, ColumnValue::wei)
     }),
     (Column::uint("log_count"), |r| {
@@ -673,16 +682,16 @@ const LOG_CELLS: [(Column, fn(&Log) -> ColumnValue); 13] = [
         ColumnValue::Uint(l.transaction_index)
     }),
     (Column::text("address"), |l| ColumnValue::hex(l.address)),
-    (Column::text("topic0"), |l| {
+    (Column::text("topic0").optional(), |l| {
         ColumnValue::some(l.topic0, ColumnValue::hex)
     }),
-    (Column::text("topic1"), |l| {
+    (Column::text("topic1").optional(), |l| {
         ColumnValue::some(l.topic1, ColumnValue::hex)
     }),
-    (Column::text("topic2"), |l| {
+    (Column::text("topic2").optional(), |l| {
         ColumnValue::some(l.topic2, ColumnValue::hex)
     }),
-    (Column::text("topic3"), |l| {
+    (Column::text("topic3").optional(), |l| {
         ColumnValue::some(l.topic3, ColumnValue::hex)
     }),
     (Column::text("data"), |l| ColumnValue::bytes(&l.data)),
@@ -910,7 +919,56 @@ mod tests {
             let columns = table.columns();
             let tail = &columns[columns.len() - COMMON_COLUMNS.len()..];
             assert_eq!(tail, COMMON_COLUMNS, "the {table} table ends with them");
+            assert!(
+                tail.iter().all(|column| column.required),
+                "chain and dedupe_key are present on every row"
+            );
         }
+    }
+
+    /// Absence is declared on the column, beside the renderer that can return null.
+    #[test]
+    fn only_fields_the_chain_can_omit_are_optional() {
+        let optional = [
+            ("block", "withdrawals_root"),
+            ("block", "total_difficulty"),
+            ("block", "size"),
+            ("block", "base_fee_per_gas"),
+            ("block", "blob_gas_used"),
+            ("block", "excess_blob_gas"),
+            ("block", "parent_beacon_block_root"),
+            ("transaction", "to_address"),
+            ("transaction", "gas_price"),
+            ("transaction", "max_fee_per_gas"),
+            ("transaction", "max_priority_fee_per_gas"),
+            ("transaction", "max_fee_per_blob_gas"),
+            ("transaction", "chain_id"),
+            ("transaction", "access_list"),
+            ("transaction", "blob_versioned_hashes"),
+            ("transaction", "authorization_list"),
+            ("receipt", "to_address"),
+            ("receipt", "contract_address"),
+            ("receipt", "blob_gas_used"),
+            ("receipt", "blob_gas_price"),
+            ("log", "topic0"),
+            ("log", "topic1"),
+            ("log", "topic2"),
+            ("log", "topic3"),
+        ];
+        let mut found = 0;
+        for table in Table::ALL {
+            for column in table.columns() {
+                if !column.required {
+                    found += 1;
+                    assert!(
+                        optional.contains(&(table.name(), column.name)),
+                        "{table}.{} is optional without being a field the chain can omit",
+                        column.name
+                    );
+                }
+            }
+        }
+        assert_eq!(found, optional.len());
     }
 
     /// Every value's variant matches its column's declared type. The two are one contract

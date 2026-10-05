@@ -43,7 +43,11 @@ use crate::decode::DecodingSink;
 use crate::decode::{ContractRegistry, RegistryError};
 use crate::ingest::Ingest;
 use crate::ingest::pipeline::PipelineError;
-use crate::sink::{self, DuckDbSink, SinkError, StdoutJsonSink};
+#[cfg(any(feature = "duckdb", feature = "postgres"))]
+use crate::sink;
+#[cfg(feature = "duckdb")]
+use crate::sink::DuckDbSink;
+use crate::sink::{SinkError, StdoutJsonSink};
 
 /// Why the indexer stopped.
 ///
@@ -69,6 +73,10 @@ pub enum RuntimeError {
     #[cfg(feature = "duckdb")]
     #[error("storage could not be opened: {0}")]
     OpenStore(#[from] sink::duckdb::StoreError),
+    /// `PostgreSQL` could not be connected or initialized before ingest started.
+    #[cfg(feature = "postgres")]
+    #[error("PostgreSQL storage could not be opened: {0}")]
+    OpenPostgres(#[from] sink::postgres::StoreError),
     /// Ingest stopped: a source failed, a sink refused an envelope, or the head
     /// subscription ended.
     #[error("ingest stopped: {0}")]
@@ -138,6 +146,17 @@ impl Pipeline {
                     .await?;
                 Ok(())
             }
+            #[cfg(feature = "postgres")]
+            Sink::Postgres(postgres) => {
+                let mut store = sink::PostgresSink::open(postgres).await?;
+                let (blocks, receiver) = sink::channel::ChannelSink::new();
+                let batch_records = postgres.batch_records;
+                let storage =
+                    tokio::spawn(async move { receiver.drain(&mut store, batch_records).await });
+                let ingest = ingest.run(DecodingSink::new(registry, blocks)).await;
+                finish(storage.await, ingest)
+            }
+            #[cfg(feature = "duckdb")]
             Sink::DuckDb(duckdb) => {
                 // Open the store before ingest starts, so a bad path fails at startup
                 // rather than after the first block.
@@ -169,6 +188,7 @@ impl Pipeline {
 /// which is neither a store failure nor an ingest failure. Ingest's error on this path
 /// is the failed send that followed — [`crate::sink::SinkError::StorageClosed`] — so it
 /// is returned only when the store itself finished.
+#[cfg(any(feature = "duckdb", feature = "postgres"))]
 fn finish(
     storage: Result<Result<u64, SinkError>, tokio::task::JoinError>,
     ingest: Result<(), PipelineError>,
@@ -200,7 +220,7 @@ pub async fn run(path: &str) -> Result<(), RuntimeError> {
     Pipeline::from_settings(&settings)?.run(&settings).await
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "duckdb"))]
 // The crate denies `expect`/`unwrap` to keep production paths honest; tests are allowed
 // them per the repository test style, since a failed expectation there means the fixture
 // or setup is wrong.

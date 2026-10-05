@@ -144,6 +144,9 @@ pub enum Sink {
     #[cfg(feature = "duckdb")]
     #[serde(rename = "duckdb")]
     DuckDb(crate::sink::duckdb::DuckDbSettings),
+    /// A remote `PostgreSQL` database, using asynchronous transactional COPY.
+    #[cfg(feature = "postgres")]
+    Postgres(crate::sink::postgres::PostgresSettings),
 }
 
 /// What the decode stage decodes, in its own file.
@@ -440,6 +443,22 @@ ws_url = "wss://example.invalid"
             matches!(settings.sink, Sink::Stdout(_)),
             "the no-store run is available whatever the features: {settings:?}"
         );
+    }
+
+    #[cfg(feature = "postgres")]
+    #[test]
+    fn postgres_is_selected_and_cannot_be_combined_with_stdout() {
+        let input = format!(
+            "{}\n[sink.postgres]\nconnection_string = 'host=localhost dbname=indexer'\nbatch_records = 1000\n",
+            ingest_only()
+        );
+        let settings = Settings::from_str(&input).expect("PostgreSQL settings");
+        let Sink::Postgres(postgres) = settings.sink else {
+            panic!("expected PostgreSQL");
+        };
+        assert_eq!(postgres.batch_records, 1000);
+        assert_eq!(postgres.connection_string, "host=localhost dbname=indexer");
+        assert!(Settings::from_str(&format!("{input}\n[sink.stdout]\n")).is_err());
     }
 
     /// Two backends named at once is a contradiction, and picking one silently is exactly

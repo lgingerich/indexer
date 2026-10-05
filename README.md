@@ -476,6 +476,39 @@ That join is the streaming aggregation layer in [Not built yet](#not-built-yet).
 `protocol` and the argument names are the join keys, which is why they are on the
 wire rather than re-derived downstream.
 
+### PostgreSQL 18 sink
+
+Build with `cargo run --release --no-default-features --features postgres -- indexer.toml`
+(or add `--features postgres` to the default build to retain DuckDB support). Replace
+`[sink.duckdb]` with exactly one PostgreSQL sink table:
+
+```toml
+[sink.postgres]
+connection_string = "host=localhost port=5432 user=indexer dbname=indexer sslmode=require"
+batch_records = 500
+```
+
+The connection string accepts PostgreSQL URL or keyword syntax. TLS uses the platform
+certificate store; use `sslmode=disable` only for trusted local connections. Connection
+strings are redacted from startup logs. The database must already exist, and the role
+needs permission to create and write the dataset tables in its configured search path.
+
+The sink creates the same seven typed tables as DuckDB. Columns the chain always
+provides are `NOT NULL`; fields it can omit stay nullable. Each table has a non-unique
+index on `(chain, dedupe_key)`. A flush bulk-loads with binary `COPY` in one transaction.
+Unsigned 64-bit fields use `NUMERIC(20,0)`, hex values use `TEXT`, booleans use
+`BOOLEAN`, and documents use `JSONB`. Existing tables are not migrated. Duplicates are
+preserved, and failed batches remain buffered. A lost connection during commit can leave
+the outcome unknown; retrying is not exactly-once. Restart recovery remains unimplemented,
+as with the DuckDB sink.
+
+The PostgreSQL integration check creates a private schema on a PostgreSQL 18 server:
+
+```bash
+INDEXER_TEST_POSTGRES_URL='host=localhost user=indexer dbname=indexer sslmode=disable' \
+  cargo nextest run --all-features --run-ignored only -E 'test(sink::postgres::tests::copy_is_atomic)'
+```
+
 ### Other client settings
 
 The store takes settings this file does not restate, passed straight through and

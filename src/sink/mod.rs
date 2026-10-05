@@ -13,24 +13,27 @@
 //! - `channel` — the one hop that crosses tasks: a bounded in-process channel of
 //!   blocks, from decode to storage. It is what lets a slow store stall without stalling
 //!   ingest.
-//! - [`duckdb`] — the store, an embedded `DuckDB` database.
+//! - `duckdb` — an embedded `DuckDB` database.
+//! - `postgres` — a remote `PostgreSQL` 18 database with asynchronous transactional COPY.
 //! - [`stdout`] — newline-delimited JSON, for watching the stream.
 //!
-//! Sinks do not own their engine: a sink takes a connection or opens one behind
-//! [`duckdb::DuckDbSink::open`], and runs over a test double either way, so client
-//! settings live in one place.
+//! Stores take a connection or open one from their own settings, so client settings
+//! live beside the backend that knows how to apply them.
 
 /// The bounded channel from decode to storage: the one hop that crosses tasks.
 ///
-/// Behind the `duckdb` feature, because its only consumer is the store's writer in
-/// [`runtime`](crate::runtime) — a `stdout` run has no store to stall, so it has no
-/// second task and nothing for the channel to carry. A build without the engine does
-/// not compile a queue it cannot fill.
-#[cfg(feature = "duckdb")]
+/// Enabled with either store feature: its consumer is the store's writer in
+/// [`runtime`](crate::runtime). A stdout-only build has no storage task or channel.
+#[cfg(any(feature = "duckdb", feature = "postgres"))]
 pub(crate) mod channel;
 #[cfg(feature = "duckdb")]
 pub mod duckdb;
+#[cfg(feature = "postgres")]
+pub mod postgres;
 pub mod stdout;
+
+#[cfg(feature = "postgres")]
+pub use postgres::{PostgresSettings, PostgresSink};
 
 #[cfg(feature = "duckdb")]
 pub use duckdb::{DuckDbSettings, DuckDbSink};
@@ -82,7 +85,7 @@ pub trait EnvelopeSink: Send {
 /// from a malformed row by matching, not by formatting.
 ///
 /// Leaf errors arrive through `#[from]`, so a sink propagates them with `?` rather than
-/// wrapping them in a message: [`duckdb::StoreError`] and `serde_json`'s and
+/// wrapping them in a message: the store's error and `serde_json`'s and
 /// `std::io`'s own errors each name their cause better than this layer could.
 #[derive(Debug, Error)]
 pub enum SinkError {
@@ -108,4 +111,8 @@ pub enum SinkError {
     #[cfg(feature = "duckdb")]
     #[error(transparent)]
     Store(#[from] duckdb::StoreError),
+    /// `PostgreSQL` connection, schema, or transactional write failed.
+    #[cfg(feature = "postgres")]
+    #[error(transparent)]
+    Postgres(#[from] postgres::StoreError),
 }

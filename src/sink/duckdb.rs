@@ -128,21 +128,23 @@ fn sql_type(kind: ColumnType) -> &'static str {
 /// A `CREATE TABLE IF NOT EXISTS` for one table, generated from its header.
 ///
 /// Generated rather than written out, because a hand-written DDL and a row header are two
-/// statements of the same fact. Generating it means a column added to the dataset appears
-/// in the schema without anyone remembering the DDL, and a column that exists in the DDL
-/// but not in the data cannot go unnoticed.
-///
-/// Every column is nullable, deliberately: a `NOT NULL` constraint here would be a claim
-/// about the chain that this layer cannot make — a field is absent on some records and
-/// present on others, and which is a fact about the data, not about the schema.
+/// statements of the same fact. Nullability comes from [`Column::required`](crate::wire::row::Column::required).
+/// The identity index is not unique: the same `dedupe_key` can be appended again, and a
+/// unique constraint would reject that replay.
 fn create_table(table: Table) -> String {
     let columns = table
         .columns()
         .iter()
-        .map(|column| format!("{} {}", column.name, sql_type(column.kind)))
+        .map(|column| {
+            let nullability = if column.required { " NOT NULL" } else { "" };
+            format!("{} {}{nullability}", column.name, sql_type(column.kind))
+        })
         .collect::<Vec<_>>()
         .join(", ");
-    format!("CREATE TABLE IF NOT EXISTS {} ({columns})", table.name())
+    format!(
+        "CREATE TABLE IF NOT EXISTS {table} ({columns});\n\
+         CREATE INDEX IF NOT EXISTS {table}_chain_dedupe_key ON {table} (chain, dedupe_key)"
+    )
 }
 
 // The engine conversion belongs at this boundary; text and JSON borrow the buffered

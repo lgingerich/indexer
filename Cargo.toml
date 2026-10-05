@@ -12,15 +12,14 @@ license = "MIT OR Apache-2.0"
 [[bin]]
 name = "indexer"
 path = "src/main.rs"
-# The pipeline needs a store to write to, so the binary is skipped without one rather
-# than failing the build.
-required-features = ["duckdb"]
 
 [features]
 default = ["duckdb"]
-# Local `DuckDB` store (`sink::duckdb`). On by default: it is the default store, and
-# the pipeline needs exactly one to run. Remove it only to build without the C++ engine.
+# Local `DuckDB` store (`sink::duckdb`), enabled by default.
+# Disable it for a PostgreSQL-only or stdout-only build without the C++ engine.
 duckdb = ["dep:duckdb"]
+# Remote PostgreSQL store, using asynchronous COPY and platform TLS.
+postgres = ["dep:bytes", "dep:native-tls", "dep:postgres-native-tls", "dep:tokio-postgres"]
 
 [dependencies]
 alloy-consensus = "1.8.3"
@@ -48,7 +47,11 @@ alloy-json-abi = { version = "1.7.3", default-features = false }
 # Bundled DuckDB compiles the C++ engine once via duckdb-sys; it is an embedded,
 # single-writer store, used only by the local DuckDB sink (`duckdb` feature).
 duckdb = { version = "1.10505.0", default-features = false, features = ["bundled"], optional = true }
-futures-util = "0.3.34"
+bytes = { version = "1.12.1", optional = true }
+futures-util = { version = "0.3.34", features = ["sink"] }
+native-tls = { version = "0.2.18", optional = true }
+postgres-native-tls = { version = "0.5.3", optional = true }
+tokio-postgres = { version = "0.7.18", optional = true }
 # native-tls keeps TLS on the platform (Security.framework on macOS, OpenSSL on
 # Linux) so TLS adds no bundled C toolchain of its own.
 reqwest = { version = "0.13.5", default-features = false, features = ["json", "http2", "native-tls"] }
