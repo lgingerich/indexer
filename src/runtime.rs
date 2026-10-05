@@ -91,6 +91,7 @@ pub enum RuntimeError {
     #[error("storage task panicked: {source}")]
     StorageTaskPanicked {
         /// `tokio`'s join error, which carries the panic payload.
+        #[from]
         source: tokio::task::JoinError,
     },
 }
@@ -137,10 +138,12 @@ impl Pipeline {
         // The settings' backend is the branch, so a backend this build does not have is
         // already a startup error and each arm here opens exactly what it named.
         match &settings.sink {
-            Sink::Stdout(_) => Ok(ingest
-                .run(DecodingSink::new(registry, StdoutJsonSink::new()))
-                .await
-                .map_err(RuntimeError::Ingest)?),
+            Sink::Stdout(_) => {
+                ingest
+                    .run(DecodingSink::new(registry, StdoutJsonSink::new()))
+                    .await?;
+                Ok(())
+            }
             Sink::DuckDb(duckdb) => {
                 // Open the store before ingest starts, so a bad path fails at startup
                 // rather than after the first block.
@@ -165,12 +168,10 @@ impl Pipeline {
                 // ingest failure — it is the store's writer dying outside its own error
                 // path (an unwrap on a row width, say), so it gets its own variant
                 // rather than being folded into `Storage`.
-                let stored = storage
-                    .await
-                    .map_err(|source| RuntimeError::StorageTaskPanicked { source })?
-                    .map_err(RuntimeError::Storage)?;
+                let stored = storage.await??;
                 info!(stored, "storage stopped");
-                ingest.map_err(RuntimeError::Ingest)
+                ingest?;
+                Ok(())
             }
         }
     }
