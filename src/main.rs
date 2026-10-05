@@ -37,7 +37,6 @@ fn settings_path() -> String {
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> ExitCode {
     tracing_subscriber::fmt()
-        .json()
         .with_writer(std::io::stderr)
         .with_env_filter(EnvFilter::from_default_env())
         .init();

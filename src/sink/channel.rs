@@ -26,8 +26,13 @@
 //! because the chain and the store are the record — the store's high-water mark says
 //! where to resume, and the node can serve the blocks after it.
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
+
 use tokio::sync::mpsc;
 
+use super::progress::{self, HEAD_UNKNOWN, Progress};
 use crate::sink::{EnvelopeSink, SinkError};
 use crate::wire::envelope::Envelope;
 
@@ -43,6 +48,8 @@ const CAPACITY: usize = 32;
 pub(crate) struct ChannelSink {
     sender: mpsc::Sender<Vec<Envelope>>,
     batch: Vec<Envelope>,
+    /// Newest canonical head ingest has sampled. Storage reads it when a commit lands.
+    head: Arc<AtomicU64>,
 }
 
 impl ChannelSink {
@@ -51,12 +58,18 @@ impl ChannelSink {
     #[must_use]
     pub(crate) fn new() -> (Self, ChannelReceiver) {
         let (sender, receiver) = mpsc::channel(CAPACITY);
+        let head = Arc::new(AtomicU64::new(HEAD_UNKNOWN));
         (
             Self {
                 sender,
                 batch: Vec::new(),
+                head: Arc::clone(&head),
             },
-            ChannelReceiver { receiver },
+            ChannelReceiver {
+                receiver,
+                head,
+                progress: Progress::default(),
+            },
         )
     }
 }
@@ -87,12 +100,18 @@ impl EnvelopeSink for ChannelSink {
             .map_err(|_| SinkError::StorageClosed)?;
         Ok(())
     }
+
+    fn observe_head(&mut self, height: u64) {
+        self.head.store(height, Ordering::Release);
+    }
 }
 
 /// The receiving half: what storage drains.
 #[derive(Debug)]
 pub(crate) struct ChannelReceiver {
     receiver: mpsc::Receiver<Vec<Envelope>>,
+    head: Arc<AtomicU64>,
+    progress: Progress,
 }
 
 impl ChannelReceiver {
@@ -104,6 +123,9 @@ impl ChannelReceiver {
     /// behind, the backlog goes in fewer, larger commits, which is how a store recovers
     /// from a stall. A block is never split across flushes, so a commit boundary is
     /// always a block boundary.
+    ///
+    /// A successful flush is reported by the progress log: one line per commit near the
+    /// sampled head, and one line per second while catching up.
     ///
     /// # Errors
     ///
@@ -118,6 +140,7 @@ impl ChannelReceiver {
         while let Some(first) = self.receiver.recv().await {
             let mut pending = first.len();
             for envelope in first {
+                self.progress.note(&envelope);
                 sink.publish(envelope).await?;
             }
             while pending < max_records {
@@ -126,12 +149,22 @@ impl ChannelReceiver {
                 };
                 pending += block.len();
                 for envelope in block {
+                    self.progress.note(&envelope);
                     sink.publish(envelope).await?;
                 }
             }
+            let started = Instant::now();
             sink.flush().await?;
+            let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+            let head = progress::sampled_head(self.head.load(Ordering::Acquire));
+            self.progress
+                .committed(pending as u64, elapsed_ms, head, Instant::now());
             stored += pending as u64;
         }
+        self.progress.finish(
+            progress::sampled_head(self.head.load(Ordering::Acquire)),
+            Instant::now(),
+        );
         Ok(stored)
     }
 }

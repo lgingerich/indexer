@@ -12,7 +12,7 @@
 //!
 //! - `channel` — the one hop that crosses tasks: a bounded in-process channel of
 //!   blocks, from decode to storage. It is what lets a slow store stall without stalling
-//!   ingest.
+//!   ingest. Commit progress is logged from `progress`, not from the channel.
 //! - `duckdb` — an embedded `DuckDB` database.
 //! - `postgres` — a remote `PostgreSQL` 18 database with asynchronous transactional COPY.
 //! - [`stdout`] — newline-delimited JSON, for watching the stream.
@@ -30,6 +30,8 @@ pub(crate) mod channel;
 pub mod duckdb;
 #[cfg(feature = "postgres")]
 pub mod postgres;
+#[cfg(any(feature = "duckdb", feature = "postgres"))]
+mod progress;
 pub mod stdout;
 
 #[cfg(feature = "postgres")]
@@ -73,6 +75,14 @@ pub trait EnvelopeSink: Send {
     /// rather than continuing past a lost batch.
     fn flush(&mut self) -> impl Future<Output = Result<(), SinkError>> + Send {
         async { Ok(()) }
+    }
+
+    /// Records the newest sampled canonical head, so a commit can report its lag.
+    ///
+    /// The default ignores it. The storage channel keeps the latest sample for its
+    /// progress line; a sink with no commit log has nothing to compare against.
+    fn observe_head(&mut self, height: u64) {
+        let _ = height;
     }
 }
 

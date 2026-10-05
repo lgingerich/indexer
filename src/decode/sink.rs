@@ -68,6 +68,10 @@ impl<K: EnvelopeSink> EnvelopeSink for DecodingSink<K> {
     async fn flush(&mut self) -> Result<(), SinkError> {
         self.inner.flush().await
     }
+
+    fn observe_head(&mut self, height: u64) {
+        self.inner.observe_head(height);
+    }
 }
 
 #[cfg(test)]

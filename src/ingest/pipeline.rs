@@ -389,6 +389,7 @@ impl<S: BlockSource, K: EnvelopeSink> Machine<S, K> {
             });
         }
         self.ring.check_finality(finalized)?;
+        self.sink.observe_head(head.height);
         self.state = State::Backfilling {
             next,
             target: finalized,
@@ -435,6 +436,7 @@ impl<S: BlockSource, K: EnvelopeSink> Machine<S, K> {
         if id != head {
             return Err(PipelineError::UnstableSource);
         }
+        self.sink.observe_head(head.height);
         self.ring.check_finality(finalized)?;
         self.emit_finality(finalized).await?;
         Self::check_budget(head, finalized)?;
@@ -557,6 +559,7 @@ impl<S: BlockSource, K: EnvelopeSink> Machine<S, K> {
             });
         }
 
+        self.sink.observe_head(target.height);
         let orphaned = self.ring.orphaned(ancestor);
         if !orphaned.is_empty() {
             self.deliver(vec![Event::Reorg(Reorg {
