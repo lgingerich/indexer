@@ -55,9 +55,10 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::str::FromStr as _;
 use std::sync::Arc;
 
-use alloy_primitives::{Address, B256};
+use alloy_primitives::{Address, AddressError, B256};
 use serde::Deserialize;
 
 use super::abi::{Abi, DecodedEvent};
@@ -156,9 +157,14 @@ pub trait AbiRegistry {
 }
 
 /// The loaded registry: one shared ABI per address, plus the discovery rules.
+///
+/// Keyed chain-then-address rather than by the `(ChainId, Address)` tuple, because every
+/// lookup takes a borrowed [`ChainId`] on the hot path: nesting makes the per-log lookup
+/// two map hits with no allocation, where the tuple key must clone the chain's `String`
+/// to borrow it — and most logs are a miss, so that clone would be most of the call.
 #[derive(Debug, Default)]
 pub struct ContractRegistry {
-    entries: HashMap<(ChainId, Address), Contract>,
+    entries: HashMap<ChainId, HashMap<Address, Contract>>,
     rules: HashMap<(ChainId, Address, B256), Rule>,
 }
 
@@ -226,10 +232,12 @@ impl ContractRegistry {
     ///
     /// Returns an error when an ABI cannot be read or is not an ABI, when a name
     /// referenced by a contract or rule is not declared, when an address does not parse,
-    /// when two contracts claim one `(chain, address)`, and when a discovery rule names
-    /// an event its factory's ABI does not declare. Each is a startup error rather than a
-    /// silent no-op: a registry that decodes less than it was told to is a wrong answer
-    /// that looks like a quiet chain.
+    /// when two contracts claim one `(chain, address)`, when a discovery rule's factory is
+    /// not a registered contract, when the rule names an event its factory's ABI does not
+    /// declare, when the rule's `child` is not an `address` argument that event declares,
+    /// and when two rules claim one `(chain, address, selector)`. Each is a startup error
+    /// rather than a silent no-op: a registry that decodes less than it was told to is a
+    /// wrong answer that looks like a quiet chain.
     pub fn load(config: &RegistryConfig, base: impl AsRef<Path>) -> Result<Self, RegistryError> {
         let base = base.as_ref();
         let mut registry = Self::default();
@@ -266,17 +274,22 @@ impl ContractRegistry {
         };
 
         for contract in &config.contract {
-            let address = parse_address(&contract.chain, &contract.address)?;
+            let address = address(&contract.address)?;
             let origin = format!("{}.{}", contract.chain, contract.address);
             let abi = abi_named(&contract.abi, &origin)?;
-            let key = (ChainId::new(&contract.chain), address);
             // The ABI's name is the protocol tag: an ABI is exactly the granularity a
             // protocol has, and the settings already name it.
             let entry = Contract {
                 abi,
                 protocol: contract.abi.clone(),
             };
-            if registry.entries.insert(key, entry).is_some() {
+            if registry
+                .entries
+                .entry(ChainId::new(&contract.chain))
+                .or_default()
+                .insert(address, entry)
+                .is_some()
+            {
                 return Err(RegistryError::Duplicate {
                     chain: contract.chain.clone(),
                     address: contract.address.clone(),
@@ -285,31 +298,64 @@ impl ContractRegistry {
         }
 
         for discovery in &config.discovery {
-            let address = parse_address(&discovery.chain, &discovery.address)?;
+            let address = address(&discovery.address)?;
             let origin = format!("{}.{}", discovery.chain, discovery.address);
             let abi = abi_named(&discovery.abi, &origin)?;
+            let chain = ChainId::new(&discovery.chain);
+            let fail = |detail: String| RegistryError::Discovery {
+                chain: discovery.chain.clone(),
+                address: discovery.address.clone(),
+                detail,
+            };
             // The factory must itself be registered to emit the event, so the rule is
-            // validated against the factory's ABI.
-            let selector = registry
+            // validated against the factory's ABI. A factory that is not registered is
+            // its own mistake, distinct from a rule naming an event the ABI lacks: the
+            // factory has to decode for the rule to ever be consulted.
+            let factory = registry
                 .entries
-                .get(&(ChainId::new(&discovery.chain), address))
-                .and_then(|factory| factory.abi.selector(&discovery.event))
-                .ok_or_else(|| RegistryError::Discovery {
-                    chain: discovery.chain.clone(),
-                    address: discovery.address.clone(),
-                    detail: format!(
-                        "event {:?} is not declared by the factory's ABI",
-                        discovery.event
-                    ),
+                .get(&chain)
+                .and_then(|on_chain| on_chain.get(&address))
+                .ok_or_else(|| {
+                    fail(format!(
+                        "{} is not a registered contract",
+                        discovery.address
+                    ))
                 })?;
-            registry.rules.insert(
-                (ChainId::new(&discovery.chain), address, selector),
-                Rule {
-                    child: discovery.child.clone(),
-                    protocol: discovery.abi.clone(),
-                    abi,
-                },
-            );
+            let selector = factory.abi.selector(&discovery.event).ok_or_else(|| {
+                fail(format!(
+                    "event {:?} is not declared by the factory's ABI",
+                    discovery.event
+                ))
+            })?;
+            // The event exists, so the `child` name or its type is what is wrong: a rule
+            // that names an argument the event does not declare could never fire, which
+            // would silently stop the whole factory from teaching the registry. A tuple
+            // component does not count: `child_address` reads top-level arguments only,
+            // so accepting one here would let through a rule that cannot resolve.
+            if !factory
+                .abi
+                .declares_address_arg(&discovery.event, &discovery.child)
+            {
+                return Err(fail(format!(
+                    "{} declares no address argument named {:?}",
+                    discovery.event, discovery.child
+                )));
+            }
+            let rule = Rule {
+                child: discovery.child.clone(),
+                protocol: discovery.abi.clone(),
+                abi,
+            };
+            if registry
+                .rules
+                .insert((chain, address, selector), rule)
+                .is_some()
+            {
+                return Err(fail(format!(
+                    "event {:?} already has a discovery rule",
+                    discovery.event
+                )));
+            }
         }
 
         Ok(registry)
@@ -325,29 +371,41 @@ impl ContractRegistry {
     /// learned one is not.
     pub fn register_discovered(&mut self, chain: &ChainId, discovery: Discovery) {
         self.entries
-            .entry((chain.clone(), discovery.child))
+            .entry(chain.clone())
+            .or_default()
+            .entry(discovery.child)
             .or_insert_with(|| Contract {
                 abi: discovery.abi,
                 protocol: discovery.protocol,
             });
     }
 
-    /// Whether any address is registered.
+    /// How many addresses are registered, across every chain.
+    ///
+    /// Crate-private rather than public, the way [`Batches::len`](crate::sink) is: a count
+    /// is worth reporting, not worth being a registry operation. Its two readers are
+    /// [`DecodingSink`](crate::decode::DecodingSink)'s `Debug` and the startup warning,
+    /// both of which want "how much did we pick up" and neither of which should be able
+    /// to grow a public surface on the registry.
     #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
+    pub(crate) fn len(&self) -> usize {
+        self.entries.values().map(HashMap::len).sum()
     }
 
-    /// How many addresses are registered, for logging what was picked up.
+    /// Whether no address is registered at all, so nothing will decode.
+    ///
+    /// Separate from [`Self::len`] because the question is asked once, at startup, and a
+    /// count of zero answers it — but a caller asking it deserves a name that says what
+    /// it means, and clippy's `len_without_is_empty` insists the pair exist together.
     #[must_use]
-    pub fn len(&self) -> usize {
-        self.entries.len()
+    pub(crate) fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 }
 
 impl AbiRegistry for ContractRegistry {
     fn contract(&self, chain: &ChainId, address: Address, _block: u64) -> Option<Contract> {
-        self.entries.get(&(chain.clone(), address)).cloned()
+        self.entries.get(chain)?.get(&address).cloned()
     }
 
     fn discovery(
@@ -368,11 +426,15 @@ impl AbiRegistry for ContractRegistry {
     }
 }
 
-/// Parses an address, naming the entry it came from when it does not.
-fn parse_address(chain: &str, address: &str) -> Result<Address, RegistryError> {
-    address.parse().map_err(|_| RegistryError::Address {
-        entry: format!("{chain}.{address}"),
-    })
+/// Parses one registry entry's `address`, the leaf parse every entry shares.
+///
+/// A `map_err` with no added prose, because it adds no prose: `Address`'s `FromStr`
+/// reports [`FromHexError`](alloy_primitives::hex::FromHexError), which is not exported,
+/// while [`AddressError`] is — and it wraps that same hex error unchanged. So this only
+/// changes which type the caller sees, never what it says, and the entry it came from is
+/// named by the message `Address` builds, which already quotes the offending value.
+fn address(text: &str) -> Result<Address, RegistryError> {
+    Address::from_str(text).map_err(|source| RegistryError::Address(AddressError::Hex(source)))
 }
 
 /// Reads a child address from the decoded event's named argument `name`.
@@ -425,11 +487,15 @@ pub enum RegistryError {
     #[error(transparent)]
     Abi(#[from] super::abi::DecodeError),
     /// An entry's address did not parse.
-    #[error("registration {entry:?} has an invalid address")]
-    Address {
-        /// The entry as written.
-        entry: String,
-    },
+    ///
+    /// Transparent, so [`AddressError`] survives to the caller rather than being flattened
+    /// into a sentence of this layer's own: "invalid string length" and "invalid hex
+    /// character" are different mistakes with different fixes, and a caller holding only a
+    /// string cannot tell them apart. It is the leaf `Address`'s own `FromStr` reports —
+    /// reached through [`Address::parse_checksummed`]'s error type, which is the only
+    /// exported one — so nothing here reconstructs or re-labels it.
+    #[error(transparent)]
+    Address(#[from] AddressError),
     /// A `[[abi]]` entry references an ABI name that no ABI declares.
     #[error("entry {entry:?} references ABI {name:?}, which no [[abi]] declares")]
     UnknownAbi {
@@ -646,12 +712,115 @@ mod tests {
         );
     }
 
+    /// A rule naming a child argument the event does not declare is the same mistake one
+    /// level in: `PoolCreated` exists, but nothing named `pool` can be read out of it, so
+    /// the rule would silently never fire and every pool the factory creates would go
+    /// undecoded. The event *is* declared here, so this is specifically about `child`.
+    #[test]
+    fn a_rule_naming_an_argument_the_event_lacks_is_refused() {
+        let registry = load(&RegistryConfig {
+            abi: vec![factory_abi(), pool_abi()],
+            contract: vec![contract("base", FACTORY, "uniswap_v3_factory")],
+            // `PoolCreated` declares `pool`, not `poolAddress`.
+            discovery: vec![discovery(
+                "base",
+                FACTORY,
+                SIGNATURE,
+                "poolAddress",
+                "uniswap_v3_pool",
+            )],
+        });
+        assert!(
+            matches!(
+                registry,
+                Err(super::RegistryError::Discovery { ref detail, .. })
+                    if detail.contains("no address argument")
+            ),
+            "a child name the event does not declare must be caught, got {registry:?}"
+        );
+    }
+
+    /// A `child` that names a declared argument of the wrong type is refused too: the name
+    /// resolves, but it holds a `uint24`, so reading an address out of it could never
+    /// work. `tickSpacing` is a real declared, non-address argument of `PoolCreated`.
+    #[test]
+    fn a_rule_naming_a_non_address_argument_is_refused() {
+        let registry = load(&RegistryConfig {
+            abi: vec![factory_abi(), pool_abi()],
+            contract: vec![contract("base", FACTORY, "uniswap_v3_factory")],
+            discovery: vec![discovery(
+                "base",
+                FACTORY,
+                SIGNATURE,
+                "tickSpacing",
+                "uniswap_v3_pool",
+            )],
+        });
+        assert!(
+            matches!(
+                registry,
+                Err(super::RegistryError::Discovery { ref detail, .. })
+                    if detail.contains("no address argument")
+            ),
+            "a non-address child must be caught, got {registry:?}"
+        );
+    }
+
+    /// A rule for a factory that is not registered at all is its own mistake, and says
+    /// so. Collapsing it into "event not declared" would point an author at the wrong
+    /// line: the event is fine, the missing `[[contract]]` is the problem.
+    #[test]
+    fn a_rule_for_an_unregistered_factory_names_the_missing_contract() {
+        let registry = load(&RegistryConfig {
+            abi: vec![factory_abi(), pool_abi()],
+            // No `[[contract]]` for the factory, so nothing can emit the event.
+            discovery: vec![discovery(
+                "base",
+                FACTORY,
+                SIGNATURE,
+                "pool",
+                "uniswap_v3_pool",
+            )],
+            ..RegistryConfig::default()
+        });
+        assert!(
+            matches!(
+                registry,
+                Err(super::RegistryError::Discovery { ref detail, .. })
+                    if detail.contains("not a registered contract")
+            ),
+            "a rule with no registered factory must say so, got {registry:?}"
+        );
+    }
+
+    /// Two rules for one factory event are last-wins if nothing objects, which is how a
+    /// child silently decodes with the wrong ABI. Same refusal as a duplicate address.
+    #[test]
+    fn two_rules_for_one_event_are_refused() {
+        let registry = load(&RegistryConfig {
+            abi: vec![factory_abi(), pool_abi()],
+            contract: vec![contract("base", FACTORY, "uniswap_v3_factory")],
+            discovery: vec![
+                discovery("base", FACTORY, SIGNATURE, "pool", "uniswap_v3_pool"),
+                discovery("base", FACTORY, SIGNATURE, "pool", "uniswap_v3_pool"),
+            ],
+        });
+        assert!(
+            matches!(
+                registry,
+                Err(super::RegistryError::Discovery { ref detail, .. })
+                    if detail.contains("already has a discovery rule")
+            ),
+            "a duplicate rule must be caught, got {registry:?}"
+        );
+    }
+
     /// No entries is an empty registry, not an error: running without decoding is
     /// legitimate and the caller says so at startup.
     #[test]
     fn no_entries_is_an_empty_registry() {
         let registry = load(&RegistryConfig::default()).expect("empty is fine");
-        assert!(registry.is_empty());
+        assert_eq!(registry.len(), 0);
     }
 
     /// Discovery never overrides a static registration. A learned address is

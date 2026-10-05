@@ -90,6 +90,26 @@ impl Abi {
             .map(Event::selector)
     }
 
+    /// Whether the event with `signature` declares an `address` argument named `name`.
+    ///
+    /// A discovery rule names the argument holding a new child's address, so the rule is
+    /// checked here at load: a name the event does not declare, or one that is not an
+    /// `address`, is a rule that could never fire, and refusing it while the registry is
+    /// built beats finding out later as a protocol that quietly stopped decoding. A
+    /// tuple is not an `address` however it is spelled, so a rule cannot name one.
+    #[must_use]
+    pub fn declares_address_arg(&self, signature: &str, name: &str) -> bool {
+        self.by_selector
+            .values()
+            .find(|event| event.signature() == signature)
+            .is_some_and(|event| {
+                event
+                    .inputs
+                    .iter()
+                    .any(|input| input.name == name && input.ty == "address")
+            })
+    }
+
     /// Decodes a log into a [`DecodedEvent`], if this ABI declares the log's event.
     ///
     /// Returns `Ok(None)` when no event in the ABI has the log's selector. That is a

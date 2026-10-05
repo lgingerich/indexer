@@ -23,7 +23,11 @@ use crate::sink::{EnvelopeSink, SinkError};
 use crate::wire::envelope::Envelope;
 
 /// An [`EnvelopeSink`] that decodes each envelope and forwards both to `inner`.
-#[derive(Debug)]
+///
+/// `Debug` is hand-written for the same reason [`DuckDbSink`](crate::sink::DuckDbSink)'s
+/// is: the derived one would print the registry, and a registry holds every loaded ABI —
+/// tens of kilobytes of event signatures per address, thousands of addresses. The one
+/// number an operator needs is how much it learned, so that is all this prints.
 pub struct DecodingSink<K> {
     /// Owned here, not inside the transform: discovery mutates it between records, and
     /// the transform reads the current snapshot per call.
@@ -31,11 +35,21 @@ pub struct DecodingSink<K> {
     inner: K,
 }
 
+impl<K: EnvelopeSink> std::fmt::Debug for DecodingSink<K> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DecodingSink")
+            .field("registered", &self.registry.len())
+            .finish_non_exhaustive()
+    }
+}
+
 impl<K: EnvelopeSink> DecodingSink<K> {
     /// Decodes with `registry`, forwarding to `inner`.
     ///
-    /// An empty registry is allowed and decodes nothing, which is said here rather than
-    /// left to look like a quiet chain.
+    /// An empty registry is allowed and decodes nothing, which the [`Debug`] output says
+    /// (`registered: 0`) rather than leaving to look like a quiet chain. A sink that
+    /// announces its state is how this layer matches the others: each one says what it
+    /// opened when it opened it.
     #[must_use]
     pub fn new(registry: ContractRegistry, inner: K) -> Self {
         if registry.is_empty() {
