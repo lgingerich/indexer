@@ -30,7 +30,11 @@ fn settings_path() -> String {
         .unwrap_or_else(|| DEFAULT_SETTINGS.to_owned())
 }
 
-#[tokio::main]
+// A DuckDB flush blocks the worker that polls it, and
+// ingest has to keep running on another one. `rt-multi-thread` makes this the default;
+// naming it means dropping that feature fails the build instead of silently running
+// ingest and the flush on one thread.
+#[tokio::main(flavor = "multi_thread")]
 async fn main() -> ExitCode {
     tracing_subscriber::fmt()
         .json()

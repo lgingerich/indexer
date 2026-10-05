@@ -160,20 +160,28 @@ impl Pipeline {
                 let ingest = ingest.run(DecodingSink::new(registry, blocks)).await;
 
                 // Ingest's half of the channel is gone by now, so storage drains what is
-                // queued and ends. Its error comes first: if the store died, ingest's
-                // failure is only the failed send.
-                //
-                // A panicked task is `JoinError`, which is neither a store nor an
-                // ingest failure — it is the store's writer dying outside its own error
-                // path (an unwrap on a row width, say), so it gets its own variant
-                // rather than being folded into `Storage`.
-                let stored = storage.await??;
-                info!(stored, "storage stopped");
-                ingest?;
-                Ok(())
+                // queued and ends. The join order is [`finish`].
+                finish(storage.await, ingest)
             }
         }
     }
+}
+
+/// Reports how the two tasks stopped.
+///
+/// Storage comes first. Its error is a rejected write, and its panic is a `JoinError`:
+/// the writer died outside the store's own error path (an unwrap on a row width, say),
+/// which is neither a store failure nor an ingest failure. Ingest's error on this path
+/// is the failed send that followed — [`crate::sink::SinkError::StorageClosed`] — so it
+/// is returned only when the store itself finished.
+fn finish(
+    storage: Result<Result<u64, SinkError>, tokio::task::JoinError>,
+    ingest: Result<(), PipelineError>,
+) -> Result<(), RuntimeError> {
+    let stored = storage??;
+    info!(stored, "storage stopped");
+    ingest?;
+    Ok(())
 }
 
 /// Loads the settings at `path` and runs the pipeline they describe.
@@ -208,10 +216,12 @@ mod tests {
     use crate::config::Settings;
     use crate::decode::DecodingSink;
     use crate::decode::registry::{AbiEntry, ContractEntry, ContractRegistry, RegistryConfig};
-    use crate::sink::{self, DuckDbSink, EnvelopeSink as _};
+    use crate::ingest::pipeline::PipelineError;
+    use crate::sink::duckdb::StoreError;
+    use crate::sink::{self, DuckDbSink, EnvelopeSink as _, SinkError};
     use crate::wire::envelope::Envelope;
 
-    use super::Pipeline;
+    use super::{Pipeline, RuntimeError, finish};
 
     /// The shipped registry, as an absolute path so [`Settings::from_str`] carries no
     /// directory to resolve it against.
@@ -234,6 +244,34 @@ ws_url = "wss://example.invalid"
     fn a_chain_config_assembles_the_pipeline() {
         let settings = Settings::from_str(SETTINGS).expect("settings parse");
         Pipeline::from_settings(&settings).expect("the pipeline builds");
+    }
+
+    /// The store's write error is the one returned when ingest then fails because the
+    /// receiver is gone. That second failure is the failed send, and reporting it would
+    /// hide the write that caused it.
+    #[test]
+    fn a_failed_store_is_reported_ahead_of_the_closed_send() {
+        let connection = duckdb::Connection::open_in_memory().expect("open in-memory DuckDB");
+        connection
+            .execute_batch("CREATE TABLE block (not_a_column INTEGER)")
+            .expect("schema");
+        let source = connection
+            .execute("INSERT INTO block VALUES (1, 2)", [])
+            .expect_err("two values cannot fit one column");
+        let storage = Ok(Err(SinkError::Store(StoreError::Append {
+            table: "block",
+            source,
+        })));
+        let ingest = Err(PipelineError::Sink(SinkError::StorageClosed));
+
+        let error = finish(storage, ingest).expect_err("the store rejected the batch");
+        assert!(
+            matches!(
+                error,
+                RuntimeError::Storage(SinkError::Store(StoreError::Append { table: "block", .. }))
+            ),
+            "the append error must be the one reported, not the closed send: {error:?}"
+        );
     }
 
     /// A registry that names a file that is not there is an assembly error, not a quiet
