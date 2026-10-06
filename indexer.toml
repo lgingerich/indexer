@@ -9,6 +9,9 @@
 chain = "base"
 http_url = "https://base-rpc.publicnode.com"
 ws_url = "wss://base-rpc.publicnode.com"
+# Datasets to fetch and store. Omitted means all four. Logs without receipts use
+# one eth_getLogs per height; a header is still read so linkage keeps working.
+# datasets = ["block", "transaction", "receipt", "log"]
 
 # Where records go, and by which backend. Required: the table names the backend, so
 # exactly one may be present. `[sink.duckdb]` persists; naming `[sink.stdout]` instead

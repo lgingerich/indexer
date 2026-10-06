@@ -6,8 +6,9 @@
 //!
 //! - [`BlockSource::subscribe_heads`] is the *live* path. It must be push-based to
 //!   meet a sub-100ms budget.
-//! - [`BlockSource::fetch_block`] is the *pull* path. It fetches one block with
-//!   everything in it, which is what backfill and reorg reconciliation need.
+//! - [`BlockSource::fetch_block`] is the *pull* path. It fetches one block, limited
+//!   to the datasets the source was built with, which is what backfill and reorg
+//!   reconciliation need.
 //!
 //! A source also owns two things the generic pipeline must not hardcode: how to
 //! turn a chain's block into [`Event`]s, and what finality means for this chain,

@@ -36,7 +36,7 @@
 //! symptom.
 
 use thiserror::Error;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::config::{Settings, SettingsError, Sink};
 use crate::decode::DecodingSink;
@@ -47,7 +47,7 @@ use crate::ingest::pipeline::PipelineError;
 use crate::sink;
 #[cfg(feature = "duckdb")]
 use crate::sink::DuckDbSink;
-use crate::sink::{SinkError, StdoutJsonSink};
+use crate::sink::{SelectingSink, SinkError, StdoutJsonSink};
 
 /// Why the indexer stopped.
 ///
@@ -119,6 +119,7 @@ impl Pipeline {
             &settings.ingest.chain,
             &settings.ingest.http_url,
             &settings.ingest.ws_url,
+            &settings.ingest.datasets,
         );
         let registry = settings.registry_path().map_or_else(
             || Ok(ContractRegistry::default()),
@@ -136,13 +137,19 @@ impl Pipeline {
     /// carries that part's own error, because "storage stopped" says nothing about why.
     pub(crate) async fn run(self, settings: &Settings) -> Result<(), RuntimeError> {
         let Self { ingest, registry } = self;
+        if !settings.ingest.datasets.log && !registry.is_empty() {
+            warn!("log dataset is not selected; registered contracts will not decode");
+        }
 
         // The settings' backend is the branch, so a backend this build does not have is
         // already a startup error and each arm here opens exactly what it named.
         match &settings.sink {
             Sink::Stdout(_) => {
                 ingest
-                    .run(DecodingSink::new(registry, StdoutJsonSink::new()))
+                    .run(SelectingSink::new(
+                        &settings.ingest.datasets,
+                        DecodingSink::new(registry, StdoutJsonSink::new()),
+                    ))
                     .await?;
                 Ok(())
             }
@@ -153,7 +160,12 @@ impl Pipeline {
                 let batch_records = postgres.batch_records;
                 let storage =
                     tokio::spawn(async move { receiver.drain(&mut store, batch_records).await });
-                let ingest = ingest.run(DecodingSink::new(registry, blocks)).await;
+                let ingest = ingest
+                    .run(SelectingSink::new(
+                        &settings.ingest.datasets,
+                        DecodingSink::new(registry, blocks),
+                    ))
+                    .await;
                 finish(storage.await, ingest)
             }
             #[cfg(feature = "duckdb")]
@@ -171,7 +183,12 @@ impl Pipeline {
                 let storage =
                     tokio::spawn(async move { receiver.drain(&mut store, batch_records).await });
 
-                let ingest = ingest.run(DecodingSink::new(registry, blocks)).await;
+                let ingest = ingest
+                    .run(SelectingSink::new(
+                        &settings.ingest.datasets,
+                        DecodingSink::new(registry, blocks),
+                    ))
+                    .await;
 
                 // Ingest's half of the channel is gone by now, so storage drains what is
                 // queued and ends. The join order is [`finish`].

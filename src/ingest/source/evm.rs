@@ -5,19 +5,21 @@
 //! paying a poll interval. JSON-RPC over HTTP is the pull path. Requirements worth
 //! stating because they are easy to get wrong:
 //!
-//! - Blocks are requested with full transaction objects, and receipts come from
-//!   `eth_getBlockReceipts`, so a block is fetched in one round trip rather than
-//!   assembled field by field over many. Every field the datasets below declare is
-//!   carried across; a few the node also returns are not, and each omission is named
-//!   at the projection that makes it. Some nodes
-//!   lack that method (some L2s, pre-Cancun Ethereum); it is answered with
+//! - The selected datasets decide the batch. Transactions require full transaction
+//!   objects. Receipts come from `eth_getBlockReceipts`, and when logs are selected
+//!   too they are taken from those receipts. Logs alone use `eth_getLogs` for that
+//!   one height. A header is always fetched: the pipeline reads parent linkage from
+//!   it, whether or not the block row is stored. Every field the selected datasets
+//!   declare is carried across; a few the node also returns are not, and each
+//!   omission is named at the projection that makes it. Some nodes lack
+//!   `eth_getBlockReceipts` (some L2s, pre-Cancun Ethereum); it is answered with
 //!   `-32601` or null, and the source then fetches each receipt with
 //!   `eth_getTransactionReceipt` in batches of `RECEIPT_BATCH_LIMIT`.
 //! - Finality comes from the node's `finalized` block tag, so each chain's own
 //!   rules apply: about two epochs on Ethereum, L1 finality of the batch on an L2.
-//! - All three calls are sent as one batch, so a block costs one round trip. They
+//! - The calls are sent as one batch, so a block costs one round trip. They
 //!   still execute separately on the node, so a reorg between them can pair a
-//!   block with another fork's receipts; every receipt's `blockHash` is checked.
+//!   block with another fork's receipts or logs; every `blockHash` is checked.
 //! - The batch is parsed into alloy's RPC types, then projected field by field into
 //!   the [`crate::wire::datasets`] records; nothing is kept as opaque JSON.
 //! - Parsing uses alloy's *catch-all* (`any`) types, so a chain's non-Ethereum
@@ -35,12 +37,14 @@ use alloy_network::eip2718::Typed2718 as _;
 use alloy_network::{AnyNetwork, TransactionResponse};
 use alloy_primitives::B256;
 use alloy_provider::{Provider, ProviderBuilder, RootProvider, WsConnect};
+use alloy_rpc_types_eth::Filter;
 use alloy_rpc_types_eth::Log as RpcLog;
 use alloy_transport::TransportError;
 use futures_util::StreamExt;
 use serde::Deserialize;
 
 use super::{BlockId, BlockSource, FetchedBlock, HeadStream, METHOD_NOT_FOUND, SourceError};
+use crate::sink::Datasets;
 use crate::wire::datasets::evm::{Block, Log, Receipt, Transaction};
 use crate::wire::envelope::{ChainId, Event};
 
@@ -57,10 +61,13 @@ pub struct EvmSource {
     chain: ChainId,
     ws_url: String,
     provider: RootProvider<AnyNetwork>,
+    datasets: Datasets,
 }
 
 impl EvmSource {
-    /// Builds a source for `chain` with a ten-second HTTP timeout.
+    /// Builds a source for `chain` that fetches `datasets`.
+    ///
+    /// The header is still fetched when the block dataset is off: linkage needs it.
     ///
     /// # Errors
     ///
@@ -69,6 +76,7 @@ impl EvmSource {
         chain: impl Into<ChainId>,
         http_url: impl Into<String>,
         ws_url: impl Into<String>,
+        datasets: Datasets,
     ) -> Result<Self, SourceError> {
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(10))
@@ -88,6 +96,7 @@ impl EvmSource {
             chain: chain.into(),
             ws_url: ws_url.into(),
             provider,
+            datasets,
         })
     }
 }
@@ -127,7 +136,7 @@ fn transport(context: &'static str, source: TransportError) -> SourceError {
     SourceError::Transport { context, source }
 }
 
-/// The three results one batched block request carries, still in alloy's RPC types
+/// The results one batched block request carries, still in alloy's RPC types
 /// and not yet projected into [`crate::wire::datasets`] records.
 ///
 /// The block and receipts use alloy's *catch-all* (`any`) types, so a chain's
@@ -146,6 +155,11 @@ pub struct RpcBatch {
     /// a [`METHOD_NOT_FOUND`] error and others with a `null` result, so both are
     /// treated the same way.
     pub receipts: Option<Vec<AnyTransactionReceipt>>,
+    /// Logs from `eth_getLogs` for this height.
+    ///
+    /// `None` when logs are taken from [`Self::receipts`] instead, which is the
+    /// case whenever receipts were fetched.
+    pub logs: Option<Vec<RpcLog>>,
     /// The chain's newest finalized block at request time.
     pub finalized: BlockId,
 }
@@ -164,6 +178,7 @@ pub fn decode_block(batch: RpcBatch) -> Result<FetchedBlock, SourceError> {
     let RpcBatch {
         block,
         receipts,
+        logs,
         finalized,
     } = batch;
     // The batched method is the only way receipts reach a pure decode; when a node
@@ -171,97 +186,156 @@ pub fn decode_block(batch: RpcBatch) -> Result<FetchedBlock, SourceError> {
     let receipts =
         receipts.ok_or_else(|| malformed("eth_getBlockReceipts", "receipts were not fetched"))?;
     Ok(FetchedBlock {
-        events: decode_events(&block, &receipts)?,
+        events: project(&block, Some(&receipts), logs.as_deref(), Datasets::all())?,
         finalized,
     })
 }
 
-/// Projects a block and its receipts into dataset events.
-fn decode_events(
+/// Projects a fetched block into dataset events, always leading with the header.
+///
+/// The loop is the full-dataset order: each transaction, then its receipt, then
+/// that receipt's logs. A push runs only when `datasets` names it. Logs fetched
+/// with `eth_getLogs` are appended after that loop, in the order the node returned.
+fn project(
     block: &AnyRpcBlock,
-    receipts: &[AnyTransactionReceipt],
+    receipts: Option<&[AnyTransactionReceipt]>,
+    logs: Option<&[RpcLog]>,
+    datasets: Datasets,
 ) -> Result<Vec<Event>, SourceError> {
     const RECEIPTS: &str = "eth_getBlockReceipts";
+    if datasets.receipt && receipts.is_none() {
+        return Err(malformed(RECEIPTS, "receipts were not fetched"));
+    }
+    let separate_logs = datasets.log && !datasets.receipt;
+    if separate_logs && logs.is_none() {
+        return Err(malformed("eth_getLogs", "logs were not fetched"));
+    }
 
-    let transactions = block
-        .0
-        .inner
-        .transactions
-        .as_transactions()
-        .ok_or_else(|| {
-            malformed(
-                "eth_getBlockByNumber",
-                "block returned transaction hashes only",
-            )
-        })?;
-    if receipts.len() != transactions.len() {
+    let transactions = &block.0.inner.transactions;
+    let full = transactions.as_transactions();
+    if datasets.transaction && full.is_none() {
+        return Err(malformed(
+            "eth_getBlockByNumber",
+            "block returned transaction hashes only",
+        ));
+    }
+    let tx_hashes: Vec<B256> = transactions.hashes().collect();
+    if let Some(receipts) = receipts
+        && receipts.len() != tx_hashes.len()
+    {
         return Err(malformed(
             RECEIPTS,
             format!(
                 "{} receipts for {} transactions",
                 receipts.len(),
-                transactions.len()
+                tx_hashes.len()
             ),
         ));
     }
 
     let number = block.0.inner.header.inner.number;
     let hash = block.0.inner.header.hash;
-
-    // One block, a transaction and receipt per transaction, and every log.
-    let log_count: usize = receipts.iter().map(|receipt| receipt.logs().len()).sum();
-    let mut events = Vec::with_capacity(1 + transactions.len() * 2 + log_count);
-    events.push(Event::Block(Box::new(decode_header(block, transactions))));
-
-    for (position, (transaction, receipt)) in transactions.iter().zip(receipts).enumerate() {
-        let tx_hash = transaction.tx_hash();
-        let tx_index = position as u64;
-
-        let receipt_block = receipt.block_hash.unwrap_or_default();
-        if receipt_block != hash {
-            return Err(malformed(
-                RECEIPTS,
-                format!(
-                    "receipt belongs to block {receipt_block}, not {hash}; the chain reorganised mid-request"
-                ),
-            ));
+    let timestamp = block.0.inner.header.inner.timestamp;
+    let mut events = Vec::new();
+    events.push(Event::Block(Box::new(decode_header(block))));
+    if datasets.transaction || receipts.is_some() {
+        for (position, tx_hash) in tx_hashes.iter().copied().enumerate() {
+            let tx_index = position as u64;
+            if datasets.transaction {
+                let transaction = &full.ok_or_else(|| {
+                    malformed(
+                        "eth_getBlockByNumber",
+                        "block returned transaction hashes only",
+                    )
+                })?[position];
+                events.push(Event::Transaction(Box::new(decode_transaction(
+                    transaction,
+                    tx_index,
+                    number,
+                    timestamp,
+                    hash,
+                ))));
+            }
+            let Some(receipts) = receipts else {
+                continue;
+            };
+            let receipt = &receipts[position];
+            let receipt_block = receipt.block_hash.unwrap_or_default();
+            if receipt_block != hash {
+                return Err(malformed(
+                    RECEIPTS,
+                    format!(
+                        "receipt belongs to block {receipt_block}, not {hash}; the chain reorganised mid-request"
+                    ),
+                ));
+            }
+            if receipt.transaction_index != Some(tx_index) || receipt.transaction_hash != tx_hash {
+                return Err(malformed(
+                    RECEIPTS,
+                    format!(
+                        "receipt {position} has transactionIndex {:?}, not {tx_index}",
+                        receipt.transaction_index
+                    ),
+                ));
+            }
+            if datasets.receipt {
+                events.push(Event::Receipt(Box::new(decode_receipt(
+                    receipt, tx_hash, tx_index, number, hash, timestamp,
+                ))));
+            }
+            if datasets.log {
+                for log in receipt.logs() {
+                    events.push(Event::Log(Box::new(log_record(
+                        log, tx_index, number, hash, timestamp, RECEIPTS,
+                    )?)));
+                }
+            }
         }
-        if receipt.transaction_index != Some(tx_index) {
-            return Err(malformed(
-                RECEIPTS,
-                format!(
-                    "receipt {position} has transactionIndex {:?}, not {tx_index}",
-                    receipt.transaction_index
-                ),
-            ));
-        }
-
-        events.push(Event::Transaction(Box::new(decode_transaction(
-            transaction,
-            tx_index,
-            number,
-            block.0.inner.header.inner.timestamp,
-            hash,
-        ))));
-        events.push(Event::Receipt(Box::new(decode_receipt(
-            receipt,
-            tx_hash,
-            tx_index,
-            number,
-            hash,
-            block.0.inner.header.inner.timestamp,
-        ))));
-        for log in receipt.logs() {
-            events.push(Event::Log(Box::new(log_record(
-                log,
-                tx_index,
-                number,
-                hash,
-                block.0.inner.header.inner.timestamp,
+    }
+    if separate_logs {
+        for log in logs.ok_or_else(|| malformed("eth_getLogs", "logs were not fetched"))? {
+            events.push(Event::Log(Box::new(filtered_log(
+                log, number, hash, timestamp,
             )?)));
         }
     }
     Ok(events)
+}
+
+/// One `eth_getLogs` row, checked against the header it was requested for.
+fn filtered_log(
+    log: &RpcLog,
+    block_number: u64,
+    block_hash: B256,
+    block_timestamp: u64,
+) -> Result<Log, SourceError> {
+    const LOGS: &str = "eth_getLogs";
+    let got = log
+        .block_hash
+        .ok_or_else(|| malformed(LOGS, "log has no blockHash"))?;
+    if got != block_hash {
+        return Err(malformed(
+            LOGS,
+            format!("log belongs to block {got}, not {block_hash}"),
+        ));
+    }
+    if log.block_number != Some(block_number) {
+        return Err(malformed(
+            LOGS,
+            format!("log blockNumber {:?}, not {block_number}", log.block_number),
+        ));
+    }
+    let tx_index = log
+        .transaction_index
+        .ok_or_else(|| malformed(LOGS, "log has no transactionIndex"))?;
+    log_record(
+        log,
+        tx_index,
+        block_number,
+        block_hash,
+        block_timestamp,
+        LOGS,
+    )
 }
 
 /// Flattens a block header and its transaction hashes into the block dataset.
@@ -272,8 +346,9 @@ fn decode_events(
 /// may carry instead of a `status` (alloy's `coerce_status` maps that variant to
 /// `true`, so a pre-Byzantium failure would read as a success). A consumer needing them
 /// reads the header and the receipt.
-fn decode_header(block: &AnyRpcBlock, transactions: &[AnyRpcTransaction]) -> Block {
+fn decode_header(block: &AnyRpcBlock) -> Block {
     let header = &block.0.inner.header;
+    let transactions = &block.0.inner.transactions;
     Block {
         number: header.number,
         hash: header.hash,
@@ -299,10 +374,7 @@ fn decode_header(block: &AnyRpcBlock, transactions: &[AnyRpcTransaction]) -> Blo
         excess_blob_gas: header.inner.excess_blob_gas,
         parent_beacon_block_root: header.inner.parent_beacon_block_root,
         ommers: block.0.inner.uncles.clone(),
-        transaction_hashes: transactions
-            .iter()
-            .map(AnyRpcTransaction::tx_hash)
-            .collect(),
+        transaction_hashes: transactions.hashes().collect(),
     }
 }
 
@@ -431,14 +503,14 @@ fn log_record(
     block_number: u64,
     block_hash: B256,
     block_timestamp: u64,
+    context: &str,
 ) -> Result<Log, SourceError> {
-    const CONTEXT: &str = "eth_getBlockReceipts";
     let transaction_hash = log
         .transaction_hash
-        .ok_or_else(|| malformed(CONTEXT, "log has no transactionHash"))?;
+        .ok_or_else(|| malformed(context, "log has no transactionHash"))?;
     let log_index = log.log_index.ok_or_else(|| {
         malformed(
-            CONTEXT,
+            context,
             "log has no logIndex; it cannot be placed in the block",
         )
     })?;
@@ -497,10 +569,18 @@ impl BlockSource for EvmSource {
         // Nodes that do not serve `eth_getBlockReceipts` (some L2s, and pre-Cancun
         // Ethereum) answer it with `METHOD_NOT_FOUND` or null. Fetch the receipts
         // by transaction hash instead, so the block still becomes events.
-        if batch.receipts.is_none() {
+        if self.datasets.receipt && batch.receipts.is_none() {
             batch.receipts = Some(self.fetch_receipts(&batch.block).await?);
         }
-        decode_block(batch)
+        Ok(FetchedBlock {
+            events: project(
+                &batch.block,
+                batch.receipts.as_deref(),
+                batch.logs.as_deref(),
+                self.datasets,
+            )?,
+            finalized: batch.finalized,
+        })
     }
 
     async fn current_head(&self) -> Result<BlockId, SourceError> {
@@ -530,29 +610,16 @@ impl EvmSource {
         block: &AnyRpcBlock,
     ) -> Result<Vec<AnyTransactionReceipt>, SourceError> {
         const RECEIPT: &str = "eth_getTransactionReceipt";
-        let transactions = block
-            .0
-            .inner
-            .transactions
-            .as_transactions()
-            .ok_or_else(|| {
-                malformed(
-                    "eth_getBlockByNumber",
-                    "block returned transaction hashes only",
-                )
-            })?;
+        let hashes: Vec<B256> = block.0.inner.transactions.hashes().collect();
 
-        let mut receipts = Vec::with_capacity(transactions.len());
-        for chunk in transactions.chunks(RECEIPT_BATCH_LIMIT) {
+        let mut receipts = Vec::with_capacity(hashes.len());
+        for chunk in hashes.chunks(RECEIPT_BATCH_LIMIT) {
             let mut batch = alloy_rpc_client::BatchRequest::new(self.provider.client());
             let mut calls = Vec::with_capacity(chunk.len());
-            for transaction in chunk {
+            for hash in chunk {
                 calls.push(
                     batch
-                        .add_call::<_, Option<AnyTransactionReceipt>>(
-                            RECEIPT,
-                            &(transaction.tx_hash(),),
-                        )
+                        .add_call::<_, Option<AnyTransactionReceipt>>(RECEIPT, &(*hash,))
                         .map_err(|source| transport(RECEIPT, source))?,
                 );
             }
@@ -572,20 +639,41 @@ impl EvmSource {
         Ok(receipts)
     }
 
-    /// Fetches full transactions, block receipts, and finality in one HTTP batch.
+    /// Fetches the header, the dataset calls this source needs, and finality, in one batch.
     async fn fetch_batch(&self, height: u64) -> Result<RpcBatch, SourceError> {
         const BLOCK: &str = "eth_getBlockByNumber";
         const RECEIPTS: &str = "eth_getBlockReceipts";
+        const LOGS: &str = "eth_getLogs";
         let tag = alloy_rpc_types_eth::BlockNumberOrTag::Number(height);
+        let filter = Filter::new().select(height);
         // In 1.8.3 Provider::client() returns RpcClientInner; new_batch() is
         // only on RpcClient. This is its identical BatchRequest constructor.
         let mut batch = alloy_rpc_client::BatchRequest::new(self.provider.client());
+        // Full objects only when transactions are stored. Hashes still fill the
+        // block row and the receipt fallback. Order matches the all-dataset batch
+        // the tests lock: block, then receipts, then logs, then finality.
         let block = batch
-            .add_call::<_, Option<AnyRpcBlock>>(BLOCK, &(tag, true))
+            .add_call::<_, Option<AnyRpcBlock>>(BLOCK, &(tag, self.datasets.transaction))
             .map_err(|source| transport(BLOCK, source))?;
-        let receipts = batch
-            .add_call::<_, Option<Vec<AnyTransactionReceipt>>>(RECEIPTS, &(tag,))
-            .map_err(|source| transport(RECEIPTS, source))?;
+        let receipts = if self.datasets.receipt {
+            Some(
+                batch
+                    .add_call::<_, Option<Vec<AnyTransactionReceipt>>>(RECEIPTS, &(tag,))
+                    .map_err(|source| transport(RECEIPTS, source))?,
+            )
+        } else {
+            None
+        };
+        let separate_logs = self.datasets.log && !self.datasets.receipt;
+        let logs = if separate_logs {
+            Some(
+                batch
+                    .add_call::<_, Vec<RpcLog>>(LOGS, &(filter,))
+                    .map_err(|source| transport(LOGS, source))?,
+            )
+        } else {
+            None
+        };
         // ponytail: finality carries the transaction-hash list too. Poll the
         // finalized tag on a timer if its bandwidth becomes material.
         let finalized = batch
@@ -599,10 +687,17 @@ impl EvmSource {
             .await
             .map_err(|source| transport(BLOCK, source))?
             .ok_or_else(|| malformed(BLOCK, "result was null"))?;
-        let receipts = match receipts.await {
-            Ok(receipts) => receipts,
-            Err(RpcError::ErrorResp(error)) if error.code == METHOD_NOT_FOUND => None,
-            Err(source) => return Err(transport(RECEIPTS, source)),
+        let receipts = match receipts {
+            Some(receipts) => match receipts.await {
+                Ok(receipts) => receipts,
+                Err(RpcError::ErrorResp(error)) if error.code == METHOD_NOT_FOUND => None,
+                Err(source) => return Err(transport(RECEIPTS, source)),
+            },
+            None => None,
+        };
+        let logs = match logs {
+            Some(logs) => Some(logs.await.map_err(|source| transport(LOGS, source))?),
+            None => None,
         };
         let finalized = finalized
             .await
@@ -611,6 +706,7 @@ impl EvmSource {
         Ok(RpcBatch {
             block,
             receipts,
+            logs,
             finalized: finalized.into(),
         })
     }
@@ -635,6 +731,7 @@ mod tests {
 
     use super::{EvmSource, RpcBatch, decode_block};
     use crate::ingest::source::{BlockSource, SourceError};
+    use crate::sink::Datasets;
     use crate::wire::envelope::Event;
 
     /// A real HTTP boundary: inspect requests and return replies in reverse order.
@@ -696,11 +793,102 @@ mod tests {
     #[tokio::test]
     async fn primary_fetch_is_one_three_call_batch_with_reversed_responses() {
         let (url, server) = rpc_server(1, |request| primary_reply(request, &block(), &receipts()));
-        let source = EvmSource::new("ethereum", url, "ws://unused").expect("source");
+        let source =
+            EvmSource::new("ethereum", url, "ws://unused", Datasets::all()).expect("source");
         let fetched = source.fetch_block(18_000_000).await.expect("fetch");
         assert_eq!(fetched.events.len(), 7);
         assert_eq!(fetched.finalized.height, 16);
         assert_eq!(server.join().expect("server").len(), 1);
+    }
+
+    #[tokio::test]
+    async fn logs_only_fetches_a_header_and_one_get_logs() {
+        let mut header = block();
+        header["transactions"] = json!([hash(0x11), hash(0x22)]);
+        let logs = receipts()[0]["logs"].clone();
+        let (url, server) = rpc_server(1, move |request| {
+            let calls = request.as_array().expect("batch");
+            assert_eq!(calls.len(), 3);
+            assert_eq!(calls[0]["method"], "eth_getBlockByNumber");
+            assert_eq!(calls[0]["params"], json!(["0x112a880", false]));
+            assert_eq!(calls[1]["method"], "eth_getLogs");
+            assert_eq!(calls[1]["params"][0]["fromBlock"], "0x112a880");
+            assert_eq!(calls[1]["params"][0]["toBlock"], "0x112a880");
+            assert!(calls[1]["params"][0].get("address").is_none());
+            assert_eq!(calls[2]["params"], json!(["finalized", false]));
+            json!([
+                {"jsonrpc": "2.0", "id": calls[2]["id"], "result": {"number": "0x10", "hash": hash(0xf0)}},
+                {"jsonrpc": "2.0", "id": calls[1]["id"], "result": logs},
+                {"jsonrpc": "2.0", "id": calls[0]["id"], "result": header},
+            ])
+        });
+        let source = EvmSource::new(
+            "ethereum",
+            url,
+            "ws://unused",
+            serde_json::from_str(r#"["log"]"#).expect("datasets"),
+        )
+        .expect("source");
+        let fetched = source.fetch_block(18_000_000).await.expect("fetch");
+        let kinds: Vec<&str> = fetched.events.iter().map(Event::kind).collect();
+        assert_eq!(kinds, ["block", "log", "log"]);
+        server.join().expect("server");
+    }
+
+    #[tokio::test]
+    async fn receipts_supply_logs_without_a_second_log_call() {
+        let (url, server) = rpc_server(1, |request| {
+            let calls = request.as_array().expect("batch");
+            assert_eq!(calls.len(), 3);
+            assert_eq!(calls[0]["params"], json!(["0x112a880", false]));
+            assert_eq!(calls[1]["method"], "eth_getBlockReceipts");
+            assert!(
+                calls.iter().all(|call| call["method"] != "eth_getLogs"),
+                "logs come off the receipts"
+            );
+            json!([
+                {"jsonrpc": "2.0", "id": calls[2]["id"], "result": {"number": "0x10", "hash": hash(0xf0)}},
+                {"jsonrpc": "2.0", "id": calls[1]["id"], "result": receipts()},
+                {"jsonrpc": "2.0", "id": calls[0]["id"], "result": block()},
+            ])
+        });
+        let source = EvmSource::new(
+            "ethereum",
+            url,
+            "ws://unused",
+            serde_json::from_str(r#"["receipt", "log"]"#).expect("datasets"),
+        )
+        .expect("source");
+        let fetched = source.fetch_block(18_000_000).await.expect("fetch");
+        let kinds: Vec<&str> = fetched.events.iter().map(Event::kind).collect();
+        assert_eq!(kinds, ["block", "receipt", "log", "log", "receipt"]);
+        server.join().expect("server");
+    }
+
+    #[tokio::test]
+    async fn transactions_skip_the_receipt_call() {
+        let (url, server) = rpc_server(1, |request| {
+            let calls = request.as_array().expect("batch");
+            assert_eq!(calls.len(), 2);
+            assert_eq!(calls[0]["method"], "eth_getBlockByNumber");
+            assert_eq!(calls[0]["params"], json!(["0x112a880", true]));
+            assert_eq!(calls[1]["params"], json!(["finalized", false]));
+            json!([
+                {"jsonrpc": "2.0", "id": calls[1]["id"], "result": {"number": "0x10", "hash": hash(0xf0)}},
+                {"jsonrpc": "2.0", "id": calls[0]["id"], "result": block()},
+            ])
+        });
+        let source = EvmSource::new(
+            "ethereum",
+            url,
+            "ws://unused",
+            serde_json::from_str(r#"["block", "transaction"]"#).expect("datasets"),
+        )
+        .expect("source");
+        let fetched = source.fetch_block(18_000_000).await.expect("fetch");
+        let kinds: Vec<&str> = fetched.events.iter().map(Event::kind).collect();
+        assert_eq!(kinds, ["block", "transaction", "transaction"]);
+        server.join().expect("server");
     }
 
     #[tokio::test]
@@ -750,7 +938,8 @@ mod tests {
                     )
                 }
             });
-            let source = EvmSource::new("base", url, "ws://unused").expect("source");
+            let source =
+                EvmSource::new("base", url, "ws://unused", Datasets::all()).expect("source");
             let fetched = source
                 .fetch_block(18_000_000)
                 .await
@@ -793,7 +982,8 @@ mod tests {
                 }
                 response
             });
-            let source = EvmSource::new("ethereum", url, "ws://unused").expect("source");
+            let source =
+                EvmSource::new("ethereum", url, "ws://unused", Datasets::all()).expect("source");
             let error = source.fetch_block(18_000_000).await.expect_err("must fail");
             if malformed {
                 assert!(matches!(
@@ -855,7 +1045,8 @@ mod tests {
                 }
             }
         });
-        let source = EvmSource::new("ethereum", "http://unused", url).expect("source");
+        let source =
+            EvmSource::new("ethereum", "http://unused", url, Datasets::all()).expect("source");
         let mut heads = source.subscribe_heads().await.expect("subscribe");
         drop(source);
         let consume = async {
@@ -999,6 +1190,7 @@ mod tests {
         RpcBatch {
             block: serde_json::from_value(block.clone()).expect("block fixture"),
             receipts: Some(serde_json::from_value(receipts.clone()).expect("receipt fixture")),
+            logs: None,
             finalized: super::BlockId {
                 height: 17_999_936,
                 hash: B256::repeat_byte(0xf0),
@@ -1159,7 +1351,8 @@ mod tests {
         let (url, server) = rpc_server(1, move |request| {
             primary_reply(request, &block(), &receipts)
         });
-        let source = EvmSource::new("ethereum", url, "ws://unused").expect("source");
+        let source =
+            EvmSource::new("ethereum", url, "ws://unused", Datasets::all()).expect("source");
         let error = source
             .fetch_block(18_000_000)
             .await
@@ -1204,6 +1397,7 @@ mod tests {
         let batch = RpcBatch {
             block: serde_json::from_value(block()).expect("block parses"),
             receipts: None,
+            logs: None,
             finalized: crate::ingest::source::BlockId {
                 height: 0,
                 hash: B256::ZERO,
@@ -1246,7 +1440,7 @@ mod tests {
         receipts[0]["logs"] = json!([]);
 
         let (url, server) = rpc_server(1, move |request| primary_reply(request, &block, &receipts));
-        let source = EvmSource::new("base", url, "ws://unused").expect("source");
+        let source = EvmSource::new("base", url, "ws://unused", Datasets::all()).expect("source");
         let fetched = source
             .fetch_block(18_000_000)
             .await

@@ -126,6 +126,7 @@ fn synthetic_batch(tx_count: usize, logs_per_tx: usize) -> RpcBatch {
     RpcBatch {
         block: serde_json::from_value(block).expect("block fixture"),
         receipts: Some(serde_json::from_value(json!(receipts)).expect("receipt fixture")),
+        logs: None,
         finalized: BlockId {
             height: 17_999_936,
             hash: alloy_primitives::B256::with_last_byte(0xf0),

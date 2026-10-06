@@ -102,23 +102,35 @@ impl CommitStats {
             self.chain = Some(envelope.chain.clone());
         }
         match &envelope.event {
-            Event::Block(block) => {
-                self.blocks += 1;
-                self.from = Some(
-                    self.from
-                        .map_or(block.number, |from| from.min(block.number)),
-                );
-                if self.to.is_none_or(|to| block.number >= to) {
-                    self.to = Some(block.number);
-                    self.tip_hash = block.hash;
-                }
+            Event::Block(block) => self.observe_block(block.number, block.hash),
+            Event::Transaction(transaction) => {
+                self.observe_block(transaction.block_number, transaction.block_hash);
             }
+            Event::Receipt(receipt) => {
+                self.observe_block(receipt.block_number, receipt.block_hash);
+            }
+            Event::Log(log) => self.observe_block(log.block_number, log.block_hash),
+            Event::Decoded(decoded) => self.observe_block(decoded.block_number, decoded.block_hash),
             Event::Reorg(reorg) => self.reorgs.push(LoggedReorg {
                 height: reorg.height,
                 orphaned: reorg.orphaned_hashes.len(),
                 new_head: reorg.new_head_hash,
             }),
-            _ => {}
+            Event::Finalized(_) => {}
+        }
+    }
+
+    /// Records one block inside the commit. Further rows from the same block do not
+    /// count as another block, so a logs-only commit still reports a single height.
+    fn observe_block(&mut self, number: u64, hash: B256) {
+        let same = self.to == Some(number) && self.tip_hash == hash;
+        if !same {
+            self.blocks += 1;
+        }
+        self.from = Some(self.from.map_or(number, |from| from.min(number)));
+        if self.to.is_none_or(|to| number >= to) {
+            self.to = Some(number);
+            self.tip_hash = hash;
         }
     }
 
@@ -302,7 +314,7 @@ mod tests {
 
     use alloy_primitives::B256;
 
-    use crate::wire::envelope::{Block, ChainId, Envelope, Event, Finalized, Reorg};
+    use crate::wire::envelope::{Block, ChainId, Envelope, Event, Finalized, Log, Reorg};
 
     use super::{Commit, CommitStats, Window};
 
@@ -428,6 +440,24 @@ mod tests {
         assert_eq!(
             (commit.from, commit.to, commit.rows, commit.tip_hash),
             (8, 8, 3, B256::from([0xcd; 32]),)
+        );
+
+        let mut stats = CommitStats::default();
+        let hash = B256::from([0xcd; 32]);
+        for _ in 0..2 {
+            stats.note(&Envelope::new(
+                ChainId::new("base"),
+                Event::Log(Box::new(Log {
+                    block_number: 8,
+                    block_hash: hash,
+                    ..Log::default()
+                })),
+            ));
+        }
+        let commit = stats.into_commit(2, 4).expect("logs are progress");
+        assert_eq!(
+            (commit.from, commit.to, commit.blocks, commit.tip_hash),
+            (8, 8, 1, hash)
         );
     }
 }

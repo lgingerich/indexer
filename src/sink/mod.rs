@@ -13,6 +13,7 @@
 //! - `channel` — the one hop that crosses tasks: a bounded in-process channel of
 //!   blocks, from decode to storage. It is what lets a slow store stall without stalling
 //!   ingest. Commit progress is logged from `progress`, not from the channel.
+//! - `datasets` — which datasets a run keeps, and the sink that drops the rest.
 //! - `duckdb` — an embedded `DuckDB` database.
 //! - `postgres` — a remote `PostgreSQL` 18 database with asynchronous transactional COPY.
 //! - [`stdout`] — newline-delimited JSON, for watching the stream.
@@ -32,6 +33,7 @@ pub mod duckdb;
 pub mod postgres;
 #[cfg(any(feature = "duckdb", feature = "postgres"))]
 mod progress;
+mod datasets;
 pub mod stdout;
 
 #[cfg(feature = "postgres")]
@@ -39,6 +41,7 @@ pub use postgres::{PostgresSettings, PostgresSink};
 
 #[cfg(feature = "duckdb")]
 pub use duckdb::{DuckDbSettings, DuckDbSink};
+pub use datasets::{Datasets, SelectingSink};
 pub use stdout::{StdoutJsonSink, StdoutSettings};
 
 use thiserror::Error;

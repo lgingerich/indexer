@@ -153,9 +153,10 @@ that matters most: `decode` must not depend on `ingest`.
 ## What works
 
 - **EVM ingestion.** Live heads over WebSocket (`eth_subscribe`/`newHeads`), and
-  each block fetched over JSON-RPC with full transactions, receipts, and logs in
-  one batched request. Nothing the node returns is dropped. See
-  `src/ingest/source/evm.rs`.
+  each block fetched over JSON-RPC in one batched request. `[ingest] datasets`
+  chooses which of block, transaction, receipt, and log are fetched and stored;
+  omitted, all four are. A header is still read for every height so linkage and
+  finality keep working. See `src/ingest/source/evm.rs`.
 - **One event per dataset.** A `block` event, then for each transaction a
   `transaction` event, its `receipt` event, and its `log` events. Each dataset is a
   normalized table — a block references its transactions by hash, a receipt carries
@@ -189,8 +190,13 @@ that matters most: `decode` must not depend on `ingest`.
   entries are discarded except for one linkage anchor. See `src/ingest/pipeline.rs`.
 - **Finalized backfill and catch-up.** The library can index earlier finalized history;
   production starts at the source-finalized anchor and catches up before following live
-  notifications. Gaps are fetched forward, and forks are validated before retraction.
-  Source failures propagate without automatic retries.
+  heads. Decode runs on that path, so a historical log is stored raw and, when it matches,
+  decoded. Alloy keeps the WebSocket subscription independent of fetches and sink
+  delivery, and reconnects and resubscribes with bounded retries. Notifications are
+  wake-up hints: HTTP reconciliation fills gaps and resolves reorgs, with a 30-second
+  fallback when the subscription is silent. HTTP failures and exhausted subscription
+  recovery are terminal. A process restart still starts over at the current finalized
+  anchor.
 - **NDJSON to stdout.** See `src/sink/stdout.rs`; the `[sink.stdout]` backend prints the
   stream instead of storing it, and opens no store.
 - **A local `DuckDB` store**, behind the `duckdb` feature (on by default). Embedded and
@@ -202,92 +208,87 @@ anywhere, so `cargo run` alone runs the pipeline.
 
 ## Not built yet
 
-The process starts at the node's finalized anchor, catches up, and appends every envelope.
-A restart does not restore the last stored finalized checkpoint, remove previous-run
-orphaned rows, or deduplicate replay. A reorg remains a row the store never acts on.
-Channel acceptance is not a durable storage checkpoint. The work below closes those gaps.
+The running process starts at the node's finalized anchor, catches up through decode,
+and appends every row. These are the gaps that leaves.
+
+Durability is one chain. The others stand alone.
 
 ```
 idempotent writes ─┬─▶ resume from the store
-                   └─▶ idempotent historical, startup, and stored-log replay
+                   └─▶ stored-log replay
 reorg + finality applied in the store
-streaming aggregation: joins and derived calculations
-Avro as the envelope, inside the process and downstream
-selective datasets and RPC features: logs, blocks, transactions; logs by contract address
-attempt historical data → decoder pipeline → storage
+streaming aggregation
+Avro for a serialized envelope
+address filter and ranged log backfill
 ```
 
 ### Resume from the store
 
-Dropping the broker made the store the durability plan. The chain can replay any
-block, and the store says how far that replay has already been committed.
+The chain can replay any block. The store is what should say how far that replay has
+already been committed. It does not. Startup always samples the node's current
+finalized anchor and continues from there. The channel is not a checkpoint: accepting
+a block there means the storage task has the batch, not that a commit landed.
 
 ```
 startup
    │
-   ├─ read the last committed height
-   ├─ rebuild the undo ring from the recent rows at and above it
+   ├─ read the last committed finalized identity
+   ├─ rebuild the undo ring from the stored rows at and above it
    └─ continue from the next height
 ```
 
-Without the rebuilt ring, a reorg in the blocks the process no longer remembers
-cannot be retracted. The durability TODO in `pipeline.rs` tracks restoring the last
-committed finalized identity and reconciling the stored suffix before replay.
-
-### Backfill, and the handoff to live
-
-Ingestion supports finalized historical backfill and sequential catch-up to live heads.
-What remains is durable, idempotent replay against the store. Alloy maintains the
-WebSocket connection independently of fetches and sink delivery, and reconnects and
-resubscribes with bounded retries. Notifications are wake-up hints, not a replay log:
-HTTP reconciliation fills gaps and resolves reorgs, with a 30-second fallback wake-up
-when the subscription is silent. HTTP failures and exhausted subscription recovery
-remain terminal; reconnecting does not restore history after a process restart.
+Without the rebuilt ring, a reorg in blocks this process no longer remembers cannot
+be retracted, and rows that run left behind stay. The durability TODO in
+`src/ingest/pipeline.rs` is this item: restore the last committed finalized identity
+and reconcile the stored unfinalized suffix before replay.
 
 ### Reorgs and finality in the store
 
-`reorg` and `finalized` are written into their own tables and then ignored. Orphaned
-blocks stay forever, and nothing below the watermark is dropped. A key that descends
-from a block carries the block hash, so the two branches of a reorg are already
-distinct rows — what is missing is a store that acts on the marker rather than
-recording it.
+Ingest publishes `reorg` and `finalized`, and both stores append them to the `reorg`
+and `finalized` tables. Nothing else reads those rows. An orphaned block stays, and
+nothing at or below the watermark is treated as permanent.
+
+A key that descends from a block carries the block hash, so the two branches of a
+reorg are already distinct rows. What is missing is a store that acts on the marker.
 
 ```
-today     reorg { orphaned: [3, 2] }  ──▶ a row in `reorgs`, and nothing else changes
-          finalized { height: 100 }    ──▶ a row in `finalized`
+today     reorg { orphaned_hashes }   ──▶ a row in `reorg`
+          finalized { height, hash }  ──▶ a row in `finalized`
 
 planned   reorg      ──▶ mark the rows for those block hashes no longer canonical
           finalized  ──▶ rows at or below this height are permanent
 ```
 
-Marking rather than deleting, because the same rule has to hold for a data lake, where
-a row cannot be mutated, and for a serving store, where it is an append too.
+Marking rather than deleting, so the same rule holds for a data lake, where a row
+cannot be mutated, and for a serving store, where the write is still an append.
 
 ### Idempotent writes
 
-Resume and backfill both replay a block that may already be stored. The key is
-already on every event; the table does not use it.
+Resume and backfill both replay a block that may already be stored. Every row carries
+`chain` and `dedupe_key`, and both stores index that pair. The index is not unique,
+and the write is an append (`DuckDB` appender, `PostgreSQL` `COPY`).
 
 ```
-today     insert the envelope                     a replay is a second row
+today     append the row                          a replay is a second row
 
 planned   upsert on (chain, dedupe_key)           a replay is the same row
 ```
 
-Upsert is a *replay* tool, not a reorg tool. A reorg's two branches have different
-keys by design, so an upsert leaves both rows — which is what the marking rule above
-needs. Reorg handling and idempotent writes are separate pieces of machinery.
+Upsert is a replay tool, not a reorg tool. A reorg's two branches have different keys
+by design, so an upsert leaves both rows — which is what the marking rule above
+needs.
 
 ### Stored-log replay
 
-Re-decoding retained raw logs is not implemented. A future replay path would also need
-idempotent replacement or deduplication of decoded rows.
+Re-decoding logs already in the store is not implemented. That path would read
+retained raw logs, run them through the same decoder, and replace or deduplicate the
+decoded rows. The idempotent write above is what makes the replacement safe.
 
 ### Streaming aggregation
 
 Decode emits facts. A swap's tokens, decimals, and windows over those facts are
 joins and derived calculations, and they belong in a streaming layer after the
-store rather than in the decoder. See [What decode does not do](#what-decode-does-not-do).
+store. See [What decode does not do](#what-decode-does-not-do).
 
 ```
 raw logs + decoded records ──▶ aggregation ──▶ trades, balances, windows
@@ -295,29 +296,20 @@ raw logs + decoded records ──▶ aggregation ──▶ trades, balances, win
                 └──── reference data ┘     tokens, decimals, symbols
 ```
 
-### Avro as the wire protocol
+### Avro for a serialized envelope
 
-The envelope is JSON: newline-delimited on stdout, and a JSON column in `events`.
-Avro replaces that encoding everywhere an envelope is serialized — inside the
-indexer and in every stage downstream — so there is one schema instead of a JSON
-object each consumer parses for itself.
+Inside the process an envelope is a Rust value on the channel, and the stores write
+one typed table per dataset. The only serialization is stdout, which writes
+newline-delimited JSON. Avro is the planned encoding for that serialized envelope —
+stdout and anything downstream of it — so those hops share one schema.
 
-```
-today     Envelope ── JSON ──▶ stdout, the `events.envelope` column, downstream
+### Address filter and ranged log backfill
 
-planned   Envelope ── Avro ──▶ the same hops, one schema for all of them
-```
-
-### Selective datasets and RPC features
-
-Choose which datasets to index — logs, blocks, transactions — rather than enabling
-all of them together. Fetch and subscribe only to the RPC features those datasets
-need, with contract-address filters for log subscriptions.
-
-### Historical data through the decoder
-
-Attempt to route historical data through the decoder pipeline before storage, so
-backfill can write both raw events and decoded records rather than bypassing decode.
+`[ingest] datasets` chooses which rows are fetched. Logs without receipts use one
+`eth_getLogs` per height, with no address filter, and backfill still walks one
+height at a time. A contract filter and a wider `eth_getLogs` range for historical
+blocks are not built. A `logs` subscription is not the log source: it has no
+end-of-block marker.
 
 Also not built, and not on the path above: mempool ingestion and a Parquet archive.
 
@@ -383,6 +375,7 @@ the field:
 
 | Key | Default | Meaning |
 | --- | --- | --- |
+| `ingest.datasets` | block, transaction, receipt, log | Which datasets are fetched and stored. The header is still read for every height |
 | `sink.duckdb.batch_records` | `500` | Most records one store commit may cover; a backlog of blocks is folded into one commit up to this, and a block is never split |
 | `sink.duckdb.path` | `indexer.duckdb` | Path to the store |
 

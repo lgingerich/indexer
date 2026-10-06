@@ -8,7 +8,7 @@ use tracing::info;
 
 use crate::ingest::pipeline::{Machine, PipelineError};
 use crate::ingest::source::EvmSource;
-use crate::sink::EnvelopeSink;
+use crate::sink::{Datasets, EnvelopeSink};
 
 /// Builds and runs the ingest stage.
 #[derive(Debug)]
@@ -16,6 +16,7 @@ pub struct Ingest {
     chain: String,
     http_url: String,
     ws_url: String,
+    datasets: Datasets,
 }
 
 impl Ingest {
@@ -28,11 +29,13 @@ impl Ingest {
         chain: impl Into<String>,
         http_url: impl Into<String>,
         ws_url: impl Into<String>,
+        datasets: &Datasets,
     ) -> Self {
         Self {
             chain: chain.into(),
             http_url: http_url.into(),
             ws_url: ws_url.into(),
+            datasets: *datasets,
         }
     }
 
@@ -50,9 +53,10 @@ impl Ingest {
             chain = %self.chain,
             http = %self.http_url,
             ws = %self.ws_url,
+            datasets = %self.datasets,
             "ingest started"
         );
-        let source = EvmSource::new(self.chain, self.http_url, self.ws_url)?;
+        let source = EvmSource::new(self.chain, self.http_url, self.ws_url, self.datasets)?;
         Machine::new(source, sink).run().await
     }
 }

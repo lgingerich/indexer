@@ -101,6 +101,9 @@ pub struct IngestSettings {
     /// The WebSocket endpoint used for heads. Required, and non-empty.
     #[serde(deserialize_with = "non_empty")]
     pub ws_url: String,
+    /// Which datasets to fetch and store. Omitted means all four.
+    #[serde(default)]
+    pub datasets: crate::sink::Datasets,
 }
 
 /// Where records go, and by which backend.
@@ -300,6 +303,78 @@ ws_url = "wss://example.invalid"
         let settings = Settings::from_str(minimal()).expect("minimal settings parse");
 
         assert!(settings.decode.registry.is_none(), "nothing is decoded");
+        assert_eq!(
+            settings.ingest.datasets,
+            crate::sink::Datasets::all(),
+            "an omitted list stores every dataset"
+        );
+    }
+
+    #[test]
+    fn datasets_accept_a_subset_and_reject_an_empty_or_unknown_list() {
+        let selected = Settings::from_str(
+            r#"
+[ingest]
+chain = "base"
+http_url = "https://example.invalid"
+ws_url = "wss://example.invalid"
+datasets = ["log", "block"]
+
+[sink.stdout]
+"#,
+        )
+        .expect("subset parses");
+        assert!(selected.ingest.datasets.log && selected.ingest.datasets.block);
+        assert!(!selected.ingest.datasets.transaction);
+        assert!(!selected.ingest.datasets.receipt);
+
+        let empty = Settings::from_str(
+            r#"
+[ingest]
+chain = "base"
+http_url = "https://example.invalid"
+ws_url = "wss://example.invalid"
+datasets = []
+
+[sink.stdout]
+"#,
+        )
+        .expect_err("empty dataset list")
+        .to_string();
+        assert!(
+            empty.contains("dataset") || empty.contains("block"),
+            "{empty}"
+        );
+
+        let unknown = Settings::from_str(
+            r#"
+[ingest]
+chain = "base"
+http_url = "https://example.invalid"
+ws_url = "wss://example.invalid"
+datasets = ["blocks"]
+
+[sink.stdout]
+"#,
+        )
+        .expect_err("unknown dataset")
+        .to_string();
+        assert!(unknown.contains("blocks"), "{unknown}");
+
+        let duplicate = Settings::from_str(
+            r#"
+[ingest]
+chain = "base"
+http_url = "https://example.invalid"
+ws_url = "wss://example.invalid"
+datasets = ["log", "log"]
+
+[sink.stdout]
+"#,
+        )
+        .expect_err("duplicate dataset")
+        .to_string();
+        assert!(duplicate.contains("duplicate"), "{duplicate}");
     }
 
     /// The store's own defaults, compared against the type's, so a retune there cannot
