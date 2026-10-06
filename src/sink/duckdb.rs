@@ -16,7 +16,7 @@
 //! - the DDL, generated from [`Table::columns`](crate::wire::row::Table::columns) so the
 //!   schema and the data cannot disagree about what a table has;
 //! - how a [`ColumnValue`] becomes a `duckdb` type;
-//! - the appender, and the commit.
+//! - the append into a staging table, the upsert onto `(chain, dedupe_key)`, and the commit.
 //!
 //! So adding a store means writing one module that consumes the same rows, rather than
 //! re-deciding for each of six tables what a log is.
@@ -129,8 +129,7 @@ fn sql_type(kind: ColumnType) -> &'static str {
 ///
 /// Generated rather than written out, because a hand-written DDL and a row header are two
 /// statements of the same fact. Nullability comes from [`Column::required`](crate::wire::row::Column::required).
-/// The identity index is not unique: the same `dedupe_key` can be appended again, and a
-/// unique constraint would reject that replay.
+/// `(chain, dedupe_key)` is unique so a replay can upsert.
 fn create_table(table: Table) -> String {
     let columns = table
         .columns()
@@ -141,9 +140,37 @@ fn create_table(table: Table) -> String {
         })
         .collect::<Vec<_>>()
         .join(", ");
+    format!("CREATE TABLE IF NOT EXISTS \"{table}\" ({columns}, UNIQUE (chain, dedupe_key))")
+}
+
+fn staging_table(table: Table) -> String {
+    format!("staging_{table}")
+}
+
+/// Merges the staging table into the dataset table.
+///
+/// `DISTINCT ON` keeps one row per key when a batch holds a key twice, and `rowid` is the
+/// staging table's insertion order, so the last copy wins — the same row a replay would
+/// land on. `ON CONFLICT` then updates a row an earlier flush already wrote.
+fn upsert_sql(table: Table) -> String {
+    let columns = table.columns();
+    let names = columns
+        .iter()
+        .map(|column| format!("\"{}\"", column.name))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let assignments = columns
+        .iter()
+        .filter(|column| column.name != "chain" && column.name != "dedupe_key")
+        .map(|column| format!("\"{name}\" = EXCLUDED.\"{name}\"", name = column.name))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let staging = staging_table(table);
     format!(
-        "CREATE TABLE IF NOT EXISTS {table} ({columns});\n\
-         CREATE INDEX IF NOT EXISTS {table}_chain_dedupe_key ON {table} (chain, dedupe_key)"
+        "INSERT INTO \"{table}\" ({names}) \
+         SELECT DISTINCT ON (\"chain\", \"dedupe_key\") {names} FROM \"{staging}\" \
+         ORDER BY \"chain\", \"dedupe_key\", rowid DESC \
+         ON CONFLICT (\"chain\", \"dedupe_key\") DO UPDATE SET {assignments}"
     )
 }
 
@@ -160,10 +187,11 @@ impl ToSql for ColumnValue {
     }
 }
 
-/// Appends envelopes to a local `DuckDB` database, one atomic batch per [`flush`].
+/// Upserts envelopes into a local `DuckDB` database, one atomic batch per [`flush`].
 ///
 /// Rows stay buffered until commit succeeds. Failed batches roll back and remain
-/// buffered; successful flushes preserve duplicates rather than deduplicating keys.
+/// buffered. A replay of `(chain, dedupe_key)` updates that row; the last copy in the
+/// batch wins.
 ///
 /// [`flush`]: EnvelopeSink::flush
 pub struct DuckDbSink {
@@ -296,6 +324,22 @@ pub enum StoreError {
         /// The engine's own reason.
         source: duckdb::Error,
     },
+    /// The staging table for an upsert could not be prepared.
+    #[error("prepare {table} upsert: {source}")]
+    Prepare {
+        /// Which table's staging table failed.
+        table: &'static str,
+        /// The engine's own reason.
+        source: duckdb::Error,
+    },
+    /// The staged rows could not be merged into the table.
+    #[error("upsert {table}: {source}")]
+    Upsert {
+        /// Which table rejected the merge.
+        table: &'static str,
+        /// The engine's own reason.
+        source: duckdb::Error,
+    },
     /// A table's buffered appends could not be flushed into the transaction.
     #[error("flush {table}: {source}")]
     Flush {
@@ -321,10 +365,13 @@ pub enum StoreError {
 impl DuckDbSink {
     /// Writes every table in one transaction, then clears the buffer after commit.
     ///
+    /// Each table is appended into a temporary staging table and merged with
+    /// `INSERT … ON CONFLICT DO UPDATE`. A key a batch holds twice keeps its last copy. On
+    /// failure the transaction rolls back and the whole batch stays buffered for a retry.
+    ///
     /// # Errors
     ///
-    /// Returns an error if the transaction or an appender fails. On failure the
-    /// transaction rolls back and the whole batch stays buffered for a retry.
+    /// Returns an error if the transaction, the staging append, or the upsert fails.
     fn write_batch(&mut self) -> Result<(), StoreError> {
         if self.rows.is_empty() {
             return Ok(());
@@ -344,28 +391,47 @@ impl DuckDbSink {
             if rows.peek().is_none() {
                 continue;
             }
-            let mut appender =
-                transaction
-                    .appender(table.name())
-                    .map_err(|source| StoreError::Appender {
-                        table: table.name(),
-                        source,
-                    })?;
-            for row in rows {
-                // Iterator parameters also support tables wider than 32 columns.
-                appender
-                    .append_row(appender_params_from_iter(row.values()))
-                    .map_err(|source| StoreError::Append {
-                        table: table.name(),
-                        source,
-                    })?;
+            let staging = staging_table(table);
+            // A temporary table is invisible to the appender, which looks up `main`.
+            // The staging table is created and dropped in this transaction.
+            transaction
+                .execute_batch(&format!(
+                    "CREATE OR REPLACE TABLE \"{staging}\" AS SELECT * FROM \"{table}\" WHERE false"
+                ))
+                .map_err(|source| StoreError::Prepare {
+                    table: table.name(),
+                    source,
+                })?;
+            // The appender borrows the transaction, so it drops before the upsert.
+            {
+                let mut appender =
+                    transaction
+                        .appender(&staging)
+                        .map_err(|source| StoreError::Appender {
+                            table: table.name(),
+                            source,
+                        })?;
+                for row in rows {
+                    // Iterator parameters also support tables wider than 32 columns.
+                    appender
+                        .append_row(appender_params_from_iter(row.values()))
+                        .map_err(|source| StoreError::Append {
+                            table: table.name(),
+                            source,
+                        })?;
+                }
+                // Flush errors must be observed; Drop cannot report them.
+                appender.flush().map_err(|source| StoreError::Flush {
+                    table: table.name(),
+                    source,
+                })?;
             }
-            // Flush errors must be observed; Drop cannot report them. The appender
-            // drops before commit (and before rollback on an error).
-            appender.flush().map_err(|source| StoreError::Flush {
-                table: table.name(),
-                source,
-            })?;
+            transaction
+                .execute_batch(&format!("{};\nDROP TABLE \"{staging}\"", upsert_sql(table)))
+                .map_err(|source| StoreError::Upsert {
+                    table: table.name(),
+                    source,
+                })?;
         }
         transaction
             .commit()
@@ -677,7 +743,7 @@ mod tests {
 
         assert!(matches!(
             sink.flush().await,
-            Err(crate::sink::SinkError::Store(super::StoreError::Appender {
+            Err(crate::sink::SinkError::Store(super::StoreError::Prepare {
                 table: "reorg",
                 ..
             }))
@@ -719,7 +785,7 @@ mod tests {
                 chain(),
                 Event::Reorg(Reorg {
                     height,
-                    new_head_hash: hash(0x11),
+                    new_head_hash: hash(u8::try_from(height).expect("heights 0 and 1")),
                     orphaned_hashes: vec![],
                 }),
             ))
@@ -729,7 +795,7 @@ mod tests {
 
         assert!(matches!(
             sink.flush().await,
-            Err(crate::sink::SinkError::Store(super::StoreError::Flush {
+            Err(crate::sink::SinkError::Store(super::StoreError::Upsert {
                 table: "reorg",
                 ..
             }))
@@ -757,7 +823,7 @@ mod tests {
                 chain(),
                 Event::Reorg(Reorg {
                     height,
-                    new_head_hash: hash(0x11),
+                    new_head_hash: hash(u8::try_from(height).expect("five heights")),
                     orphaned_hashes: vec![],
                 }),
             ))
@@ -767,6 +833,68 @@ mod tests {
         sink.flush().await.expect("batch flushes");
 
         assert_eq!(row_count(&sink, "reorg"), 5);
+    }
+
+    /// A batch that holds a key twice keeps its last copy, a later flush of the same key
+    /// updates the stored row rather than appending a second, and a replacement block has
+    /// its own key so both reorg branches stay.
+    #[tokio::test]
+    async fn a_replay_updates_the_row_and_a_reorg_keeps_both_branches() {
+        let mut sink = sink();
+        let orphaned = Log {
+            log_index: 0,
+            transaction_hash: TxHash::from([0x11; 32]),
+            block_number: 100,
+            block_hash: hash(0xaa),
+            block_timestamp: 1,
+            ..Log::default()
+        };
+        let mut replay = orphaned.clone();
+        replay.block_timestamp = 5;
+        sink.publish(Envelope::new(
+            chain(),
+            Event::Log(Box::new(orphaned.clone())),
+        ))
+        .await
+        .expect("orphaned log buffers");
+        sink.publish(Envelope::new(chain(), Event::Log(Box::new(replay))))
+            .await
+            .expect("replay buffers");
+        sink.flush()
+            .await
+            .expect("a repeated key in one batch is one row");
+
+        assert_eq!(row_count(&sink, "log"), 1);
+        assert_eq!(log_timestamp(&sink), 5, "the later copy in the batch wins");
+
+        // The same key in a later flush updates the stored row, not appends a second —
+        // the merge's `DO UPDATE` branch, which a first flush into an empty table misses.
+        let mut redelivered = orphaned.clone();
+        redelivered.block_timestamp = 7;
+        sink.publish(Envelope::new(chain(), Event::Log(Box::new(redelivered))))
+            .await
+            .expect("redelivery buffers");
+        sink.flush().await.expect("a redelivery updates the row");
+        assert_eq!(
+            row_count(&sink, "log"),
+            1,
+            "a replay never appends a second"
+        );
+        assert_eq!(
+            log_timestamp(&sink),
+            7,
+            "the replay's value replaces the stored one"
+        );
+
+        // A replacement block's log is a different key, so the reorg's other branch stays.
+        let mut replacement = orphaned;
+        replacement.block_hash = hash(0xbb);
+        replacement.block_timestamp = 9;
+        sink.publish(Envelope::new(chain(), Event::Log(Box::new(replacement))))
+            .await
+            .expect("replacement buffers");
+        sink.flush().await.expect("replacement is its own row");
+        assert_eq!(row_count(&sink, "log"), 2);
     }
 
     /// Connecting twice to the same file must not fail on the existing tables.
@@ -810,5 +938,11 @@ mod tests {
                 row.get(0)
             })
             .expect("count reads back")
+    }
+
+    fn log_timestamp(sink: &DuckDbSink) -> u64 {
+        sink.connection
+            .query_row("SELECT block_timestamp FROM log", [], |row| row.get(0))
+            .expect("timestamp reads back")
     }
 }

@@ -1,11 +1,14 @@
 //! `PostgreSQL` 18 storage using the shared typed rows and transactional binary `COPY`.
 //!
-//! Each flush appends all buffered datasets in one transaction. Binary `COPY` sends each
-//! value in `PostgreSQL`'s native field format, so the server does not parse text. Duplicates
-//! are preserved, just as in the `DuckDB` store. Unsigned integers use `NUMERIC(20,0)`
-//! (`PostgreSQL` has no unsigned bigint), documents use `JSONB`, and hex values remain
-//! `TEXT`. Columns the chain always provides are `NOT NULL`, and each table has a
-//! non-unique index on `(chain, dedupe_key)`. Existing tables are not migrated.
+//! Each flush loads all buffered datasets in one transaction. Binary `COPY` sends each
+//! value in `PostgreSQL`'s native field format, so the server does not parse text, into a
+//! temporary table that is then upserted on `(chain, dedupe_key)`. The merge dedupes the
+//! batch with `DISTINCT ON`, keeping the last copy of a repeated key — `PostgreSQL`
+//! refuses to touch one conflict row twice in a statement, and its ordering leans on
+//! `ctid` (see `upsert_sql`). Unsigned integers use `NUMERIC(20,0)` (`PostgreSQL` has no
+//! unsigned bigint), documents use `JSONB`, and hex values remain `TEXT`. Columns the
+//! chain always provides are `NOT NULL`, and `(chain, dedupe_key)` is unique on each
+//! table. Columns of an existing table are not migrated.
 //! Connection strings accept the driver's URL or keyword syntax; TLS uses platform
 //! certificate validation and the connection's `sslmode`.
 
@@ -66,7 +69,8 @@ fn pg_type(kind: ColumnType) -> Type {
     }
 }
 
-/// Table DDL plus the non-unique identity index, both rendered from [`Table::columns`].
+/// Table DDL rendered from [`Table::columns`]. `(chain, dedupe_key)` is unique so a
+/// replay can upsert.
 fn create_table(table: Table) -> String {
     let columns = table
         .columns()
@@ -78,8 +82,50 @@ fn create_table(table: Table) -> String {
         .collect::<Vec<_>>()
         .join(", ");
     format!(
-        "CREATE TABLE IF NOT EXISTS \"{table}\" ({columns});\n\
-         CREATE INDEX IF NOT EXISTS \"{table}_chain_dedupe_key\" ON \"{table}\" (\"chain\", \"dedupe_key\")"
+        "CREATE TABLE IF NOT EXISTS \"{table}\" ({columns}, UNIQUE (\"chain\", \"dedupe_key\"))"
+    )
+}
+
+fn staging_table(table: Table) -> String {
+    format!("staging_{table}")
+}
+
+fn quoted_columns(table: Table) -> String {
+    table
+        .columns()
+        .iter()
+        .map(|column| format!("\"{}\"", column.name))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Merges the staging table into the dataset table.
+///
+/// `DISTINCT ON` keeps one row per key when a batch holds a key twice (the `COPY` appended
+/// both), and `ctid` is the staging table's insertion order, so the last copy wins.
+/// `ON CONFLICT` then updates a row an earlier flush already wrote.
+///
+/// ponytail: `ctid DESC` is a physical-order shortcut, not a guarantee. A single `COPY`
+/// into a fresh temp heap allocates ascending `ctid`s, which is all this leans on, but a
+/// planner that changed the load order would flip which copy "wins". Postgres keys the
+/// rows by `(chain, dedupe_key)` alone, so there is no column to order by when a batch
+/// repeats a key — the fix is to carry a per-row sequence in the row, which is a wire
+/// change rather than a store one.
+fn upsert_sql(table: Table) -> String {
+    let names = quoted_columns(table);
+    let assignments = table
+        .columns()
+        .iter()
+        .filter(|column| column.name != "chain" && column.name != "dedupe_key")
+        .map(|column| format!("\"{name}\" = EXCLUDED.\"{name}\"", name = column.name))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let staging = staging_table(table);
+    format!(
+        "INSERT INTO \"{table}\" ({names}) \
+         SELECT DISTINCT ON (\"chain\", \"dedupe_key\") {names} FROM \"{staging}\" \
+         ORDER BY \"chain\", \"dedupe_key\", ctid DESC \
+         ON CONFLICT (\"chain\", \"dedupe_key\") DO UPDATE SET {assignments}"
     )
 }
 
@@ -97,7 +143,10 @@ fn copy_plan(table: Table) -> CopyPlan {
         .collect::<Vec<_>>()
         .join(", ");
     CopyPlan {
-        statement: format!("COPY \"{table}\" ({names}) FROM STDIN WITH (FORMAT binary)"),
+        statement: format!(
+            "COPY \"{}\" ({names}) FROM STDIN WITH (FORMAT binary)",
+            staging_table(table)
+        ),
         types: columns.iter().map(|column| pg_type(column.kind)).collect(),
     }
 }
@@ -168,16 +217,18 @@ impl ToSql for ColumnValue {
     to_sql_checked!();
 }
 
-/// Appends envelopes to `PostgreSQL`; buffered rows are cleared only after commit succeeds.
+/// Upserts envelopes into `PostgreSQL`; buffered rows are cleared only after commit succeeds.
 ///
-/// A failed COPY rolls back the entire batch and leaves it buffered. A connection loss
-/// during commit can leave its outcome unknown, so retrying is not exactly-once delivery.
-/// No writes occur until [`EnvelopeSink::flush`].
+/// A failed flush rolls back the entire batch and leaves it buffered. A replay of
+/// `(chain, dedupe_key)` updates that row. A connection loss during commit can leave its
+/// outcome unknown, so retrying is not exactly-once delivery. No writes occur until
+/// [`EnvelopeSink::flush`].
 #[derive(Debug)]
 pub struct PostgresSink {
     client: Client,
     rows: Vec<Row>,
     plans: [CopyPlan; 6],
+    merges: [String; 6],
     connection_task: Option<tokio::task::JoinHandle<()>>,
 }
 
@@ -220,6 +271,7 @@ impl PostgresSink {
             client,
             rows: Vec::new(),
             plans: Table::ALL.map(copy_plan),
+            merges: Table::ALL.map(upsert_sql),
             connection_task: None,
         })
     }
@@ -231,10 +283,17 @@ impl PostgresSink {
         let transaction = self.client.transaction().await?;
         // ponytail: six fixed tables mean six linear scans. Group at publish time
         // only if the number of datasets or profiling warrants a grouping buffer.
-        for (table, plan) in Table::ALL.into_iter().zip(&self.plans) {
+        for ((table, plan), merge) in Table::ALL.into_iter().zip(&self.plans).zip(&self.merges) {
             if !self.rows.iter().any(|row| row.table() == table) {
                 continue;
             }
+            let staging = staging_table(table);
+            transaction
+                .batch_execute(&format!(
+                    "CREATE TEMP TABLE \"{staging}\" (LIKE \"{table}\" INCLUDING DEFAULTS) \
+                     ON COMMIT DROP"
+                ))
+                .await?;
             let writer =
                 BinaryCopyInWriter::new(transaction.copy_in(&plan.statement).await?, &plan.types);
             pin_mut!(writer);
@@ -245,6 +304,7 @@ impl PostgresSink {
                 writer.as_mut().write_raw(row.values()).await?;
             }
             writer.as_mut().finish().await?;
+            transaction.batch_execute(merge).await?;
         }
         transaction.commit().await?;
         self.rows.clear();
@@ -314,9 +374,31 @@ mod tests {
         for table in Table::ALL {
             let ddl = create_table(table);
             let plan = copy_plan(table);
-            assert!(ddl.contains(&format!(
-                "CREATE INDEX IF NOT EXISTS \"{table}_chain_dedupe_key\""
-            )));
+            assert!(
+                ddl.contains("UNIQUE (\"chain\", \"dedupe_key\")"),
+                "{table} upserts on its identity"
+            );
+            let merge = upsert_sql(table);
+            assert!(
+                merge.contains("ON CONFLICT (\"chain\", \"dedupe_key\") DO UPDATE SET"),
+                "{table} merges on the identity"
+            );
+            assert!(
+                merge.contains("SELECT DISTINCT ON (\"chain\", \"dedupe_key\")"),
+                "{table} keeps one row per key when a batch repeats one"
+            );
+            assert!(
+                merge.contains("ORDER BY \"chain\", \"dedupe_key\", ctid DESC"),
+                "{table} keeps the last copy in the batch"
+            );
+            assert!(
+                merge.contains(&format!("FROM \"staging_{table}\"")),
+                "{table} merges from its staging table"
+            );
+            assert!(
+                !merge.contains("\"chain\" = EXCLUDED"),
+                "the conflict columns stay the row's identity"
+            );
             for column in table.columns() {
                 let definition = format!(
                     "\"{}\" {}{}",
@@ -334,7 +416,7 @@ mod tests {
                 .join(", ");
             assert_eq!(
                 plan.statement,
-                format!("COPY \"{table}\" ({names}) FROM STDIN WITH (FORMAT binary)")
+                format!("COPY \"staging_{table}\" ({names}) FROM STDIN WITH (FORMAT binary)")
             );
             assert_eq!(plan.types.len(), table.columns().len());
         }
@@ -368,7 +450,7 @@ mod tests {
     /// Tables are created in a schema named for this process and dropped afterward.
     #[tokio::test]
     #[ignore = "requires INDEXER_TEST_POSTGRES_URL pointing to PostgreSQL 18"]
-    async fn copy_is_atomic_retains_failed_batches_and_preserves_duplicates() {
+    async fn copy_is_atomic_retains_failed_batches_and_upserts_a_replay() {
         let url = std::env::var("INDEXER_TEST_POSTGRES_URL").expect("test database URL");
         let (client, connection) = tokio_postgres::connect(&url, tokio_postgres::NoTls)
             .await
@@ -412,7 +494,7 @@ mod tests {
             .query("SELECT height::text, chain FROM reorg", &[])
             .await
             .expect("rows");
-        assert_eq!(rows.len(), 2);
+        assert_eq!(rows.len(), 1, "a repeated key in one batch is one row");
         assert_eq!(rows[0].get::<_, String>(0), u64::MAX.to_string());
         assert_eq!(rows[0].get::<_, String>(1), chain.as_str());
         let rejected = Event::Reorg(Reorg {
@@ -434,14 +516,23 @@ mod tests {
             Err(SinkError::Postgres(StoreError::Database(_)))
         ));
         assert_eq!(sink.rows.len(), 1);
-        assert_eq!(count(&sink, Table::Reorg).await, 2);
+        assert_eq!(count(&sink, Table::Reorg).await, 1);
         sink.client
             .batch_execute("ALTER TABLE reorg DROP CONSTRAINT reject_height")
             .await
             .expect("remove constraint");
         sink.flush().await.expect("retry");
         assert!(sink.rows.is_empty());
-        assert_eq!(count(&sink, Table::Reorg).await, 3);
+        assert_eq!(count(&sink, Table::Reorg).await, 1);
+        assert_eq!(
+            sink.client
+                .query_one("SELECT height::text FROM reorg", &[])
+                .await
+                .expect("updated row")
+                .get::<_, String>(0),
+            "42",
+            "the retried replay updates the stored row"
+        );
         let hashes: serde_json::Value = serde_json::from_str(
             &sink
                 .client

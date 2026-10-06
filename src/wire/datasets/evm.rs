@@ -6,27 +6,23 @@
 //! | Dataset | RPC source | Natural key |
 //! | --- | --- | --- |
 //! | [`Block`] | `eth_getBlockByNumber` | `hash` |
-//! | [`Transaction`] | the block's `transactions` array | `hash` |
+//! | [`Transaction`] | the block's `transactions` array | `(block_hash, hash)` |
 //! | [`Receipt`] | `eth_getBlockReceipts` / `eth_getTransactionReceipt` | `(block_hash, transaction_hash)` |
 //! | [`Log`] | a receipt's `logs` array | `(block_hash, transaction_hash, log_index)` |
 //!
 //! Every key is the hashes that identify the row plus a dataset tag. The block's
 //! **hash**, not its number: a height says where a block sat, the hash says *which*
 //! block sat there, and only the second tells two rows apart. A reorg replaces the block
-//! at a height with a different one, and a transaction re-included in the replacement
-//! produces a log at the same height, in the same transaction, at the same index — so a
-//! key built without the hash would name two physically distinct rows identically.
+//! at a height with a different one. A transaction re-included there keeps its signed
+//! hash, and its receipt and logs sit at the same height, in the same transaction, at
+//! the same index — so a key built without the block hash would name two physically
+//! distinct rows identically. Inclusion fields on the transaction itself
+//! (`transaction_index`, `block_timestamp`, the effective `gas_price`) differ the same way.
 //!
 //! `block_number` is deliberately *not* in the key. It is recoverable from the row, and
 //! the block hash identifies the block on its own, so a key carrying both states the
 //! same fact twice. Ordering and partitioning use the `number` column, which is a
 //! number for exactly that purpose; a key is an identity, not a sort prefix.
-//!
-//! [`Transaction`] is the one dataset still keyed by the transaction hash alone. That
-//! is a known gap rather than a fact: a reorg can re-include a signed transaction in a
-//! replacement block, and its inclusion fields then differ. The key stays on the hash
-//! until reorg handling for downstream stores is decided, so the mechanism is not
-//! settled here ahead of that decision.
 //!
 //! Every dataset that outlives its block carries `block_timestamp`, denormalized
 //! from the block header. A store partitions and clusters on time rather than
@@ -141,7 +137,10 @@ impl Block {
 
 /// One transaction, from its block's `transactions` array.
 ///
-/// Natural key is `hash`.
+/// Natural key is `(block_hash, hash)`. The transaction hash identifies the signed
+/// transaction. The block hash keeps a re-included copy in a replacement block as its
+/// own row: `block_number`, `transaction_index`, `block_timestamp`, and the effective
+/// `gas_price` can differ between the two.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct Transaction {
     /// Unique identifier of this transaction.
@@ -236,10 +235,13 @@ pub struct Transaction {
 }
 
 impl Transaction {
-    /// A key that is stable across redelivery and unique per transaction.
+    /// A key that is stable across redelivery and unique per inclusion.
+    ///
+    /// Carries the block hash: a re-included transaction lands in a replacement block,
+    /// and the two inclusions are different rows.
     #[must_use]
     pub fn dedupe_key(&self) -> String {
-        format!("{}:tx", self.hash)
+        format!("{}:{}:tx", self.block_hash, self.hash)
     }
 }
 

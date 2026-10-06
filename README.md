@@ -96,6 +96,12 @@ A row's key carries the block's hash, so orphaned block 2 and replacement block 
 different rows rather than one row overwritten. A fork older than the ring is an error
 rather than an empty retraction.
 
+A replay of a row already stored updates that row. Both stores upsert on a unique
+`(chain, dedupe_key)`: the batch is loaded the same way, then merged, and the last copy
+of a key in the batch wins. The two branches of a reorg have different keys, so the
+upsert leaves both rows. A `reorg` marker is keyed by the new head, so a replay of that
+head updates the one marker.
+
 ### When the store stalls
 
 Caught up, one block arrives and leaves as its own commit:
@@ -221,59 +227,122 @@ anywhere, so `cargo run` alone runs the pipeline.
 ## Not built yet
 
 The running process starts at the node's finalized anchor, catches up through decode,
-and appends every row. These are the gaps that leaves.
-
-Durability is one chain. The others stand alone.
+and writes every row. These are the gaps that leaves.
 
 ```
-idempotent writes ─┬─▶ resume from the store
-                   └─▶ stored-log replay
+resume from the store
+stored-log replay
 streaming aggregation
 Avro for a serialized envelope
 ranged log backfill
+deterministic within-batch dedupe
 ```
 
 ### Resume from the store
 
-The chain can replay any block. The store is what should say how far that replay has
-already been committed. It does not. Startup always samples the node's current
-finalized anchor and continues from there. The channel is not a checkpoint: accepting
-a block there means the storage task has the batch, not that a commit landed.
+**Crash-safe resume is not implemented and is deferred from the ingestion redesign.**
+Today, startup samples the node's current finalized anchor instead of restoring a
+storage checkpoint. The proposed design in [INGEST_DESIGN.md](INGEST_DESIGN.md) replaces
+that anchor with an explicit start and a sliding undo window, but it does not yet add
+persistent recovery. The behavior below distinguishes ordinary live reorg handling
+from what remains unsafe across a restart.
 
-```
-startup
-   │
-   ├─ read the last committed finalized identity
-   ├─ rebuild the undo ring from the stored rows at and above it
-   └─ continue from the next height
-```
+#### A block becomes orphaned while its logs are being fetched
 
-Without the rebuilt ring, a reorg in blocks this process no longer remembers cannot
-be retracted, and rows that run left behind stay. The durability TODO in
-`src/ingest/pipeline.rs` is this item: restore the last committed finalized identity
-and reconcile the stored unfinalized suffix before replay.
+Suppose a WebSocket header announces block A at height H. In the proposed logs-only
+path, ingestion fetches logs pinned to A's hash and uses the header's identity,
+parent hash, and timestamp. Meanwhile, the node replaces A with block B at the same
+height.
 
-### Idempotent writes
+- If divergence is detected before A is published, discard the unpublished candidate
+  and fetch B. There is no accepted A to retract.
+- If A has already been accepted, retain its data. Reconciliation finds the common
+  ancestor, emits a `reorg` record naming A and any accepted descendants as orphaned,
+  then fetches and publishes the replacement branch, including B's logs.
+- A hash-pinned request must return A's logs or fail, not return B's logs paired with
+  A's header. A number-based fallback needs extra identity checks; an empty log result
+  alone cannot prove which branch was queried.
 
-Resume and backfill both replay a block that may already be stored. Every row carries
-`chain` and `dedupe_key`, and both stores index that pair. The index is not unique,
-and the write is an append (`DuckDB` appender, `PostgreSQL` `COPY`).
+This is correct provisional ingestion while the process can reconcile the fork inside
+its retained undo window. It does not require an extra canonical-block query before
+every live commit: a reorg can occur after such a query anyway. It does require eventual
+reconciliation and downstream application of the committed orphan records. A fork
+outside retained recovery history must stop explicitly, not silently leave incorrect
+coverage. This fast path is planned, not implemented today.
 
-```
-today     append the row                          a replay is a second row
+#### Where a crash breaks that recovery
 
-planned   upsert on (chain, dedupe_key)           a replay is the same row
-```
+Complete-block transactions prevent a partially committed set of selected datasets
+for one block. They do not make the process's undo ring durable, and they do not make
+an entire reorg and replacement replay one transaction.
 
-Upsert is a replay tool, not a reorg tool. A reorg's two branches have different keys
-by design, so an upsert leaves both rows — which is what the marking rule above
-needs.
+Consider these crash points:
+
+1. **A is only in memory or queued.** The channel has accepted the block, but storage
+   has not committed it. A crash loses that work. Recovery must replay from committed
+   coverage, not from the fetch cursor or channel-accepted tip.
+2. **A commits, but its orphan record does not.** The node has switched to B, yet the
+   database still contains A without a committed marker excluding it. A crash loses
+   the in-memory branch identities needed to identify that stored suffix. Restarting
+   at a newer height does not repair it, and merely upserting B keeps A under its
+   distinct fork-specific key. Readers can incorrectly include A until recovery
+   explicitly records the orphaned branch.
+3. **The orphan record commits, but replacements do not.** Readers can exclude A,
+   but the replacement branch is missing or only partially covered. Recovery must
+   know which replacement blocks actually committed and complete the replay; the
+   existence of the marker does not establish replacement coverage.
+4. **B commits, but progress exists only in memory.** Restarting must not skip unknown
+   gaps or infer that earlier blocks were committed just because B exists. Replaying
+   identical row keys is supported, but row deduplication alone cannot restore branch
+   state or repair missed orphan records.
+5. **The commit outcome is unknown after a connection failure.** A transaction may
+   have committed before its acknowledgement was lost. The current process stops;
+   future recovery must inspect durable state rather than assume either success or
+   rollback and blindly retry delivery.
+
+A logs-only database cannot use `MAX(block_number)` as a checkpoint. Empty blocks
+produce no log rows, orphan branches can contribute higher heights, and a maximum
+height does not prove contiguous coverage. Similarly, the in-memory tip can be ahead
+of committed storage by the queued blocks. The channel is not a durable log.
+
+#### What future crash-safe resume needs
+
+Persist contiguous committed coverage and a bounded block-identity ledger independently
+of dataset selection, including empty blocks. The ledger must retain the predecessor
+and undoable suffix needed to compare the stored branch with the node after restart.
+These are recovery identities, not assertions of official finality.
+
+Dataset rows, reorg records, and the checkpoint/ledger changes describing those rows
+must commit in the same storage transaction. Fetch-side progress must not advance the
+durable checkpoint, and bounded queued progress must not cause eviction of the only
+identities required to recover the committed branch.
+
+On startup, restore the committed identities, compare them with the source, find a
+retained common ancestor, and record any newly discovered orphaned suffix before
+replaying replacements and extending coverage. If that ancestor is no longer retained,
+stop for explicit recovery from an earlier known point. Do not silently clear history
+or claim automatic repair.
+
+Preserving all branch data remains the storage contract. Readers consult
+`reorg.orphaned_hashes`, scoped by chain, rather than expect an `orphaned` table or
+automatic row deletion. Until persistent reconciliation exists, those records may be
+incomplete after a crash, even though each committed block's rows are internally
+complete. Applying the existing markers cannot exclude a branch whose marker was
+never committed.
+
+A further reader limitation is branch reacceptance: if a previously orphaned hash later
+becomes canonical again, permanently excluding every historically orphaned hash is not
+sufficient. A general canonical reader needs ordered branch-state/reacceptance semantics
+or a maintained canonical mapping. That is separate from preserving the raw data and
+is not implemented by this restart analysis.
 
 ### Stored-log replay
 
 Re-decoding logs already in the store is not implemented. That path would read
 retained raw logs, run them through the same decoder, and replace or deduplicate the
-decoded rows. The idempotent write above is what makes the replacement safe.
+decoded rows. The store upserts on `(chain, dedupe_key)`, which makes a replay of the
+same interpretation replace the stored row. A different ABI stays a separate row,
+because that identity is part of the key.
 
 ### Streaming aggregation
 
@@ -303,6 +372,15 @@ height at a time. A wider `eth_getLogs` range for historical blocks is not built
 A `logs` subscription is not the log source: it has no end-of-block marker.
 
 Also not built, and not on the path above: mempool ingestion and a Parquet archive.
+
+### Deterministic within-batch dedupe
+
+A batch that holds one `(chain, dedupe_key)` twice keeps the last copy, but "last" is read
+from `ctid` (PostgreSQL) or `rowid` (DuckDB) — physical insertion order, not a column the
+row carries. Both stores upsert, so the cross-batch case is exact; only the within-batch
+tie is on borrowed time. The upgrade is a per-envelope sequence on the row, ordered on
+instead of the row's physical position. It is a wire change, so it is deferred. See the
+note under [PostgreSQL 18 sink](#postgresql-18-sink).
 
 ## Run it
 
@@ -479,13 +557,21 @@ strings are redacted from startup logs. The database must already exist, and the
 needs permission to create and write the dataset tables in its configured search path.
 
 The sink creates the same six typed tables as DuckDB. Columns the chain always
-provides are `NOT NULL`; fields it can omit stay nullable. Each table has a non-unique
-index on `(chain, dedupe_key)`. A flush bulk-loads with binary `COPY` in one transaction.
-Unsigned 64-bit fields use `NUMERIC(20,0)`, hex values use `TEXT`, booleans use
-`BOOLEAN`, and documents use `JSONB`. Existing tables are not migrated. Duplicates are
-preserved, and failed batches remain buffered. A lost connection during commit can leave
+provides are `NOT NULL`; fields it can omit stay nullable. Each table has a unique
+index on `(chain, dedupe_key)`. A flush bulk-loads with binary `COPY` into a temporary
+table, then upserts into the dataset table, in one transaction. Unsigned 64-bit fields
+use `NUMERIC(20,0)`, hex values use `TEXT`, booleans use `BOOLEAN`, and documents use
+`JSONB`. A replay updates the existing row. Columns of an existing table are not
+migrated. Failed batches remain buffered. A lost connection during commit can leave
 the outcome unknown; retrying is not exactly-once. Restart recovery remains unimplemented,
 as with the DuckDB sink.
+
+> **TODO — deterministic within-batch dedupe.** When one batch holds a key twice, the
+> merge keeps the *last* copy using `ctid` (DuckDB uses `rowid`) as a stand-in for
+> insertion order. That is a physical-order shortcut, not a guarantee. The rows are keyed
+> by `(chain, dedupe_key)` alone, so there is no semantic column to order by. The fix is to
+> carry a per-envelope sequence on the row and order on that; it is a wire change, so it is
+> deferred. Tracked in [Not built yet](#not-built-yet).
 
 The PostgreSQL integration check creates a private schema on a PostgreSQL 18 server:
 
@@ -548,9 +634,9 @@ signal** — `reorg` — drives a consumer's state machine and carries no
 payload. The line is one flat object: `chain`,
 `v`, and the event's fields under its `type` tag. Consumers deduplicate on
 each event's `dedupe_key`. Each dataset's key comes from its
-natural key, so a transaction and its receipt (both keyed by the transaction hash)
-stay distinct — and a key that descends from a block carries the block hash too, so the
-two branches of a reorg are separate rows.
+natural key, so a transaction and its receipt (both keyed by the block hash and the
+transaction hash) stay distinct by their dataset tag — and a key that descends from a
+block carries the block hash, so the two branches of a reorg are separate rows.
 
 `src/wire/row.rs` renders a dataset as the rows a store persists: the table, its columns
 with their types, and the values in that order. The mapping is one answer for every

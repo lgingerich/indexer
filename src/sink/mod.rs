@@ -16,6 +16,7 @@
 //! - `datasets` — which datasets a run keeps, and the sink that drops the rest.
 //! - `duckdb` — an embedded `DuckDB` database.
 //! - `postgres` — a remote `PostgreSQL` 18 database with asynchronous transactional COPY.
+//!   Both stores upsert on `(chain, dedupe_key)`.
 //! - [`stdout`] — newline-delimited JSON, for watching the stream.
 //!
 //! Stores take a connection or open one from their own settings, so client settings

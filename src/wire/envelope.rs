@@ -267,6 +267,11 @@ impl Event {
     /// the identity of the change they announce. It is scoped to the stream, so it
     /// excludes the chain, and it deliberately excludes `sequence`, which changes if
     /// the indexer restarts and replays from a different point.
+    ///
+    /// A later copy of a key supersedes an earlier one: the stores upsert, keeping the
+    /// last row a batch holds for a key. A consumer that deduplicates by dropping repeats
+    /// must therefore keep the newest copy, not the first, or it can disagree with what
+    /// the store holds.
     #[must_use]
     pub fn dedupe_key(&self) -> String {
         match self {
@@ -457,6 +462,24 @@ mod tests {
         assert_eq!(orphaned.log_index, replacement.log_index);
     }
 
+    /// The same for a transaction: re-including it yields a second row from the
+    /// replacement block. The signed hash is unchanged, so only the block hash keeps
+    /// the two inclusions from collapsing under an upsert.
+    #[test]
+    fn a_transaction_and_its_replacement_in_a_reorg_do_not_share_a_key() {
+        let orphaned = Transaction {
+            hash: TxHash::from([0x01; 32]),
+            transaction_index: 0,
+            block_number: 100,
+            block_hash: hash(0xaa),
+            ..Transaction::default()
+        };
+        let mut replacement = orphaned.clone();
+        replacement.block_hash = hash(0xbb);
+
+        assert_ne!(orphaned.dedupe_key(), replacement.dedupe_key());
+    }
+
     /// The same for a receipt: re-including a transaction yields a second receipt from
     /// the replacement block, and the two are physically different rows.
     #[test]
@@ -528,11 +551,12 @@ mod tests {
         assert_eq!(
             Transaction {
                 block_number: 100,
+                block_hash,
                 hash: tx,
                 ..Transaction::default()
             }
             .dedupe_key(),
-            format!("0x{tx_hex}:tx")
+            format!("0x{block_hex}:0x{tx_hex}:tx")
         );
         assert_eq!(
             Receipt {
