@@ -11,7 +11,7 @@
 //! - **Derived** ([`Event::Decoded`]): a record the decode stage produces from a
 //!   dataset, carrying its typed arguments under their ABI names. It is a dataset,
 //!   not a control signal, and it always follows the log it was decoded from.
-//! - **Control** ([`Reorg`], [`Finalized`]): signals about the indexer's own state,
+//! - **Control** ([`Reorg`]): a signal about the indexer's own state,
 //!   not records of a chain. They carry no verbatim payload and exist to drive a
 //!   consumer's state machine, so they are defined here.
 //!
@@ -117,20 +117,6 @@ pub struct Reorg {
     pub new_head_hash: B256,
     /// Hashes of the blocks that are no longer canonical, newest first.
     pub orphaned_hashes: Vec<B256>,
-}
-
-/// A finality watermark: this block and everything below it are permanent.
-///
-/// Taken from the chain's own definition of finality rather than a block count, and
-/// published only when it advances. A later [`Reorg`] never retracts it, because a
-/// reorg cannot reach a finalized block.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Finalized {
-    /// Height of the newest finalized block.
-    #[serde(with = "alloy_serde::quantity")]
-    pub height: u64,
-    /// Hash of the newest finalized block.
-    pub hash: B256,
 }
 
 /// One log decoded against a contract ABI, as typed arguments.
@@ -257,8 +243,6 @@ pub enum Event {
     Decoded(Box<Decoded>),
     /// A discontinuity in the published chain.
     Reorg(Reorg),
-    /// A finality watermark.
-    Finalized(Finalized),
 }
 
 impl Event {
@@ -272,7 +256,6 @@ impl Event {
             Self::Log(_) => "log",
             Self::Decoded(_) => "decoded",
             Self::Reorg(_) => "reorg",
-            Self::Finalized(_) => "finalized",
         }
     }
 
@@ -293,7 +276,6 @@ impl Event {
             Self::Log(log) => log.dedupe_key(),
             Self::Decoded(decoded) => decoded.dedupe_key(),
             Self::Reorg(reorg) => format!("{}:reorg", reorg.new_head_hash),
-            Self::Finalized(finalized) => format!("{}:finalized", finalized.hash),
         }
     }
 }
@@ -355,8 +337,8 @@ mod tests {
     use alloy_primitives::{Address, B256, TxHash, U256};
 
     use super::{
-        AbiType, Block, ChainId, Decoded, DecodedArg, Envelope, Event, Finalized, Log, Receipt,
-        Reorg, SCHEMA_VERSION, Transaction, TypedValue,
+        AbiType, Block, ChainId, Decoded, DecodedArg, Envelope, Event, Log, Receipt, Reorg,
+        SCHEMA_VERSION, Transaction, TypedValue,
     };
 
     fn chain() -> ChainId {
@@ -425,23 +407,24 @@ mod tests {
 
     /// The wire object carries exactly the envelope's keys (`chain`, `v`) plus the
     /// event's (`type` and its fields) — nothing else rides along. Pinned on
-    /// `Finalized`, whose two fields make the count exact.
+    /// `Reorg`, whose fields make the count exact.
     #[test]
     fn the_wire_object_carries_only_the_envelope_and_event_fields() {
         let envelope = Envelope::new(
             chain(),
-            Event::Finalized(Finalized {
+            Event::Reorg(Reorg {
                 height: 42,
-                hash: hash(0x11),
+                new_head_hash: hash(0x11),
+                orphaned_hashes: vec![hash(0x22)],
             }),
         );
         let value = serde_json::to_value(&envelope).expect("envelope serializes");
-        assert_eq!(value["type"], "finalized");
+        assert_eq!(value["type"], "reorg");
         assert_eq!(value["height"], "0x2a");
-        assert_eq!(value["hash"], format!("0x{}", "11".repeat(32)));
+        assert_eq!(value["new_head_hash"], format!("0x{}", "11".repeat(32)));
         assert_eq!(value["chain"], "ethereum");
         assert_eq!(value["v"], SCHEMA_VERSION);
-        assert_eq!(value.as_object().expect("object").len(), 5);
+        assert_eq!(value.as_object().expect("object").len(), 6);
     }
 
     /// A log and the same transaction's log in the block that replaced it are
@@ -605,14 +588,6 @@ mod tests {
             .dedupe_key(),
             format!("0x{block_hex}:reorg")
         );
-        assert_eq!(
-            Event::Finalized(Finalized {
-                height: 100,
-                hash: block_hash,
-            })
-            .dedupe_key(),
-            format!("0x{block_hex}:finalized")
-        );
     }
 
     /// The version is stamped on every rendered line, and a line carrying no `v`
@@ -621,9 +596,10 @@ mod tests {
     fn the_schema_version_is_stamped_and_absent_v_reads_as_the_first_shape() {
         let envelope = Envelope::new(
             chain(),
-            Event::Finalized(Finalized {
+            Event::Reorg(Reorg {
                 height: 42,
-                hash: hash(0x11),
+                new_head_hash: hash(0x11),
+                orphaned_hashes: vec![],
             }),
         );
         let mut value = serde_json::to_value(&envelope).expect("envelope serializes");
@@ -746,10 +722,6 @@ mod tests {
                 height: 1,
                 new_head_hash: hash(3),
                 orphaned_hashes: vec![hash(2)],
-            }),
-            Event::Finalized(Finalized {
-                height: 1,
-                hash: hash(3),
             }),
         ];
         for event in variants {

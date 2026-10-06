@@ -78,7 +78,7 @@ impl<K: EnvelopeSink> EnvelopeSink for DecodingSink<K> {
 #[expect(clippy::expect_used)]
 mod tests {
     use super::*;
-    use crate::wire::envelope::{ChainId, Finalized, Log};
+    use crate::wire::envelope::{ChainId, Log};
 
     #[derive(Default)]
     struct Collect {
@@ -101,9 +101,10 @@ mod tests {
         let mut sink = DecodingSink::new(ContractRegistry::default(), Collect::default());
         for event in [
             Event::Log(Box::default()),
-            Event::Finalized(Finalized {
+            Event::Reorg(crate::wire::envelope::Reorg {
                 height: 1,
-                hash: alloy_primitives::B256::ZERO,
+                new_head_hash: alloy_primitives::B256::ZERO,
+                orphaned_hashes: vec![],
             }),
         ] {
             sink.publish(Envelope::new(ChainId::new("base"), event))

@@ -50,7 +50,7 @@ impl Datasets {
     /// Whether this event is stored.
     ///
     /// A decoded record is kept only when logs are, because it is produced from a log.
-    /// Reorg and finality always pass.
+    /// A reorg always passes.
     #[must_use]
     pub const fn keeps(self, event: &Event) -> bool {
         match event {
@@ -58,7 +58,7 @@ impl Datasets {
             Event::Transaction(_) => self.transaction,
             Event::Receipt(_) => self.receipt,
             Event::Log(_) | Event::Decoded(_) => self.log,
-            Event::Reorg(_) | Event::Finalized(_) => true,
+            Event::Reorg(_) => true,
         }
     }
 }
@@ -164,7 +164,7 @@ mod tests {
 
     use super::{Datasets, SelectingSink};
     use crate::sink::{EnvelopeSink as _, SinkError};
-    use crate::wire::envelope::{ChainId, Envelope, Event, Finalized, Log, Reorg};
+    use crate::wire::envelope::{ChainId, Envelope, Event, Log, Reorg};
 
     struct Mem(Vec<&'static str>);
 
@@ -192,15 +192,11 @@ mod tests {
                 new_head_hash: B256::ZERO,
                 orphaned_hashes: vec![],
             }),
-            Event::Finalized(Finalized {
-                height: 1,
-                hash: B256::ZERO,
-            }),
         ] {
             sink.publish(Envelope::new(chain.clone(), event))
                 .await
                 .expect("publish");
         }
-        assert_eq!(sink.inner.0, ["log", "reorg", "finalized"]);
+        assert_eq!(sink.inner.0, ["log", "reorg"]);
     }
 }

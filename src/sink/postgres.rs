@@ -177,7 +177,7 @@ impl ToSql for ColumnValue {
 pub struct PostgresSink {
     client: Client,
     rows: Vec<Row>,
-    plans: [CopyPlan; 7],
+    plans: [CopyPlan; 6],
     connection_task: Option<tokio::task::JoinHandle<()>>,
 }
 
@@ -229,7 +229,7 @@ impl PostgresSink {
             return Ok(());
         }
         let transaction = self.client.transaction().await?;
-        // ponytail: seven fixed tables mean seven linear scans. Group at publish time
+        // ponytail: six fixed tables mean six linear scans. Group at publish time
         // only if the number of datasets or profiling warrants a grouping buffer.
         for (table, plan) in Table::ALL.into_iter().zip(&self.plans) {
             if !self.rows.iter().any(|row| row.table() == table) {
@@ -288,7 +288,7 @@ pub enum StoreError {
 mod tests {
     use alloy_primitives::B256;
 
-    use crate::wire::envelope::{ChainId, Event, Finalized};
+    use crate::wire::envelope::{ChainId, Event, Reorg};
 
     use super::*;
 
@@ -395,40 +395,37 @@ mod tests {
         let mut sink = PostgresSink::new(client).await.expect("sink");
         sink.flush().await.expect("empty flush");
         let chain = ChainId::new("tab\tnewline\nslash\\unicodeé");
-        let event = Event::Finalized(Finalized {
+        let event = Event::Reorg(Reorg {
             height: u64::MAX,
-            hash: B256::ZERO,
+            new_head_hash: B256::ZERO,
+            orphaned_hashes: vec![B256::ZERO],
         });
         for _ in 0..2 {
             sink.publish(Envelope::new(chain.clone(), event.clone()))
                 .await
                 .expect("publish");
         }
-        assert_eq!(count(&sink, Table::Finalized).await, 0);
+        assert_eq!(count(&sink, Table::Reorg).await, 0);
         sink.flush().await.expect("commit");
         let rows = sink
             .client
-            .query("SELECT height::text, chain FROM finalized", &[])
+            .query("SELECT height::text, chain FROM reorg", &[])
             .await
             .expect("rows");
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].get::<_, String>(0), u64::MAX.to_string());
         assert_eq!(rows[0].get::<_, String>(1), chain.as_str());
-        // An earlier table's COPY must roll back if a later table rejects a row.
-        let reorg = Event::Reorg(crate::wire::envelope::Reorg {
+        let rejected = Event::Reorg(Reorg {
             height: 42,
             new_head_hash: B256::ZERO,
             orphaned_hashes: vec![B256::ZERO],
         });
-        sink.publish(Envelope::new(chain.clone(), reorg))
+        sink.publish(Envelope::new(chain, rejected))
             .await
             .expect("reorg");
-        sink.publish(Envelope::new(chain, event))
-            .await
-            .expect("finalized");
         sink.client
             .batch_execute(
-                "ALTER TABLE finalized ADD CONSTRAINT reject_height CHECK (height = 0) NOT VALID",
+                "ALTER TABLE reorg ADD CONSTRAINT reject_height CHECK (height = 0) NOT VALID",
             )
             .await
             .expect("constraint");
@@ -436,15 +433,15 @@ mod tests {
             sink.flush().await,
             Err(SinkError::Postgres(StoreError::Database(_)))
         ));
-        assert_eq!(sink.rows.len(), 2);
-        assert_eq!(count(&sink, Table::Reorg).await, 0);
+        assert_eq!(sink.rows.len(), 1);
+        assert_eq!(count(&sink, Table::Reorg).await, 2);
         sink.client
-            .batch_execute("ALTER TABLE finalized DROP CONSTRAINT reject_height")
+            .batch_execute("ALTER TABLE reorg DROP CONSTRAINT reject_height")
             .await
             .expect("remove constraint");
         sink.flush().await.expect("retry");
         assert!(sink.rows.is_empty());
-        assert_eq!(count(&sink, Table::Reorg).await, 1);
+        assert_eq!(count(&sink, Table::Reorg).await, 3);
         let hashes: serde_json::Value = serde_json::from_str(
             &sink
                 .client

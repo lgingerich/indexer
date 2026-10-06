@@ -44,8 +44,8 @@ use std::process::ExitCode;
 
 use alloy_primitives::{Address, B256, Bloom, Bytes, I256, TxHash, U256};
 use indexer::wire::envelope::{
-    Block, ChainId, Decoded, DecodedArg, Envelope, Event, Finalized, Log, Receipt, Reorg,
-    Transaction, TypedValue,
+    Block, ChainId, Decoded, DecodedArg, Envelope, Event, Log, Receipt, Reorg, Transaction,
+    TypedValue,
 };
 
 /// The chain these are from.
@@ -89,15 +89,7 @@ fn main() -> ExitCode {
 /// fixture also shows that the child datasets reference the block by scalar key rather
 /// than embedding it.
 fn envelopes() -> Vec<Envelope> {
-    vec![
-        block(),
-        transaction(),
-        receipt(),
-        log(),
-        decoded(),
-        reorg(),
-        finalized(),
-    ]
+    vec![block(), transaction(), receipt(), log(), decoded(), reorg()]
 }
 
 /// A block header, carrying its transactions' hashes rather than the transactions.
@@ -271,14 +263,6 @@ fn reorg() -> Envelope {
         new_head_hash: hash(0x17),
         // Newest first.
         orphaned_hashes: vec![BLOCK_HASH],
-    }))
-}
-
-/// A finality watermark: this height and everything below it is permanent.
-fn finalized() -> Envelope {
-    envelope(Event::Finalized(Finalized {
-        height: BLOCK_NUMBER - 64,
-        hash: hash(0x16),
     }))
 }
 

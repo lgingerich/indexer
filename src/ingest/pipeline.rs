@@ -14,7 +14,7 @@
 
 use crate::ingest::source::{BlockId, BlockSource, FetchedBlock, SourceError};
 use crate::sink::{EnvelopeSink, SinkError};
-use crate::wire::envelope::{Envelope, Event, Finalized, Reorg};
+use crate::wire::envelope::{Envelope, Event, Reorg};
 use alloy_primitives::B256;
 use futures_util::StreamExt as _;
 use std::collections::VecDeque;
@@ -413,7 +413,7 @@ impl<S: BlockSource, K: EnvelopeSink> Machine<S, K> {
         if next == target.height {
             // The captured anchor remains available even when newer observations are
             // ahead of indexed coverage; publish that exact identity first.
-            self.publish_finality(target).await?;
+            self.publish_finality(target)?;
             self.state = State::Syncing;
         } else {
             self.state = State::Backfilling {
@@ -438,7 +438,7 @@ impl<S: BlockSource, K: EnvelopeSink> Machine<S, K> {
         }
         self.sink.observe_head(head.height);
         self.ring.check_finality(finalized)?;
-        self.emit_finality(finalized).await?;
+        self.emit_finality(finalized)?;
         Self::check_budget(head, finalized)?;
         if self.accepted(head.height) == Some(head) {
             return Ok(false);
@@ -462,7 +462,7 @@ impl<S: BlockSource, K: EnvelopeSink> Machine<S, K> {
                     });
                 }
                 self.append(block, next, true).await?;
-                self.emit_finality(finalized).await?;
+                self.emit_finality(finalized)?;
                 return Ok(true);
             }
             // Re-read the target by height only when needed; the existing source cannot
@@ -573,7 +573,7 @@ impl<S: BlockSource, K: EnvelopeSink> Machine<S, K> {
         }
         for (height, block) in branch.into_iter().rev() {
             self.append(block, height, true).await?;
-            self.emit_finality(finalized).await?;
+            self.emit_finality(finalized)?;
         }
         self.state = State::Syncing;
         Ok(())
@@ -617,11 +617,10 @@ impl<S: BlockSource, K: EnvelopeSink> Machine<S, K> {
         Ok(())
     }
 
-    /// Announces an observation only when its exact identity is already accepted.
+    /// Advances the in-memory anchor only when its exact identity is already accepted.
     /// Rejects regression against the applied anchor; an ahead-of-coverage or different
-    /// branch identity is deferred without storing another watermark. Duplicates emit
-    /// nothing. Successful announcements flush even when no new block was published.
-    async fn emit_finality(&mut self, observed: BlockId) -> Result<(), PipelineError> {
+    /// branch identity is deferred. Nothing is written to the sink.
+    fn emit_finality(&mut self, observed: BlockId) -> Result<(), PipelineError> {
         self.ring.check_finality(observed)?;
         if self.ring.anchor == Some(observed) {
             return Ok(());
@@ -634,19 +633,13 @@ impl<S: BlockSource, K: EnvelopeSink> Machine<S, K> {
             // finalize the old branch; validate the candidate before retracting it.
             return Ok(());
         }
-        self.publish_finality(observed).await
+        self.publish_finality(observed)
     }
 
-    /// Delivers a finality marker, then advances the anchor and drops finalized entries.
+    /// Advances the in-memory anchor and drops finalized entries. Finality is not stored.
     /// The caller must establish that this identity belongs to accepted coverage.
-    /// Sink failure leaves the ring unchanged; acceptance is not a durable checkpoint.
-    async fn publish_finality(&mut self, finalized: BlockId) -> Result<(), PipelineError> {
+    fn publish_finality(&mut self, finalized: BlockId) -> Result<(), PipelineError> {
         self.ring.check_finality(finalized)?;
-        self.deliver(vec![Event::Finalized(Finalized {
-            height: finalized.height,
-            hash: finalized.hash,
-        })])
-        .await?;
         self.ring.finalize(finalized);
         Ok(())
     }
@@ -1027,14 +1020,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn duplicate_finality_is_flushed_without_another_block() {
+    async fn duplicate_finality_advances_the_anchor_without_a_write() {
         let source = Source::linear(5, 2);
         let mut machine = Machine::new(source, Sink::default());
         catch_up(&mut machine).await;
         let before = machine.sink.flushes;
+        let rows = machine.sink.events.len();
         machine.source.data.finalized = 5;
         assert!(!machine.step().await.expect("duplicate step"));
-        assert_eq!(machine.sink.flushes, before + 1);
+        assert_eq!(machine.sink.flushes, before);
+        assert_eq!(machine.sink.events.len(), rows);
         assert_eq!(machine.undo_depth(), 0);
         assert_eq!(machine.emitted_finality().expect("finality").height, 5);
     }
@@ -1219,7 +1214,6 @@ mod tests {
                 height: 6,
                 hash: hash(6),
             })
-            .await
             .expect("defer");
         assert_eq!(machine.emitted_finality(), anchor);
         // Only regression below applied finality is invalid; an unapplied observation
@@ -1229,7 +1223,6 @@ mod tests {
                 height: 4,
                 hash: hash(4),
             })
-            .await
             .expect("fresh observation");
         assert_eq!(
             machine.emitted_finality(),

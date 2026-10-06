@@ -19,7 +19,7 @@
 //! - the appender, and the commit.
 //!
 //! So adding a store means writing one module that consumes the same rows, rather than
-//! re-deciding for each of seven tables what a log is.
+//! re-deciding for each of six tables what a log is.
 //!
 //! # Column types
 //!
@@ -333,7 +333,7 @@ impl DuckDbSink {
             .connection
             .transaction()
             .map_err(|source| StoreError::Begin { source })?;
-        // ponytail: seven fixed tables mean seven linear scans, with no grouping buffer.
+        // ponytail: six fixed tables mean six linear scans, with no grouping buffer.
         // Group at publish time only if the table count or profiling warrants it.
         for table in Table::ALL {
             let mut rows = self
@@ -386,7 +386,7 @@ mod tests {
 
     use crate::sink::EnvelopeSink as _;
     use crate::wire::envelope::{
-        Block, ChainId, Envelope, Event, Finalized, Log, Receipt, Reorg, Transaction,
+        Block, ChainId, Envelope, Event, Log, Receipt, Reorg, Transaction,
     };
     use crate::wire::row::{Table, row_for};
 
@@ -472,13 +472,6 @@ mod tests {
                     height: 100,
                     new_head_hash: hash(0x55),
                     orphaned_hashes: vec![hash(0x66)],
-                }),
-            ),
-            Envelope::new(
-                chain(),
-                Event::Finalized(Finalized {
-                    height: 100,
-                    hash: hash(0x01),
                 }),
             ),
         ]
@@ -664,7 +657,7 @@ mod tests {
         for envelope in every_kind() {
             sink.publish(envelope).await.expect("row buffers");
         }
-        assert_eq!(sink.rows.len(), 6, "buffered but not written");
+        assert_eq!(sink.rows.len(), 5, "buffered but not written");
         assert_eq!(row_count(&sink, "log"), 0);
 
         sink.flush().await.expect("batch flushes");
@@ -679,26 +672,26 @@ mod tests {
             sink.publish(envelope).await.expect("row buffers");
         }
         sink.connection
-            .execute_batch("DROP TABLE finalized")
+            .execute_batch("DROP TABLE reorg")
             .expect("remove the last table in the batch");
 
         assert!(matches!(
             sink.flush().await,
             Err(crate::sink::SinkError::Store(super::StoreError::Appender {
-                table: "finalized",
+                table: "reorg",
                 ..
             }))
         ));
-        assert_eq!(sink.rows.len(), 6, "failed batch stays buffered");
+        assert_eq!(sink.rows.len(), 5, "failed batch stays buffered");
         for table in Table::ALL
             .into_iter()
-            .filter(|table| *table != Table::Finalized)
+            .filter(|table| *table != Table::Reorg)
         {
             assert_eq!(row_count(&sink, table.name()), 0, "{table} rolls back");
         }
 
         sink.connection
-            .execute_batch(&super::create_table(Table::Finalized))
+            .execute_batch(&super::create_table(Table::Reorg))
             .expect("restore the missing table");
         sink.flush()
             .await
@@ -716,17 +709,18 @@ mod tests {
     #[tokio::test]
     async fn a_deferred_constraint_failure_keeps_the_batch_and_rolls_back() {
         let mut sink = sink();
-        let constrained = super::create_table(Table::Finalized)
+        let constrained = super::create_table(Table::Reorg)
             .replace("height UBIGINT", "height UBIGINT CHECK (height < 1)");
         sink.connection
-            .execute_batch(&format!("DROP TABLE finalized; {constrained}"))
-            .expect("constrain the finality table");
+            .execute_batch(&format!("DROP TABLE reorg; {constrained}"))
+            .expect("constrain the reorg table");
         for height in 0..2 {
             sink.publish(Envelope::new(
                 chain(),
-                Event::Finalized(Finalized {
+                Event::Reorg(Reorg {
                     height,
-                    hash: hash(0x11),
+                    new_head_hash: hash(0x11),
+                    orphaned_hashes: vec![],
                 }),
             ))
             .await
@@ -736,21 +730,21 @@ mod tests {
         assert!(matches!(
             sink.flush().await,
             Err(crate::sink::SinkError::Store(super::StoreError::Flush {
-                table: "finalized",
+                table: "reorg",
                 ..
             }))
         ));
-        assert_eq!(row_count(&sink, "finalized"), 0);
+        assert_eq!(row_count(&sink, "reorg"), 0);
         assert_eq!(sink.rows.len(), 2);
 
         sink.connection
             .execute_batch(&format!(
-                "DROP TABLE finalized; {}",
-                super::create_table(Table::Finalized)
+                "DROP TABLE reorg; {}",
+                super::create_table(Table::Reorg)
             ))
             .expect("remove the constraint");
         sink.flush().await.expect("retry the whole batch");
-        assert_eq!(row_count(&sink, "finalized"), 2);
+        assert_eq!(row_count(&sink, "reorg"), 2);
         assert_eq!(sink.rows.len(), 0);
     }
 
@@ -761,9 +755,10 @@ mod tests {
         for height in 0..5 {
             sink.publish(Envelope::new(
                 chain(),
-                Event::Finalized(Finalized {
+                Event::Reorg(Reorg {
                     height,
-                    hash: hash(0x11),
+                    new_head_hash: hash(0x11),
+                    orphaned_hashes: vec![],
                 }),
             ))
             .await
@@ -771,7 +766,7 @@ mod tests {
         }
         sink.flush().await.expect("batch flushes");
 
-        assert_eq!(row_count(&sink, "finalized"), 5);
+        assert_eq!(row_count(&sink, "reorg"), 5);
     }
 
     /// Connecting twice to the same file must not fail on the existing tables.

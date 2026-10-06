@@ -35,7 +35,6 @@ ordered events, each with its dataset's natural key
       │   block
       │   transaction, receipt, log, decoded, log, …
       │   transaction, receipt, …
-      │   finalized                         only when the watermark advanced
       │
       ▼  flush, once
 one channel message
@@ -55,7 +54,7 @@ can decode.
 ```
 envelope
    │
-   ├─ block, transaction, receipt, reorg, finalized ──▶ forwarded as it arrived
+   ├─ block, transaction, receipt, reorg ──▶ forwarded as it arrived
    │
    └─ log
         ├─ no ABI for (chain, address), or no such event ──▶ the log, nothing added
@@ -77,14 +76,24 @@ memory budget; insufficient capacity is an error rather than silent eviction.
 published     1 ─── 2 ─── 3
 new head           └─── 2'          2' builds on 1, not on 2
 
-the store sees
-  …  block 1 …  block 2 …  block 3 …
-  reorg { height: 2, orphaned: [3, 2] }
-  block 2' …
+appended, in order
+  block 1, block 2, block 3
+  reorg { height: 2, orphaned_hashes: [3, 2] }
+  block 2', and its transactions, receipts, logs, and decoded rows
 ```
 
-A row's key carries the block's hash, so the orphaned block 2 and its replacement 2' are
-different rows rather than one row written twice. A fork older than the ring is an error
+The store appends every one of those rows. It does not delete the orphaned branch, mark
+it noncanonical, or hide it from a dataset query. `block`, `transaction`, `receipt`,
+`log`, and `decoded` contain both branches. The `reorg` table records which block hashes
+stopped being canonical, and that is the only place that fact is stored.
+
+A downstream read that wants the current chain has to exclude every block hash named by
+`reorg.orphaned_hashes`. A read that does not apply those markers returns orphaned rows
+alongside their replacements. The same rule applies to every dataset row that carries one
+of those block hashes, not only to the `block` table.
+
+A row's key carries the block's hash, so orphaned block 2 and replacement block 2' are
+different rows rather than one row overwritten. A fork older than the ring is an error
 rather than an empty retraction.
 
 ### When the store stalls
@@ -181,15 +190,16 @@ that matters most: `decode` must not depend on `ingest`.
   `DuckDB` database: one typed table per dataset, with real columns rather than a JSON
   blob. What a dataset's columns *are* lives in `src/wire/row.rs`, not in the store, so a
   second store reuses the mapping instead of re-deriving it.
-- **Finality watermark.** A `finalized` event says a block and everything below
-  it are permanent. Its height comes from the node's own `finalized` tag, so each
-  chain's rules apply with no confirmation count to tune; on Base it trails the
-  tip by about 600 blocks. It is published only when it advances.
+- **Finality watermark.** Ingestion reads the node's `finalized` tag and keeps that
+  boundary in memory. On Base it trails the tip by about 600 blocks. Ingestion will not
+  reorganize that height, and it drops finalized identities from the undo window except
+  for one linkage anchor. The boundary is not written to the store.
 - **Reorg retraction.** Parent-hash linkage is checked on every block. A mismatch
-  publishes a `reorg` event whose `orphaned_hashes` say which block hashes stopped being
-  canonical, and the replacement branch is published under its own keys. The undo window
-  retains the full unfinalized tail up to a fixed 4,096-block budget, and finalized
-  entries are discarded except for one linkage anchor. See `src/ingest/pipeline.rs`.
+  appends a `reorg` event whose `orphaned_hashes` name the block hashes that stopped
+  being canonical, then appends the replacement branch under its own keys. Dataset tables
+  keep both branches; a reader applies the `reorg` rows to see only the current chain.
+  The undo window retains the full unfinalized tail up to a fixed 4,096-block budget, and
+  finalized entries are discarded except for one linkage anchor. See `src/ingest/pipeline.rs`.
 - **Finalized backfill and catch-up.** The library can index earlier finalized history;
   production starts at the source-finalized anchor and catches up before following live
   heads. Decode runs on that path, so a historical log is stored raw and, when it matches,
@@ -218,7 +228,6 @@ Durability is one chain. The others stand alone.
 ```
 idempotent writes ─┬─▶ resume from the store
                    └─▶ stored-log replay
-reorg + finality applied in the store
 streaming aggregation
 Avro for a serialized envelope
 ranged log backfill
@@ -243,26 +252,6 @@ Without the rebuilt ring, a reorg in blocks this process no longer remembers can
 be retracted, and rows that run left behind stay. The durability TODO in
 `src/ingest/pipeline.rs` is this item: restore the last committed finalized identity
 and reconcile the stored unfinalized suffix before replay.
-
-### Reorgs and finality in the store
-
-Ingest publishes `reorg` and `finalized`, and both stores append them to the `reorg`
-and `finalized` tables. Nothing else reads those rows. An orphaned block stays, and
-nothing at or below the watermark is treated as permanent.
-
-A key that descends from a block carries the block hash, so the two branches of a
-reorg are already distinct rows. What is missing is a store that acts on the marker.
-
-```
-today     reorg { orphaned_hashes }   ──▶ a row in `reorg`
-          finalized { height, hash }  ──▶ a row in `finalized`
-
-planned   reorg      ──▶ mark the rows for those block hashes no longer canonical
-          finalized  ──▶ rows at or below this height are permanent
-```
-
-Marking rather than deleting, so the same rule holds for a data lake, where a row
-cannot be mutated, and for a serving store, where the write is still an append.
 
 ### Idempotent writes
 
@@ -489,7 +478,7 @@ certificate store; use `sslmode=disable` only for trusted local connections. Con
 strings are redacted from startup logs. The database must already exist, and the role
 needs permission to create and write the dataset tables in its configured search path.
 
-The sink creates the same seven typed tables as DuckDB. Columns the chain always
+The sink creates the same six typed tables as DuckDB. Columns the chain always
 provides are `NOT NULL`; fields it can omit stay nullable. Each table has a non-unique
 index on `(chain, dedupe_key)`. A flush bulk-loads with binary `COPY` in one transaction.
 Unsigned 64-bit fields use `NUMERIC(20,0)`, hex values use `TEXT`, booleans use
@@ -520,7 +509,7 @@ They live under the `DuckDB` table because they are DuckDB's, and no other backe
 know what to do with them. Anything unrecognized is an error from DuckDB naming the
 setting, so a typo is caught at startup rather than silently ignored. Every envelope
 lands in its dataset's own typed table — `block`, `transaction`, `receipt`, `log`,
-`decoded`, `reorg`, `finalized` — with real columns rather than a JSON blob, so a
+`decoded`, `reorg` — with real columns rather than a JSON blob, so a
 consumer filters and joins on values. The schema is generated from the row headers in
 `src/wire/row.rs`, so a column added to a dataset appears without anyone editing the
 DDL.
@@ -555,7 +544,7 @@ persistence row; children are referenced by scalar key, never embedded. **Derive
 records — `decoded` — are what the decode stage produces from a dataset, carrying
 typed ABI arguments; the type of every argument travels with it, so a consumer can
 rebuild a typed column without reading the ABI. **Control
-signals** — `reorg`, `finalized` — drive a consumer's state machine and carry no
+signal** — `reorg` — drives a consumer's state machine and carries no
 payload. The line is one flat object: `chain`,
 `v`, and the event's fields under its `type` tag. Consumers deduplicate on
 each event's `dedupe_key`. Each dataset's key comes from its

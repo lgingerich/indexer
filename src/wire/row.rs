@@ -50,7 +50,7 @@ use std::fmt;
 use alloy_primitives::{Bytes, U256};
 
 use crate::wire::datasets::evm::{Block, Log, Receipt, Transaction};
-use crate::wire::envelope::{ChainId, Decoded, Event, Finalized, Reorg};
+use crate::wire::envelope::{ChainId, Decoded, Event, Reorg};
 
 /// One table a store persists.
 ///
@@ -74,23 +74,20 @@ pub enum Table {
     Decoded,
     /// Reorg markers: which block hashes stopped being canonical.
     Reorg,
-    /// Finality watermarks.
-    Finalized,
 }
 
 impl Table {
     /// Every table, in the order a store would create them.
     ///
-    /// A `const` list rather than a derive: seven cases do not justify a dependency, and a
+    /// A `const` list rather than a derive: six cases do not justify a dependency, and a
     /// hand-written list is one a reader can check.
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 6] = [
         Self::Block,
         Self::Transaction,
         Self::Receipt,
         Self::Log,
         Self::Decoded,
         Self::Reorg,
-        Self::Finalized,
     ];
 
     /// The name a store files this table under.
@@ -106,7 +103,6 @@ impl Table {
             Self::Log => "log",
             Self::Decoded => "decoded",
             Self::Reorg => "reorg",
-            Self::Finalized => "finalized",
         }
     }
 
@@ -124,7 +120,6 @@ impl Table {
             Self::Log => cells_columns(&LOG_CELLS),
             Self::Decoded => cells_columns(&DECODED_CELLS),
             Self::Reorg => cells_columns(&REORG_CELLS),
-            Self::Finalized => cells_columns(&FINALIZED_CELLS),
         };
         columns.extend(COMMON_COLUMNS);
         columns
@@ -417,7 +412,6 @@ pub fn row_for(chain: &ChainId, event: &Event) -> Row {
         Event::Log(l) => (Table::Log, log_cells(l)),
         Event::Decoded(d) => (Table::Decoded, decoded_cells(d)),
         Event::Reorg(r) => (Table::Reorg, reorg_cells(r)),
-        Event::Finalized(f) => (Table::Finalized, finalized_cells(f)),
     };
     Row::new(table, cells.with_common(chain, &event.dedupe_key()))
 }
@@ -799,22 +793,6 @@ fn reorg_cells(r: &Reorg) -> Columns {
     )
 }
 
-/// The `finalized` table, as one cell per column.
-const FINALIZED_CELLS: [(Column, fn(&Finalized) -> ColumnValue); 2] = [
-    (Column::uint("height"), |f| ColumnValue::Uint(f.height)),
-    (Column::text("hash"), |f| ColumnValue::hex(f.hash)),
-];
-
-/// Builds the `finalized` table's cells for one watermark.
-fn finalized_cells(f: &Finalized) -> Columns {
-    Columns(
-        FINALIZED_CELLS
-            .iter()
-            .map(|(column, render)| (*column, render(f)))
-            .collect(),
-    )
-}
-
 #[cfg(test)]
 // The crate denies `expect`/`unwrap` to keep production paths honest; tests are
 // allowed them per the repository test style, since a failed expectation there
@@ -823,9 +801,7 @@ fn finalized_cells(f: &Finalized) -> Columns {
 mod tests {
     use alloy_primitives::{Address, B256, TxHash};
 
-    use crate::wire::envelope::{
-        Block, ChainId, Decoded, Event, Finalized, Log, Receipt, Reorg, Transaction,
-    };
+    use crate::wire::envelope::{Block, ChainId, Decoded, Event, Log, Receipt, Reorg, Transaction};
 
     use super::{COMMON_COLUMNS, ColumnType, ColumnValue, Table, row_for};
 
@@ -888,10 +864,6 @@ mod tests {
                 height: 100,
                 new_head_hash: hash(0x01),
                 orphaned_hashes: vec![hash(0x02)],
-            }),
-            Event::Finalized(Finalized {
-                height: 100,
-                hash: hash(0x01),
             }),
         ]
     }

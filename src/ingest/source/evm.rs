@@ -864,13 +864,16 @@ mod tests {
             let filter = &calls[1]["params"][0];
             assert_eq!(filter["fromBlock"], "0x112a880");
             assert_eq!(filter["toBlock"], "0x112a880");
-            let sent: Vec<Address> = filter["address"]
+            let mut sent: Vec<Address> = filter["address"]
                 .as_array()
                 .expect("address list")
                 .iter()
                 .map(|value| value.as_str().expect("address").parse().expect("address"))
                 .collect();
-            assert_eq!(sent, [want, other]);
+            sent.sort_unstable();
+            let mut expected = [want, other];
+            expected.sort_unstable();
+            assert_eq!(sent, expected);
             json!([
                 {"jsonrpc": "2.0", "id": calls[2]["id"], "result": {"number": "0x10", "hash": hash(0xf0)}},
                 {"jsonrpc": "2.0", "id": calls[1]["id"], "result": logs},

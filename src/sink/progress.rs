@@ -116,7 +116,6 @@ impl CommitStats {
                 orphaned: reorg.orphaned_hashes.len(),
                 new_head: reorg.new_head_hash,
             }),
-            Event::Finalized(_) => {}
         }
     }
 
@@ -314,7 +313,7 @@ mod tests {
 
     use alloy_primitives::B256;
 
-    use crate::wire::envelope::{Block, ChainId, Envelope, Event, Finalized, Log, Reorg};
+    use crate::wire::envelope::{Block, ChainId, Envelope, Event, Log, Reorg};
 
     use super::{Commit, CommitStats, Window};
 
@@ -399,22 +398,12 @@ mod tests {
         assert_eq!(again[1].as_ref().map(|line| line.to), Some(999));
     }
 
-    /// A finality marker is not a block, and a reorg is reported by its orphan count
+    /// An empty commit is not progress, and a reorg is reported by its orphan count
     /// rather than as a progress line.
     #[test]
     fn control_batches_are_not_block_progress() {
-        let mut stats = CommitStats::default();
-        stats.note(&Envelope::new(
-            ChainId::new("base"),
-            Event::Finalized(Finalized {
-                height: 4,
-                hash: B256::from([0x11; 32]),
-            }),
-        ));
-        assert!(
-            stats.into_commit(1, 1).is_none(),
-            "finality alone is not progress"
-        );
+        let stats = CommitStats::default();
+        assert!(stats.into_commit(0, 1).is_none(), "nothing is not progress");
 
         let block = Block {
             number: 8,

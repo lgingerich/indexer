@@ -180,20 +180,21 @@ mod tests {
     use alloy_primitives::B256;
 
     use crate::sink::{EnvelopeSink, SinkError};
-    use crate::wire::envelope::{ChainId, Envelope, Event, Finalized};
+    use crate::wire::envelope::{Block, ChainId, Envelope, Event};
 
     use super::ChannelSink;
 
-    /// A finalized marker at `height`, which stands in for a block's worth of
-    /// envelopes — the channel carries no field of its own, so a test needs a value to
-    /// tell one envelope from another, and a height is one every dataset has.
+    /// A block at `height`, which stands in for a block's worth of envelopes. The
+    /// channel carries no field of its own, so a test needs a value to tell one
+    /// envelope from another.
     fn envelope(height: u64) -> Envelope {
         Envelope::new(
             ChainId::new("base"),
-            Event::Finalized(Finalized {
-                height,
-                hash: B256::from([0x11; 32]),
-            }),
+            Event::Block(Box::new(Block {
+                number: height,
+                hash: B256::from(alloy_primitives::U256::from(height).to_be_bytes()),
+                ..Block::default()
+            })),
         )
     }
 
