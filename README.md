@@ -155,8 +155,10 @@ that matters most: `decode` must not depend on `ingest`.
 - **EVM ingestion.** Live heads over WebSocket (`eth_subscribe`/`newHeads`), and
   each block fetched over JSON-RPC in one batched request. `[ingest] datasets`
   chooses which of block, transaction, receipt, and log are fetched and stored;
-  omitted, all four are. A header is still read for every height so linkage and
-  finality keep working. See `src/ingest/source/evm.rs`.
+  omitted, all four are. Logs without receipts use one `eth_getLogs` per height,
+  and `[ingest] log_addresses` limits that call to those contracts. A header is
+  still read for every height so linkage and finality keep working. See
+  `src/ingest/source/evm.rs`.
 - **One event per dataset.** A `block` event, then for each transaction a
   `transaction` event, its `receipt` event, and its `log` events. Each dataset is a
   normalized table — a block references its transactions by hash, a receipt carries
@@ -219,7 +221,7 @@ idempotent writes ─┬─▶ resume from the store
 reorg + finality applied in the store
 streaming aggregation
 Avro for a serialized envelope
-address filter and ranged log backfill
+ranged log backfill
 ```
 
 ### Resume from the store
@@ -303,13 +305,13 @@ one typed table per dataset. The only serialization is stdout, which writes
 newline-delimited JSON. Avro is the planned encoding for that serialized envelope —
 stdout and anything downstream of it — so those hops share one schema.
 
-### Address filter and ranged log backfill
+### Ranged log backfill
 
-`[ingest] datasets` chooses which rows are fetched. Logs without receipts use one
-`eth_getLogs` per height, with no address filter, and backfill still walks one
-height at a time. A contract filter and a wider `eth_getLogs` range for historical
-blocks are not built. A `logs` subscription is not the log source: it has no
-end-of-block marker.
+`[ingest] log_addresses` limits each `eth_getLogs` to those contracts. That call
+runs when logs are selected and receipts are not; with receipts, logs come from
+the receipts and an address list is refused at startup. Backfill still walks one
+height at a time. A wider `eth_getLogs` range for historical blocks is not built.
+A `logs` subscription is not the log source: it has no end-of-block marker.
 
 Also not built, and not on the path above: mempool ingestion and a Parquet archive.
 
@@ -376,6 +378,7 @@ the field:
 | Key | Default | Meaning |
 | --- | --- | --- |
 | `ingest.datasets` | block, transaction, receipt, log | Which datasets are fetched and stored. The header is still read for every height |
+| `ingest.log_addresses` | none | Contracts passed to `eth_getLogs`. Empty fetches every log. Valid only when `log` is selected and `receipt` is not |
 | `sink.duckdb.batch_records` | `500` | Most records one store commit may cover; a backlog of blocks is folded into one commit up to this, and a block is never split |
 | `sink.duckdb.path` | `indexer.duckdb` | Path to the store |
 

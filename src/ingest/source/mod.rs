@@ -98,6 +98,14 @@ pub enum SourceError {
         /// Which invariant failed.
         detail: String,
     },
+    /// Contract addresses were set, but this source would not send them.
+    ///
+    /// `eth_getLogs` is the filtered call, and it runs only when logs are selected
+    /// and receipts are not. With receipts, logs are taken from those receipts.
+    #[error(
+        "log addresses apply to eth_getLogs, which runs when the log dataset is selected and receipts are not"
+    )]
+    LogAddresses,
 }
 
 /// A chain data source: one live subscription plus on-demand block fetches.

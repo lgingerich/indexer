@@ -104,6 +104,13 @@ pub struct IngestSettings {
     /// Which datasets to fetch and store. Omitted means all four.
     #[serde(default)]
     pub datasets: crate::sink::Datasets,
+    /// Contracts `eth_getLogs` is limited to. Omitted or empty fetches every log.
+    ///
+    /// Sent only when logs are selected and receipts are not. Any other combination
+    /// with a non-empty list is rejected when the source is built: receipts already
+    /// carry every log, so the filtered call would not run.
+    #[serde(default)]
+    pub log_addresses: Vec<alloy_primitives::Address>,
 }
 
 /// Where records go, and by which backend.
@@ -307,6 +314,46 @@ ws_url = "wss://example.invalid"
             settings.ingest.datasets,
             crate::sink::Datasets::all(),
             "an omitted list stores every dataset"
+        );
+        assert!(
+            settings.ingest.log_addresses.is_empty(),
+            "an omitted list fetches every log"
+        );
+    }
+
+    #[test]
+    fn log_addresses_parse_and_reject_a_malformed_address() {
+        let selected = Settings::from_str(
+            r#"
+[ingest]
+chain = "base"
+http_url = "https://example.invalid"
+ws_url = "wss://example.invalid"
+datasets = ["log"]
+log_addresses = ["0x1111111111111111111111111111111111111111"]
+
+[sink.stdout]
+"#,
+        )
+        .expect("address list parses");
+        assert_eq!(selected.ingest.log_addresses.len(), 1);
+
+        let malformed = Settings::from_str(
+            r#"
+[ingest]
+chain = "base"
+http_url = "https://example.invalid"
+ws_url = "wss://example.invalid"
+log_addresses = ["not-an-address"]
+
+[sink.stdout]
+"#,
+        )
+        .expect_err("malformed address")
+        .to_string();
+        assert!(
+            malformed.contains("log_addresses") || malformed.contains("address"),
+            "{malformed}"
         );
     }
 

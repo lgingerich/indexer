@@ -120,7 +120,9 @@ impl Pipeline {
             &settings.ingest.http_url,
             &settings.ingest.ws_url,
             &settings.ingest.datasets,
-        );
+            &settings.ingest.log_addresses,
+        )
+        .map_err(PipelineError::from)?;
         let registry = settings.registry_path().map_or_else(
             || Ok(ContractRegistry::default()),
             ContractRegistry::from_file,

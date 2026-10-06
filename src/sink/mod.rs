@@ -27,21 +27,21 @@
 /// [`runtime`](crate::runtime). A stdout-only build has no storage task or channel.
 #[cfg(any(feature = "duckdb", feature = "postgres"))]
 pub(crate) mod channel;
+mod datasets;
 #[cfg(feature = "duckdb")]
 pub mod duckdb;
 #[cfg(feature = "postgres")]
 pub mod postgres;
 #[cfg(any(feature = "duckdb", feature = "postgres"))]
 mod progress;
-mod datasets;
 pub mod stdout;
 
 #[cfg(feature = "postgres")]
 pub use postgres::{PostgresSettings, PostgresSink};
 
+pub use datasets::{Datasets, SelectingSink};
 #[cfg(feature = "duckdb")]
 pub use duckdb::{DuckDbSettings, DuckDbSink};
-pub use datasets::{Datasets, SelectingSink};
 pub use stdout::{StdoutJsonSink, StdoutSettings};
 
 use thiserror::Error;
