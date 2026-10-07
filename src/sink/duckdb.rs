@@ -44,7 +44,7 @@ use serde::Deserialize;
 use thiserror::Error;
 use tracing::info;
 
-use crate::sink::{EnvelopeSink, SinkError};
+use crate::sink::{EnvelopeSink, SinkError, last_per_key};
 use crate::wire::envelope::Envelope;
 use crate::wire::row::{ColumnType, ColumnValue, Row, Table, row_for};
 /// The `DuckDB` file written when the settings name no path.
@@ -149,9 +149,8 @@ fn staging_table(table: Table) -> String {
 
 /// Merges the staging table into the dataset table.
 ///
-/// `DISTINCT ON` keeps one row per key when a batch holds a key twice, and `rowid` is the
-/// staging table's insertion order, so the last copy wins — the same row a replay would
-/// land on. `ON CONFLICT` then updates a row an earlier flush already wrote.
+/// The staging table holds each key once (see `last_per_key`), so `ON CONFLICT` only
+/// updates a row an earlier flush already wrote.
 fn upsert_sql(table: Table) -> String {
     let columns = table.columns();
     let names = columns
@@ -167,9 +166,7 @@ fn upsert_sql(table: Table) -> String {
         .join(", ");
     let staging = staging_table(table);
     format!(
-        "INSERT INTO \"{table}\" ({names}) \
-         SELECT DISTINCT ON (\"chain\", \"dedupe_key\") {names} FROM \"{staging}\" \
-         ORDER BY \"chain\", \"dedupe_key\", rowid DESC \
+        "INSERT INTO \"{table}\" ({names}) SELECT {names} FROM \"{staging}\" \
          ON CONFLICT (\"chain\", \"dedupe_key\") DO UPDATE SET {assignments}"
     )
 }
@@ -383,12 +380,8 @@ impl DuckDbSink {
         // ponytail: six fixed tables mean six linear scans, with no grouping buffer.
         // Group at publish time only if the table count or profiling warrants it.
         for table in Table::ALL {
-            let mut rows = self
-                .rows
-                .iter()
-                .filter(|row| row.table() == table)
-                .peekable();
-            if rows.peek().is_none() {
+            let rows = last_per_key(&self.rows, table);
+            if rows.is_empty() {
                 continue;
             }
             let staging = staging_table(table);

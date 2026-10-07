@@ -48,6 +48,26 @@ pub use stdout::{StdoutJsonSink, StdoutSettings};
 use thiserror::Error;
 
 use crate::wire::envelope::Envelope;
+#[cfg(any(feature = "duckdb", feature = "postgres"))]
+use crate::wire::row::{Row, Table};
+
+/// The rows of `table` a store should load: the last buffered copy of each
+/// `(chain, dedupe_key)`, in publish order.
+///
+/// A store's merge must not see a key twice — both engines refuse to update one conflict
+/// row twice in a statement — and "last" means last published, which only the buffer
+/// knows; the staging table's physical order does not promise it.
+#[cfg(any(feature = "duckdb", feature = "postgres"))]
+fn last_per_key(rows: &[Row], table: Table) -> Vec<&Row> {
+    let mut seen = std::collections::HashSet::new();
+    let mut kept: Vec<&Row> = rows
+        .iter()
+        .rev()
+        .filter(|row| row.table() == table && seen.insert((row.chain(), row.dedupe_key())))
+        .collect();
+    kept.reverse();
+    kept
+}
 
 /// Receives envelopes in per-chain order, as the pipeline publishes them.
 ///

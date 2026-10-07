@@ -98,8 +98,8 @@ different rows rather than one row overwritten. A fork older than the retained w
 an error rather than an empty retraction.
 
 A replay of a row already stored updates that row. Both stores upsert on a unique
-`(chain, dedupe_key)`: the batch is loaded the same way, then merged, and the last copy
-of a key in the batch wins. The two branches of a reorg have different keys, so the
+`(chain, dedupe_key)`: only the last published copy of a key in the batch is loaded,
+then merged. The two branches of a reorg have different keys, so the
 upsert leaves both rows. A `reorg` marker is keyed by the new head, so a replay of that
 head updates the one marker.
 
@@ -240,7 +240,6 @@ stored-log replay
 streaming aggregation
 Avro for a serialized envelope
 ranged log backfill
-deterministic within-batch dedupe
 ```
 
 ### Resume from the store
@@ -378,15 +377,6 @@ cross-block batching of the per-height block/receipt calls, are not built.
 A `logs` subscription is not the log source: it has no end-of-block marker.
 
 Also not built, and not on the path above: mempool ingestion and a Parquet archive.
-
-### Deterministic within-batch dedupe
-
-A batch that holds one `(chain, dedupe_key)` twice keeps the last copy, but "last" is read
-from `ctid` (PostgreSQL) or `rowid` (DuckDB) — physical insertion order, not a column the
-row carries. Both stores upsert, so the cross-batch case is exact; only the within-batch
-tie is on borrowed time. The upgrade is a per-envelope sequence on the row, ordered on
-instead of the row's physical position. It is a wire change, so it is deferred. See the
-note under [PostgreSQL 18 sink](#postgresql-18-sink).
 
 ## Run it
 
@@ -572,13 +562,6 @@ use `NUMERIC(20,0)`, hex values use `TEXT`, booleans use `BOOLEAN`, and document
 migrated. Failed batches remain buffered. A lost connection during commit can leave
 the outcome unknown; retrying is not exactly-once. Restart recovery remains unimplemented,
 as with the DuckDB sink.
-
-> **TODO — deterministic within-batch dedupe.** When one batch holds a key twice, the
-> merge keeps the *last* copy using `ctid` (DuckDB uses `rowid`) as a stand-in for
-> insertion order. That is a physical-order shortcut, not a guarantee. The rows are keyed
-> by `(chain, dedupe_key)` alone, so there is no semantic column to order by. The fix is to
-> carry a per-envelope sequence on the row and order on that; it is a wire change, so it is
-> deferred. Tracked in [Not built yet](#not-built-yet).
 
 The PostgreSQL integration check creates a private schema on a PostgreSQL 18 server:
 

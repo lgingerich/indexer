@@ -2,10 +2,9 @@
 //!
 //! Each flush loads all buffered datasets in one transaction. Binary `COPY` sends each
 //! value in `PostgreSQL`'s native field format, so the server does not parse text, into a
-//! temporary table that is then upserted on `(chain, dedupe_key)`. The merge dedupes the
-//! batch with `DISTINCT ON`, keeping the last copy of a repeated key — `PostgreSQL`
-//! refuses to touch one conflict row twice in a statement, and its ordering leans on
-//! `ctid` (see `upsert_sql`). Unsigned integers use `NUMERIC(20,0)` (`PostgreSQL` has no
+//! temporary table that is then upserted on `(chain, dedupe_key)`. Only the last buffered
+//! copy of a repeated key is loaded, since `PostgreSQL` refuses to touch one conflict row
+//! twice in a statement. Unsigned integers use `NUMERIC(20,0)` (`PostgreSQL` has no
 //! unsigned bigint), documents use `JSONB`, and hex values remain `TEXT`. Columns the
 //! chain always provides are `NOT NULL`, and `(chain, dedupe_key)` is unique on each
 //! table. Columns of an existing table are not migrated.
@@ -23,7 +22,7 @@ use tokio_postgres::Client;
 use tokio_postgres::binary_copy::BinaryCopyInWriter;
 use tokio_postgres::types::{IsNull, ToSql, Type, to_sql_checked};
 
-use crate::sink::{EnvelopeSink, SinkError};
+use crate::sink::{EnvelopeSink, SinkError, last_per_key};
 use crate::wire::envelope::Envelope;
 use crate::wire::row::{ColumnType, ColumnValue, Row, Table, row_for};
 
@@ -101,16 +100,8 @@ fn quoted_columns(table: Table) -> String {
 
 /// Merges the staging table into the dataset table.
 ///
-/// `DISTINCT ON` keeps one row per key when a batch holds a key twice (the `COPY` appended
-/// both), and `ctid` is the staging table's insertion order, so the last copy wins.
-/// `ON CONFLICT` then updates a row an earlier flush already wrote.
-///
-/// ponytail: `ctid DESC` is a physical-order shortcut, not a guarantee. A single `COPY`
-/// into a fresh temp heap allocates ascending `ctid`s, which is all this leans on, but a
-/// planner that changed the load order would flip which copy "wins". Postgres keys the
-/// rows by `(chain, dedupe_key)` alone, so there is no column to order by when a batch
-/// repeats a key — the fix is to carry a per-row sequence in the row, which is a wire
-/// change rather than a store one.
+/// The staging table holds each key once (see `last_per_key`), so `ON CONFLICT` only
+/// updates a row an earlier flush already wrote.
 fn upsert_sql(table: Table) -> String {
     let names = quoted_columns(table);
     let assignments = table
@@ -122,9 +113,7 @@ fn upsert_sql(table: Table) -> String {
         .join(", ");
     let staging = staging_table(table);
     format!(
-        "INSERT INTO \"{table}\" ({names}) \
-         SELECT DISTINCT ON (\"chain\", \"dedupe_key\") {names} FROM \"{staging}\" \
-         ORDER BY \"chain\", \"dedupe_key\", ctid DESC \
+        "INSERT INTO \"{table}\" ({names}) SELECT {names} FROM \"{staging}\" \
          ON CONFLICT (\"chain\", \"dedupe_key\") DO UPDATE SET {assignments}"
     )
 }
@@ -284,7 +273,8 @@ impl PostgresSink {
         // ponytail: six fixed tables mean six linear scans. Group at publish time
         // only if the number of datasets or profiling warrants a grouping buffer.
         for ((table, plan), merge) in Table::ALL.into_iter().zip(&self.plans).zip(&self.merges) {
-            if !self.rows.iter().any(|row| row.table() == table) {
+            let rows = last_per_key(&self.rows, table);
+            if rows.is_empty() {
                 continue;
             }
             let staging = staging_table(table);
@@ -297,10 +287,7 @@ impl PostgresSink {
             let writer =
                 BinaryCopyInWriter::new(transaction.copy_in(&plan.statement).await?, &plan.types);
             pin_mut!(writer);
-            for row in &self.rows {
-                if row.table() != table {
-                    continue;
-                }
+            for row in rows {
                 writer.as_mut().write_raw(row.values()).await?;
             }
             writer.as_mut().finish().await?;
@@ -382,14 +369,6 @@ mod tests {
             assert!(
                 merge.contains("ON CONFLICT (\"chain\", \"dedupe_key\") DO UPDATE SET"),
                 "{table} merges on the identity"
-            );
-            assert!(
-                merge.contains("SELECT DISTINCT ON (\"chain\", \"dedupe_key\")"),
-                "{table} keeps one row per key when a batch repeats one"
-            );
-            assert!(
-                merge.contains("ORDER BY \"chain\", \"dedupe_key\", ctid DESC"),
-                "{table} keeps the last copy in the batch"
             );
             assert!(
                 merge.contains(&format!("FROM \"staging_{table}\"")),
@@ -477,15 +456,14 @@ mod tests {
         let mut sink = PostgresSink::new(client).await.expect("sink");
         sink.flush().await.expect("empty flush");
         let chain = ChainId::new("tab\tnewline\nslash\\unicodeé");
-        let event = Event::Reorg(Reorg {
-            height: u64::MAX,
-            new_head_hash: B256::ZERO,
-            orphaned_hashes: vec![B256::ZERO],
-        });
-        for _ in 0..2 {
-            sink.publish(Envelope::new(chain.clone(), event.clone()))
-                .await
-                .expect("publish");
+        for height in [1, u64::MAX] {
+            let reorg = Reorg {
+                height,
+                new_head_hash: B256::ZERO,
+                orphaned_hashes: vec![B256::ZERO],
+            };
+            let envelope = Envelope::new(chain.clone(), Event::Reorg(reorg));
+            sink.publish(envelope).await.expect("publish");
         }
         assert_eq!(count(&sink, Table::Reorg).await, 0);
         sink.flush().await.expect("commit");
@@ -495,7 +473,8 @@ mod tests {
             .await
             .expect("rows");
         assert_eq!(rows.len(), 1, "a repeated key in one batch is one row");
-        assert_eq!(rows[0].get::<_, String>(0), u64::MAX.to_string());
+        let height: String = rows[0].get(0);
+        assert_eq!(height, u64::MAX.to_string(), "last copy wins");
         assert_eq!(rows[0].get::<_, String>(1), chain.as_str());
         let rejected = Event::Reorg(Reorg {
             height: 42,
