@@ -134,6 +134,24 @@ impl Table {
         columns.extend(COMMON_COLUMNS);
         columns
     }
+
+    /// The column naming the block each row belongs to, or `None` for a table whose rows
+    /// belong to no single block.
+    ///
+    /// This is what a store deletes by when a reorg orphans a block: every row of every
+    /// table that answers `Some` is retracted with its block. Exhaustive, so a new table
+    /// cannot be added without deciding whether a reorg removes its rows. `reorg` answers
+    /// `None` because its rows are the record of what was retracted, not part of a block.
+    #[must_use]
+    pub const fn block_hash_column(self) -> Option<&'static str> {
+        match self {
+            Self::Block | Self::AcceptedBlock => Some("hash"),
+            Self::Transaction | Self::Receipt | Self::Log | Self::Decoded | Self::Contract => {
+                Some("block_hash")
+            }
+            Self::Reorg => None,
+        }
+    }
 }
 
 impl fmt::Display for Table {
@@ -401,6 +419,15 @@ impl Row {
     #[must_use]
     pub fn chain(&self) -> &str {
         self.text("chain")
+    }
+
+    /// The hash of the block this row belongs to, from
+    /// [`Table::block_hash_column`]; `None` for a table whose rows belong to no block.
+    #[must_use]
+    pub fn block_hash(&self) -> Option<&str> {
+        self.table
+            .block_hash_column()
+            .map(|column| self.text(column))
     }
 }
 
@@ -977,6 +1004,35 @@ mod tests {
             assert_eq!(row.values().len(), row.columns().len());
             assert_eq!(row.chain(), "ethereum");
             assert_eq!(row.dedupe_key(), event.dedupe_key());
+        }
+    }
+
+    /// Every table but `reorg` names its block, by a text column it really has, so a
+    /// reorg retracts its rows. A table that answered `None` by mistake would keep an
+    /// orphaned branch forever.
+    #[test]
+    fn every_table_but_reorg_names_its_block() {
+        for event in every_kind() {
+            let row = row_for(&chain(), &event);
+            let table = row.table();
+            if table == Table::Reorg {
+                assert_eq!(row.block_hash(), None, "a reorg belongs to no block");
+                continue;
+            }
+            let column = table
+                .block_hash_column()
+                .expect("every other table belongs to a block");
+            assert!(
+                table
+                    .columns()
+                    .iter()
+                    .any(|c| c.name == column && c.kind == ColumnType::Text && c.required),
+                "{table}.{column} is a required text column"
+            );
+            assert_eq!(
+                row.block_hash(),
+                Some(format!("{:#x}", hash(0x01)).as_str())
+            );
         }
     }
 

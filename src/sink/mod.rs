@@ -51,24 +51,90 @@ use thiserror::Error;
 use crate::wire::envelope::AcceptedBlock;
 use crate::wire::envelope::Envelope;
 #[cfg(any(feature = "duckdb", feature = "postgres"))]
-use crate::wire::row::{Row, Table};
-
-/// The rows of `table` a store should load: the last buffered copy of each
-/// `(chain, dedupe_key)`, in publish order.
-///
-/// A store's merge must not see a key twice — both engines refuse to update one conflict
-/// row twice in a statement — and "last" means last published, which only the buffer
-/// knows; the staging table's physical order does not promise it.
+use crate::wire::envelope::Event;
 #[cfg(any(feature = "duckdb", feature = "postgres"))]
-fn last_per_key(rows: &[Row], table: Table) -> Vec<&Row> {
-    let mut seen = std::collections::HashSet::new();
-    let mut kept: Vec<&Row> = rows
-        .iter()
-        .rev()
-        .filter(|row| row.table() == table && seen.insert((row.chain(), row.dedupe_key())))
-        .collect();
-    kept.reverse();
-    kept
+use crate::wire::row::{Row, Table, row_for};
+
+/// What a store has been handed since its last commit: the rows to write, and the
+/// blocks a buffered `reorg` retracted.
+///
+/// A store holds only the canonical chain. A `reorg` orphans blocks that are either
+/// already committed or still in this buffer — blocks are published in order and the
+/// storage channel is FIFO, so an orphaned block can never arrive after its `reorg`.
+/// [`push`](Self::push) drops the buffered ones at once, and the store deletes the
+/// committed ones by [`Table::block_hash_column`] in the same transaction that writes
+/// [`rows`](Self::rows), before writing them. Deleting first is what makes a block that
+/// returns — orphaned, then canonical again in a later `reorg` — end up stored: its
+/// rows, published again after the `reorg` that orphaned it, are written after the
+/// delete.
+///
+/// Both are cleared only after a commit succeeds, so a failed commit retries the deletes
+/// with the rows, and a retry of a committed batch deletes nothing and upserts onto
+/// itself.
+#[cfg(any(feature = "duckdb", feature = "postgres"))]
+#[derive(Debug, Default)]
+struct Batch {
+    /// Rows to upsert, in publish order.
+    rows: Vec<Row>,
+    /// Orphaned block hashes to delete from the store, as `0x` hex, by chain.
+    orphaned: std::collections::BTreeMap<String, std::collections::BTreeSet<String>>,
+}
+
+#[cfg(any(feature = "duckdb", feature = "postgres"))]
+impl Batch {
+    /// Buffers one envelope's row. A `reorg` first drops every buffered row of the
+    /// blocks it orphans and records them for deletion; its own row is kept as the
+    /// record of the retraction.
+    fn push(&mut self, envelope: &Envelope) {
+        if let Event::Reorg(reorg) = &envelope.event
+            && !reorg.orphaned_hashes.is_empty()
+        {
+            let chain = envelope.chain.as_str();
+            let hashes: std::collections::BTreeSet<String> = reorg
+                .orphaned_hashes
+                .iter()
+                .map(|hash| format!("{hash:#x}"))
+                .collect();
+            self.rows.retain(|row| {
+                row.chain() != chain || !row.block_hash().is_some_and(|h| hashes.contains(h))
+            });
+            self.orphaned
+                .entry(chain.to_owned())
+                .or_default()
+                .extend(hashes);
+        }
+        self.rows.push(row_for(&envelope.chain, &envelope.event));
+    }
+
+    /// The rows of `table` a store should load: the last buffered copy of each
+    /// `(chain, dedupe_key)`, in publish order.
+    ///
+    /// A store's merge must not see a key twice — both engines refuse to update one
+    /// conflict row twice in a statement — and "last" means last published, which only
+    /// the buffer knows; the staging table's physical order does not promise it.
+    fn last_per_key(&self, table: Table) -> Vec<&Row> {
+        let mut seen = std::collections::HashSet::new();
+        let mut kept: Vec<&Row> = self
+            .rows
+            .iter()
+            .rev()
+            .filter(|row| row.table() == table && seen.insert((row.chain(), row.dedupe_key())))
+            .collect();
+        kept.reverse();
+        kept
+    }
+
+    /// Whether there is nothing to commit. A `reorg` always buffers its own row, so a
+    /// batch with deletions is never empty.
+    fn is_empty(&self) -> bool {
+        self.rows.is_empty()
+    }
+
+    /// Forgets everything, once a commit has made it durable.
+    fn clear(&mut self) {
+        self.rows.clear();
+        self.orphaned.clear();
+    }
 }
 
 /// A stored discovered contract, as a store's query returns it.

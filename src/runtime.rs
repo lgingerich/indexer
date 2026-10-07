@@ -64,9 +64,10 @@ use crate::wire::envelope::ChainId;
 ///
 /// The top of the chain and the only place the layers meet, so each variant names *which*
 /// part stopped rather than restating what went wrong: the cause is already typed one
-/// level down and travels intact inside the variant. That is what makes `{error:?}` worth
-/// printing at the process boundary — it walks the `#[from]` chain and shows every layer,
-/// where a single string would have shown only the outermost.
+/// level down and travels intact inside the variant. Every variant prints that cause —
+/// `{source}` or `transparent` — so the `Display` the process boundary logs shows every
+/// layer in one line, where `Debug` would bury the same chain under the raw values behind
+/// it.
 ///
 /// The assembly failures are kept apart from the runtime ones on purpose. A bad settings
 /// file or unreadable manifests are fixed by editing a file and restarting; a pipeline
@@ -459,7 +460,8 @@ ws_url = "wss://example.invalid"
     /// The whole hand-off, minus the network: a factory's creation log goes through
     /// decode, over the channel, and into the store with the pool it discovered; the
     /// pool's swap decodes in the same batch; a restart reads the pool back and decodes
-    /// it; and once a reorg orphans the creating block, a restart no longer does.
+    /// it; and once a reorg orphans the creating block, the pool is deleted with it and a
+    /// restart no longer decodes it.
     #[tokio::test]
     async fn a_discovered_contract_is_stored_and_survives_a_restart() {
         let pool = Address::from([0xd0; 20]);
@@ -521,7 +523,7 @@ ws_url = "wss://example.invalid"
         };
         assert!(restarted.decode(&log).expect("decode").is_some());
 
-        // The creating block is orphaned: the stored row stays, but is not restored.
+        // The creating block is orphaned: the stored row is deleted, so nothing restores.
         store
             .publish(Envelope::new(
                 chain.clone(),
@@ -535,7 +537,7 @@ ws_url = "wss://example.invalid"
             .expect("publish");
         store.flush().await.expect("flush");
         assert!(store.contracts(&chain).expect("read back").is_empty());
-        assert_eq!(count(&reader, "contract"), 1);
+        assert_eq!(count(&reader, "contract"), 0);
     }
 
     /// A fixed chain: the head and, per height, the block's identity and its events. Its
@@ -655,8 +657,8 @@ ws_url = "wss://example.invalid"
     /// the second resumes after it while the chain only grew, discovering a pool created
     /// while nothing was running; the third resumes after a reorg replaced the pool's
     /// block while nothing was running. The store ends with no gap in its ledger, one
-    /// reorg naming the stored suffix, and the pool retracted — its later swap does not
-    /// decode.
+    /// reorg naming the stored suffix, nothing of the orphaned blocks, and the pool
+    /// retracted — its later swap does not decode.
     #[tokio::test]
     async fn a_restart_resumes_from_the_store_and_reconciles_a_fork_while_down() {
         let pool = Address::from([0xd0; 20]);
@@ -699,9 +701,18 @@ ws_url = "wss://example.invalid"
         );
         assert_eq!(count(&connection, "reorg"), 1);
         assert_eq!(
-            count(&connection, "decoded"),
-            1,
-            "the swap from the retracted pool"
+            [
+                count(&connection, "log"),
+                count(&connection, "decoded"),
+                count(&connection, "contract")
+            ],
+            [1, 0, 0],
+            "the creation went with its orphaned block; only the undecoded swap remains"
+        );
+        assert_eq!(
+            heights(&connection).len(),
+            7,
+            "the orphaned blocks left the ledger"
         );
         let store = DuckDbSink::new(connection.try_clone().expect("handle")).expect("open");
         let chain = ChainId::new("base");

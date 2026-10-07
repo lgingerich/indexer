@@ -19,23 +19,13 @@ ws_url = "wss://base-rpc.publicnode.com"
 # datasets = ["block", "transaction", "receipt", "log"]
 # log_addresses = ["0x1111111111111111111111111111111111111111"]
 
-# Where records go, and by which backend. Required: the table names the backend, so
-# exactly one may be present. `[sink.duckdb]` persists; naming `[sink.stdout]` instead
-# prints the stream and opens no store. An unknown backend is a startup error.
-# [sink.stdout]
-[sink.duckdb]
-path = "indexer.duckdb"
-
-# The most records one store commit may cover. Storage commits each block as it arrives
-# and, when it has fallen behind, folds the waiting blocks into one commit up to this many.
-# A block is never split, so a commit can run past this by up to one block.
-# batch_records = 500
-
-# Any other DuckDB setting, passed straight through and validated by the engine. It lives
-# under this table because it is DuckDB's, and nothing else here would understand it.
-[sink.duckdb.settings]
-threads = "4"
-max_memory = "1GB"
+# A remote PostgreSQL 18 database, written with transactional binary COPY and
+# upserted on (chain, dedupe_key). Requires the `postgres` feature. The connection
+# string is a secret, since it carries the password: URL or keyword syntax, with TLS
+# following its sslmode.
+[sink.postgres]
+connection_string = { env = "INDEXER_POSTGRES_URL" }
+batch_records = 500
 
 # What the decode stage decodes: a directory of protocol manifests — see `protocols/` —
 # so the catalog grows without churning these settings. Absent means nothing is decoded,

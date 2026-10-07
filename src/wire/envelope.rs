@@ -258,7 +258,7 @@ impl Decoded {
 ///
 /// Natural key is `(block_hash, transaction_hash, log_index, address)`: the creation log
 /// plus the child, so a creation in an orphaned block and its replay in the replacement
-/// are different rows, and a reader applies `reorg` markers to them like any other row.
+/// are different rows, and a `reorg` deletes the orphaned one like any other row.
 /// The store holding these rows is how discovered contracts survive a restart.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Contract {

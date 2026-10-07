@@ -6,8 +6,12 @@
 //! copy of a repeated key is loaded, since `PostgreSQL` refuses to touch one conflict row
 //! twice in a statement. Unsigned integers use `NUMERIC(20,0)` (`PostgreSQL` has no
 //! unsigned bigint), documents use `JSONB`, and hex values remain `TEXT`. Columns the
-//! chain always provides are `NOT NULL`, and `(chain, dedupe_key)` is unique on each
-//! table. Columns of an existing table are not migrated.
+//! chain always provides are `NOT NULL`, and `(chain, dedupe_key)` is each table's primary
+//! key — the replica identity logical replication needs to publish a delete. A `reorg`
+//! deletes its orphaned blocks' rows in the same transaction, through an index on each
+//! table's `(chain, block hash)`. Columns of an existing table are not migrated: the index
+//! is added to it at startup, but a table created before the primary key keeps its
+//! `UNIQUE` constraint instead.
 //! Connection strings accept the driver's URL or keyword syntax; TLS uses platform
 //! certificate validation and the connection's `sslmode`.
 
@@ -25,11 +29,10 @@ use tokio_postgres::types::{IsNull, ToSql, Type, to_sql_checked};
 use crate::config::Secret;
 use crate::decode::StoredContract;
 use crate::sink::{
-    EnvelopeSink, InvalidStoredValue, SinkError, last_per_key, parse_stored, stored_block,
-    stored_contract,
+    Batch, EnvelopeSink, InvalidStoredValue, SinkError, parse_stored, stored_block, stored_contract,
 };
 use crate::wire::envelope::{AcceptedBlock, ChainId, Envelope};
-use crate::wire::row::{ColumnType, ColumnValue, Row, Table, row_for};
+use crate::wire::row::{ColumnType, ColumnValue, Table};
 
 /// `PostgreSQL` connection and backlog batching settings for `[sink.postgres]`.
 #[derive(Debug, Deserialize)]
@@ -65,12 +68,8 @@ fn pg_type(kind: ColumnType) -> Type {
     }
 }
 
-/// The block hashes a stored `reorg` on chain `$1` names as orphaned.
-const ORPHANED: &str =
-    "(SELECT jsonb_array_elements_text(orphaned_hashes) FROM \"reorg\" WHERE chain = $1)";
-
-/// Table DDL rendered from [`Table::columns`]. `(chain, dedupe_key)` is unique so a
-/// replay can upsert.
+/// Table DDL rendered from [`Table::columns`]. `(chain, dedupe_key)` is the primary key,
+/// so a replay can upsert and logical replication can publish a delete.
 fn create_table(table: Table) -> String {
     let columns = table
         .columns()
@@ -82,8 +81,26 @@ fn create_table(table: Table) -> String {
         .collect::<Vec<_>>()
         .join(", ");
     format!(
-        "CREATE TABLE IF NOT EXISTS \"{table}\" ({columns}, UNIQUE (\"chain\", \"dedupe_key\"))"
+        "CREATE TABLE IF NOT EXISTS \"{table}\" ({columns}, PRIMARY KEY (\"chain\", \"dedupe_key\"))"
     )
+}
+
+/// The index a `reorg`'s delete finds a block's rows by, for a table whose rows belong
+/// to a block.
+fn create_block_index(table: Table) -> Option<String> {
+    table.block_hash_column().map(|column| {
+        format!(
+            "CREATE INDEX IF NOT EXISTS \"{table}_block_index\" ON \"{table}\" (\"chain\", \"{column}\")"
+        )
+    })
+}
+
+/// Deletes chain `$1`'s rows of the blocks in `$2`, for a table whose rows belong to a
+/// block.
+fn delete_blocks_sql(table: Table) -> Option<String> {
+    table.block_hash_column().map(|column| {
+        format!("DELETE FROM \"{table}\" WHERE \"chain\" = $1 AND \"{column}\" = ANY($2)")
+    })
 }
 
 fn staging_table(table: Table) -> String {
@@ -216,9 +233,10 @@ impl ToSql for ColumnValue {
 #[derive(Debug)]
 pub struct PostgresSink {
     client: Client,
-    rows: Vec<Row>,
+    batch: Batch,
     plans: [CopyPlan; Table::ALL.len()],
     merges: [String; Table::ALL.len()],
+    deletes: [Option<String>; Table::ALL.len()],
     connection_task: Option<tokio::task::JoinHandle<()>>,
 }
 
@@ -243,7 +261,7 @@ impl PostgresSink {
         Ok(sink)
     }
 
-    /// Takes a connected client and creates the dataset tables.
+    /// Takes a connected client and creates the dataset tables and their block indexes.
     ///
     /// The caller must already be driving the client's connection future. Existing tables
     /// are reused without schema migration or validation.
@@ -252,22 +270,28 @@ impl PostgresSink {
     ///
     /// Returns [`StoreError::Database`] when table creation fails.
     pub async fn new(mut client: Client) -> Result<Self, StoreError> {
+        let ddl = Table::ALL
+            .into_iter()
+            .map(create_table)
+            .chain(Table::ALL.into_iter().filter_map(create_block_index))
+            .collect::<Vec<_>>()
+            .join(";\n")
+            + ";";
         let transaction = client.transaction().await?;
-        transaction
-            .batch_execute(&(Table::ALL.map(create_table).join(";\n") + ";"))
-            .await?;
+        transaction.batch_execute(&ddl).await?;
         transaction.commit().await?;
         Ok(Self {
             client,
-            rows: Vec::new(),
+            batch: Batch::default(),
             plans: Table::ALL.map(copy_plan),
             merges: Table::ALL.map(upsert_sql),
+            deletes: Table::ALL.map(delete_blocks_sql),
             connection_task: None,
         })
     }
 
-    /// The contracts discovered on `chain` that this store holds, excluding any created in
-    /// a block a stored `reorg` names as orphaned.
+    /// The contracts discovered on `chain` that this store holds. One created in a block a
+    /// `reorg` orphaned was deleted with that block, so every row here is canonical.
     ///
     /// Read once at startup, before the first write, so a restart decodes every contract
     /// a previous run discovered.
@@ -280,10 +304,7 @@ impl PostgresSink {
         let rows = self
             .client
             .query(
-                &format!(
-                    "SELECT protocol, name, address, block_hash FROM \"contract\" \
-                     WHERE chain = $1 AND block_hash NOT IN {ORPHANED}"
-                ),
+                "SELECT protocol, name, address, block_hash FROM \"contract\" WHERE chain = $1",
                 &[&chain.as_str()],
             )
             .await?;
@@ -299,8 +320,9 @@ impl PostgresSink {
         Ok(contracts)
     }
 
-    /// The newest `limit` accepted blocks on `chain` that no stored `reorg` orphans,
-    /// oldest first, after dropping every older row.
+    /// The newest `limit` accepted blocks on `chain`, oldest first, after dropping every
+    /// older row. An orphaned block's row was deleted by its `reorg`, so these are
+    /// canonical.
     ///
     /// Read once at startup, before the first write: the result is the undo window a
     /// restart resumes from. Rows below the oldest one returned can never be read again,
@@ -320,11 +342,8 @@ impl PostgresSink {
         let rows = self
             .client
             .query(
-                &format!(
-                    "SELECT height::TEXT, hash, parent_hash, \"timestamp\"::TEXT \
-                     FROM \"accepted_block\" WHERE chain = $1 AND hash NOT IN {ORPHANED} \
-                     ORDER BY height DESC LIMIT $2"
-                ),
+                "SELECT height::TEXT, hash, parent_hash, \"timestamp\"::TEXT \
+                 FROM \"accepted_block\" WHERE chain = $1 ORDER BY height DESC LIMIT $2",
                 &[&chain.as_str(), &i64::try_from(limit).unwrap_or(i64::MAX)],
             )
             .await?;
@@ -349,14 +368,22 @@ impl PostgresSink {
     }
 
     async fn write_batch(&mut self) -> Result<(), StoreError> {
-        if self.rows.is_empty() {
+        if self.batch.is_empty() {
             return Ok(());
         }
         let transaction = self.client.transaction().await?;
+        // Deletes before upserts, so a block orphaned and then canonical again within
+        // this batch is deleted and rewritten rather than rewritten and deleted.
+        for delete in self.deletes.iter().flatten() {
+            for (chain, hashes) in &self.batch.orphaned {
+                let hashes: Vec<&str> = hashes.iter().map(String::as_str).collect();
+                transaction.execute(delete, &[chain, &hashes]).await?;
+            }
+        }
         // ponytail: eight fixed tables mean eight linear scans. Group at publish time
         // only if the number of datasets or profiling warrants a grouping buffer.
         for ((table, plan), merge) in Table::ALL.into_iter().zip(&self.plans).zip(&self.merges) {
-            let rows = last_per_key(&self.rows, table);
+            let rows = self.batch.last_per_key(table);
             if rows.is_empty() {
                 continue;
             }
@@ -377,7 +404,7 @@ impl PostgresSink {
             transaction.batch_execute(merge).await?;
         }
         transaction.commit().await?;
-        self.rows.clear();
+        self.batch.clear();
         Ok(())
     }
 }
@@ -392,7 +419,7 @@ impl Drop for PostgresSink {
 
 impl EnvelopeSink for PostgresSink {
     async fn publish(&mut self, envelope: Envelope) -> Result<(), SinkError> {
-        self.rows.push(row_for(&envelope.chain, &envelope.event));
+        self.batch.push(&envelope);
         Ok(())
     }
 
@@ -448,9 +475,15 @@ mod tests {
             let ddl = create_table(table);
             let plan = copy_plan(table);
             assert!(
-                ddl.contains("UNIQUE (\"chain\", \"dedupe_key\")"),
-                "{table} upserts on its identity"
+                ddl.contains("PRIMARY KEY (\"chain\", \"dedupe_key\")"),
+                "{table} upserts on its identity and can publish a delete"
             );
+            assert_eq!(
+                create_block_index(table).is_some(),
+                table != Table::Reorg,
+                "{table} is indexed by block exactly when a reorg deletes from it"
+            );
+            assert_eq!(delete_blocks_sql(table).is_some(), table != Table::Reorg);
             let merge = upsert_sql(table);
             assert!(
                 merge.contains("ON CONFLICT (\"chain\", \"dedupe_key\") DO UPDATE SET"),
@@ -511,11 +544,11 @@ mod tests {
             .get(0)
     }
 
-    /// A stored contract reads back scoped to its chain, and is excluded once a stored
-    /// reorg orphans its creating block.
+    /// A stored contract reads back scoped to its chain, and is deleted once a reorg
+    /// orphans its creating block.
     #[tokio::test]
     #[ignore = "requires INDEXER_TEST_POSTGRES_URL pointing to PostgreSQL 18"]
-    async fn stored_contracts_read_back_and_orphaned_ones_are_excluded() {
+    async fn stored_contracts_read_back_and_orphaned_ones_are_deleted() {
         use alloy_primitives::Address;
 
         use crate::wire::envelope::Contract;
@@ -578,6 +611,11 @@ mod tests {
             .expect("publish");
         sink.flush().await.expect("commit");
         assert!(sink.contracts(&chain).await.expect("read back").is_empty());
+        assert_eq!(
+            count(&sink, Table::Contract).await,
+            1,
+            "the other chain's contract stays"
+        );
 
         sink.client
             .batch_execute(&format!("DROP SCHEMA \"{schema}\" CASCADE"))
@@ -647,8 +685,8 @@ mod tests {
         );
         assert_eq!(
             count(&sink, Table::AcceptedBlock).await,
-            5,
-            "7 through 10 on base, and ethereum's row"
+            4,
+            "7 through 9 on base, and ethereum's row; 10 was deleted"
         );
         assert_eq!(
             sink.ledger(&ChainId::new("ethereum"), 3)
@@ -659,6 +697,118 @@ mod tests {
 
         sink.client
             .batch_execute(&format!("DROP SCHEMA \"{schema}\" CASCADE"))
+            .await
+            .expect("drop test schema");
+        drop(sink);
+        task.abort();
+    }
+
+    /// A reorg deletes its orphaned blocks' rows in every table — committed earlier or
+    /// buffered in the same batch — and a block that returns is stored. Run with every
+    /// table in a publication, which refuses a delete from a table without a replica
+    /// identity, so it also proves the primary key is one.
+    #[tokio::test]
+    #[ignore = "requires INDEXER_TEST_POSTGRES_URL pointing to PostgreSQL 18"]
+    async fn a_reorg_deletes_orphaned_blocks_under_a_publication() {
+        use crate::wire::datasets::evm::{Block, Log};
+        use crate::wire::envelope::AcceptedBlock;
+
+        let url = std::env::var("INDEXER_TEST_POSTGRES_URL").expect("test database URL");
+        let (client, connection) = tokio_postgres::connect(&url, tokio_postgres::NoTls)
+            .await
+            .expect("connect");
+        let task = tokio::spawn(connection);
+        let schema = format!("reorg_test_{}", std::process::id());
+        client
+            .batch_execute(&format!(
+                "CREATE SCHEMA \"{schema}\"; SET search_path TO \"{schema}\""
+            ))
+            .await
+            .expect("test schema");
+        let mut sink = PostgresSink::new(client).await.expect("sink");
+        sink.client
+            .batch_execute(&format!(
+                "CREATE PUBLICATION \"{schema}\" FOR TABLES IN SCHEMA \"{schema}\""
+            ))
+            .await
+            .expect("publication");
+        let chain = ChainId::new("base");
+        let block = |byte: u8| {
+            let hash = B256::with_last_byte(byte);
+            [
+                Event::Block(Box::new(Block {
+                    number: 100,
+                    hash,
+                    ..Block::default()
+                })),
+                Event::Log(Box::new(Log {
+                    block_number: 100,
+                    block_hash: hash,
+                    ..Log::default()
+                })),
+                Event::AcceptedBlock(AcceptedBlock {
+                    height: 100,
+                    hash,
+                    parent_hash: B256::ZERO,
+                    timestamp: 0,
+                }),
+            ]
+            .map(|event| Envelope::new(chain.clone(), event))
+        };
+        let reorg = |byte: u8| {
+            Envelope::new(
+                chain.clone(),
+                Event::Reorg(Reorg {
+                    height: 100,
+                    new_head_hash: B256::with_last_byte(byte ^ 0xff),
+                    orphaned_hashes: vec![B256::with_last_byte(byte)],
+                }),
+            )
+        };
+        let stored = async |sink: &PostgresSink| -> Vec<(String, String)> {
+            sink.client
+                .query(
+                    "SELECT 'block', hash FROM block UNION ALL \
+                     SELECT 'log', block_hash FROM log UNION ALL \
+                     SELECT 'accepted_block', hash FROM accepted_block ORDER BY 1",
+                    &[],
+                )
+                .await
+                .expect("rows")
+                .iter()
+                .map(|row| (row.get(0), row.get(1)))
+                .collect()
+        };
+        let only = |byte: u8| {
+            let hash = format!("{:#x}", B256::with_last_byte(byte));
+            ["accepted_block", "block", "log"].map(|table| (table.to_owned(), hash.clone()))
+        };
+
+        // A committed block, retracted by a later batch that also holds its replacement.
+        for envelope in block(0xa1) {
+            sink.publish(envelope).await.expect("publish");
+        }
+        sink.flush().await.expect("commit A");
+        sink.publish(reorg(0xa1)).await.expect("publish");
+        for envelope in block(0xb1) {
+            sink.publish(envelope).await.expect("publish");
+        }
+        sink.flush().await.expect("commit the reorg");
+        assert_eq!(stored(&sink).await, only(0xb1));
+
+        // A' orphaned within one batch, and A canonical again after it.
+        sink.publish(reorg(0xb1)).await.expect("publish");
+        for envelope in block(0xa1) {
+            sink.publish(envelope).await.expect("publish");
+        }
+        sink.flush().await.expect("commit the return");
+        assert_eq!(stored(&sink).await, only(0xa1));
+        assert_eq!(count(&sink, Table::Reorg).await, 2);
+
+        sink.client
+            .batch_execute(&format!(
+                "DROP PUBLICATION \"{schema}\"; DROP SCHEMA \"{schema}\" CASCADE"
+            ))
             .await
             .expect("drop test schema");
         drop(sink);
@@ -734,14 +884,14 @@ mod tests {
             sink.flush().await,
             Err(SinkError::Postgres(StoreError::Database(_)))
         ));
-        assert_eq!(sink.rows.len(), 1);
+        assert_eq!(sink.batch.rows.len(), 1);
         assert_eq!(count(&sink, Table::Reorg).await, 1);
         sink.client
             .batch_execute("ALTER TABLE reorg DROP CONSTRAINT reject_height")
             .await
             .expect("remove constraint");
         sink.flush().await.expect("retry");
-        assert!(sink.rows.is_empty());
+        assert!(sink.batch.rows.is_empty());
         assert_eq!(count(&sink, Table::Reorg).await, 1);
         assert_eq!(
             sink.client

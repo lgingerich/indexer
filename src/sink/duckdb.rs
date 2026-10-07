@@ -10,13 +10,14 @@
 //!
 //! What a log's columns *are* is not a `DuckDB` question. It is the same question for
 //! every store, and [`crate::wire::row`] answers it once, beside the datasets it is about:
-//! this sink receives a [`Row`] — a table, its column names, and values in that order —
+//! this sink receives a [`Row`](crate::wire::row::Row) — a table, its column names, and values in that order —
 //! and knows only what is genuinely `DuckDB`'s:
 //!
 //! - the DDL, generated from [`Table::columns`](crate::wire::row::Table::columns) so the
 //!   schema and the data cannot disagree about what a table has;
 //! - how a [`ColumnValue`] becomes a `duckdb` type;
-//! - the append into a staging table, the upsert onto `(chain, dedupe_key)`, and the commit.
+//! - the append into a staging table, the upsert onto `(chain, dedupe_key)`, a `reorg`'s
+//!   delete of its orphaned blocks, and the commit.
 //!
 //! So adding a store means writing one module that consumes the same rows, rather than
 //! re-deciding for each of six tables what a log is.
@@ -46,10 +47,10 @@ use tracing::info;
 
 use crate::decode::StoredContract;
 use crate::sink::{
-    EnvelopeSink, InvalidStoredValue, SinkError, last_per_key, stored_block, stored_contract,
+    Batch, EnvelopeSink, InvalidStoredValue, SinkError, stored_block, stored_contract,
 };
 use crate::wire::envelope::{AcceptedBlock, ChainId, Envelope};
-use crate::wire::row::{ColumnType, ColumnValue, Row, Table, row_for};
+use crate::wire::row::{ColumnType, ColumnValue, Table};
 /// The `DuckDB` file written when the settings name no path.
 const DEFAULT_PATH: &str = "indexer.duckdb";
 
@@ -196,13 +197,13 @@ impl ToSql for ColumnValue {
 /// [`flush`]: EnvelopeSink::flush
 pub struct DuckDbSink {
     connection: Connection,
-    rows: Vec<Row>,
+    batch: Batch,
 }
 
 impl std::fmt::Debug for DuckDbSink {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DuckDbSink")
-            .field("buffered", &self.rows.len())
+            .field("buffered", &self.batch.rows.len())
             .finish_non_exhaustive()
     }
 }
@@ -255,41 +256,35 @@ impl DuckDbSink {
             .map_err(|source| StoreError::Schema { source })?;
         Ok(Self {
             connection,
-            rows: Vec::new(),
+            batch: Batch::default(),
         })
     }
 }
 
-/// The block hashes a stored `reorg` on chain `$1` names as orphaned.
-macro_rules! orphaned {
-    () => {
-        "(SELECT unnest(from_json(orphaned_hashes, '[\"VARCHAR\"]')) FROM \"reorg\" WHERE chain = $1)"
-    };
+/// The discovered contracts on chain `$1`. Only the columns a restart needs.
+const CONTRACTS: &str =
+    "SELECT protocol, name, address, block_hash FROM \"contract\" WHERE chain = $1";
+
+/// The newest `$2` accepted blocks on chain `$1`, newest first.
+const LEDGER: &str = "SELECT height, hash, parent_hash, \"timestamp\" FROM \"accepted_block\" \
+     WHERE chain = $1 ORDER BY height DESC LIMIT $2";
+
+/// Deletes chain `$1`'s rows of block `$2`, for a table whose rows belong to a block.
+///
+/// One block per statement rather than a list parameter: a reorg names a handful of
+/// blocks, and a scalar parameter needs nothing from the driver's list support.
+fn delete_block_sql(table: Table) -> Option<String> {
+    table
+        .block_hash_column()
+        .map(|column| format!("DELETE FROM \"{table}\" WHERE chain = $1 AND \"{column}\" = $2"))
 }
-
-/// The discovered contracts on chain `$1`, minus those created in an orphaned block.
-/// Only the columns a restart needs.
-const CONTRACTS: &str = concat!(
-    "SELECT protocol, name, address, block_hash FROM \"contract\" \
-     WHERE chain = $1 AND block_hash NOT IN ",
-    orphaned!()
-);
-
-/// The newest `$2` accepted blocks on chain `$1` that no stored `reorg` orphans, newest
-/// first.
-const LEDGER: &str = concat!(
-    "SELECT height, hash, parent_hash, \"timestamp\" FROM \"accepted_block\" \
-     WHERE chain = $1 AND hash NOT IN ",
-    orphaned!(),
-    " ORDER BY height DESC LIMIT $2"
-);
 
 /// Drops chain `$1`'s accepted blocks below height `$2`.
 const PRUNE_LEDGER: &str = "DELETE FROM \"accepted_block\" WHERE chain = $1 AND height < $2";
 
 impl DuckDbSink {
-    /// The contracts discovered on `chain` that this store holds, excluding any created in
-    /// a block a stored `reorg` names as orphaned.
+    /// The contracts discovered on `chain` that this store holds. One created in a block a
+    /// `reorg` orphaned was deleted with that block, so every row here is canonical.
     ///
     /// Read once at startup, before the first write, so a restart decodes every contract
     /// a previous run discovered.
@@ -319,8 +314,9 @@ impl DuckDbSink {
         Ok(contracts)
     }
 
-    /// The newest `limit` accepted blocks on `chain` that no stored `reorg` orphans,
-    /// oldest first, after dropping every older row.
+    /// The newest `limit` accepted blocks on `chain`, oldest first, after dropping every
+    /// older row. An orphaned block's row was deleted by its `reorg`, so these are
+    /// canonical.
     ///
     /// Read once at startup, before the first write: the result is the undo window a
     /// restart resumes from. Rows below the oldest one returned can never be read again,
@@ -364,7 +360,7 @@ impl DuckDbSink {
 
 impl EnvelopeSink for DuckDbSink {
     async fn publish(&mut self, envelope: Envelope) -> Result<(), SinkError> {
-        self.rows.push(row_for(&envelope.chain, &envelope.event));
+        self.batch.push(&envelope);
         Ok(())
     }
 
@@ -427,6 +423,14 @@ pub enum StoreError {
         /// The engine's own reason.
         source: duckdb::Error,
     },
+    /// An orphaned block's rows could not be deleted.
+    #[error("delete orphaned {table} rows: {source}")]
+    Delete {
+        /// Which table's delete failed.
+        table: &'static str,
+        /// The engine's own reason.
+        source: duckdb::Error,
+    },
     /// The staging table for an upsert could not be prepared.
     #[error("prepare {table} upsert: {source}")]
     Prepare {
@@ -477,7 +481,8 @@ pub enum StoreError {
 impl DuckDbSink {
     /// Writes every table in one transaction, then clears the buffer after commit.
     ///
-    /// Each table is appended into a temporary staging table and merged with
+    /// The rows of every block a buffered `reorg` orphaned are deleted first. Then each
+    /// table is appended into a temporary staging table and merged with
     /// `INSERT … ON CONFLICT DO UPDATE`. A key a batch holds twice keeps its last copy. On
     /// failure the transaction rolls back and the whole batch stays buffered for a retry.
     ///
@@ -485,17 +490,34 @@ impl DuckDbSink {
     ///
     /// Returns an error if the transaction, the staging append, or the upsert fails.
     fn write_batch(&mut self) -> Result<(), StoreError> {
-        if self.rows.is_empty() {
+        if self.batch.is_empty() {
             return Ok(());
         }
         let transaction = self
             .connection
             .transaction()
             .map_err(|source| StoreError::Begin { source })?;
+        // Deletes before upserts, so a block orphaned and then canonical again within
+        // this batch is deleted and rewritten rather than rewritten and deleted.
+        for table in Table::ALL {
+            let Some(delete) = delete_block_sql(table) else {
+                continue;
+            };
+            for (chain, hashes) in &self.batch.orphaned {
+                for hash in hashes {
+                    transaction
+                        .execute(&delete, duckdb::params![chain, hash])
+                        .map_err(|source| StoreError::Delete {
+                            table: table.name(),
+                            source,
+                        })?;
+                }
+            }
+        }
         // ponytail: eight fixed tables mean eight linear scans, with no grouping buffer.
         // Group at publish time only if the table count or profiling warrants it.
         for table in Table::ALL {
-            let rows = last_per_key(&self.rows, table);
+            let rows = self.batch.last_per_key(table);
             if rows.is_empty() {
                 continue;
             }
@@ -544,7 +566,7 @@ impl DuckDbSink {
         transaction
             .commit()
             .map_err(|source| StoreError::Commit { source })?;
-        self.rows.clear();
+        self.batch.clear();
         Ok(())
     }
 }
@@ -856,14 +878,14 @@ mod tests {
             sink.publish(envelope).await.expect("row buffers");
         }
         assert_eq!(
-            sink.rows.len(),
+            sink.batch.rows.len(),
             every_kind().len(),
             "buffered but not written"
         );
         assert_eq!(row_count(&sink, "log"), 0);
 
         sink.flush().await.expect("batch flushes");
-        assert_eq!(sink.rows.len(), 0, "the buffers are cleared");
+        assert_eq!(sink.batch.rows.len(), 0, "the buffers are cleared");
         assert_eq!(row_count(&sink, "log"), 1);
     }
 
@@ -885,7 +907,7 @@ mod tests {
             }))
         ));
         assert_eq!(
-            sink.rows.len(),
+            sink.batch.rows.len(),
             every_kind().len(),
             "failed batch stays buffered"
         );
@@ -903,7 +925,7 @@ mod tests {
             .await
             .expect("retry commits the original batch");
         sink.flush().await.expect("empty flush is a no-op");
-        assert_eq!(sink.rows.len(), 0);
+        assert_eq!(sink.batch.rows.len(), 0);
         for table in Table::ALL {
             assert_eq!(
                 row_count(&sink, table.name()),
@@ -941,7 +963,7 @@ mod tests {
             }))
         ));
         assert_eq!(row_count(&sink, "reorg"), 0);
-        assert_eq!(sink.rows.len(), 2);
+        assert_eq!(sink.batch.rows.len(), 2);
 
         sink.connection
             .execute_batch(&format!(
@@ -951,7 +973,7 @@ mod tests {
             .expect("remove the constraint");
         sink.flush().await.expect("retry the whole batch");
         assert_eq!(row_count(&sink, "reorg"), 2);
-        assert_eq!(sink.rows.len(), 0);
+        assert_eq!(sink.batch.rows.len(), 0);
     }
 
     /// A batch of several rows lands in one flush.
@@ -976,10 +998,10 @@ mod tests {
     }
 
     /// A batch that holds a key twice keeps its last copy, a later flush of the same key
-    /// updates the stored row rather than appending a second, and a replacement block has
-    /// its own key so both reorg branches stay.
+    /// updates the stored row rather than appending a second, and a reorg replaces the
+    /// orphaned branch's row with the replacement's.
     #[tokio::test]
-    async fn a_replay_updates_the_row_and_a_reorg_keeps_both_branches() {
+    async fn a_replay_updates_the_row_and_a_reorg_replaces_the_branch() {
         let mut sink = sink();
         let orphaned = Log {
             log_index: 0,
@@ -1026,15 +1048,179 @@ mod tests {
             "the replay's value replaces the stored one"
         );
 
-        // A replacement block's log is a different key, so the reorg's other branch stays.
+        // The reorg deletes the stored branch; the replacement is its own key.
         let mut replacement = orphaned;
         replacement.block_hash = hash(0xbb);
         replacement.block_timestamp = 9;
+        sink.publish(reorg(&[0xaa])).await.expect("reorg buffers");
         sink.publish(Envelope::new(chain(), Event::Log(Box::new(replacement))))
             .await
             .expect("replacement buffers");
-        sink.flush().await.expect("replacement is its own row");
-        assert_eq!(row_count(&sink, "log"), 2);
+        sink.flush()
+            .await
+            .expect("the reorg and its replacement commit");
+        assert_eq!(row_count(&sink, "log"), 1, "only the replacement remains");
+        assert_eq!(log_timestamp(&sink), 9);
+    }
+
+    /// A reorg naming `orphaned` blocks, by their fixture hash bytes.
+    fn reorg(orphaned: &[u8]) -> Envelope {
+        Envelope::new(
+            chain(),
+            Event::Reorg(Reorg {
+                height: 100,
+                // Not the fixture marker's head, so this marker is its own row.
+                new_head_hash: hash(0x56),
+                orphaned_hashes: orphaned.iter().map(|byte| hash(*byte)).collect(),
+            }),
+        )
+    }
+
+    /// Every table but `reorg`, with how many rows it holds.
+    fn block_tables(sink: &DuckDbSink) -> Vec<(Table, i64)> {
+        Table::ALL
+            .into_iter()
+            .filter(|table| *table != Table::Reorg)
+            .map(|table| (table, row_count(sink, table.name())))
+            .collect()
+    }
+
+    /// A reorg deletes a committed block's rows from every table that belongs to a
+    /// block, the ledger included, and keeps itself as the record of the retraction.
+    #[tokio::test]
+    async fn a_reorg_deletes_a_committed_block_from_every_table() {
+        let mut sink = sink();
+        store(&mut sink).await;
+        let other_chain = every_kind().into_iter().map(|mut envelope| {
+            envelope.chain = ChainId::new("ethereum");
+            envelope
+        });
+        for envelope in other_chain {
+            sink.publish(envelope).await.expect("row buffers");
+        }
+        sink.flush().await.expect("both chains commit");
+
+        sink.publish(reorg(&[0x01])).await.expect("reorg buffers");
+        sink.flush().await.expect("the reorg commits");
+
+        for (table, rows) in block_tables(&sink) {
+            let base: i64 = sink
+                .connection
+                .query_row(
+                    &format!("SELECT count(*) FROM \"{table}\" WHERE chain = 'base'"),
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("count reads back");
+            assert_eq!(base, 0, "{table} keeps nothing of the orphaned block");
+            assert_eq!(
+                rows,
+                i64::from(table != Table::Decoded),
+                "{table} keeps the other chain's row"
+            );
+        }
+        assert_eq!(
+            row_count(&sink, "reorg"),
+            3,
+            "two fixture markers and this one"
+        );
+    }
+
+    /// An orphaned block still in the buffer is dropped before it is ever written.
+    #[tokio::test]
+    async fn a_reorg_drops_an_orphaned_block_from_the_same_batch() {
+        let mut sink = sink();
+        for envelope in every_kind() {
+            sink.publish(envelope).await.expect("row buffers");
+        }
+        sink.publish(reorg(&[0x01])).await.expect("reorg buffers");
+        assert_eq!(
+            sink.batch.rows.len(),
+            2,
+            "only the two reorg markers stay buffered"
+        );
+        sink.flush().await.expect("batch commits");
+
+        for (table, rows) in block_tables(&sink) {
+            assert_eq!(rows, 0, "{table} never sees the orphaned block");
+        }
+        assert_eq!(row_count(&sink, "reorg"), 2);
+    }
+
+    /// A block orphaned and then canonical again is stored, whether its return arrives in
+    /// a later batch or the same one: the deletes run before the rows are written.
+    #[tokio::test]
+    async fn a_block_that_returns_after_a_reorg_is_stored() {
+        let log = |block: u8| {
+            Envelope::new(
+                chain(),
+                Event::Log(Box::new(Log {
+                    log_index: 0,
+                    transaction_hash: TxHash::from([0x11; 32]),
+                    block_number: 100,
+                    block_hash: hash(block),
+                    ..Log::default()
+                })),
+            )
+        };
+        let stored_blocks = |sink: &DuckDbSink| -> Vec<String> {
+            sink.connection
+                .prepare("SELECT block_hash FROM log ORDER BY block_hash")
+                .expect("prepare")
+                .query_map([], |row| row.get(0))
+                .expect("query")
+                .collect::<Result<_, _>>()
+                .expect("rows")
+        };
+
+        // Across batches: A, then A', then A again.
+        let mut sink = sink();
+        for envelopes in [
+            vec![log(0xaa)],
+            vec![reorg(&[0xaa]), log(0xbb)],
+            vec![reorg(&[0xbb]), log(0xaa)],
+        ] {
+            for envelope in envelopes {
+                sink.publish(envelope).await.expect("row buffers");
+            }
+            sink.flush().await.expect("batch commits");
+        }
+        assert_eq!(stored_blocks(&sink), [format!("{:#x}", hash(0xaa))]);
+
+        // Within one batch, with A already committed.
+        let mut sink = DuckDbSink::new(Connection::open_in_memory().expect("open DuckDB"))
+            .expect("create dataset tables");
+        sink.publish(log(0xaa)).await.expect("row buffers");
+        sink.flush().await.expect("A commits");
+        for envelope in [reorg(&[0xaa]), log(0xbb), reorg(&[0xbb]), log(0xaa)] {
+            sink.publish(envelope).await.expect("row buffers");
+        }
+        sink.flush()
+            .await
+            .expect("deleting and rewriting one key in a transaction commits");
+        assert_eq!(stored_blocks(&sink), [format!("{:#x}", hash(0xaa))]);
+    }
+
+    /// A failed commit keeps the reorg's deletions with its rows, and the retry applies
+    /// them.
+    #[tokio::test]
+    async fn a_failed_reorg_commit_keeps_its_deletes_for_the_retry() {
+        let mut sink = sink();
+        store(&mut sink).await;
+        sink.publish(reorg(&[0x01])).await.expect("reorg buffers");
+        sink.connection
+            .execute_batch("DROP TABLE reorg")
+            .expect("remove a table the batch writes");
+        assert!(sink.flush().await.is_err(), "the commit fails");
+        assert_eq!(row_count(&sink, "log"), 1, "the delete rolled back");
+
+        sink.connection
+            .execute_batch(&super::create_table(Table::Reorg))
+            .expect("restore the missing table");
+        sink.flush().await.expect("the retry commits");
+        for (table, rows) in block_tables(&sink) {
+            assert_eq!(rows, 0, "{table} is retracted on the retry");
+        }
     }
 
     fn accepted(height: u64) -> AcceptedBlock {
@@ -1066,7 +1252,7 @@ mod tests {
         ))
         .await
         .expect("buffer");
-        // Block 10 was orphaned, so the tip falls back to 9.
+        // Block 10 was orphaned and deleted, so the tip falls back to 9.
         sink.publish(Envelope::new(
             chain(),
             Event::Reorg(Reorg {
@@ -1089,7 +1275,7 @@ mod tests {
             .expect("query")
             .collect::<Result<_, _>>()
             .expect("rows");
-        assert_eq!(remaining, [7, 8, 9, 10], "the orphaned row above stays");
+        assert_eq!(remaining, [7, 8, 9], "the orphaned row above was deleted");
         assert_eq!(
             sink.ledger(&ChainId::new("ethereum"), 3)
                 .expect("read back"),

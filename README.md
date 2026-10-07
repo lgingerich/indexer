@@ -87,31 +87,47 @@ finality claim: a fork deeper than it stops with an error rather than a guessed 
 published     1 ─── 2 ─── 3
 new head           └─── 2'          2' builds on 1, not on 2
 
-appended, in order
+published, in order
   block 1, block 2, block 3
   reorg { height: 2, orphaned_hashes: [3, 2] }
   block 2', and its transactions, receipts, logs, and decoded rows
+
+stored
+  block 1, block 2'                 and each one's rows
+  reorg { height: 2, orphaned_hashes: [3, 2] }
 ```
 
-The store appends every one of those rows. It does not delete the orphaned branch, mark
-it noncanonical, or hide it from a dataset query. `block`, `transaction`, `receipt`,
-`log`, `decoded`, and `contract` contain both branches. The `reorg` table records which block hashes
-stopped being canonical, and that is the only place that fact is stored.
+The store holds only the current chain. A `reorg` deletes every row of the blocks it
+orphans — from `block`, `transaction`, `receipt`, `log`, `decoded`, `contract`, and
+`accepted_block` — in the same transaction that writes the `reorg` row and the
+replacements, so no commit ever shows both branches or neither. A dataset query needs no
+filter. The `reorg` row stays as the record of what was retracted.
 
-A downstream read that wants the current chain has to exclude every block hash named by
-`reorg.orphaned_hashes`. A read that does not apply those markers returns orphaned rows
-alongside their replacements. The same rule applies to every dataset row that carries one
-of those block hashes, not only to the `block` table.
+Each table names the column its block is found by (`Table::block_hash_column`: `hash`
+for `block` and `accepted_block`, `block_hash` elsewhere), and the delete goes by that
+column, not by `dedupe_key`. An orphaned block is either already committed or still
+buffered in the same batch — blocks are published in order and the storage channel is
+FIFO — so the store drops the buffered rows when the `reorg` arrives and deletes the
+committed ones before writing the batch. Deleting first is what stores a block that
+returns: orphaned by one `reorg` and canonical again after a later one, its republished
+rows are written after the delete. A failed commit keeps the deletions with the rows and
+retries both; a retry of a commit that did land deletes nothing and upserts onto itself.
+
+In `PostgreSQL`, `(chain, dedupe_key)` is each table's primary key — the replica
+identity logical replication needs to publish a delete — and `(chain, <block hash>)` is
+indexed so the delete does not scan. The index is added to an existing table at
+startup; the primary key is not, so a table created before it keeps its `UNIQUE`
+constraint and a store meant for logical replication should be re-created. `DuckDB`
+deletes the same rows without the extra index.
 
 A row's key carries the block's hash, so orphaned block 2 and replacement block 2' are
 different rows rather than one row overwritten. A fork older than the retained window is
 an error rather than an empty retraction.
 
-A replay of a row already stored updates that row. Both stores upsert on a unique
+A replay of a row already stored updates that row. Both stores upsert on
 `(chain, dedupe_key)`: only the last published copy of a key in the batch is loaded,
-then merged. The two branches of a reorg have different keys, so the
-upsert leaves both rows. A `reorg` marker is keyed by the new head, so a replay of that
-head updates the one marker.
+then merged. A `reorg` marker is keyed by the new head, so a replay of that head updates
+the one marker.
 
 ### When the store stalls
 
@@ -151,7 +167,7 @@ and the node serves the blocks after it.
 
 The store's `accepted_block` table is a ledger of every block it committed, one row per
 block, each written in the same transaction as that block's rows. At startup the newest
-4,097 rows whose hash no `reorg` row orphans are read back — the undo window plus its
+4,097 rows are read back — an orphaned block's row was deleted by its `reorg` — the undo window plus its
 floor — and every older row for the chain is deleted, so the table stays bounded across
 restarts. Only the newest parent-linked run of those rows is kept; a gap below it is
 logged and the window starts above it.
@@ -185,7 +201,7 @@ How each crash point resolves:
 | --- | --- | --- |
 | A block was queued, not committed | The ledger's tip is older | Replays from the tip |
 | A committed, its later `reorg` did not | A is in the ledger, with no marker | Finds A differs, appends the `reorg`, replays |
-| The `reorg` committed, replacements did not | A is excluded; the tip falls back to the ancestor | Resumes after the ancestor, fetching the replacements |
+| The `reorg` committed, replacements did not | A was deleted; the tip falls back to the ancestor | Resumes after the ancestor, fetching the replacements |
 | B committed, progress only in memory | The ledger includes B | Resumes after B |
 | A `PostgreSQL` commit's outcome is unknown | Whatever committed | Reads it; replaying a committed row upserts onto itself |
 
@@ -195,15 +211,8 @@ recreate the gaps resume closes. `[sink.stdout]` has no store, so it always star
 
 Resume guarantees contiguity from the restored tip forward, not before it: gaps that
 runs before resume existed left behind are not backfilled. And `MAX(block_number)` of a
-dataset is not a substitute for the ledger — empty blocks write no rows, orphaned
-branches can be higher, and a maximum proves nothing about contiguity.
-
-**Branch reacceptance is not handled.** `reorg.orphaned_hashes` is the only record of
-which hashes stopped being canonical, and readers — the ledger and contract read-back
-included — exclude every hash it ever names. If a previously orphaned hash later becomes
-canonical again, it stays excluded. For resume the cost is a re-fetch of that block; a
-general canonical reader would need ordered branch state or a maintained canonical
-mapping, which is not implemented.
+dataset is not a substitute for the ledger — empty blocks write no rows, and a maximum
+proves nothing about contiguity.
 
 ## Layout
 
@@ -280,8 +289,9 @@ that matters most: `decode` must not depend on `ingest`.
   is what a restart restores the window from.
 - **Reorg retraction.** Parent-hash linkage is checked on every block. A mismatch
   appends a `reorg` event whose `orphaned_hashes` name the block hashes that stopped
-  being canonical, then appends the replacement branch under its own keys. Dataset tables
-  keep both branches; a reader applies the `reorg` rows to see only the current chain.
+  being canonical, then appends the replacement branch under its own keys. The store
+  deletes the orphaned blocks' rows in the same transaction, so its tables hold only the
+  current chain and the `reorg` rows are the history of what was retracted.
   The sliding window retains up to a fixed 4,096 identities. See `src/ingest/pipeline.rs`.
 - **Headless backfill, then live heads.** Startup samples the head once and captures it
   as a backfill target; on an empty store `[ingest] start_block` may request earlier
@@ -457,7 +467,9 @@ the field:
 | `sink.duckdb.settings` | Any other DuckDB setting, passed straight through |
 
 `RUST_LOG` is still read from the environment, because a log filter is not deployment
-configuration.
+configuration. When it is unset, a debug build logs at `info` and a release build at
+`error`, so the developer sees the run and a deployment's log volume stays the operator's
+call.
 
 An unknown key is a startup error naming the line and the key, so a misspelling is
 caught rather than silently leaving a setting at its default. An unknown backend is
@@ -540,8 +552,8 @@ Rules chain: a discovered contract can have `created_by` children of its own.
 
 **Restarts.** The `contract` rows are the state: each commits in the same transaction as
 the block that created it, so the store never holds a block without its discoveries or
-the reverse. At startup the store's rows are read back, minus any created in a block a
-`reorg` row orphans. A run [resumes from the store](#resume-from-the-store), so the
+the reverse. At startup the store's rows are read back; one created in a block a `reorg`
+orphaned was deleted with that block. A run [resumes from the store](#resume-from-the-store), so the
 blocks missed while the process was down are replayed and a pool created then is
 discovered; a reorg while it was down retracts a pool whose creating block it orphaned.
 A pool created before the first run is never seen — list those as seeds. With
@@ -613,8 +625,9 @@ exist, and the role needs permission to create and write the dataset tables in i
 configured search path.
 
 The sink creates the same eight typed tables as DuckDB. Columns the chain always
-provides are `NOT NULL`; fields it can omit stay nullable. Each table has a unique
-index on `(chain, dedupe_key)`. A flush bulk-loads with binary `COPY` into a temporary
+provides are `NOT NULL`; fields it can omit stay nullable. Each table's primary key is
+`(chain, dedupe_key)`, and every table but `reorg` is indexed on its block hash for
+[reorg deletes](#a-reorg). A flush bulk-loads with binary `COPY` into a temporary
 table, then upserts into the dataset table, in one transaction. Unsigned 64-bit fields
 use `NUMERIC(20,0)`, hex values use `TEXT`, booleans use `BOOLEAN`, and documents use
 `JSONB`. A replay updates the existing row. Columns of an existing table are not
