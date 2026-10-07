@@ -2,8 +2,9 @@
 //!
 //! One binary, started as a process. What runs is not decided here — the settings file
 //! says it, and [`indexer::runtime`] assembles it: ingest follows the configured chain,
-//! decode uses the configured registry, and storage writes the configured store. So this
-//! file is only the process boundary: logging, the settings path, and the exit code.
+//! decode uses the configured protocol manifests, and storage writes the configured store.
+//! So this file is only the process boundary: logging, the settings path, and the exit
+//! code.
 //!
 //! # Settings
 //!

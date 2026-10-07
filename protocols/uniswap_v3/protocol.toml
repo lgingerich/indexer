@@ -1,0 +1,19 @@
+# Uniswap V3. See `src/decode/catalog.rs` for the manifest format.
+#
+# Every pool comes from the factory's `PoolCreated`, so pools are discovered rather than
+# listed: a pool created while the indexer runs decodes from its creating block.
+protocol = "uniswap_v3"
+
+[[contract]]
+abi = ["UniswapV3Factory.json"]
+addresses = { base = ["0x33128a8fC17869897dcE68Ed026d694621f6FDfD"] }
+
+[[contract]]
+abi = ["UniswapV3Pool.json"]
+created_by = [{ contract = "UniswapV3Factory", event = "PoolCreated", param = "pool" }]
+# Seeds: busy pools created before any run, so a short run decodes swaps out of the box.
+# The second is the pool `examples/decode_logs.rs` decodes.
+addresses = { base = [
+    "0x2df380544b88adb3ad0a94100dcc45fd705aae2d",
+    "0xd0b53D9277642d899DF5C87A3966A349A798F224",
+] }

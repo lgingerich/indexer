@@ -44,8 +44,9 @@ use serde::Deserialize;
 use thiserror::Error;
 use tracing::info;
 
-use crate::sink::{EnvelopeSink, SinkError, last_per_key};
-use crate::wire::envelope::Envelope;
+use crate::decode::StoredContract;
+use crate::sink::{EnvelopeSink, InvalidAddress, SinkError, last_per_key, stored_contract};
+use crate::wire::envelope::{ChainId, Envelope};
 use crate::wire::row::{ColumnType, ColumnValue, Row, Table, row_for};
 /// The `DuckDB` file written when the settings name no path.
 const DEFAULT_PATH: &str = "indexer.duckdb";
@@ -257,6 +258,40 @@ impl DuckDbSink {
     }
 }
 
+/// The discovered contracts on chain `$1`, minus those created in a block a stored
+/// `reorg` names as orphaned. Only the columns a restart needs.
+const CONTRACTS: &str = "SELECT protocol, name, address FROM \"contract\" \
+    WHERE chain = $1 AND block_hash NOT IN \
+    (SELECT unnest(from_json(orphaned_hashes, '[\"VARCHAR\"]')) FROM \"reorg\" WHERE chain = $1)";
+
+impl DuckDbSink {
+    /// The contracts discovered on `chain` that this store holds, excluding any created in
+    /// a block a stored `reorg` names as orphaned.
+    ///
+    /// Read once at startup, before the first write, so a restart decodes every contract
+    /// a previous run discovered.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::Read`] when the query fails and [`StoreError::Restore`] when
+    /// a stored address does not parse.
+    pub fn contracts(&self, chain: &ChainId) -> Result<Vec<StoredContract>, StoreError> {
+        let read = |source| StoreError::Read { source };
+        let mut statement = self.connection.prepare(CONTRACTS).map_err(read)?;
+        let rows = statement
+            .query_map([chain.as_str()], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get::<_, String>(2)?))
+            })
+            .map_err(read)?;
+        let mut contracts = Vec::new();
+        for row in rows {
+            let (protocol, name, address) = row.map_err(read)?;
+            contracts.push(stored_contract(protocol, name, &address)?);
+        }
+        Ok(contracts)
+    }
+}
+
 impl EnvelopeSink for DuckDbSink {
     async fn publish(&mut self, envelope: Envelope) -> Result<(), SinkError> {
         self.rows.push(row_for(&envelope.chain, &envelope.event));
@@ -276,8 +311,9 @@ impl EnvelopeSink for DuckDbSink {
 /// are inputs the caller supplied, and an operator reading a log should be able to match
 /// on the key rather than parse it back out of prose.
 ///
-/// Every variant here is a [`duckdb::Error`], which is what keeps this enum narrower than
-/// the layer above it: the engine is the only thing that can fail at these points.
+/// Every variant but [`StoreError::Restore`] is a [`duckdb::Error`], which is what keeps
+/// this enum narrower than the layer above it: the engine is the only thing that can fail
+/// at those points.
 ///
 /// The engine's error is carried rather than stringified, so the `#[error]` output reads
 /// the same as a formatted message would while staying matchable by a caller.
@@ -357,6 +393,15 @@ pub enum StoreError {
         /// The engine's own reason.
         source: duckdb::Error,
     },
+    /// Stored contracts could not be read back at startup.
+    #[error("read stored contracts: {source}")]
+    Read {
+        /// The engine's own reason.
+        source: duckdb::Error,
+    },
+    /// A stored contract's address did not parse.
+    #[error(transparent)]
+    Restore(#[from] InvalidAddress),
 }
 
 impl DuckDbSink {
@@ -377,7 +422,7 @@ impl DuckDbSink {
             .connection
             .transaction()
             .map_err(|source| StoreError::Begin { source })?;
-        // ponytail: six fixed tables mean six linear scans, with no grouping buffer.
+        // ponytail: seven fixed tables mean seven linear scans, with no grouping buffer.
         // Group at publish time only if the table count or profiling warrants it.
         for table in Table::ALL {
             let rows = last_per_key(&self.rows, table);
@@ -445,7 +490,7 @@ mod tests {
 
     use crate::sink::EnvelopeSink as _;
     use crate::wire::envelope::{
-        Block, ChainId, Envelope, Event, Log, Receipt, Reorg, Transaction,
+        Block, ChainId, Contract, Envelope, Event, Log, Receipt, Reorg, Transaction,
     };
     use crate::wire::row::{Table, row_for};
 
@@ -527,6 +572,21 @@ mod tests {
             ),
             Envelope::new(
                 chain(),
+                Event::Contract(Box::new(Contract {
+                    protocol: "uniswap_v3".to_owned(),
+                    name: "UniswapV3Pool".to_owned(),
+                    address: Address::from([0x77; 20]),
+                    factory_address: Address::from([0x33; 20]),
+                    transaction_hash: TxHash::from([0x11; 32]),
+                    transaction_index: 3,
+                    log_index: 7,
+                    block_number: 100,
+                    block_hash: hash(0x01),
+                    block_timestamp: 1_700_000_000,
+                })),
+            ),
+            Envelope::new(
+                chain(),
                 Event::Reorg(Reorg {
                     height: 100,
                     new_head_hash: hash(0x55),
@@ -547,8 +607,8 @@ mod tests {
     /// single `events` table: a log is a row of typed columns in `log`, not a row with
     /// most of them null.
     ///
-    /// The fixture has no decoded record — only the decode stage produces those — so
-    /// `decoded` is expected to be empty rather than to hold one.
+    /// The fixture has no decoded record, so `decoded` is expected to be empty rather than
+    /// to hold one; the decode stage's own output is covered in `decode` and `runtime`.
     #[tokio::test]
     async fn each_event_kind_lands_in_its_own_table() {
         let mut sink = sink();
@@ -716,7 +776,11 @@ mod tests {
         for envelope in every_kind() {
             sink.publish(envelope).await.expect("row buffers");
         }
-        assert_eq!(sink.rows.len(), 5, "buffered but not written");
+        assert_eq!(
+            sink.rows.len(),
+            every_kind().len(),
+            "buffered but not written"
+        );
         assert_eq!(row_count(&sink, "log"), 0);
 
         sink.flush().await.expect("batch flushes");
@@ -741,7 +805,11 @@ mod tests {
                 ..
             }))
         ));
-        assert_eq!(sink.rows.len(), 5, "failed batch stays buffered");
+        assert_eq!(
+            sink.rows.len(),
+            every_kind().len(),
+            "failed batch stays buffered"
+        );
         for table in Table::ALL
             .into_iter()
             .filter(|table| *table != Table::Reorg)

@@ -50,7 +50,7 @@ use std::fmt;
 use alloy_primitives::{Bytes, U256};
 
 use crate::wire::datasets::evm::{Block, Log, Receipt, Transaction};
-use crate::wire::envelope::{ChainId, Decoded, Event, Reorg};
+use crate::wire::envelope::{ChainId, Contract, Decoded, Event, Reorg};
 
 /// One table a store persists.
 ///
@@ -72,6 +72,8 @@ pub enum Table {
     Log,
     /// Decoded event records, whose arguments ride as documents.
     Decoded,
+    /// Contracts discovered from a factory's creation event.
+    Contract,
     /// Reorg markers: which block hashes stopped being canonical.
     Reorg,
 }
@@ -79,14 +81,15 @@ pub enum Table {
 impl Table {
     /// Every table, in the order a store would create them.
     ///
-    /// A `const` list rather than a derive: six cases do not justify a dependency, and a
-    /// hand-written list is one a reader can check.
-    pub const ALL: [Self; 6] = [
+    /// A `const` list rather than a derive: seven cases do not justify a dependency, and
+    /// a hand-written list is one a reader can check.
+    pub const ALL: [Self; 7] = [
         Self::Block,
         Self::Transaction,
         Self::Receipt,
         Self::Log,
         Self::Decoded,
+        Self::Contract,
         Self::Reorg,
     ];
 
@@ -102,6 +105,7 @@ impl Table {
             Self::Receipt => "receipt",
             Self::Log => "log",
             Self::Decoded => "decoded",
+            Self::Contract => "contract",
             Self::Reorg => "reorg",
         }
     }
@@ -119,6 +123,7 @@ impl Table {
             Self::Receipt => cells_columns(&RECEIPT_CELLS),
             Self::Log => cells_columns(&LOG_CELLS),
             Self::Decoded => cells_columns(&DECODED_CELLS),
+            Self::Contract => cells_columns(&CONTRACT_CELLS),
             Self::Reorg => cells_columns(&REORG_CELLS),
         };
         columns.extend(COMMON_COLUMNS);
@@ -411,6 +416,7 @@ pub fn row_for(chain: &ChainId, event: &Event) -> Row {
         Event::Receipt(r) => (Table::Receipt, receipt_cells(r)),
         Event::Log(l) => (Table::Log, log_cells(l)),
         Event::Decoded(d) => (Table::Decoded, decoded_cells(d)),
+        Event::Contract(c) => (Table::Contract, contract_cells(c)),
         Event::Reorg(r) => (Table::Reorg, reorg_cells(r)),
     };
     Row::new(table, cells.with_common(chain, &event.dedupe_key()))
@@ -715,7 +721,7 @@ fn log_cells(l: &Log) -> Columns {
 ///
 /// The two documents hold what varies per event — the indexed and non-indexed arguments —
 /// while everything that identifies the row is a typed column: a store can key, join,
-/// filter, and partition on `protocol`, `address`, `selector`, `abi_id`, `block_hash`,
+/// filter, and partition on `protocol`, `address`, `selector`, `event_id`, `block_hash`,
 /// `block_timestamp`, and `log_index` without parsing the record. The argument *values*
 /// still vary in type per event, so they stay documents; the identity does not, and keeping
 /// it locked in a document would force every query back through JSON.
@@ -726,7 +732,7 @@ const DECODED_CELLS: [(Column, fn(&Decoded) -> ColumnValue); 15] = [
         ColumnValue::Text(d.protocol.clone())
     }),
     (Column::text("selector"), |d| ColumnValue::hex(d.selector)),
-    (Column::text("abi_id"), |d| ColumnValue::hex(d.abi_id)),
+    (Column::text("event_id"), |d| ColumnValue::hex(d.event_id)),
     (Column::text("signature"), |d| {
         ColumnValue::Text(d.signature.clone())
     }),
@@ -767,6 +773,49 @@ fn decoded_cells(d: &Decoded) -> Columns {
     )
 }
 
+/// The `contract` table, as one cell per column.
+///
+/// The provenance columns of Allium's `dex.pools`, generalized past pools: what was
+/// created, by which factory, and where its creation log sits.
+const CONTRACT_CELLS: [(Column, fn(&Contract) -> ColumnValue); 10] = [
+    (Column::text("protocol"), |c| {
+        ColumnValue::Text(c.protocol.clone())
+    }),
+    (Column::text("name"), |c| ColumnValue::Text(c.name.clone())),
+    (Column::text("address"), |c| ColumnValue::hex(c.address)),
+    (Column::text("factory_address"), |c| {
+        ColumnValue::hex(c.factory_address)
+    }),
+    (Column::text("transaction_hash"), |c| {
+        ColumnValue::hex(c.transaction_hash)
+    }),
+    (Column::uint("transaction_index"), |c| {
+        ColumnValue::Uint(c.transaction_index)
+    }),
+    (Column::uint("log_index"), |c| {
+        ColumnValue::Uint(c.log_index)
+    }),
+    (Column::uint("block_number"), |c| {
+        ColumnValue::Uint(c.block_number)
+    }),
+    (Column::text("block_hash"), |c| {
+        ColumnValue::hex(c.block_hash)
+    }),
+    (Column::uint("block_timestamp"), |c| {
+        ColumnValue::Uint(c.block_timestamp)
+    }),
+];
+
+/// Builds the `contract` table's cells for one discovered contract.
+fn contract_cells(c: &Contract) -> Columns {
+    Columns(
+        CONTRACT_CELLS
+            .iter()
+            .map(|(column, render)| (*column, render(c)))
+            .collect(),
+    )
+}
+
 /// The `reorg` table, as one cell per column.
 ///
 /// `orphaned_hashes` is a document rather than a set of rows, and it is the one event
@@ -801,7 +850,9 @@ fn reorg_cells(r: &Reorg) -> Columns {
 mod tests {
     use alloy_primitives::{Address, B256, TxHash};
 
-    use crate::wire::envelope::{Block, ChainId, Decoded, Event, Log, Receipt, Reorg, Transaction};
+    use crate::wire::envelope::{
+        Block, ChainId, Contract, Decoded, Event, Log, Receipt, Reorg, Transaction,
+    };
 
     use super::{COMMON_COLUMNS, ColumnType, ColumnValue, Table, row_for};
 
@@ -847,7 +898,7 @@ mod tests {
                 name: "Swap".to_owned(),
                 address: Address::from([0xd0; 20]),
                 protocol: "uniswap_v3".to_owned(),
-                abi_id: hash(0x08),
+                event_id: hash(0x08),
                 selector: hash(0x07),
                 signature: "Swap(address)".to_owned(),
                 anonymous: false,
@@ -856,6 +907,18 @@ mod tests {
                 log_index: 7,
                 indexed: Vec::new(),
                 body: Vec::new(),
+                block_number: 100,
+                block_hash: hash(0x01),
+                block_timestamp: 1_700_000_000,
+            })),
+            Event::Contract(Box::new(Contract {
+                protocol: "uniswap_v3".to_owned(),
+                name: "UniswapV3Pool".to_owned(),
+                address: Address::from([0xd0; 20]),
+                factory_address: Address::from([0xfa; 20]),
+                transaction_hash: TxHash::from([0x11; 32]),
+                transaction_index: 3,
+                log_index: 6,
                 block_number: 100,
                 block_hash: hash(0x01),
                 block_timestamp: 1_700_000_000,
@@ -1111,7 +1174,7 @@ mod tests {
             name: "Swap".to_owned(),
             address: Address::from([0xd0; 20]),
             protocol: "uniswap_v3".to_owned(),
-            abi_id: hash(0x08),
+            event_id: hash(0x08),
             selector: hash(0x07),
             signature: "Swap(address)".to_owned(),
             anonymous: false,
@@ -1128,7 +1191,7 @@ mod tests {
         let row = row_for(&chain(), &event);
 
         assert_eq!(row.text("protocol"), "uniswap_v3");
-        assert_eq!(row.text("abi_id"), format!("{:#x}", decoded.abi_id));
+        assert_eq!(row.text("event_id"), format!("{:#x}", decoded.event_id));
         assert_eq!(row.text("address"), format!("{:#x}", decoded.address));
         assert_eq!(row.text("block_hash"), format!("{:#x}", decoded.block_hash));
         assert_eq!(row.value("log_index"), &ColumnValue::Uint(7));

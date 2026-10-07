@@ -1,19 +1,24 @@
-//! Schema-aware ABI event decoding with immutable, predefined registrations.
+//! Schema-aware ABI event decoding with factory discovery.
 //!
-//! ABIs are validated and prepared at startup. The registry selects an ABI by chain,
-//! address and original block height; protocol identity is separate from ABI identity.
-//! [`Decoder`] decodes logs during ingestion.
+//! Protocol manifests (see [`Catalog`]) name each protocol's contract kinds, their ABIs,
+//! their seed addresses per chain, and the creation events that discover more. The
+//! [`Decoder`] decodes a log only when its address is a known contract — a seed or a
+//! discovered child — and stamps the record with that contract's protocol. Decoding is
+//! *attributed*: a log whose signature matches a known event but whose address is not a
+//! known contract is not decoded, because anyone can deploy a contract that emits a
+//! lookalike event.
 //!
 //! [`DecodingSink`] runs before the storage channel and forwards raw records regardless
-//! of ordinary decode failures. Dynamic discovery, automatic ABI resolution, within-block
-//! upgrades and canonical-chain/reorg handling are deliberately not implemented.
+//! of ordinary decode failures. Discovered contracts are published as their own dataset,
+//! so the store holds them in the same transaction as the block that created them and a
+//! restart reads them back.
 
 mod abi;
+mod catalog;
 mod decoder;
-mod registry;
 mod sink;
 
 pub use abi::{Abi, AbiError, DecodeError, DecodedEvent};
-pub use decoder::Decoder;
-pub use registry::{Contract, ContractEntry, ContractRegistry, RegistryConfig, RegistryError};
+pub use catalog::{Catalog, CatalogError};
+pub use decoder::{Decoder, Decoding, StoredContract};
 pub use sink::DecodingSink;

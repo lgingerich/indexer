@@ -1,15 +1,16 @@
 //! Live decode stays inline before the bounded storage channel.
 
-use tracing::warn;
+use tracing::{info, warn};
 
-use crate::decode::{ContractRegistry, DecodeError, Decoder};
+use crate::decode::{DecodeError, Decoder};
 use crate::sink::{EnvelopeSink, SinkError};
-use crate::wire::envelope::{Envelope, Event};
+use crate::wire::envelope::{ChainId, Envelope, Event, Log};
 
-/// Forwards every raw record and adds matching decoded logs.
+/// Forwards every raw record and adds decoded logs and discovered contracts.
 ///
-/// Registrations are immutable. Reorg markers are forwarded unchanged;
-/// this stage does not claim that append-only stored records are canonical.
+/// After a log it can decode, it publishes the decoded record and then any contract the
+/// log created. A reorg marker is forwarded unchanged and retracts the contracts created
+/// in the orphaned blocks.
 pub struct DecodingSink<K> {
     decoder: Decoder,
     inner: K,
@@ -18,49 +19,72 @@ pub struct DecodingSink<K> {
 impl<K> std::fmt::Debug for DecodingSink<K> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DecodingSink")
-            .field("registrations", &self.decoder.registrations())
+            .field("contracts", &self.decoder.contracts())
             .finish_non_exhaustive()
     }
 }
 
 impl<K: EnvelopeSink> DecodingSink<K> {
-    /// Creates the live stage using the same decoder as historical replay.
+    /// Creates the decode stage in front of `inner`.
     #[must_use]
-    pub fn new(registry: ContractRegistry, inner: K) -> Self {
-        if registry.is_empty() {
+    pub fn new(decoder: Decoder, inner: K) -> Self {
+        if decoder.contracts() == 0 {
             warn!("no contracts registered; no log will decode");
         }
-        Self {
-            decoder: Decoder::new(registry),
-            inner,
+        Self { decoder, inner }
+    }
+
+    /// Decodes one log into the records to publish after it.
+    ///
+    /// Ordinary decode failures are logged and skipped, leaving the raw log; an internal
+    /// invariant failure stops the run.
+    fn decode(&mut self, chain: &ChainId, log: &Log) -> Result<Vec<Event>, SinkError> {
+        match self.decoder.decode(log) {
+            Ok(Some(decoding)) => {
+                let mut events = Vec::with_capacity(1 + decoding.discovered.len());
+                events.push(Event::Decoded(Box::new(decoding.decoded)));
+                events.extend(
+                    decoding
+                        .discovered
+                        .into_iter()
+                        .map(|contract| Event::Contract(Box::new(contract))),
+                );
+                Ok(events)
+            }
+            Ok(None) => Ok(Vec::new()),
+            Err(error @ DecodeError::Shape) => Err(SinkError::Decode(error)),
+            Err(error) => {
+                warn!(%chain, address = %log.address,
+                    block = log.block_number, block_hash = %log.block_hash,
+                    transaction = %log.transaction_hash, log_index = log.log_index,
+                    event_id = ?self.decoder.event_id(log), selector = ?log.topic0,
+                    error = ?error, "log decode failed; preserving raw record");
+                Ok(Vec::new())
+            }
         }
     }
 }
 
 impl<K: EnvelopeSink> EnvelopeSink for DecodingSink<K> {
     async fn publish(&mut self, envelope: Envelope) -> Result<(), SinkError> {
-        let decoded = if let Event::Log(log) = &envelope.event {
-            match self.decoder.decode(&envelope.chain, log) {
-                Ok(decoded) => decoded,
-                Err(error @ DecodeError::Shape) => return Err(SinkError::Decode(error)),
-                Err(error) => {
-                    warn!(chain = %envelope.chain, address = %log.address,
-                        block = log.block_number, block_hash = %log.block_hash,
-                        transaction = %log.transaction_hash, log_index = log.log_index,
-                        abi_id = ?self.decoder.abi_id(&envelope.chain, log), selector = ?log.topic0,
-                        error = ?error, "log decode failed; preserving raw record");
-                    None
+        let added = match &envelope.event {
+            Event::Log(log) => self.decode(&envelope.chain, log)?,
+            Event::Reorg(reorg) => {
+                let retracted = self.decoder.retract(&reorg.orphaned_hashes);
+                if retracted > 0 {
+                    info!(chain = %envelope.chain, retracted,
+                        "retracted contracts created in orphaned blocks");
                 }
+                Vec::new()
             }
-        } else {
-            None
+            _ => Vec::new(),
         };
-        let output = decoded.map(|decoded| {
-            Envelope::new(envelope.chain.clone(), Event::Decoded(Box::new(decoded)))
-        });
+        let chain = envelope.chain.clone();
         self.inner.publish(envelope).await?;
-        if let Some(output) = output {
-            self.inner.publish(output).await?;
+        for event in added {
+            self.inner
+                .publish(Envelope::new(chain.clone(), event))
+                .await?;
         }
         Ok(())
     }
@@ -77,8 +101,14 @@ impl<K: EnvelopeSink> EnvelopeSink for DecodingSink<K> {
 #[cfg(test)]
 #[expect(clippy::expect_used)]
 mod tests {
+    use std::path::Path;
+
+    use alloy_dyn_abi::DynSolValue;
+    use alloy_primitives::{Address, B256, keccak256};
+
     use super::*;
-    use crate::wire::envelope::{ChainId, Log};
+    use crate::decode::Catalog;
+    use crate::wire::envelope::Reorg;
 
     #[derive(Default)]
     struct Collect {
@@ -96,75 +126,111 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn misses_and_control_markers_pass_through_once() {
-        let mut sink = DecodingSink::new(ContractRegistry::default(), Collect::default());
-        for event in [
-            Event::Log(Box::default()),
-            Event::Reorg(crate::wire::envelope::Reorg {
-                height: 1,
-                new_head_hash: alloy_primitives::B256::ZERO,
-                orphaned_hashes: vec![],
-            }),
-        ] {
-            sink.publish(Envelope::new(ChainId::new("base"), event))
-                .await
-                .expect("publish");
-        }
-        sink.flush().await.expect("flush");
-        assert_eq!(sink.inner.records.len(), 2);
-        assert_eq!(sink.inner.flushes, 1);
+    fn chain() -> ChainId {
+        ChainId::new("base")
     }
 
-    #[tokio::test]
-    async fn matching_logs_add_records_and_bad_logs_keep_raw() {
-        let registry = ContractRegistry::load(
-            &crate::decode::RegistryConfig {
-                abis: Some("abis".into()),
-                contract: vec![crate::decode::ContractEntry {
-                    chain: "base".into(),
-                    address: "0xd0b53D9277642d899DF5C87A3966A349A798F224".into(),
-                    abi: "uniswap/v3/pool".into(),
-                    protocol: "uniswap_v3".into(),
-                    from_block: 0,
-                    to_block: None,
-                }],
-            },
-            env!("CARGO_MANIFEST_DIR"),
+    fn sink() -> DecodingSink<Collect> {
+        let catalog = Catalog::load(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("protocols"),
+            &chain(),
         )
-        .expect("registry");
-        let mut source: Envelope = serde_json::from_str(
+        .expect("catalog");
+        DecodingSink::new(Decoder::new(catalog), Collect::default())
+    }
+
+    fn pool_created(pool: Address, block: B256) -> Log {
+        Log {
+            address: "0x33128a8fC17869897dcE68Ed026d694621f6FDfD"
+                .parse()
+                .expect("factory"),
+            topic0: Some(keccak256(
+                "PoolCreated(address,address,uint24,int24,address)",
+            )),
+            topic1: Some(B256::with_last_byte(1)),
+            topic2: Some(B256::with_last_byte(2)),
+            topic3: Some(B256::with_last_byte(3)),
+            data: DynSolValue::Tuple(vec![
+                DynSolValue::Int(alloy_primitives::I256::try_from(60).expect("int"), 24),
+                DynSolValue::Address(pool),
+            ])
+            .abi_encode_params()
+            .into(),
+            block_hash: block,
+            ..Log::default()
+        }
+    }
+
+    fn swap(pool: Address) -> Log {
+        let source: Envelope = serde_json::from_str(
             include_str!("../../examples/fixtures/uniswap_v3_swaps.ndjson")
                 .lines()
                 .next()
                 .expect("line"),
         )
         .expect("fixture");
-        let Event::Log(log) = &mut source.event else {
+        let Event::Log(mut log) = source.event else {
             panic!("log");
         };
-        log.address = "0xd0b53D9277642d899DF5C87A3966A349A798F224"
-            .parse()
-            .expect("address");
-        let mut bad = source.clone();
-        let Event::Log(log) = &mut bad.event else {
-            panic!("log");
-        };
-        log.data = alloy_primitives::Bytes::new();
-        let mut sink = DecodingSink::new(registry, Collect::default());
-        sink.publish(source).await.expect("publish");
-        sink.publish(bad).await.expect("bad log is nonfatal");
+        log.address = pool;
+        *log
+    }
+
+    fn log(log: Log) -> Envelope {
+        Envelope::new(chain(), Event::Log(Box::new(log)))
+    }
+
+    fn reorg(orphaned: B256) -> Envelope {
+        Envelope::new(
+            chain(),
+            Event::Reorg(Reorg {
+                height: 10,
+                new_head_hash: B256::ZERO,
+                orphaned_hashes: vec![orphaned],
+            }),
+        )
+    }
+
+    fn kinds(sink: &DecodingSink<Collect>) -> Vec<&'static str> {
+        sink.inner.records.iter().map(Envelope::kind).collect()
+    }
+
+    #[tokio::test]
+    async fn misses_and_control_markers_pass_through_once() {
+        let mut sink = sink();
+        sink.publish(log(Log::default())).await.expect("publish");
+        sink.publish(reorg(B256::ZERO)).await.expect("publish");
+        sink.flush().await.expect("flush");
+        assert_eq!(kinds(&sink), ["log", "reorg"]);
+        assert_eq!(sink.inner.flushes, 1);
+    }
+
+    /// A creation log is followed by its decoded record and the contract; the child's
+    /// swap decodes at once; a malformed swap keeps only its raw log; and once a reorg
+    /// orphans the creating block, the child stops decoding.
+    #[tokio::test]
+    async fn a_creation_publishes_the_contract_and_a_reorg_retracts_it() {
+        let pool = Address::from([0xd0; 20]);
+        let block = B256::with_last_byte(9);
+        let mut sink = sink();
+        sink.publish(log(pool_created(pool, block)))
+            .await
+            .expect("creation");
+        sink.publish(log(swap(pool))).await.expect("swap");
+        let mut bad = swap(pool);
+        bad.data = alloy_primitives::Bytes::new();
+        sink.publish(log(bad)).await.expect("a bad log is nonfatal");
         assert_eq!(
-            sink.inner
-                .records
-                .iter()
-                .map(Envelope::kind)
-                .collect::<Vec<_>>(),
-            ["log", "decoded", "log"]
+            kinds(&sink),
+            ["log", "decoded", "contract", "log", "decoded", "log"]
         );
-        let Event::Log(log) = &sink.inner.records[2].event else {
-            panic!("raw log");
+        let Event::Contract(contract) = &sink.inner.records[2].event else {
+            panic!("contract");
         };
-        assert_eq!(log.data, Log::default().data);
+        assert_eq!((contract.address, contract.block_hash), (pool, block));
+
+        sink.publish(reorg(block)).await.expect("reorg");
+        sink.publish(log(swap(pool))).await.expect("swap");
+        assert_eq!(kinds(&sink)[6..], ["reorg", "log"]);
     }
 }

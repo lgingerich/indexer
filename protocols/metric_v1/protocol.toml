@@ -1,0 +1,42 @@
+# Metric OMM v1. See `src/decode/catalog.rs` for the manifest format.
+#
+# No deployment addresses are listed yet, so nothing here decodes until a chain's
+# addresses are added. Pools come from the factory's `PoolCreated` once it is.
+protocol = "metric_v1"
+
+[[contract]]
+abi = ["MetricOmmPoolFactory.json"]
+
+[[contract]]
+abi = ["MetricOmmPool.json"]
+created_by = [{ contract = "MetricOmmPoolFactory", event = "PoolCreated", param = "poolAddress" }]
+
+[[contract]]
+abi = ["MetricOmmPoolDataProvider.json"]
+
+[[contract]]
+abi = ["MetricOmmPoolLiquidityAdder.json"]
+
+[[contract]]
+abi = ["MetricOmmSimpleRouter.json"]
+
+[[contract]]
+abi = ["MetricOmmSwapQuoter.json"]
+
+[[contract]]
+abi = ["OracleProvider.json"]
+
+[[contract]]
+abi = ["PriceProvider.json"]
+
+[[contract]]
+abi = ["DepositAllowlistExtension.json"]
+
+[[contract]]
+abi = ["SwapAllowlistExtension.json"]
+
+[[contract]]
+abi = ["OracleValueStopLossExtension.json"]
+
+[[contract]]
+abi = ["PriceVelocityGuardExtension.json"]

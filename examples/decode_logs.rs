@@ -20,9 +20,9 @@
 //! - Every argument carries the ABI's own name. That is what lets a consumer address
 //!   `amount0` rather than count positions, which breaks silently when an ABI revision
 //!   reorders a parameter.
-//! - The record carries `protocol`, taken from the registry entry that matched the
-//!   address. Nothing in the ABI could supply it, and it is what lets a downstream
-//!   consumer group rows by protocol without knowing any address.
+//! - The record carries `protocol`, taken from the manifest that lists the pool.
+//!   Nothing in the ABI could supply it, and it is what lets a downstream consumer group
+//!   rows by protocol without knowing any address.
 //!
 //!    The record deliberately carries **no** dataset. Turning these arguments into a
 //!   `dex.trades` row needs to know which tokens the pool trades and how many decimals
@@ -33,7 +33,8 @@
 //!
 //! This example is self-contained on purpose: it takes no arguments and needs no network,
 //! because a demo that has to be configured is a demo that gets skipped. To decode a
-//! different contract, change `POOL`, `CHAIN`, and the `abis` root in the registry below.
+//! different contract, list its address in a protocol manifest under `protocols/` and
+//! change `CHAIN` and the fixture below.
 //!
 //! To capture real input for it, run the indexer with `stdout = true` in `[ingest]`,
 //! which prints the stream instead of storing it:
@@ -42,21 +43,17 @@
 //! RUST_LOG=warn cargo run --release 2>/dev/null | head -200 > envelopes.ndjson
 //! ```
 //!
-//! A real registry is keyed by `(chain, address, block)` and answers per log. This
-//! example builds the same `ContractRegistry` the settings file builds, so it exercises
-//! the path the pipeline does — including the `protocol` stamped from the entry.
+//! This example builds the same `Catalog` and `Decoder` the settings file builds, so it
+//! exercises the path the pipeline does — including the `protocol` stamped from the
+//! manifest.
 
 // A runnable tool rather than a library, so printing is the whole job.
 #![expect(clippy::print_stdout, clippy::print_stderr, clippy::expect_used)]
 
 use std::process::ExitCode;
 
-use indexer::decode::Decoder;
-use indexer::decode::{ContractEntry, ContractRegistry, RegistryConfig};
+use indexer::decode::{Catalog, Decoder};
 use indexer::wire::envelope::Envelope;
-
-/// The pool these logs came from, and the address its ABI is registered against.
-const POOL: &str = "0xd0b53D9277642d899DF5C87A3966A349A798F224";
 
 /// The chain the captured logs are from.
 const CHAIN: &str = "base";
@@ -69,28 +66,15 @@ const CHAIN: &str = "base";
 const SWAPS: &str = include_str!("fixtures/uniswap_v3_swaps.ndjson");
 
 fn main() -> ExitCode {
-    // The real registry, built the way the settings file builds it, so the example
-    // exercises the same path the pipeline does rather than a stub.
-    let registry = ContractRegistry::load(
-        &RegistryConfig {
-            abis: Some(std::path::PathBuf::from(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/abis"
-            ))),
-            contract: vec![ContractEntry {
-                chain: CHAIN.to_owned(),
-                address: POOL.to_owned(),
-                abi: "uniswap/v3/pool".to_owned(),
-                protocol: "uniswap_v3".to_owned(),
-                from_block: 0,
-                to_block: None,
-            }],
-        },
-        ".",
+    // The shipped protocol manifests, loaded the way the settings file loads them, so
+    // the example exercises the same path the pipeline does rather than a stub. The pool
+    // is one of the Uniswap V3 manifest's seed addresses on Base.
+    let catalog = Catalog::load(
+        concat!(env!("CARGO_MANIFEST_DIR"), "/protocols"),
+        &CHAIN.into(),
     )
-    .expect("the registry loads");
-
-    let decoder = Decoder::new(registry);
+    .expect("the shipped protocols load");
+    let mut decoder = Decoder::new(catalog);
     let mut decoded_count = 0_usize;
     for (number, line) in SWAPS.lines().enumerate() {
         if line.trim().is_empty() {
@@ -101,12 +85,12 @@ fn main() -> ExitCode {
         let indexer::wire::envelope::Event::Log(log) = &envelope.event else {
             continue;
         };
-        match decoder.decode(&envelope.chain, log) {
-            Ok(Some(record)) => {
+        match decoder.decode(log) {
+            Ok(Some(decoding)) => {
                 decoded_count += 1;
                 let out = Envelope::new(
                     envelope.chain,
-                    indexer::wire::envelope::Event::Decoded(Box::new(record)),
+                    indexer::wire::envelope::Event::Decoded(Box::new(decoding.decoded)),
                 );
                 println!(
                     "{}",

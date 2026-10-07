@@ -22,8 +22,11 @@
 //! # What the settings decide
 //!
 //! - **Ingest** follows the chain `[ingest]` names. It is required, so it always runs.
-//! - **Decode** uses the registry `[decode] registry` names. An absent or empty registry
-//!   decodes nothing, which is a legitimate way to run and is said at startup.
+//! - **Decode** uses the protocol manifests `[decode] protocols` names. An absent or empty
+//!   catalog decodes nothing, which is a legitimate way to run and is said at startup.
+//!   Contracts a previous run discovered are read back from the store before ingest
+//!   starts, so a restart decodes them; `[sink.stdout]` has no store and starts with the
+//!   manifests' seeds only.
 //! - **The sink** is the `[sink.<backend>]` table. With `[sink.stdout]` no store is
 //!   opened at all: the stream is printed instead.
 //!
@@ -39,8 +42,7 @@ use thiserror::Error;
 use tracing::{info, warn};
 
 use crate::config::{Settings, SettingsError, Sink};
-use crate::decode::DecodingSink;
-use crate::decode::{ContractRegistry, RegistryError};
+use crate::decode::{Catalog, CatalogError, Decoder, DecodingSink};
 use crate::ingest::Ingest;
 use crate::ingest::pipeline::PipelineError;
 #[cfg(any(feature = "duckdb", feature = "postgres"))]
@@ -48,6 +50,7 @@ use crate::sink;
 #[cfg(feature = "duckdb")]
 use crate::sink::DuckDbSink;
 use crate::sink::{SinkError, StdoutJsonSink};
+use crate::wire::envelope::ChainId;
 
 /// Why the indexer stopped.
 ///
@@ -58,7 +61,7 @@ use crate::sink::{SinkError, StdoutJsonSink};
 /// where a single string would have shown only the outermost.
 ///
 /// The assembly failures are kept apart from the runtime ones on purpose. A bad settings
-/// file or an unreadable registry is fixed by editing a file and restarting; a pipeline
+/// file or unreadable manifests are fixed by editing a file and restarting; a pipeline
 /// failure is what a running indexer reports when it stops. Collapsing them would leave a
 /// caller unable to tell "this deployment never started" from "this run died".
 #[derive(Debug, Error)]
@@ -66,9 +69,9 @@ pub enum RuntimeError {
     /// The settings could not be read or parsed.
     #[error("settings could not be loaded: {0}")]
     Settings(#[from] SettingsError),
-    /// The registry could not be loaded, so nothing would have decoded.
-    #[error("contract registry could not be loaded: {0}")]
-    Registry(#[from] RegistryError),
+    /// The protocol manifests could not be loaded, so nothing would have decoded.
+    #[error("protocol manifests could not be loaded: {0}")]
+    Catalog(#[from] CatalogError),
     /// The store could not be opened, so there was nowhere to write.
     #[cfg(feature = "duckdb")]
     #[error("storage could not be opened: {0}")]
@@ -102,18 +105,18 @@ pub enum RuntimeError {
 #[derive(Debug)]
 pub(crate) struct Pipeline {
     ingest: Ingest,
-    registry: ContractRegistry,
+    decoder: Decoder,
 }
 
 impl Pipeline {
     /// Assembles the pipeline the settings describe.
     ///
-    /// Opens nothing: the store is connected in [`Pipeline::run`], so building fails on an
-    /// unreadable registry without touching a database file.
+    /// Opens nothing: the store is connected in [`Pipeline::run`], so building fails on
+    /// unreadable manifests without touching a database file.
     ///
     /// # Errors
     ///
-    /// Returns [`RuntimeError::Registry`] when the registry cannot be read.
+    /// Returns [`RuntimeError::Catalog`] when the manifests cannot be loaded.
     pub(crate) fn from_settings(settings: &Settings) -> Result<Self, RuntimeError> {
         let ingest = Ingest::new(
             &settings.ingest.chain,
@@ -124,11 +127,20 @@ impl Pipeline {
             settings.ingest.start_block,
         )
         .map_err(PipelineError::from)?;
-        let registry = settings.registry_path().map_or_else(
-            || Ok(ContractRegistry::default()),
-            ContractRegistry::from_file,
+        let mut catalog = settings.protocols_path().map_or_else(
+            || Ok(Catalog::default()),
+            |path| Catalog::load(path, &ChainId::new(&settings.ingest.chain)),
         )?;
-        Ok(Self { ingest, registry })
+        // The address filter is an explicit "only these contracts", fixed at startup, so
+        // a discovered contract's logs would never be fetched. Respect it instead.
+        if catalog.discovers() && !settings.ingest.log_addresses.is_empty() {
+            warn!("ingest.log_addresses is set; created_by discovery is disabled");
+            catalog.disable_discovery();
+        }
+        Ok(Self {
+            ingest,
+            decoder: Decoder::new(catalog),
+        })
     }
 
     /// Runs until ingest or storage stops.
@@ -139,8 +151,8 @@ impl Pipeline {
     /// [`RuntimeError::Ingest`] or [`RuntimeError::Storage`] when a part fails. Each
     /// carries that part's own error, because "storage stopped" says nothing about why.
     pub(crate) async fn run(self, settings: &Settings) -> Result<(), RuntimeError> {
-        let Self { ingest, registry } = self;
-        if !settings.ingest.datasets.log && !registry.is_empty() {
+        let Self { ingest, decoder } = self;
+        if !settings.ingest.datasets.log && decoder.contracts() > 0 {
             warn!("log dataset is not selected; registered contracts will not decode");
         }
 
@@ -148,19 +160,22 @@ impl Pipeline {
         // already a startup error and each arm here opens exactly what it named.
         match &settings.sink {
             Sink::Stdout(_) => {
+                // No store, so nothing to restore: a run starts from the manifests' seeds.
                 ingest
-                    .run(DecodingSink::new(registry, StdoutJsonSink::new()))
+                    .run(DecodingSink::new(decoder, StdoutJsonSink::new()))
                     .await?;
                 Ok(())
             }
             #[cfg(feature = "postgres")]
             Sink::Postgres(postgres) => {
                 let mut store = sink::PostgresSink::open(postgres).await?;
+                let chain = ChainId::new(&settings.ingest.chain);
+                let decoder = restore(decoder, &chain, store.contracts(&chain).await?);
                 let (blocks, receiver) = sink::channel::ChannelSink::new();
                 let batch_records = postgres.batch_records;
                 let storage =
                     tokio::spawn(async move { receiver.drain(&mut store, batch_records).await });
-                let ingest = ingest.run(DecodingSink::new(registry, blocks)).await;
+                let ingest = ingest.run(DecodingSink::new(decoder, blocks)).await;
                 finish(storage.await, ingest)
             }
             #[cfg(feature = "duckdb")]
@@ -168,6 +183,8 @@ impl Pipeline {
                 // Open the store before ingest starts, so a bad path fails at startup
                 // rather than after the first block.
                 let mut store = DuckDbSink::open(duckdb)?;
+                let chain = ChainId::new(&settings.ingest.chain);
+                let decoder = restore(decoder, &chain, store.contracts(&chain)?);
 
                 let (blocks, receiver) = sink::channel::ChannelSink::new();
                 let batch_records = duckdb.batch_records;
@@ -178,7 +195,7 @@ impl Pipeline {
                 let storage =
                     tokio::spawn(async move { receiver.drain(&mut store, batch_records).await });
 
-                let ingest = ingest.run(DecodingSink::new(registry, blocks)).await;
+                let ingest = ingest.run(DecodingSink::new(decoder, blocks)).await;
 
                 // Ingest's half of the channel is gone by now, so storage drains what is
                 // queued and ends. The join order is [`finish`].
@@ -186,6 +203,18 @@ impl Pipeline {
             }
         }
     }
+}
+
+/// Adds the contracts a previous run discovered, as the store read them back.
+#[cfg(any(feature = "duckdb", feature = "postgres"))]
+fn restore(
+    mut decoder: Decoder,
+    chain: &ChainId,
+    stored: Vec<crate::decode::StoredContract>,
+) -> Decoder {
+    let restored = decoder.restore(stored);
+    info!(%chain, restored, contracts = decoder.contracts(), "discovered contracts restored");
+    decoder
 }
 
 /// Reports how the two tasks stopped.
@@ -218,8 +247,8 @@ pub async fn run(path: &str) -> Result<(), RuntimeError> {
     info!(
         settings = path,
         chain = %settings.ingest.chain,
-        registry = settings
-            .registry_path()
+        protocols = settings
+            .protocols_path()
             .map_or_else(|| "-".to_owned(), |path| path.display().to_string()),
         storage = ?settings.sink,
         "starting"
@@ -235,20 +264,22 @@ pub async fn run(path: &str) -> Result<(), RuntimeError> {
 mod tests {
     use std::str::FromStr as _;
 
+    use alloy_dyn_abi::DynSolValue;
+    use alloy_primitives::{Address, B256, keccak256};
+
     use crate::config::Settings;
-    use crate::decode::DecodingSink;
-    use crate::decode::{ContractEntry, ContractRegistry, RegistryConfig};
+    use crate::decode::{Catalog, Decoder, DecodingSink, StoredContract};
     use crate::ingest::pipeline::PipelineError;
     use crate::sink::duckdb::StoreError;
     use crate::sink::{self, DuckDbSink, EnvelopeSink as _, SinkError};
-    use crate::wire::envelope::Envelope;
+    use crate::wire::envelope::{ChainId, Envelope, Event, Log, Reorg};
 
     use super::{Pipeline, RuntimeError, finish};
 
-    /// The shipped registry, as an absolute path so [`Settings::from_str`] carries no
+    /// The shipped protocols, as an absolute path so [`Settings::from_str`] carries no
     /// directory to resolve it against.
-    fn registry() -> String {
-        format!("{}/registry.toml", env!("CARGO_MANIFEST_DIR"))
+    fn protocols() -> String {
+        format!("{}/protocols", env!("CARGO_MANIFEST_DIR"))
     }
 
     const SETTINGS: &str = r#"
@@ -296,91 +327,180 @@ ws_url = "wss://example.invalid"
         );
     }
 
-    /// A registry that names a file that is not there is an assembly error, not a quiet
-    /// run that decodes nothing.
+    /// A protocols directory that is not there is an assembly error, not a quiet run that
+    /// decodes nothing.
     #[test]
-    fn a_missing_registry_file_is_an_assembly_error() {
+    fn a_missing_protocols_directory_is_an_assembly_error() {
         let settings = Settings::from_str(&format!(
-            "{SETTINGS}\n[decode]\nregistry = \"/nonexistent/registry.toml\"\n"
+            "{SETTINGS}\n[decode]\nprotocols = \"/nonexistent/protocols\"\n"
         ))
         .expect("settings parse");
-        Pipeline::from_settings(&settings).expect_err("the registry cannot be read");
+        assert!(matches!(
+            Pipeline::from_settings(&settings),
+            Err(RuntimeError::Catalog(_))
+        ));
     }
 
-    /// The shipped registry loads, so the example settings a reader copies stay runnable.
+    /// The shipped protocols load, so the example settings a reader copies stay runnable,
+    /// with or without a log address filter, which turns discovery off.
     #[test]
-    fn the_shipped_registry_assembles() {
-        let settings = Settings::from_str(&format!(
-            "{SETTINGS}\n[decode]\nregistry = {:?}\n",
-            registry()
-        ))
-        .expect("settings parse");
+    fn the_shipped_protocols_assemble_with_and_without_an_address_filter() {
+        let decode = format!("\n[decode]\nprotocols = {:?}\n", protocols());
+        let settings = Settings::from_str(&format!("{SETTINGS}{decode}")).expect("settings parse");
         Pipeline::from_settings(&settings).expect("the pipeline builds");
+
+        let filtered = SETTINGS.replace(
+            "ws_url = \"wss://example.invalid\"",
+            "ws_url = \"wss://example.invalid\"\ndatasets = [\"log\"]\n\
+             log_addresses = [\"0x1111111111111111111111111111111111111111\"]",
+        );
+        let settings = Settings::from_str(&format!("{filtered}{decode}")).expect("settings parse");
+        let mut pipeline = Pipeline::from_settings(&settings).expect("the pipeline builds");
+        let Event::Log(created) = pool_created(Address::from([0xd0; 20]), B256::ZERO).event else {
+            panic!("log");
+        };
+        let decoding = pipeline
+            .decoder
+            .decode(&created)
+            .expect("decode")
+            .expect("the factory still decodes");
+        assert!(decoding.discovered.is_empty(), "discovery is off");
     }
 
-    /// The whole hand-off, minus the network: a raw log goes through decode, over the
-    /// channel, and into the store, and its raw row and decoded row land in the same
-    /// commit. This is the seam the runtime wires, so it is checked end to end.
-    #[tokio::test]
-    async fn a_block_lands_in_the_store_raw_and_decoded_together() {
-        const POOL: &str = "0xd0b53D9277642d899DF5C87A3966A349A798F224";
-        let registry = ContractRegistry::load(
-            &RegistryConfig {
-                abis: Some("abis".into()),
-                contract: vec![ContractEntry {
-                    chain: "base".to_owned(),
-                    address: POOL.to_owned(),
-                    abi: "uniswap/v3/pool".to_owned(),
-                    protocol: "uniswap_v3".to_owned(),
-                    from_block: 0,
-                    to_block: None,
-                }],
-            },
-            env!("CARGO_MANIFEST_DIR"),
+    fn decoder() -> Decoder {
+        Decoder::new(
+            Catalog::load(protocols(), &ChainId::new("base")).expect("shipped protocols load"),
         )
-        .expect("the registry loads");
-        let swap: Envelope = serde_json::from_str(
+    }
+
+    /// A Uniswap V3 `PoolCreated` from the Base factory naming `pool`, in `block`.
+    fn pool_created(pool: Address, block: B256) -> Envelope {
+        let log = Log {
+            address: "0x33128a8fC17869897dcE68Ed026d694621f6FDfD"
+                .parse()
+                .expect("factory"),
+            topic0: Some(keccak256(
+                "PoolCreated(address,address,uint24,int24,address)",
+            )),
+            topic1: Some(B256::with_last_byte(1)),
+            topic2: Some(B256::with_last_byte(2)),
+            topic3: Some(B256::with_last_byte(3)),
+            data: DynSolValue::Tuple(vec![
+                DynSolValue::Int(alloy_primitives::I256::try_from(60).expect("int"), 24),
+                DynSolValue::Address(pool),
+            ])
+            .abi_encode_params()
+            .into(),
+            log_index: 1,
+            block_number: 10,
+            block_hash: block,
+            ..Log::default()
+        };
+        Envelope::new(ChainId::new("base"), Event::Log(Box::new(log)))
+    }
+
+    /// A real Uniswap V3 `Swap`, re-addressed to `pool`.
+    fn swap(pool: Address) -> Envelope {
+        let mut swap: Envelope = serde_json::from_str(
             include_str!("../examples/fixtures/uniswap_v3_swaps.ndjson")
                 .lines()
                 .next()
                 .expect("a fixture line"),
         )
         .expect("the fixture is a published envelope");
+        let Event::Log(log) = &mut swap.event else {
+            panic!("log");
+        };
+        log.address = pool;
+        swap
+    }
+
+    fn count(reader: &duckdb::Connection, table: &str) -> i64 {
+        reader
+            .query_row(&format!("SELECT count(*) FROM \"{table}\""), [], |row| {
+                row.get(0)
+            })
+            .expect("count")
+    }
+
+    /// The whole hand-off, minus the network: a factory's creation log goes through
+    /// decode, over the channel, and into the store with the pool it discovered; the
+    /// pool's swap decodes in the same batch; a restart reads the pool back and decodes
+    /// it; and once a reorg orphans the creating block, a restart no longer does.
+    #[tokio::test]
+    async fn a_discovered_contract_is_stored_and_survives_a_restart() {
+        let pool = Address::from([0xd0; 20]);
+        let creating = B256::with_last_byte(0xcc);
+        let chain = ChainId::new("base");
 
         let connection = duckdb::Connection::open_in_memory().expect("open in-memory DuckDB");
         let reader = connection.try_clone().expect("a second handle");
-        let mut store = DuckDbSink::new(connection).expect("create events table");
+        let mut store = DuckDbSink::new(connection).expect("create tables");
         let (blocks, receiver) = sink::channel::ChannelSink::new();
         let storage = tokio::spawn(async move { receiver.drain(&mut store, 500).await });
 
-        let mut decoding = DecodingSink::new(registry, blocks);
-        decoding.publish(swap).await.expect("publish");
+        let mut decoding = DecodingSink::new(decoder(), blocks);
+        decoding
+            .publish(pool_created(pool, creating))
+            .await
+            .expect("creation");
+        decoding.publish(swap(pool)).await.expect("swap");
         decoding.flush().await.expect("flush");
         drop(decoding);
+        storage.await.expect("no panic").expect("storage drains");
 
-        let stored = storage.await.expect("no panic").expect("storage drains");
-        assert_eq!(stored, 2, "the raw log and its decoded record");
-
-        // One table per dataset: the log is a row of typed columns in `log` and the decode
-        // beside it in `decoded`, not two rows of a shared `events` table.
-        let log_count: i64 = reader
-            .query_row("SELECT count(*) FROM log", [], |row| row.get(0))
-            .expect("count logs");
-        let decoded_count: i64 = reader
-            .query_row("SELECT count(*) FROM decoded", [], |row| row.get(0))
-            .expect("count decoded");
-        assert_eq!((log_count, decoded_count), (1, 1));
-
-        // The decoded row keys back to the raw log it came from.
-        let decoded_key: String = reader
-            .query_row("SELECT dedupe_key FROM decoded", [], |row| row.get(0))
-            .expect("the decoded key");
-        let log_key: String = reader
-            .query_row("SELECT dedupe_key FROM log", [], |row| row.get(0))
-            .expect("the log key");
-        assert!(
-            decoded_key.starts_with(&log_key),
-            "the decoded row must key back to its log: {decoded_key} vs {log_key}"
+        // One table per dataset: the raw logs, their decodes, and the discovery.
+        assert_eq!(
+            [
+                count(&reader, "log"),
+                count(&reader, "decoded"),
+                count(&reader, "contract")
+            ],
+            [2, 2, 1]
         );
+        // The decoded rows key back to the raw logs they came from.
+        let orphans: i64 = reader
+            .query_row(
+                "SELECT count(*) FROM decoded d WHERE NOT EXISTS \
+                 (SELECT 1 FROM log l WHERE starts_with(d.dedupe_key, l.dedupe_key))",
+                [],
+                |row| row.get(0),
+            )
+            .expect("join");
+        assert_eq!(orphans, 0);
+
+        // A restart: a fresh decoder knows the pool once the store's rows are restored.
+        let mut store = DuckDbSink::new(reader.try_clone().expect("handle")).expect("reopen");
+        let stored = store.contracts(&chain).expect("read back");
+        assert_eq!(
+            stored,
+            [StoredContract {
+                protocol: "uniswap_v3".to_owned(),
+                name: "UniswapV3Pool".to_owned(),
+                address: pool,
+            }]
+        );
+        let mut restarted = decoder();
+        assert_eq!(restarted.restore(stored), 1);
+        let Event::Log(log) = swap(pool).event else {
+            panic!("log");
+        };
+        assert!(restarted.decode(&log).expect("decode").is_some());
+
+        // The creating block is orphaned: the stored row stays, but is not restored.
+        store
+            .publish(Envelope::new(
+                chain.clone(),
+                Event::Reorg(Reorg {
+                    height: 10,
+                    new_head_hash: B256::with_last_byte(0xdd),
+                    orphaned_hashes: vec![creating],
+                }),
+            ))
+            .await
+            .expect("publish");
+        store.flush().await.expect("flush");
+        assert!(store.contracts(&chain).expect("read back").is_empty());
+        assert_eq!(count(&reader, "contract"), 1);
     }
 }

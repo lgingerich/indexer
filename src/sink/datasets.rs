@@ -52,15 +52,16 @@ impl Datasets {
     /// The ingest source already projects only the selected datasets, so a pipeline
     /// consumer has nothing to drop. This is the filter for a caller that decodes
     /// through [`decode_block`](crate::ingest::source::evm::decode_block), which emits
-    /// every row in its batch regardless of selection. A decoded record is kept only
-    /// when logs are, because it is produced from a log. A reorg always passes.
+    /// every row in its batch regardless of selection. A decoded record or discovered
+    /// contract is kept only when logs are, because each is produced from a log. A
+    /// reorg always passes.
     #[must_use]
     pub const fn keeps(self, event: &Event) -> bool {
         match event {
             Event::Block(_) => self.block,
             Event::Transaction(_) => self.transaction,
             Event::Receipt(_) => self.receipt,
-            Event::Log(_) | Event::Decoded(_) => self.log,
+            Event::Log(_) | Event::Decoded(_) | Event::Contract(_) => self.log,
             Event::Reorg(_) => true,
         }
     }
@@ -156,7 +157,7 @@ mod tests {
             ..Log::default()
         }));
         let decoded = Event::Decoded(Box::new(crate::wire::envelope::Decoded {
-            abi_id: B256::ZERO,
+            event_id: B256::ZERO,
             name: "Transfer".to_owned(),
             address: Address::ZERO,
             protocol: "erc20".to_owned(),

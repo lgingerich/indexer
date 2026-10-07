@@ -1,6 +1,7 @@
 //! Prepared event ABIs and schema-aware value conversion.
 
 use std::collections::BTreeMap;
+use std::collections::btree_map::Entry;
 
 use alloy_dyn_abi::{DynSolEvent, DynSolType, DynSolValue, Specifier as _};
 use alloy_json_abi::{Event, JsonAbi};
@@ -14,6 +15,8 @@ use crate::wire::typed::{AbiType, TypedValue};
 /// A decoded event without chain or transaction metadata.
 #[derive(Debug)]
 pub struct DecodedEvent {
+    /// Identity of the event definition used: see [`Abi`].
+    pub id: B256,
     /// ABI event name.
     pub name: String,
     /// Event signature hash.
@@ -36,6 +39,7 @@ struct Argument {
 
 #[derive(Debug, Clone)]
 struct PreparedEvent {
+    id: B256,
     name: String,
     signature: String,
     layout: DynSolEvent,
@@ -43,18 +47,30 @@ struct PreparedEvent {
     body: Vec<Argument>,
 }
 
-/// Immutable ABI, validated and prepared once before processing logs.
-#[derive(Debug, Clone)]
+/// An event's lookup key: its selector and how many topics it occupies, `topic0`
+/// included.
+///
+/// The selector alone is not enough. ERC-20 and ERC-721 `Transfer` share a signature and
+/// so a selector, but index a different number of arguments; the topic count is what
+/// tells their layouts apart.
+pub(crate) type EventKey = (B256, usize);
+
+/// Immutable event ABI, validated and prepared once before processing logs.
+///
+/// Built from one or more ABI files: a contract upgraded behind a proxy lists every
+/// version, and their events merge by selector and topic count. Each event carries its own
+/// identity — a hash of its definition — so a decoded record names the one event it used
+/// rather than the file it came from.
+#[derive(Debug, Clone, Default)]
 pub struct Abi {
-    id: B256,
-    events: BTreeMap<B256, PreparedEvent>,
+    events: BTreeMap<EventKey, PreparedEvent>,
 }
 
 impl Abi {
     /// Parses and prepares all events. Anonymous events are explicitly unsupported.
     ///
     /// # Errors
-    /// Returns a typed parse/layout error or rejects anonymous and ambiguous events.
+    /// Returns a typed parse/layout error or rejects anonymous and conflicting events.
     pub fn from_json(json: &str) -> Result<Self, AbiError> {
         let abi: JsonAbi = serde_json::from_str(json)?;
         let mut events = BTreeMap::new();
@@ -64,32 +80,67 @@ impl Abi {
                     event: event.name.clone(),
                 });
             }
-            let selector = event.selector();
-            let prepared = PreparedEvent::new(event).map_err(|source| AbiError::Layout {
+            let key = (
+                event.selector(),
+                1 + event.inputs.iter().filter(|input| input.indexed).count(),
+            );
+            // The definition's identity: name, types, indexed flags, and parameter and
+            // component names. Not the JSON, whose compiler-specific `internalType`s differ
+            // between builds of an unchanged event.
+            let id = keccak256(event.full_signature());
+            let prepared = PreparedEvent::new(event, id).map_err(|source| AbiError::Layout {
                 event_index,
                 source,
             })?;
-            if events.insert(selector, prepared).is_some() {
-                return Err(AbiError::DuplicateSelector { selector });
+            if events.insert(key, prepared).is_some() {
+                return Err(AbiError::Conflict { selector: key.0 });
             }
         }
-        // Content identity intentionally includes the complete parsed ABI, not its file name.
-        let id = keccak256(serde_json::to_vec(&abi)?);
-        Ok(Self { id, events })
+        Ok(Self { events })
     }
 
-    /// Content identity of the parsed ABI.
-    #[must_use]
-    pub const fn id(&self) -> B256 {
-        self.id
+    /// Adds `other`'s events. An event both declare identically is kept once.
+    ///
+    /// # Errors
+    /// Returns [`AbiError::Conflict`] when the two define one selector and topic count
+    /// differently, since a log could then decode either way.
+    pub fn merge(&mut self, other: Self) -> Result<(), AbiError> {
+        for (key, event) in other.events {
+            match self.events.entry(key) {
+                Entry::Vacant(entry) => {
+                    entry.insert(event);
+                }
+                Entry::Occupied(entry) if entry.get().id == event.id => {}
+                Entry::Occupied(_) => return Err(AbiError::Conflict { selector: key.0 }),
+            }
+        }
+        Ok(())
     }
 
-    /// Finds a declared event by canonical signature.
-    #[must_use]
-    pub fn selector(&self, signature: &str) -> Option<B256> {
+    /// The keys of every event declared under `name`.
+    pub(crate) fn events_named(&self, name: &str) -> Vec<EventKey> {
         self.events
             .iter()
-            .find_map(|(selector, event)| (event.signature == signature).then_some(*selector))
+            .filter(|(_, event)| event.name == name)
+            .map(|(key, _)| *key)
+            .collect()
+    }
+
+    /// The position of `event`'s `address` input called `param`.
+    pub(crate) fn address_input(&self, event: EventKey, param: &str) -> Option<usize> {
+        let event = self.events.get(&event)?;
+        event
+            .indexed
+            .iter()
+            .chain(&event.body)
+            .find(|argument| argument.name == param && argument.ty == DynSolType::Address)
+            .map(|argument| argument.position)
+    }
+
+    /// The identity of the event a log would decode as, for diagnostics.
+    pub(crate) fn event_id(&self, log: &Log) -> Option<B256> {
+        let key = (log.topic0?, topic_count(log));
+        self.events.get(&key).map(|event| event.id)
     }
 
     /// Decodes a raw log; unknown selectors are ordinary misses.
@@ -110,7 +161,7 @@ impl Abi {
         let Some(selector) = topics.first() else {
             return Ok(None);
         };
-        let Some(event) = self.events.get(selector) else {
+        let Some(event) = self.events.get(&(*selector, topics.len())) else {
             return Ok(None);
         };
         let decoded = event
@@ -118,6 +169,7 @@ impl Abi {
             .decode_log_parts(topics.iter().copied(), &log.data)
             .map_err(DecodeError::Log)?;
         Ok(Some(DecodedEvent {
+            id: event.id,
             name: event.name.clone(),
             selector: *selector,
             signature: event.signature.clone(),
@@ -127,8 +179,16 @@ impl Abi {
     }
 }
 
+/// How many topics a log carries, counting up to the first absent one.
+fn topic_count(log: &Log) -> usize {
+    [log.topic0, log.topic1, log.topic2, log.topic3]
+        .iter()
+        .take_while(|topic| topic.is_some())
+        .count()
+}
+
 impl PreparedEvent {
-    fn new(event: &Event) -> Result<Self, alloy_dyn_abi::Error> {
+    fn new(event: &Event, id: B256) -> Result<Self, alloy_dyn_abi::Error> {
         let resolved = event.resolve()?;
         let mut indexed = Vec::new();
         let mut body = Vec::new();
@@ -153,6 +213,7 @@ impl PreparedEvent {
         )
         .ok_or_else(|| alloy_dyn_abi::Error::custom("prepared event layout is invalid"))?;
         Ok(Self {
+            id,
             name: event.name.clone(),
             signature: event.signature(),
             layout,
@@ -344,9 +405,9 @@ pub enum AbiError {
         /// Unsupported event name.
         event: String,
     },
-    /// Two layouts claim the same event selector.
-    #[error("multiple event layouts for selector {selector}")]
-    DuplicateSelector {
+    /// Two different definitions claim the same selector and topic count.
+    #[error("conflicting event definitions for selector {selector}")]
+    Conflict {
         /// Ambiguous selector.
         selector: B256,
     },
@@ -381,7 +442,7 @@ mod tests {
 
     fn decode(abi: &str, values: &[DynSolValue], indexed: Option<B256>) -> DecodedEvent {
         let abi = Abi::from_json(abi).expect("valid ABI");
-        let selector = *abi.events.keys().next().expect("event");
+        let (selector, _) = *abi.events.keys().next().expect("event");
         abi.decode_log(&Log {
             topic0: Some(selector),
             topic1: indexed,
@@ -508,10 +569,77 @@ mod tests {
         assert!(convert(&DynSolType::Address, &DynSolValue::Uint(U256::MAX, 256)).is_err());
     }
 
+    const ERC20_TRANSFER: &str = r#"[{"type":"event","name":"Transfer","anonymous":false,"inputs":[{"name":"from","type":"address","indexed":true},{"name":"to","type":"address","indexed":true},{"name":"value","type":"uint256","indexed":false}]}]"#;
+    const ERC721_TRANSFER: &str = r#"[{"type":"event","name":"Transfer","anonymous":false,"inputs":[{"name":"from","type":"address","indexed":true},{"name":"to","type":"address","indexed":true},{"name":"tokenId","type":"uint256","indexed":true}]}]"#;
+
+    /// One selector, two layouts: the topic count picks the one a log was emitted with,
+    /// and each carries its own identity.
+    #[test]
+    fn a_shared_selector_decodes_by_topic_count() {
+        let mut abi = Abi::from_json(ERC20_TRANSFER).expect("erc20");
+        abi.merge(Abi::from_json(ERC721_TRANSFER).expect("erc721"))
+            .expect("different topic counts do not conflict");
+        let (selector, _) = *abi.events.keys().next().expect("event");
+        let fungible = Log {
+            topic0: Some(selector),
+            topic1: Some(B256::ZERO),
+            topic2: Some(B256::ZERO),
+            data: DynSolValue::Uint(U256::from(5), 256).abi_encode().into(),
+            ..Log::default()
+        };
+        let token = Log {
+            topic3: Some(B256::with_last_byte(5)),
+            data: Bytes::new(),
+            ..fungible
+        };
+        let fungible = abi.decode_log(&fungible).expect("decode").expect("erc20");
+        let token = abi.decode_log(&token).expect("decode").expect("erc721");
+        assert_eq!(fungible.body[0].name, "value");
+        assert_eq!(token.indexed[2].name, "tokenId");
+        assert_ne!(fungible.id, token.id);
+    }
+
+    /// Merging another version keeps an identical event once and refuses a different
+    /// definition under the same key, since a log could then decode either way.
+    #[test]
+    fn merging_dedupes_identical_events_and_rejects_conflicts() {
+        let mut abi = Abi::from_json(ERC20_TRANSFER).expect("erc20");
+        abi.merge(Abi::from_json(ERC20_TRANSFER).expect("erc20"))
+            .expect("identical events merge");
+        assert_eq!(abi.events.len(), 1);
+        let renamed = ERC20_TRANSFER.replace("\"value\"", "\"amount\"");
+        assert!(matches!(
+            abi.merge(Abi::from_json(&renamed).expect("renamed")),
+            Err(AbiError::Conflict { .. })
+        ));
+    }
+
+    /// An event's identity is its own definition: an unrelated event added to the file
+    /// does not move it.
+    #[test]
+    fn an_event_id_ignores_the_rest_of_the_file() {
+        let alone = Abi::from_json(ERC20_TRANSFER).expect("alone");
+        let with_more = Abi::from_json(&ERC20_TRANSFER.replace(
+            "]}]",
+            r#"]},{"type":"event","name":"Other","anonymous":false,"inputs":[]}]"#,
+        ))
+        .expect("with another event");
+        let id = |abi: &Abi| {
+            abi.events
+                .values()
+                .find(|e| e.name == "Transfer")
+                .expect("transfer")
+                .id
+        };
+        assert_eq!(id(&alone), id(&with_more));
+    }
+
     #[test]
     fn actual_swap_fixture_decodes() {
-        let abi =
-            Abi::from_json(include_str!("../../abis/uniswap/v3/pool.json")).expect("pool ABI");
+        let abi = Abi::from_json(include_str!(
+            "../../protocols/uniswap_v3/UniswapV3Pool.json"
+        ))
+        .expect("pool ABI");
         let source: crate::wire::envelope::Envelope = serde_json::from_str(
             include_str!("../../examples/fixtures/uniswap_v3_swaps.ndjson")
                 .lines()

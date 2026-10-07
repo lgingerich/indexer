@@ -69,6 +69,30 @@ fn last_per_key(rows: &[Row], table: Table) -> Vec<&Row> {
     kept
 }
 
+/// A stored discovered contract, as a store's query returns it.
+///
+/// Only the address needs parsing: the protocol and name are matched against the catalog
+/// as text.
+#[cfg(any(feature = "duckdb", feature = "postgres"))]
+fn stored_contract(
+    protocol: String,
+    name: String,
+    address: &str,
+) -> Result<crate::decode::StoredContract, InvalidAddress> {
+    Ok(crate::decode::StoredContract {
+        protocol,
+        name,
+        address: address
+            .parse()
+            .map_err(|_| InvalidAddress(address.to_owned()))?,
+    })
+}
+
+/// A stored `contract.address` that is not a 20-byte `0x` hex address.
+#[derive(Debug, Error)]
+#[error("stored contract has an invalid address: {0:?}")]
+pub struct InvalidAddress(pub String);
+
 /// Receives envelopes in per-chain order, as the pipeline publishes them.
 ///
 /// The driver holds the sink through an exclusive borrow, so it may buffer across calls

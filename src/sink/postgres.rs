@@ -23,8 +23,9 @@ use tokio_postgres::binary_copy::BinaryCopyInWriter;
 use tokio_postgres::types::{IsNull, ToSql, Type, to_sql_checked};
 
 use crate::config::Secret;
-use crate::sink::{EnvelopeSink, SinkError, last_per_key};
-use crate::wire::envelope::Envelope;
+use crate::decode::StoredContract;
+use crate::sink::{EnvelopeSink, InvalidAddress, SinkError, last_per_key, stored_contract};
+use crate::wire::envelope::{ChainId, Envelope};
 use crate::wire::row::{ColumnType, ColumnValue, Row, Table, row_for};
 
 /// `PostgreSQL` connection and backlog batching settings for `[sink.postgres]`.
@@ -209,8 +210,8 @@ impl ToSql for ColumnValue {
 pub struct PostgresSink {
     client: Client,
     rows: Vec<Row>,
-    plans: [CopyPlan; 6],
-    merges: [String; 6],
+    plans: [CopyPlan; 7],
+    merges: [String; 7],
     connection_task: Option<tokio::task::JoinHandle<()>>,
 }
 
@@ -258,12 +259,39 @@ impl PostgresSink {
         })
     }
 
+    /// The contracts discovered on `chain` that this store holds, excluding any created in
+    /// a block a stored `reorg` names as orphaned.
+    ///
+    /// Read once at startup, before the first write, so a restart decodes every contract
+    /// a previous run discovered.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::Database`] when the query fails and [`StoreError::Restore`]
+    /// when a stored address does not parse.
+    pub async fn contracts(&self, chain: &ChainId) -> Result<Vec<StoredContract>, StoreError> {
+        let rows = self
+            .client
+            .query(
+                "SELECT protocol, name, address FROM \"contract\" \
+                 WHERE chain = $1 AND block_hash NOT IN \
+                 (SELECT jsonb_array_elements_text(orphaned_hashes) FROM \"reorg\" WHERE chain = $1)",
+                &[&chain.as_str()],
+            )
+            .await?;
+        let mut contracts = Vec::with_capacity(rows.len());
+        for row in rows {
+            contracts.push(stored_contract(row.get(0), row.get(1), row.get(2))?);
+        }
+        Ok(contracts)
+    }
+
     async fn write_batch(&mut self) -> Result<(), StoreError> {
         if self.rows.is_empty() {
             return Ok(());
         }
         let transaction = self.client.transaction().await?;
-        // ponytail: six fixed tables mean six linear scans. Group at publish time
+        // ponytail: seven fixed tables mean seven linear scans. Group at publish time
         // only if the number of datasets or profiling warrants a grouping buffer.
         for ((table, plan), merge) in Table::ALL.into_iter().zip(&self.plans).zip(&self.merges) {
             let rows = last_per_key(&self.rows, table);
@@ -321,6 +349,9 @@ pub enum StoreError {
     /// `PostgreSQL` connection, schema, COPY, or transaction failure.
     #[error("PostgreSQL storage: {0}")]
     Database(#[from] tokio_postgres::Error),
+    /// A stored contract's address did not parse.
+    #[error(transparent)]
+    Restore(#[from] InvalidAddress),
 }
 
 #[cfg(test)]
@@ -416,6 +447,81 @@ mod tests {
             .await
             .expect("count rows")
             .get(0)
+    }
+
+    /// A stored contract reads back scoped to its chain, and is excluded once a stored
+    /// reorg orphans its creating block.
+    #[tokio::test]
+    #[ignore = "requires INDEXER_TEST_POSTGRES_URL pointing to PostgreSQL 18"]
+    async fn stored_contracts_read_back_and_orphaned_ones_are_excluded() {
+        use alloy_primitives::Address;
+
+        use crate::wire::envelope::Contract;
+
+        let url = std::env::var("INDEXER_TEST_POSTGRES_URL").expect("test database URL");
+        let (client, connection) = tokio_postgres::connect(&url, tokio_postgres::NoTls)
+            .await
+            .expect("connect");
+        let task = tokio::spawn(connection);
+        let schema = format!("contract_test_{}", std::process::id());
+        client
+            .batch_execute(&format!(
+                "CREATE SCHEMA \"{schema}\"; SET search_path TO \"{schema}\""
+            ))
+            .await
+            .expect("test schema");
+        let mut sink = PostgresSink::new(client).await.expect("sink");
+        let chain = ChainId::new("base");
+        let contract = Contract {
+            protocol: "uniswap_v3".to_owned(),
+            name: "UniswapV3Pool".to_owned(),
+            address: Address::from([0xd0; 20]),
+            factory_address: Address::from([0xfa; 20]),
+            transaction_hash: B256::with_last_byte(7),
+            transaction_index: 3,
+            log_index: 9,
+            block_number: 51_000_000,
+            block_hash: B256::with_last_byte(1),
+            block_timestamp: 1_700_000_000,
+        };
+        for (chain, event) in [
+            (chain.clone(), Event::Contract(Box::new(contract.clone()))),
+            (
+                ChainId::new("ethereum"),
+                Event::Contract(Box::new(contract.clone())),
+            ),
+        ] {
+            sink.publish(Envelope::new(chain, event))
+                .await
+                .expect("publish");
+        }
+        sink.flush().await.expect("commit");
+        assert_eq!(
+            sink.contracts(&chain).await.expect("read back"),
+            [StoredContract {
+                protocol: contract.protocol,
+                name: contract.name,
+                address: contract.address,
+            }]
+        );
+
+        let reorg = Reorg {
+            height: 51_000_000,
+            new_head_hash: B256::with_last_byte(2),
+            orphaned_hashes: vec![B256::with_last_byte(1)],
+        };
+        sink.publish(Envelope::new(chain.clone(), Event::Reorg(reorg)))
+            .await
+            .expect("publish");
+        sink.flush().await.expect("commit");
+        assert!(sink.contracts(&chain).await.expect("read back").is_empty());
+
+        sink.client
+            .batch_execute(&format!("DROP SCHEMA \"{schema}\" CASCADE"))
+            .await
+            .expect("drop test schema");
+        drop(sink);
+        task.abort();
     }
 
     /// Run against an isolated `PostgreSQL` 18 database with `INDEXER_TEST_POSTGRES_URL`.

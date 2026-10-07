@@ -1,6 +1,6 @@
 # Settings for a standard single-chain deployment.
 #
-# `[ingest]` names the chain to follow, `[decode] registry` names the contracts to decode,
+# `[ingest]` names the chain to follow, `[decode] protocols` names the contracts to decode,
 # and `[sink.<backend>]` says where it all goes. Ingest and decode run together in one
 # task; storage runs in another, joined by an in-process channel. Every key is documented
 # in `src/config.rs`.
@@ -37,8 +37,8 @@ path = "indexer.duckdb"
 threads = "4"
 max_memory = "1GB"
 
-# What the decode stage decodes. The registry is its own file — see `registry.toml` —
-# so the contract catalog grows without churning these settings. An absent registry
-# means nothing is decoded, which is a legitimate way to run and is said at startup.
+# What the decode stage decodes: a directory of protocol manifests — see `protocols/` —
+# so the catalog grows without churning these settings. Absent means nothing is decoded,
+# which is a legitimate way to run and is said at startup.
 [decode]
-registry = "registry.toml"
+protocols = "protocols"

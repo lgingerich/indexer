@@ -111,6 +111,9 @@ impl CommitStats {
             }
             Event::Log(log) => self.observe_block(log.block_number, log.block_hash),
             Event::Decoded(decoded) => self.observe_block(decoded.block_number, decoded.block_hash),
+            Event::Contract(contract) => {
+                self.observe_block(contract.block_number, contract.block_hash);
+            }
             Event::Reorg(reorg) => self.reorgs.push(LoggedReorg {
                 height: reorg.height,
                 orphaned: reorg.orphaned_hashes.len(),

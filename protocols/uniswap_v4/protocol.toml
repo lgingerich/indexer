@@ -1,0 +1,10 @@
+# Uniswap V4. See `src/decode/catalog.rs` for the manifest format.
+#
+# V4 has no per-pool contract: one PoolManager holds every pool, and a pool is a bytes32
+# id rather than an address, so there is nothing to discover. Its `Initialize` records
+# carry each pool's metadata.
+protocol = "uniswap_v4"
+
+[[contract]]
+abi = ["PoolManager.json"]
+addresses = { base = ["0x498581fF718922c3f8e6A244956aF099B2652b2b"] }

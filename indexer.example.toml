@@ -62,8 +62,8 @@ ws_url = "wss://base-rpc.publicnode.com"
 # connection_string = { env = "INDEXER_POSTGRES_URL" }
 # batch_records = 500
 
-# What the decode stage decodes. The registry is its own catalog file (see
-# `registry.toml`), so the contract list grows without churning this one. Absent
-# means nothing is decoded, which is a legitimate way to run.
+# What the decode stage decodes: a directory of protocol manifests (see `protocols/`),
+# so the catalog grows without churning this file. Absent means nothing is decoded,
+# which is a legitimate way to run.
 # [decode]
-# registry = "registry.toml"
+# protocols = "protocols"

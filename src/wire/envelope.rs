@@ -8,9 +8,10 @@
 //!   Each carries its own identity fields and dedupe key. Their shape is per-chain,
 //!   so the EVM records live in [`crate::wire::datasets::evm`]; Solana's would be a sibling
 //!   module and a variant here.
-//! - **Derived** ([`Event::Decoded`]): a record the decode stage produces from a
-//!   dataset, carrying its typed arguments under their ABI names. It is a dataset,
-//!   not a control signal, and it always follows the log it was decoded from.
+//! - **Derived** ([`Event::Decoded`], [`Event::Contract`]): records the decode stage
+//!   produces from a log — its typed arguments under their ABI names, or the contract a
+//!   factory's creation event names. They are datasets, not control signals, and each
+//!   always follows the log it came from.
 //! - **Control** ([`Reorg`]): a signal about the indexer's own state,
 //!   not records of a chain. They carry no verbatim payload and exist to drive a
 //!   consumer's state machine, so they are defined here.
@@ -132,21 +133,24 @@ pub struct Reorg {
 /// that record rather than a re-fetch from a node.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Decoded {
-    /// The identity of the ABI interpretation used to decode this log.
+    /// The identity of the event definition this log was decoded with: a hash of the
+    /// event's name, parameter names, types, and indexed flags.
     ///
-    /// A different ABI identity produces a separate append-only decoded row even
-    /// when the raw log and event selector are unchanged.
-    pub abi_id: B256,
+    /// Scoped to the one event, not the ABI file it came from, so editing an unrelated
+    /// event in the same file leaves every existing row's key alone. A changed definition
+    /// of *this* event produces a separate append-only decoded row even when the raw log
+    /// and event selector are unchanged.
+    pub event_id: B256,
     /// The event name from the ABI, for example `Transfer`.
     pub name: String,
     /// The contract that emitted the log.
     pub address: Address,
-    /// What the contract is, from the registry, for example `uniswap_v3`.
+    /// What the contract is, from its protocol manifest, for example `uniswap_v3`.
     ///
     /// Not derivable from the ABI: an ABI is a list of signatures and says nothing
-    /// about which protocol an address implements. It comes from the registry entry
-    /// that matched, so a consumer can group a record by protocol without knowing any
-    /// address.
+    /// about which protocol an address implements. It comes from the manifest that
+    /// listed or discovered the address, so a consumer can group a record by protocol
+    /// without knowing any address.
     ///
     /// Deliberately *not* accompanied by a dataset name. Which table an event's rows
     /// belong to depends on context this stage does not have — which token a pool
@@ -197,10 +201,10 @@ pub struct Decoded {
 impl Decoded {
     /// A key that is stable across redelivery and unique per decoded record.
     ///
-    /// Built from the raw log's natural key, event selector, and ABI identity:
-    /// `block_hash:transaction_hash:log_index:selector:abi_id:decoded`.
-    /// Redelivery of the same interpretation deduplicates, while a later ABI yields
-    /// a separate append-only interpretation. The block hash also keeps an orphaned
+    /// Built from the raw log's natural key, event selector, and event identity:
+    /// `block_hash:transaction_hash:log_index:selector:event_id:decoded`.
+    /// Redelivery of the same interpretation deduplicates, while a changed event
+    /// definition yields a separate append-only interpretation. The block hash also keeps an orphaned
     /// log's interpretation separate from its replacement's.
     #[must_use]
     pub fn dedupe_key(&self) -> String {
@@ -208,7 +212,7 @@ impl Decoded {
             "{}:{}:{}:decoded",
             self.source_key(),
             self.selector,
-            self.abi_id
+            self.event_id
         )
     }
 
@@ -220,6 +224,62 @@ impl Decoded {
     #[must_use]
     pub fn source_key(&self) -> String {
         log_key(self.block_hash, self.transaction_hash, self.log_index)
+    }
+}
+
+/// A contract the decode stage discovered from its creation event.
+///
+/// Modeled on the provenance columns of Allium's `dex.pools`: the contract, the
+/// factory that created it, and the creation log's position. A factory names each child
+/// in an event — Uniswap V3's `PoolCreated.pool` — and a protocol manifest says which
+/// argument; see [`crate::decode`]. Contracts listed by address in a manifest are seeds
+/// and are not published here.
+///
+/// Natural key is `(block_hash, transaction_hash, log_index, address)`: the creation log
+/// plus the child, so a creation in an orphaned block and its replay in the replacement
+/// are different rows, and a reader applies `reorg` markers to them like any other row.
+/// The store holding these rows is how discovered contracts survive a restart.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Contract {
+    /// The protocol the contract belongs to, from its manifest, for example `uniswap_v3`.
+    pub protocol: String,
+    /// The contract's name within its protocol, from its ABI file, for example
+    /// `UniswapV3Pool`.
+    pub name: String,
+    /// The discovered contract.
+    pub address: Address,
+    /// The contract that emitted the creation event.
+    pub factory_address: Address,
+    /// The transaction that emitted the creation event.
+    pub transaction_hash: TxHash,
+    /// The creating transaction's position in its block.
+    #[serde(with = "alloy_serde::quantity")]
+    pub transaction_index: u64,
+    /// The creation log's position in its block.
+    #[serde(with = "alloy_serde::quantity")]
+    pub log_index: u64,
+    /// Height of the block containing the creation log.
+    #[serde(with = "alloy_serde::quantity")]
+    pub block_number: u64,
+    /// Hash of the block containing the creation log.
+    pub block_hash: B256,
+    /// Timestamp of the block containing the creation log, denormalized from its header.
+    #[serde(with = "alloy_serde::quantity")]
+    pub block_timestamp: u64,
+}
+
+impl Contract {
+    /// A key that is stable across redelivery and unique per discovery:
+    /// `block_hash:transaction_hash:log_index:address:contract`.
+    #[must_use]
+    pub fn dedupe_key(&self) -> String {
+        // `{:#x}`, not `Display`: an address displays checksummed, and every key is
+        // lowercase hex like the node's own encoding.
+        format!(
+            "{}:{:#x}:contract",
+            log_key(self.block_hash, self.transaction_hash, self.log_index),
+            self.address
+        )
     }
 }
 
@@ -241,6 +301,8 @@ pub enum Event {
     Log(Box<Log>),
     /// A log decoded against a contract ABI. Only the decode stage produces this.
     Decoded(Box<Decoded>),
+    /// A contract discovered from its creation event. Only the decode stage produces this.
+    Contract(Box<Contract>),
     /// A discontinuity in the published chain.
     Reorg(Reorg),
 }
@@ -255,6 +317,7 @@ impl Event {
             Self::Receipt(_) => "receipt",
             Self::Log(_) => "log",
             Self::Decoded(_) => "decoded",
+            Self::Contract(_) => "contract",
             Self::Reorg(_) => "reorg",
         }
     }
@@ -280,6 +343,7 @@ impl Event {
             Self::Receipt(receipt) => receipt.dedupe_key(),
             Self::Log(log) => log.dedupe_key(),
             Self::Decoded(decoded) => decoded.dedupe_key(),
+            Self::Contract(contract) => contract.dedupe_key(),
             Self::Reorg(reorg) => format!("{}:reorg", reorg.new_head_hash),
         }
     }
@@ -342,9 +406,24 @@ mod tests {
     use alloy_primitives::{Address, B256, TxHash, U256};
 
     use super::{
-        AbiType, Block, ChainId, Decoded, DecodedArg, Envelope, Event, Log, Receipt, Reorg,
-        SCHEMA_VERSION, Transaction, TypedValue,
+        AbiType, Block, ChainId, Contract, Decoded, DecodedArg, Envelope, Event, Log, Receipt,
+        Reorg, SCHEMA_VERSION, Transaction, TypedValue,
     };
+
+    fn contract(block_hash: B256) -> Contract {
+        Contract {
+            protocol: "uniswap_v3".to_owned(),
+            name: "UniswapV3Pool".to_owned(),
+            address: Address::from([0xd0; 20]),
+            factory_address: Address::from([0xfa; 20]),
+            transaction_hash: TxHash::from([0xbb; 32]),
+            transaction_index: 1,
+            log_index: 3,
+            block_number: 100,
+            block_hash,
+            block_timestamp: 1_700_000_000,
+        }
+    }
 
     fn chain() -> ChainId {
         ChainId::new("ethereum")
@@ -370,7 +449,7 @@ mod tests {
             name: "Swap".to_owned(),
             address: Address::from([0xd0; 20]),
             protocol: "uniswap_v3".to_owned(),
-            abi_id: hash(0x08),
+            event_id: hash(0x08),
             selector: hash(0x07),
             signature: "Swap(address,address,int256,int256,uint160,uint128,int24)".to_owned(),
             anonymous: false,
@@ -385,7 +464,7 @@ mod tests {
         };
         assert_eq!(decoded.source_key(), log.dedupe_key());
         let mut later_interpretation = decoded.clone();
-        later_interpretation.abi_id = hash(0x09);
+        later_interpretation.event_id = hash(0x09);
         assert_ne!(decoded.dedupe_key(), later_interpretation.dedupe_key());
         assert_eq!(decoded.source_key(), later_interpretation.source_key());
     }
@@ -506,7 +585,7 @@ mod tests {
             name: "Swap".to_owned(),
             address: Address::from([0xd0; 20]),
             protocol: "uniswap_v3".to_owned(),
-            abi_id: hash(0x08),
+            event_id: hash(0x08),
             selector: hash(0x07),
             signature: "Swap(address,address,int256)".to_owned(),
             anonymous: false,
@@ -584,7 +663,7 @@ mod tests {
                 name: "Swap".to_owned(),
                 address: Address::from([0xd0; 20]),
                 protocol: "uniswap_v3".to_owned(),
-                abi_id: hash(0x08),
+                event_id: hash(0x08),
                 selector,
                 signature: "Swap(address)".to_owned(),
                 anonymous: false,
@@ -604,6 +683,10 @@ mod tests {
             )
         );
         assert_eq!(
+            Event::Contract(Box::new(contract(block_hash))).dedupe_key(),
+            format!("0x{block_hex}:0x{tx_hex}:3:0x{}:contract", "d0".repeat(20))
+        );
+        assert_eq!(
             Event::Reorg(Reorg {
                 height: 100,
                 new_head_hash: block_hash,
@@ -611,6 +694,17 @@ mod tests {
             })
             .dedupe_key(),
             format!("0x{block_hex}:reorg")
+        );
+    }
+
+    /// A discovery inherits its creation log's block hash, so a creation in an orphaned
+    /// block and its replay in the replacement are two rows a reader tells apart with
+    /// the `reorg` markers.
+    #[test]
+    fn a_contract_and_its_replacement_in_a_reorg_do_not_share_a_key() {
+        assert_ne!(
+            contract(hash(0xaa)).dedupe_key(),
+            contract(hash(0xbb)).dedupe_key()
         );
     }
 
@@ -708,7 +802,7 @@ mod tests {
                 name: "Transfer".to_owned(),
                 address: Address::from([0x22; 20]),
                 protocol: "erc20".to_owned(),
-                abi_id: hash(0x08),
+                event_id: hash(0x08),
                 selector: hash(0x07),
                 signature: "Transfer(address,address,uint256)".to_owned(),
                 anonymous: false,
@@ -742,6 +836,7 @@ mod tests {
                 block_hash: hash(5),
                 block_timestamp: 1_700_000_000,
             })),
+            Event::Contract(Box::new(contract(hash(5)))),
             Event::Reorg(Reorg {
                 height: 1,
                 new_head_hash: hash(3),

@@ -38,7 +38,7 @@
 //! # ...or `[sink.stdout]`, to print the stream and open no store.
 //!
 //! [decode]
-//! registry = "registry.toml"   # the contract catalog; optional
+//! protocols = "protocols"      # the protocol manifests; optional
 //! ```
 
 use std::path::{Path, PathBuf};
@@ -247,22 +247,21 @@ pub enum Sink {
     Postgres(crate::sink::postgres::PostgresSettings),
 }
 
-/// What the decode stage decodes, in its own file.
+/// What the decode stage decodes: a directory of protocol manifests.
 ///
-/// Kept out of the indexer's settings because it is a different kind of thing: the
-/// settings file is deployment topology — endpoints, paths — and the registry
-/// is a catalog of contracts that grows on its own schedule. It also rotates addresses,
-/// which would otherwise churn the settings file's diff on every new protocol.
+/// The manifests are kept out of the indexer's settings because they are a different kind
+/// of thing: the settings file is deployment topology — endpoints, paths — and the
+/// manifests are a catalog of protocols that grows on its own schedule.
 ///
-/// A table, not an `Option`, because decode always runs: an absent `registry` means an
-/// empty registry and nothing is decoded, which is a legitimate way to run and is said at
-/// startup rather than being silent. See [`crate::decode::RegistryConfig`] for the file's shape.
+/// A table, not an `Option`, because decode always runs: an absent `protocols` means an
+/// empty catalog and nothing is decoded, which is a legitimate way to run and is said at
+/// startup rather than being silent. See [`crate::decode::Catalog`] for the manifest shape.
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct DecodeSettings {
-    /// The registry file, relative to the settings file's directory. Absent means an
-    /// empty registry.
-    pub registry: Option<PathBuf>,
+    /// The protocols directory, relative to the settings file's directory. Absent means
+    /// an empty catalog.
+    pub protocols: Option<PathBuf>,
 }
 
 /// Why a settings file could not be turned into [`Settings`].
@@ -329,17 +328,18 @@ impl Settings {
         Ok(settings)
     }
 
-    /// The registry file decode loads, resolved against the settings file's directory.
+    /// The protocols directory decode loads, resolved against the settings file's
+    /// directory.
     ///
-    /// `None` when no registry is named, which is an empty registry rather than an error.
-    /// Through [`Settings::from_file`] the path is absolute-or-relative-to-the-file; text
-    /// parsed from a string has no directory, so the path is returned as written.
+    /// `None` when none is named, which is an empty catalog rather than an error. Through
+    /// [`Settings::from_file`] the path is absolute-or-relative-to-the-file; text parsed
+    /// from a string has no directory, so the path is returned as written.
     #[must_use]
-    pub fn registry_path(&self) -> Option<PathBuf> {
+    pub fn protocols_path(&self) -> Option<PathBuf> {
         self.decode
-            .registry
+            .protocols
             .as_ref()
-            .map(|registry| self.dir.join(registry))
+            .map(|protocols| self.dir.join(protocols))
     }
 }
 
@@ -397,7 +397,7 @@ ws_url = "wss://example.invalid"
     fn a_minimal_file_supplies_every_default() {
         let settings = Settings::from_str(minimal()).expect("minimal settings parse");
 
-        assert!(settings.decode.registry.is_none(), "nothing is decoded");
+        assert!(settings.decode.protocols.is_none(), "nothing is decoded");
         assert_eq!(
             settings.ingest.datasets,
             crate::sink::Datasets::all(),
@@ -553,7 +553,7 @@ datasets = ["log", "log"]
     }
 
     /// The fixture file yields the values each stage is built from — the endpoints, the
-    /// batch, and the resolved registry path — so the seam between the file and the
+    /// batch, and the resolved protocols path — so the seam between the file and the
     /// stages is exercised without a store.
     #[cfg(feature = "duckdb")]
     #[test]
@@ -573,46 +573,40 @@ datasets = ["log", "log"]
             duckdb.batch_records,
             DuckDbSettings::default().batch_records
         );
-        // The fixture names `registry.toml`. Parsed from text it has no directory, so the
+        // The fixture names `protocols`. Parsed from text it has no directory, so the
         // path is left as written rather than resolved against the working directory.
-        assert_eq!(
-            settings.registry_path(),
-            Some(PathBuf::from("registry.toml"))
-        );
+        assert_eq!(settings.protocols_path(), Some(PathBuf::from("protocols")));
     }
 
-    /// A registry path resolves against the settings file's own directory, not the
+    /// A protocols path resolves against the settings file's own directory, not the
     /// process's working directory, so a deployment that moves wholesale keeps working.
     #[test]
-    fn a_registry_path_resolves_against_the_settings_file() {
+    fn a_protocols_path_resolves_against_the_settings_file() {
         let dir = std::env::temp_dir().join(format!("indexer-config-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("create temp dir");
         let path = dir.join("indexer.toml");
         std::fs::write(
             &path,
-            format!("{}\n[decode]\nregistry = \"registry.toml\"\n", minimal()),
+            format!("{}\n[decode]\nprotocols = \"protocols\"\n", minimal()),
         )
         .expect("write settings");
 
         let settings = Settings::from_file(&path).expect("settings load");
-        assert_eq!(settings.registry_path(), Some(dir.join("registry.toml")));
+        assert_eq!(settings.protocols_path(), Some(dir.join("protocols")));
 
         std::fs::remove_dir_all(&dir).expect("clean up");
     }
 
-    /// Text parsed from a string has no directory, so a relative registry path is left as
+    /// Text parsed from a string has no directory, so a relative protocols path is left as
     /// written rather than silently resolved against the working directory.
     #[test]
-    fn a_registry_path_from_text_is_left_as_written() {
+    fn a_protocols_path_from_text_is_left_as_written() {
         let settings = Settings::from_str(&format!(
-            "{}\n[decode]\nregistry = \"registry.toml\"\n",
+            "{}\n[decode]\nprotocols = \"protocols\"\n",
             minimal()
         ))
         .expect("settings parse");
-        assert_eq!(
-            settings.registry_path(),
-            Some(PathBuf::from("registry.toml"))
-        );
+        assert_eq!(settings.protocols_path(), Some(PathBuf::from("protocols")));
     }
 
     /// Ingest is where the pipeline starts, so a file without it is an error rather than

@@ -44,8 +44,8 @@ use std::process::ExitCode;
 
 use alloy_primitives::{Address, B256, Bloom, Bytes, I256, TxHash, U256};
 use indexer::wire::envelope::{
-    Block, ChainId, Decoded, DecodedArg, Envelope, Event, Log, Receipt, Reorg, Transaction,
-    TypedValue,
+    Block, ChainId, Contract, Decoded, DecodedArg, Envelope, Event, Log, Receipt, Reorg,
+    Transaction, TypedValue,
 };
 
 /// The chain these are from.
@@ -89,7 +89,15 @@ fn main() -> ExitCode {
 /// fixture also shows that the child datasets reference the block by scalar key rather
 /// than embedding it.
 fn envelopes() -> Vec<Envelope> {
-    vec![block(), transaction(), receipt(), log(), decoded(), reorg()]
+    vec![
+        block(),
+        transaction(),
+        receipt(),
+        log(),
+        decoded(),
+        contract(),
+        reorg(),
+    ]
 }
 
 /// A block header, carrying its transactions' hashes rather than the transactions.
@@ -196,9 +204,9 @@ fn decoded() -> Envelope {
     envelope(Event::Decoded(Box::new(Decoded {
         name: "Swap".to_owned(),
         address: CONTRACT,
-        // From the registry entry that matched, not from the ABI.
+        // From the protocol manifest that listed the address, not from the ABI.
         protocol: "uniswap_v3".to_owned(),
-        abi_id: hash(0x08),
+        event_id: hash(0x08),
         selector: hash(0x07),
         signature: "Swap(address,address,int256,int256,uint160,uint128,int24)".to_owned(),
         anonymous: false,
@@ -250,6 +258,23 @@ fn decoded() -> Envelope {
                 },
             ),
         ],
+        block_number: BLOCK_NUMBER,
+        block_hash: BLOCK_HASH,
+        block_timestamp: TIMESTAMP,
+    })))
+}
+
+/// A contract a factory's creation event named, keyed by that creation log.
+fn contract() -> Envelope {
+    envelope(Event::Contract(Box::new(Contract {
+        // From the protocol manifest whose `created_by` rule matched.
+        protocol: "uniswap_v3".to_owned(),
+        name: "UniswapV3Pool".to_owned(),
+        address: Address::from([0x77; 20]),
+        factory_address: CONTRACT,
+        transaction_hash: TX_HASH,
+        transaction_index: 0,
+        log_index: 7,
         block_number: BLOCK_NUMBER,
         block_hash: BLOCK_HASH,
         block_timestamp: TIMESTAMP,

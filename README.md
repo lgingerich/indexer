@@ -2,8 +2,9 @@
 
 A low-latency, chain-agnostic blockchain indexer.
 
-It reads a chain's live tip, parses each block into ordered events, decodes the logs
-it has ABIs for, and stores everything in a local database. Chain-specific knowledge sits
+It reads a chain's live tip, parses each block into ordered events, decodes the logs of
+the contracts its protocol manifests name — including pools a factory creates while it
+runs — and stores everything in a local database. Chain-specific knowledge sits
 behind one trait and where events go behind another, so new chains and new stores are
 additions rather than rewrites.
 
@@ -48,23 +49,28 @@ recorded before the replacement block.
 
 ### What decode adds
 
-Decode never removes or rewrites an envelope. It only inserts a record after a log it
+Decode never removes or rewrites an envelope. It only inserts records after a log it
 can decode.
 
 ```
 envelope
    │
-   ├─ block, transaction, receipt, reorg ──▶ forwarded as it arrived
-   │
+   ├─ block, transaction, receipt ─────────▶ forwarded as it arrived
+   ├─ reorg ───────────────────────────────▶ forwarded; contracts created in the
+   │                                          orphaned blocks stop decoding
    └─ log
-        ├─ no ABI for (chain, address), or no such event ──▶ the log, nothing added
-        ├─ ABI matches, data does not decode ──────────────▶ the log, error logged
-        └─ decodes ─────────────────────────────────────────▶ the log, then its decoded record
+        ├─ address not a known contract, or no such event ─▶ the log, nothing added
+        ├─ event matches, data does not decode ────────────▶ the log, error logged
+        ├─ decodes ────────────────────────────────────────▶ the log, then its decoded record
+        └─ decodes, and is a creation event ──────────────▶ the log, its decoded record,
+                                                             then the contract it created
 ```
 
-An immutable `Decoder` decodes logs during ingestion. The registry selects
-an ABI and protocol by `(chain, address, block)` using predefined half-open block ranges.
-There is no factory discovery, network lookup, or runtime registry mutation.
+The `Decoder` holds the *contract set*: every address it decodes, mapped to a protocol
+and a contract. Seeds come from the protocol manifests; a factory's creation event
+— Uniswap V3's `PoolCreated` — adds the pool it names the moment it decodes, so the
+pool's own logs later in the same block, even the same transaction, decode too. See
+[Protocol manifests](#protocol-manifests).
 
 ### A reorg
 
@@ -85,7 +91,7 @@ appended, in order
 
 The store appends every one of those rows. It does not delete the orphaned branch, mark
 it noncanonical, or hide it from a dataset query. `block`, `transaction`, `receipt`,
-`log`, and `decoded` contain both branches. The `reorg` table records which block hashes
+`log`, `decoded`, and `contract` contain both branches. The `reorg` table records which block hashes
 stopped being canonical, and that is the only place that fact is stored.
 
 A downstream read that wants the current chain has to exclude every block hash named by
@@ -142,7 +148,7 @@ That resume is not built: a restart begins fresh at the sampled head. See
 
 One crate, one binary, four layers as modules. What runs is not hardcoded: the settings
 file states it, and `runtime` assembles the pipeline — ingest follows the configured chain,
-decode uses the configured registry, storage writes the configured store. `main` is only
+decode uses the configured protocol manifests, storage writes the configured store. `main` is only
 the process boundary. The layers share one definition of the stream through `wire`.
 
 ```
@@ -153,7 +159,8 @@ src/
 ├── wire/           the wire contract: envelope, events, dataset records, and the rows a
 │                   store persists. Pure data.
 ├── ingest/         block sources and the reorg-aware pipeline.
-├── decode/         the immutable log decoder, historical registry, and live decoding sink.
+├── decode/         protocol manifests, the log decoder and its contract set, factory
+│                   discovery, and the live decoding sink.
 └── sink/           where envelopes go: the sink trait, the decode→storage channel, the store, stdout.
 ```
 
@@ -189,12 +196,16 @@ that matters most: `decode` must not depend on `ingest`.
   height is a column, not part of the key, because it is recoverable and a key that
   restates it is saying the same thing twice. See `src/wire/envelope.rs`.
 - **A decode stage.** `src/decode::Decoder` prepares ABI layouts once and decodes each
-  registered log against the ABI for its `(chain, address, block)`, inline in
-  `DecodingSink`. Everything is forwarded as it arrived — decode adds records and removes
-  none — so a reorg marker reaches the store exactly once, from ingest.
-  Decoded records carry the ABI content hash, protocol, and each argument's original
-  position and complete ABI schema. Raw byte strings remain lossless, with readable
-  text only when valid UTF-8.
+  log from a known contract, inline in `DecodingSink`. Everything is forwarded as it
+  arrived — decode adds records and removes none — so a reorg marker reaches the store
+  exactly once, from ingest. Decoded records carry the event definition's hash
+  (`event_id`), the protocol, and each argument's original position and complete ABI
+  schema. Raw byte strings remain lossless, with readable text only when valid UTF-8.
+- **Factory discovery.** A manifest's `created_by` rule turns a factory's creation event
+  into a new contract in the set, live, and publishes it as a `contract` row in the same
+  commit as the block that created it. A reorg retracts contracts created in orphaned
+  blocks. At startup the store's `contract` rows are read back, so a restart keeps
+  decoding every pool a previous run discovered.
 - **A local store.** The process writes every envelope, raw and decoded, into a local
   `DuckDB` database: one typed table per dataset, with real columns rather than a JSON
   blob. What a dataset's columns *are* lives in `src/wire/row.rs`, not in the store, so a
@@ -240,6 +251,7 @@ stored-log replay
 streaming aggregation
 Avro for a serialized envelope
 ranged log backfill
+signature-only decoding
 ```
 
 ### Resume from the store
@@ -344,8 +356,9 @@ is not implemented by this restart analysis.
 Re-decoding logs already in the store is not implemented. That path would read
 retained raw logs, run them through the same decoder, and replace or deduplicate the
 decoded rows. The store upserts on `(chain, dedupe_key)`, which makes a replay of the
-same interpretation replace the stored row. A different ABI stays a separate row,
-because that identity is part of the key.
+same interpretation replace the stored row. A changed event definition stays a separate
+row, because its `event_id` is part of the key. A replay would also have to walk the
+contract set in block order, since a contract decodes only from its creation onward.
 
 ### Streaming aggregation
 
@@ -387,73 +400,16 @@ attributes (`chain`, `sink`). Attributes that vary per block — hash, address, 
 create a series per event and are the one way to make this expensive; `cargo bench
 --bench hot_path` with the meter live is the check that indexing latency has not moved.
 
-### Factory child discovery
+### Signature-only decoding
 
-A DEX factory — Uniswap V3's `Factory`, Metric's `MetricOmmPoolFactory` — *tells* you
-where its pools are: each emits a creation event naming the new pool. The registry does
-not listen. Every pool is a hand-written `[[contract]]` row, so a factory with ten
-thousand pools means ten thousand rows, and a pool created while the indexer runs is
-decoded only after someone edits the file. Discovery replaces the enumerated children
-with a rule.
-
-The creation event carries the child address as an argument, and the shape differs by
-factory — Uniswap V3's `PoolCreated.pool` is the fifth, non-indexed argument, while
-Metric's `PoolCreated.poolAddress` and `OracleProvider.PoolRegistered.pool` are earlier
-and indexed. So a rule names the argument *and* the event, and the loader resolves the
-position from the ABI rather than hardcoding an index:
-
-```toml
-[[contract]]                       # the factory itself is still a static registration
-chain = "base"
-address = "0x1F98431c8aD98523631AE4a59f267346ea31F984"
-abi = "uniswap/v3/factory"
-protocol = "uniswap_v3"
-
-[[factory]]                        # every child this event names is registered as seen
-chain = "base"
-address = "0x1F98431c8aD98523631AE4a59f267346ea31F984"
-abi = "uniswap/v3/factory"
-protocol = "uniswap_v3"
-event = "PoolCreated"
-child = "pool"                     # the argument naming the new address, by name
-child_abi = "uniswap/v3/pool"
-# child from_block is the creation block, not 0: a child cannot emit before it exists
-```
-
-`event` and `child` are validated against the ABI at load, the way `abi` is, so a missing
-name is a startup error rather than a rule that never fires. `protocol` stays explicit and
-is stamped on the child exactly as on a static registration. The factory's own address is
-still required — a rule has to know where to watch; it is the *children* whose addresses
-disappear from the file. This does not change the [key design](#the-contract-registry) for
-static rows, which remain explicit addresses.
-
-**Why it is not a small change.** The registry is frozen at startup and `Decoder` holds it
-by value; discovery makes it a growing, reorg-reversible index, and four consequences
-follow:
-
-- **The registry becomes mutable.** `Decoder::decode` takes `&mut self` and inserts the
-  child when the creation log is seen. Decode runs on one task, so `&mut` is enough — no
-  lock — but an insert must not invalidate lookups mid-block, so it is a sorted insert or
-  a block-boundary rebuild.
-- **Ordering is correctness, not convenience.** The child is inserted with
-  `from_block = log.block_number`, before the pool's own first logs are processed. Live
-  logs arrive in order within a block, so creation precedes swaps. Backfill is the trap: a
-  run starting *above* the factory's creation never sees the creation event and the pool
-  stays undecodable forever. A factory's `from_block`, and `start_block`, must sit below
-  where its children are created.
-- **Reorgs must un-discover.** A reorged-away creation has to remove its child, or the run
-  keeps decoding a pool that no longer exists — and the store keeps both fork branches, so
-  it would mint decoded rows for an orphaned pool. The hook already exists:
-  `Event::Reorg { orphaned_hashes }`. Each discovered child records its creation block
-  *hash*, and a reorg drops the children whose creation hash is orphaned; the replacement
-  block replays its own creation and re-adds them. Hashes, not heights, is what makes this
-  exact.
-- **Restart durability is deliberately unhandled for now.** Discovered children live only
-  in the process. Anything inside the reorg window is re-derived — startup refetches the
-  tail — but a pool created *below* the window is lost until the factory is replayed from
-  its creation block, which is expensive for a busy factory. A gitignored state file under
-  `[decode]`, loaded at startup and appended live, is the intended fix; it is a new durable
-  artifact and is not built.
+Decode is *attributed*: a log decodes only when its address is a known contract — a
+seed or a discovered child — so every decoded record carries a protocol that is a fact
+about its emitter. Allium also publishes a broader form, decoding any log whose `topic0`
+matches a known event, preferring the contract's own ABI and falling back to a generic
+one. The catalog already keys events by selector and topic count, so a
+`(topic0, topic count) → event` index across every manifest is the lookup that needs;
+those records would carry no protocol, since a matching signature says nothing about who
+emitted it — anyone can deploy a contract that emits a lookalike `Swap`. Not built.
 
 Also not built, and not on the path above: mempool ingestion and a Parquet archive.
 
@@ -465,15 +421,15 @@ decode run together in one task and storage in another; a part that ends for goo
 process, because continuing without it would leave a stream that looks alive but is not.
 
 - **`[ingest]` is required** — it names the chain to follow.
-- **Decode uses `[decode] registry`.** An absent or empty registry decodes nothing, which
+- **Decode uses `[decode] protocols`.** An absent or empty catalog decodes nothing, which
   is a legitimate way to run and is said at startup.
 - **Storage is the `[sink.<backend>]` table.** With `[sink.stdout]` no store is
   opened and the stream is printed instead.
 
 Settings come from a TOML file, named by the first argument or defaulting to
 `indexer.toml`. `indexer.toml` in the repository is a working example. What decode decodes
-lives in a separate registry file, named by `[decode] registry` and defaulting to nothing —
-`registry.toml` is a working example; see [The contract registry](#the-contract-registry).
+lives in a directory of protocol manifests, named by `[decode] protocols` and defaulting
+to nothing — `protocols/` is a working example; see [Protocol manifests](#protocol-manifests).
 
 ```bash
 RUST_LOG=info cargo run --release -- indexer.toml
@@ -489,7 +445,7 @@ ws_url = "wss://base-rpc.publicnode.com"
 path = "indexer.duckdb"
 
 [decode]
-registry = "registry.toml"
+protocols = "protocols"
 ```
 
 Each table names what owns its fields, not where a field was first needed:
@@ -503,7 +459,7 @@ Each table names what owns its fields, not where a field was first needed:
   understands has nowhere else to sit. Commit batching is part of this, because it is a
   property of the store: `DuckDB` folds a backlog into larger transactions, where a
   remote backend would batch unconditionally.
-- `[decode]` — the contract registry.
+- `[decode]` — the protocol manifests.
 
 **Required** — no value could be right by accident, so each errors at startup naming
 the field:
@@ -529,7 +485,7 @@ the field:
 
 | Key | Meaning |
 | --- | --- |
-| `decode.registry` | Path to the contract registry file, relative to the settings file. Absent means nothing is decoded |
+| `decode.protocols` | Path to the protocol manifests directory, relative to the settings file. Absent means nothing is decoded |
 | `sink.duckdb.settings` | Any other DuckDB setting, passed straight through |
 
 `RUST_LOG` is still read from the environment, because a log filter is not deployment
@@ -568,52 +524,74 @@ For local development, either:
 - write the values into a gitignored local settings file — any `*.local.toml`, e.g.
   `cargo run -- indexer.local.toml`.
 
-### The contract registry
+### Protocol manifests
 
-What decode decodes lives in its own file, named by `[decode] registry` — `registry.toml`
-in the repository is a working example. It is deliberately not part of `indexer.toml`: the
-settings file is deployment topology (endpoints, paths), while the registry is a
-catalog of contracts that grows on its own schedule. Splitting them keeps a new protocol
-from churning the deployment diff.
+What decode decodes lives in a directory named by `[decode] protocols` — `protocols/` in
+the repository is a working example. It is deliberately not part of `indexer.toml`: the
+settings file is deployment topology (endpoints, paths), while the manifests are a catalog
+of protocols that grows on its own schedule.
 
-The registry file points at an ABI directory and holds a list of registrations:
+Each protocol is a directory holding a `protocol.toml` and the ABI files it names:
 
-```toml
-abis = "abis"                       # walked recursively; every .json file under it
-
-[[contract]]
-chain = "base"
-address = "0xd0b53D9277642d899DF5C87A3966A349A798F224"
-abi = "uniswap/v3/pool"             # the file's path under `abis`, without `.json`
-protocol = "uniswap_v3"
-from_block = 0
-# to_block = 60000000     # optional exclusive bound
+```
+protocols/
+  uniswap_v3/
+    protocol.toml
+    UniswapV3Factory.json
+    UniswapV3Pool.json
 ```
 
-**How an ABI is named.** `abis` is walked recursively and each `.json` file is one ABI,
-named by its path under the root without the extension: `abis/uniswap/v3/pool.json` is
-`uniswap/v3/pool`. Protocols and versions nest as directories (`abis/uniswap/v3/…`,
-`abis/uniswap/v4/…`) without any entry to keep in sync, and a `[[contract]]` `abi` is
-that name. A file that is not `.json` is ignored.
+```toml
+protocol = "uniswap_v3"
 
-**Why an ABI is named once.** A pool protocol like Uniswap V3 has thousands of pools
-sharing one ABI. Each walked ABI is loaded and prepared once, content-addressed by
-`abi_id`, and shared; an address is a registration.
+[[contract]]
+abi = ["UniswapV3Factory.json"]
+addresses = { base = ["0x33128a8fC17869897dcE68Ed026d694621f6FDfD"] }
 
-**Historical registrations.** `protocol` is required; `from_block` defaults to zero.
-An omitted `to_block` means no upper bound. Disjoint ranges for one `(chain, address)` support proxy
-upgrades: a historical log always uses its original block's registration. Overlapping
-ranges, invalid bounds, dangling ABI names, an unreadable ABI directory, and malformed
-addresses are startup errors. The `abis` root resolves relative to the registry file,
-not the working directory.
+[[contract]]
+abi = ["UniswapV3Pool.json"]
+created_by = [{ contract = "UniswapV3Factory", event = "PoolCreated", param = "pool" }]
+addresses = { base = ["0xd0b53D9277642d899DF5C87A3966A349A798F224"] }   # optional seeds
+```
 
-Registrations are predefined and immutable. Factories do not discover or register child
-contracts during decoding; add each child's registration explicitly. Uniswap V4's
-`PoolManager` is one address registration because logical pools are `bytes32` ids,
-not deployed contracts.
+**A `[[contract]]` is one contract of the protocol,** named after its first ABI file:
+`UniswapV3Pool.json` is `UniswapV3Pool`, so name ABI files after the contract they
+describe. A rule names its parent by that name, and a stored discovery uses it to find
+its ABI after a restart, so keep it stable (list a proxy's original ABI first and append
+upgrades). Every decoded record carries the manifest's `protocol`. A process indexes one chain, so only that
+chain's `addresses` are loaded; the rest are parsed and dropped.
 
-Every decoded record carries the registration's explicit `protocol` and the ABI's
-content identity. The protocol is not inferred from an ABI filename.
+**Discovery replaces listing children.** `created_by` says that when an instance of the
+parent `contract` emits `event`, its `param` argument is a new instance of this one. The
+event and parameter are resolved against the parent's ABI at load — Uniswap V3's
+`PoolCreated.pool` is the fifth, non-indexed argument, Metric's `poolAddress` the first,
+indexed one — and the parameter must be an `address`, so a typo is a startup error
+rather than a rule that never fires. A discovered contract decodes from its creation log
+onward, and its row in `contract` records the factory, the creation log, and the block.
+Rules chain: a discovered contract can have `created_by` children of its own.
+
+**Restarts.** The `contract` rows are the state: each commits in the same transaction as
+the block that created it, so the store never holds a block without its discoveries or
+the reverse. At startup the store's rows are read back, minus any created in a block a
+`reorg` row orphans. Two gaps remain until [resume from the store](#resume-from-the-store)
+is built, both from a run starting at the sampled head rather than where the last one
+stopped: a pool created while the process was down is not discovered, and neither is a
+pool created before the first run — list those as seeds. With `[sink.stdout]` there is no
+store, so each start begins from the seeds.
+
+`ingest.log_addresses` turns discovery off, with a warning at startup. That filter is an
+explicit list fixed at startup, so a discovered contract's logs would never be fetched.
+
+**Upgrades.** List every version's ABI in `abi`. Events merge by selector and topic
+count, so a log decodes as whichever version emitted it; the same selector with a
+different definition is a startup error. There are no block ranges.
+
+**Event identity.** Each decoded record's `event_id` is the hash of the one event
+definition it used — name, parameter names, types, and indexed flags — not of the ABI
+file, so adding or editing another event in the file leaves existing rows' keys alone.
+
+Uniswap V4's `PoolManager` is a single seed: its pools are `bytes32` ids inside one
+contract, not deployed contracts, so there is nothing to discover.
 
 ### What decode does not do
 
@@ -629,7 +607,7 @@ Turning that into a `dex.trades` row needs three things the decoder does not hav
 | Needed | Source | Have it? |
 | --- | --- | --- |
 | What the arguments mean | the ABI | yes |
-| Which contract this is | the registry | yes |
+| Which contract this is | the protocol manifests | yes |
 | Which tokens, and their decimals and symbols | **reference data** | not yet |
 
 Token metadata is the gap. A Uniswap `Swap` event names neither token — only the pool
@@ -666,7 +644,7 @@ use `sslmode=disable` only for trusted local connections. The database must alre
 exist, and the role needs permission to create and write the dataset tables in its
 configured search path.
 
-The sink creates the same six typed tables as DuckDB. Columns the chain always
+The sink creates the same seven typed tables as DuckDB. Columns the chain always
 provides are `NOT NULL`; fields it can omit stay nullable. Each table has a unique
 index on `(chain, dedupe_key)`. A flush bulk-loads with binary `COPY` into a temporary
 table, then upserts into the dataset table, in one transaction. Unsigned 64-bit fields
@@ -698,7 +676,7 @@ They live under the `DuckDB` table because they are DuckDB's, and no other backe
 know what to do with them. Anything unrecognized is an error from DuckDB naming the
 setting, so a typo is caught at startup rather than silently ignored. Every envelope
 lands in its dataset's own typed table — `block`, `transaction`, `receipt`, `log`,
-`decoded`, `reorg` — with real columns rather than a JSON blob, so a
+`decoded`, `contract`, `reorg` — with real columns rather than a JSON blob, so a
 consumer filters and joins on values. The schema is generated from the row headers in
 `src/wire/row.rs`, so a column added to a dataset appears without anyone editing the
 DDL.
@@ -730,9 +708,10 @@ Events fall into three kinds. **Datasets** — `block`, `transaction`, `receipt`
 is a normalized table with a natural key and fully deconstructed fields, the same
 decomposition of the chain's datasets, so a row maps straight to a
 persistence row; children are referenced by scalar key, never embedded. **Derived**
-records — `decoded` — are what the decode stage produces from a dataset, carrying
-typed ABI arguments; the type of every argument travels with it, so a consumer can
-rebuild a typed column without reading the ABI. **Control
+records — `decoded` and `contract` — are what the decode stage produces from a log:
+typed ABI arguments, whose types travel with them so a consumer can rebuild a typed
+column without reading the ABI, and the contracts a factory created, modeled on the
+provenance columns of Allium's `dex.pools`. **Control
 signal** — `reorg` — drives a consumer's state machine and carries no
 payload. The line is one flat object: `chain`,
 `v`, and the event's fields under its `type` tag. Consumers deduplicate on
