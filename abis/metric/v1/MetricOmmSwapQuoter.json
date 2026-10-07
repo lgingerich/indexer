@@ -1,0 +1,814 @@
+[
+  {
+    "inputs": [
+      {
+        "internalType": "uint128",
+        "name": "amount",
+        "type": "uint128"
+      }
+    ],
+    "name": "AmountTooLarge",
+    "type": "error"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "uint128",
+        "name": "amount",
+        "type": "uint128"
+      }
+    ],
+    "name": "AmountTooLarge",
+    "type": "error"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "uint8",
+        "name": "hop",
+        "type": "uint8"
+      },
+      {
+        "internalType": "uint256",
+        "name": "amountIn",
+        "type": "uint256"
+      },
+      {
+        "internalType": "uint256",
+        "name": "expectedAmountIn",
+        "type": "uint256"
+      }
+    ],
+    "name": "InvalidInputAmountAtHop",
+    "type": "error"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "uint8",
+        "name": "hop",
+        "type": "uint8"
+      },
+      {
+        "internalType": "uint256",
+        "name": "amountOut",
+        "type": "uint256"
+      },
+      {
+        "internalType": "uint256",
+        "name": "expectedAmountOut",
+        "type": "uint256"
+      }
+    ],
+    "name": "InvalidOutputAmountAtHop",
+    "type": "error"
+  },
+  {
+    "inputs": [],
+    "name": "InvalidPath",
+    "type": "error"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "bool",
+        "name": "zeroForOne",
+        "type": "bool"
+      },
+      {
+        "internalType": "uint128",
+        "name": "priceLimitX64",
+        "type": "uint128"
+      }
+    ],
+    "name": "InvalidPriceLimitForDirection",
+    "type": "error"
+  },
+  {
+    "inputs": [],
+    "name": "InvalidPriceProvider",
+    "type": "error"
+  },
+  {
+    "inputs": [],
+    "name": "InvalidSwapDeltas",
+    "type": "error"
+  },
+  {
+    "inputs": [],
+    "name": "InvalidSwapDeltas",
+    "type": "error"
+  },
+  {
+    "inputs": [],
+    "name": "QuoteDidNotRevert",
+    "type": "error"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "address",
+        "name": "target",
+        "type": "address"
+      },
+      {
+        "internalType": "bytes4",
+        "name": "selector",
+        "type": "bytes4"
+      },
+      {
+        "internalType": "bytes",
+        "name": "reason",
+        "type": "bytes"
+      }
+    ],
+    "name": "WrappedError",
+    "type": "error"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "address",
+        "name": "sender",
+        "type": "address"
+      },
+      {
+        "components": [
+          {
+            "internalType": "address[]",
+            "name": "pools",
+            "type": "address[]"
+          },
+          {
+            "internalType": "bytes[]",
+            "name": "extensionDatas",
+            "type": "bytes[]"
+          },
+          {
+            "internalType": "uint256",
+            "name": "zeroForOneBitMap",
+            "type": "uint256"
+          },
+          {
+            "internalType": "uint128",
+            "name": "amountIn",
+            "type": "uint128"
+          },
+          {
+            "internalType": "uint128[]",
+            "name": "bidPricesX64",
+            "type": "uint128[]"
+          },
+          {
+            "internalType": "uint128[]",
+            "name": "askPricesX64",
+            "type": "uint128[]"
+          },
+          {
+            "internalType": "uint128[]",
+            "name": "referencePricesX64",
+            "type": "uint128[]"
+          }
+        ],
+        "internalType": "struct IMetricOmmSwapQuoter.QuoteHypotheticalExactInputParams",
+        "name": "params",
+        "type": "tuple"
+      }
+    ],
+    "name": "quoteHypotheticalExactInput",
+    "outputs": [
+      {
+        "internalType": "uint256",
+        "name": "totalIn",
+        "type": "uint256"
+      },
+      {
+        "internalType": "uint256",
+        "name": "totalOut",
+        "type": "uint256"
+      }
+    ],
+    "stateMutability": "nonpayable",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "address",
+        "name": "pool",
+        "type": "address"
+      },
+      {
+        "internalType": "address",
+        "name": "sender",
+        "type": "address"
+      },
+      {
+        "internalType": "bool",
+        "name": "zeroForOne",
+        "type": "bool"
+      },
+      {
+        "internalType": "uint128",
+        "name": "amountIn",
+        "type": "uint128"
+      },
+      {
+        "internalType": "uint128",
+        "name": "priceLimitX64",
+        "type": "uint128"
+      },
+      {
+        "internalType": "uint128",
+        "name": "bidPriceX64",
+        "type": "uint128"
+      },
+      {
+        "internalType": "uint128",
+        "name": "askPriceX64",
+        "type": "uint128"
+      },
+      {
+        "internalType": "uint128",
+        "name": "referencePriceX64",
+        "type": "uint128"
+      }
+    ],
+    "name": "quoteHypotheticalExactInputSingle",
+    "outputs": [
+      {
+        "internalType": "uint256",
+        "name": "",
+        "type": "uint256"
+      },
+      {
+        "internalType": "uint256",
+        "name": "",
+        "type": "uint256"
+      }
+    ],
+    "stateMutability": "nonpayable",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "address",
+        "name": "pool",
+        "type": "address"
+      },
+      {
+        "internalType": "address",
+        "name": "sender",
+        "type": "address"
+      },
+      {
+        "internalType": "address",
+        "name": "recipient",
+        "type": "address"
+      },
+      {
+        "internalType": "bool",
+        "name": "zeroForOne",
+        "type": "bool"
+      },
+      {
+        "internalType": "uint128",
+        "name": "amountIn",
+        "type": "uint128"
+      },
+      {
+        "internalType": "uint128",
+        "name": "priceLimitX64",
+        "type": "uint128"
+      },
+      {
+        "internalType": "uint128",
+        "name": "bidPriceX64",
+        "type": "uint128"
+      },
+      {
+        "internalType": "uint128",
+        "name": "askPriceX64",
+        "type": "uint128"
+      },
+      {
+        "internalType": "uint128",
+        "name": "referencePriceX64",
+        "type": "uint128"
+      },
+      {
+        "internalType": "bytes",
+        "name": "extensionData",
+        "type": "bytes"
+      }
+    ],
+    "name": "quoteHypotheticalExactInputSingle",
+    "outputs": [
+      {
+        "internalType": "uint256",
+        "name": "",
+        "type": "uint256"
+      },
+      {
+        "internalType": "uint256",
+        "name": "",
+        "type": "uint256"
+      }
+    ],
+    "stateMutability": "nonpayable",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "address",
+        "name": "sender",
+        "type": "address"
+      },
+      {
+        "components": [
+          {
+            "internalType": "address[]",
+            "name": "pools",
+            "type": "address[]"
+          },
+          {
+            "internalType": "bytes[]",
+            "name": "extensionDatas",
+            "type": "bytes[]"
+          },
+          {
+            "internalType": "uint256",
+            "name": "zeroForOneBitMap",
+            "type": "uint256"
+          },
+          {
+            "internalType": "uint128",
+            "name": "amountOut",
+            "type": "uint128"
+          },
+          {
+            "internalType": "uint128[]",
+            "name": "bidPricesX64",
+            "type": "uint128[]"
+          },
+          {
+            "internalType": "uint128[]",
+            "name": "askPricesX64",
+            "type": "uint128[]"
+          },
+          {
+            "internalType": "uint128[]",
+            "name": "referencePricesX64",
+            "type": "uint128[]"
+          }
+        ],
+        "internalType": "struct IMetricOmmSwapQuoter.QuoteHypotheticalExactOutputParams",
+        "name": "params",
+        "type": "tuple"
+      }
+    ],
+    "name": "quoteHypotheticalExactOutput",
+    "outputs": [
+      {
+        "internalType": "uint256",
+        "name": "amountIn",
+        "type": "uint256"
+      },
+      {
+        "internalType": "uint256",
+        "name": "amountOut",
+        "type": "uint256"
+      }
+    ],
+    "stateMutability": "nonpayable",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "address",
+        "name": "pool",
+        "type": "address"
+      },
+      {
+        "internalType": "address",
+        "name": "sender",
+        "type": "address"
+      },
+      {
+        "internalType": "bool",
+        "name": "zeroForOne",
+        "type": "bool"
+      },
+      {
+        "internalType": "uint128",
+        "name": "amountOutDesired",
+        "type": "uint128"
+      },
+      {
+        "internalType": "uint128",
+        "name": "priceLimitX64",
+        "type": "uint128"
+      },
+      {
+        "internalType": "uint128",
+        "name": "bidPriceX64",
+        "type": "uint128"
+      },
+      {
+        "internalType": "uint128",
+        "name": "askPriceX64",
+        "type": "uint128"
+      },
+      {
+        "internalType": "uint128",
+        "name": "referencePriceX64",
+        "type": "uint128"
+      }
+    ],
+    "name": "quoteHypotheticalExactOutputSingle",
+    "outputs": [
+      {
+        "internalType": "uint256",
+        "name": "",
+        "type": "uint256"
+      },
+      {
+        "internalType": "uint256",
+        "name": "",
+        "type": "uint256"
+      }
+    ],
+    "stateMutability": "nonpayable",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "address",
+        "name": "pool",
+        "type": "address"
+      },
+      {
+        "internalType": "address",
+        "name": "sender",
+        "type": "address"
+      },
+      {
+        "internalType": "address",
+        "name": "recipient",
+        "type": "address"
+      },
+      {
+        "internalType": "bool",
+        "name": "zeroForOne",
+        "type": "bool"
+      },
+      {
+        "internalType": "uint128",
+        "name": "amountOutDesired",
+        "type": "uint128"
+      },
+      {
+        "internalType": "uint128",
+        "name": "priceLimitX64",
+        "type": "uint128"
+      },
+      {
+        "internalType": "uint128",
+        "name": "bidPriceX64",
+        "type": "uint128"
+      },
+      {
+        "internalType": "uint128",
+        "name": "askPriceX64",
+        "type": "uint128"
+      },
+      {
+        "internalType": "uint128",
+        "name": "referencePriceX64",
+        "type": "uint128"
+      },
+      {
+        "internalType": "bytes",
+        "name": "extensionData",
+        "type": "bytes"
+      }
+    ],
+    "name": "quoteHypotheticalExactOutputSingle",
+    "outputs": [
+      {
+        "internalType": "uint256",
+        "name": "",
+        "type": "uint256"
+      },
+      {
+        "internalType": "uint256",
+        "name": "",
+        "type": "uint256"
+      }
+    ],
+    "stateMutability": "nonpayable",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "address",
+        "name": "sender",
+        "type": "address"
+      },
+      {
+        "components": [
+          {
+            "internalType": "address[]",
+            "name": "pools",
+            "type": "address[]"
+          },
+          {
+            "internalType": "bytes[]",
+            "name": "extensionDatas",
+            "type": "bytes[]"
+          },
+          {
+            "internalType": "uint256",
+            "name": "zeroForOneBitMap",
+            "type": "uint256"
+          },
+          {
+            "internalType": "uint128",
+            "name": "amountIn",
+            "type": "uint128"
+          }
+        ],
+        "internalType": "struct IMetricOmmSwapQuoter.QuoteExactInputParams",
+        "name": "params",
+        "type": "tuple"
+      }
+    ],
+    "name": "quoteLiveExactIn",
+    "outputs": [
+      {
+        "internalType": "uint256",
+        "name": "",
+        "type": "uint256"
+      },
+      {
+        "internalType": "uint256",
+        "name": "",
+        "type": "uint256"
+      }
+    ],
+    "stateMutability": "nonpayable",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "address",
+        "name": "pool",
+        "type": "address"
+      },
+      {
+        "internalType": "address",
+        "name": "sender",
+        "type": "address"
+      },
+      {
+        "internalType": "address",
+        "name": "recipient",
+        "type": "address"
+      },
+      {
+        "internalType": "bool",
+        "name": "zeroForOne",
+        "type": "bool"
+      },
+      {
+        "internalType": "uint128",
+        "name": "amountIn",
+        "type": "uint128"
+      },
+      {
+        "internalType": "uint128",
+        "name": "priceLimitX64",
+        "type": "uint128"
+      },
+      {
+        "internalType": "bytes",
+        "name": "extensionData",
+        "type": "bytes"
+      }
+    ],
+    "name": "quoteLiveExactInSingle",
+    "outputs": [
+      {
+        "internalType": "uint256",
+        "name": "",
+        "type": "uint256"
+      },
+      {
+        "internalType": "uint256",
+        "name": "",
+        "type": "uint256"
+      }
+    ],
+    "stateMutability": "nonpayable",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "address",
+        "name": "pool",
+        "type": "address"
+      },
+      {
+        "internalType": "address",
+        "name": "sender",
+        "type": "address"
+      },
+      {
+        "internalType": "bool",
+        "name": "zeroForOne",
+        "type": "bool"
+      },
+      {
+        "internalType": "uint128",
+        "name": "amountIn",
+        "type": "uint128"
+      },
+      {
+        "internalType": "uint128",
+        "name": "priceLimitX64",
+        "type": "uint128"
+      }
+    ],
+    "name": "quoteLiveExactInSingle",
+    "outputs": [
+      {
+        "internalType": "uint256",
+        "name": "",
+        "type": "uint256"
+      },
+      {
+        "internalType": "uint256",
+        "name": "",
+        "type": "uint256"
+      }
+    ],
+    "stateMutability": "nonpayable",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "address",
+        "name": "sender",
+        "type": "address"
+      },
+      {
+        "components": [
+          {
+            "internalType": "address[]",
+            "name": "pools",
+            "type": "address[]"
+          },
+          {
+            "internalType": "bytes[]",
+            "name": "extensionDatas",
+            "type": "bytes[]"
+          },
+          {
+            "internalType": "uint256",
+            "name": "zeroForOneBitMap",
+            "type": "uint256"
+          },
+          {
+            "internalType": "uint128",
+            "name": "amountOut",
+            "type": "uint128"
+          }
+        ],
+        "internalType": "struct IMetricOmmSwapQuoter.QuoteExactOutputParams",
+        "name": "params",
+        "type": "tuple"
+      }
+    ],
+    "name": "quoteLiveExactOut",
+    "outputs": [
+      {
+        "internalType": "uint256",
+        "name": "amountIn",
+        "type": "uint256"
+      },
+      {
+        "internalType": "uint256",
+        "name": "amountOut",
+        "type": "uint256"
+      }
+    ],
+    "stateMutability": "nonpayable",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "address",
+        "name": "pool",
+        "type": "address"
+      },
+      {
+        "internalType": "address",
+        "name": "sender",
+        "type": "address"
+      },
+      {
+        "internalType": "address",
+        "name": "recipient",
+        "type": "address"
+      },
+      {
+        "internalType": "bool",
+        "name": "zeroForOne",
+        "type": "bool"
+      },
+      {
+        "internalType": "uint128",
+        "name": "amountOutDesired",
+        "type": "uint128"
+      },
+      {
+        "internalType": "uint128",
+        "name": "priceLimitX64",
+        "type": "uint128"
+      },
+      {
+        "internalType": "bytes",
+        "name": "extensionData",
+        "type": "bytes"
+      }
+    ],
+    "name": "quoteLiveExactOutSingle",
+    "outputs": [
+      {
+        "internalType": "uint256",
+        "name": "",
+        "type": "uint256"
+      },
+      {
+        "internalType": "uint256",
+        "name": "",
+        "type": "uint256"
+      }
+    ],
+    "stateMutability": "nonpayable",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "address",
+        "name": "pool",
+        "type": "address"
+      },
+      {
+        "internalType": "address",
+        "name": "sender",
+        "type": "address"
+      },
+      {
+        "internalType": "bool",
+        "name": "zeroForOne",
+        "type": "bool"
+      },
+      {
+        "internalType": "uint128",
+        "name": "amountOutDesired",
+        "type": "uint128"
+      },
+      {
+        "internalType": "uint128",
+        "name": "priceLimitX64",
+        "type": "uint128"
+      }
+    ],
+    "name": "quoteLiveExactOutSingle",
+    "outputs": [
+      {
+        "internalType": "uint256",
+        "name": "",
+        "type": "uint256"
+      },
+      {
+        "internalType": "uint256",
+        "name": "",
+        "type": "uint256"
+      }
+    ],
+    "stateMutability": "nonpayable",
+    "type": "function"
+  }
+]

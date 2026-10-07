@@ -1,27 +1,20 @@
-# The immutable contract registry: an ABI catalog and explicit registrations.
+# The immutable contract registry: an ABI directory and explicit registrations.
 # See `src/decode/registry.rs`.
 #
 # Kept separate from `indexer.toml` because it is a catalog, not deployment topology.
-# ABI paths resolve relative to this file. Each ABI is loaded once and shared.
+# `abis` is walked recursively and each `.json` file under it is one ABI, named by its
+# path under the root without the extension (`abis/uniswap/v3/pool.json` is
+# `uniswap/v3/pool`), so protocols and versions nest as directories. Each ABI is loaded
+# once and shared.
 
-[[abi]]
-name = "uniswap_v3_pool"
-path = "abis/uniswap_v3_pool.json"
-
-[[abi]]
-name = "uniswap_v3_factory"
-path = "abis/uniswap_v3_factory.json"
-
-[[abi]]
-name = "uniswap_v4_pool_manager"
-path = "abis/uniswap_v4_pool_manager.json"
+abis = "abis"
 
 # Protocol tags are explicit and independent of ABI names. Registrations default to
 # all blocks; set from_block (inclusive) and to_block (exclusive) for ABI upgrades.
 [[contract]]
 chain = "base"
 address = "0x1F98431c8aD98523631AE4a59f267346ea31F984" # V3 factory
-abi = "uniswap_v3_factory"
+abi = "uniswap/v3/factory"
 protocol = "uniswap_v3"
 
 # Uniswap V4 has no per-pool contract: one PoolManager holds every pool, and a pool is
@@ -29,18 +22,18 @@ protocol = "uniswap_v3"
 [[contract]]
 chain = "base"
 address = "0x498581fF718922c3f8e6A244956aF099B2652b2b" # V4 PoolManager on Base
-abi = "uniswap_v4_pool_manager"
+abi = "uniswap/v4/pool_manager"
 protocol = "uniswap_v4"
 
 # Two busy V3 pools, registered explicitly so short runs decode swaps out of the box.
 [[contract]]
 chain = "base"
 address = "0x2df380544b88adb3ad0a94100dcc45fd705aae2d" # V3 pool, high volume
-abi = "uniswap_v3_pool"
+abi = "uniswap/v3/pool"
 protocol = "uniswap_v3"
 
 [[contract]]
 chain = "base"
 address = "0x1ef035205f94c7734827961c438474d089a334a0" # V3 pool, high volume
-abi = "uniswap_v3_pool"
+abi = "uniswap/v3/pool"
 protocol = "uniswap_v3"

@@ -1,0 +1,1370 @@
+[
+  {
+    "inputs": [
+      {
+        "internalType": "address",
+        "name": "factory",
+        "type": "address"
+      },
+      {
+        "internalType": "address",
+        "name": "token0",
+        "type": "address"
+      },
+      {
+        "internalType": "address",
+        "name": "token1",
+        "type": "address"
+      },
+      {
+        "internalType": "address",
+        "name": "priceProvider_",
+        "type": "address"
+      },
+      {
+        "components": [
+          {
+            "internalType": "address",
+            "name": "extension1",
+            "type": "address"
+          },
+          {
+            "internalType": "address",
+            "name": "extension2",
+            "type": "address"
+          },
+          {
+            "internalType": "address",
+            "name": "extension3",
+            "type": "address"
+          },
+          {
+            "internalType": "address",
+            "name": "extension4",
+            "type": "address"
+          },
+          {
+            "internalType": "address",
+            "name": "extension5",
+            "type": "address"
+          },
+          {
+            "internalType": "address",
+            "name": "extension6",
+            "type": "address"
+          },
+          {
+            "internalType": "address",
+            "name": "extension7",
+            "type": "address"
+          }
+        ],
+        "internalType": "struct PoolExtensions",
+        "name": "extensions",
+        "type": "tuple"
+      },
+      {
+        "components": [
+          {
+            "internalType": "uint256",
+            "name": "beforeAddLiquidity",
+            "type": "uint256"
+          },
+          {
+            "internalType": "uint256",
+            "name": "afterAddLiquidity",
+            "type": "uint256"
+          },
+          {
+            "internalType": "uint256",
+            "name": "beforeRemoveLiquidity",
+            "type": "uint256"
+          },
+          {
+            "internalType": "uint256",
+            "name": "afterRemoveLiquidity",
+            "type": "uint256"
+          },
+          {
+            "internalType": "uint256",
+            "name": "beforeSwap",
+            "type": "uint256"
+          },
+          {
+            "internalType": "uint256",
+            "name": "afterSwap",
+            "type": "uint256"
+          }
+        ],
+        "internalType": "struct ExtensionOrders",
+        "name": "extensionOrders",
+        "type": "tuple"
+      },
+      {
+        "internalType": "bool",
+        "name": "immutablePriceProvider",
+        "type": "bool"
+      },
+      {
+        "internalType": "uint256",
+        "name": "token0ScaleMultiplier",
+        "type": "uint256"
+      },
+      {
+        "internalType": "uint256",
+        "name": "token1ScaleMultiplier",
+        "type": "uint256"
+      },
+      {
+        "internalType": "uint256",
+        "name": "initialScaledAmount0PerShareE18",
+        "type": "uint256"
+      },
+      {
+        "internalType": "uint256",
+        "name": "initialScaledAmount1PerShareE18",
+        "type": "uint256"
+      },
+      {
+        "internalType": "uint256",
+        "name": "minimalOperationalLiquidity",
+        "type": "uint256"
+      },
+      {
+        "internalType": "uint24",
+        "name": "spreadFeeE6_",
+        "type": "uint24"
+      },
+      {
+        "internalType": "int24",
+        "name": "initialCurBinDistFromProvidedPriceE6",
+        "type": "int24"
+      },
+      {
+        "components": [
+          {
+            "internalType": "uint104",
+            "name": "token0BalanceScaled",
+            "type": "uint104"
+          },
+          {
+            "internalType": "uint104",
+            "name": "token1BalanceScaled",
+            "type": "uint104"
+          },
+          {
+            "internalType": "uint16",
+            "name": "lengthE6",
+            "type": "uint16"
+          },
+          {
+            "internalType": "uint16",
+            "name": "addFeeBuyE6",
+            "type": "uint16"
+          },
+          {
+            "internalType": "uint16",
+            "name": "addFeeSellE6",
+            "type": "uint16"
+          }
+        ],
+        "internalType": "struct BinState[]",
+        "name": "nonNegativeBinStates",
+        "type": "tuple[]"
+      },
+      {
+        "components": [
+          {
+            "internalType": "uint104",
+            "name": "token0BalanceScaled",
+            "type": "uint104"
+          },
+          {
+            "internalType": "uint104",
+            "name": "token1BalanceScaled",
+            "type": "uint104"
+          },
+          {
+            "internalType": "uint16",
+            "name": "lengthE6",
+            "type": "uint16"
+          },
+          {
+            "internalType": "uint16",
+            "name": "addFeeBuyE6",
+            "type": "uint16"
+          },
+          {
+            "internalType": "uint16",
+            "name": "addFeeSellE6",
+            "type": "uint16"
+          }
+        ],
+        "internalType": "struct BinState[]",
+        "name": "negativeBinStates",
+        "type": "tuple[]"
+      },
+      {
+        "internalType": "uint24",
+        "name": "notionalFeeE8_",
+        "type": "uint24"
+      },
+      {
+        "internalType": "uint16",
+        "name": "bidAskRefAsymmetryX8_",
+        "type": "uint16"
+      }
+    ],
+    "stateMutability": "nonpayable",
+    "type": "constructor"
+  },
+  {
+    "inputs": [],
+    "name": "AmountScaledExceedsMax",
+    "type": "error"
+  },
+  {
+    "inputs": [],
+    "name": "BidAskRefAsymmetryOutOfBounds",
+    "type": "error"
+  },
+  {
+    "inputs": [],
+    "name": "BidGreaterThanAsk",
+    "type": "error"
+  },
+  {
+    "inputs": [],
+    "name": "BidIsZero",
+    "type": "error"
+  },
+  {
+    "inputs": [],
+    "name": "ExtensionCallFailed",
+    "type": "error"
+  },
+  {
+    "inputs": [],
+    "name": "FinalAmountIsZero",
+    "type": "error"
+  },
+  {
+    "inputs": [],
+    "name": "IncorrectDelta",
+    "type": "error"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "uint256",
+        "name": "requested",
+        "type": "uint256"
+      },
+      {
+        "internalType": "uint256",
+        "name": "available",
+        "type": "uint256"
+      }
+    ],
+    "name": "InsufficientLiquidity",
+    "type": "error"
+  },
+  {
+    "inputs": [],
+    "name": "InsufficientTokenBalance",
+    "type": "error"
+  },
+  {
+    "inputs": [],
+    "name": "InvalidAmount",
+    "type": "error"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "int256",
+        "name": "binIdx",
+        "type": "int256"
+      }
+    ],
+    "name": "InvalidBinIndex",
+    "type": "error"
+  },
+  {
+    "inputs": [],
+    "name": "InvalidExtensionResponse",
+    "type": "error"
+  },
+  {
+    "inputs": [],
+    "name": "InvalidPauseLevel",
+    "type": "error"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "int256",
+        "name": "binIdx",
+        "type": "int256"
+      },
+      {
+        "internalType": "uint256",
+        "name": "leftovers",
+        "type": "uint256"
+      },
+      {
+        "internalType": "uint256",
+        "name": "minimalRequired",
+        "type": "uint256"
+      }
+    ],
+    "name": "LeftoversSmallerThanMinimalOperationalLiquidity",
+    "type": "error"
+  },
+  {
+    "inputs": [],
+    "name": "LiquidityDeltaLengthMismatch",
+    "type": "error"
+  },
+  {
+    "inputs": [],
+    "name": "NotAllowedToDeposit",
+    "type": "error"
+  },
+  {
+    "inputs": [],
+    "name": "NotAllowedToSwap",
+    "type": "error"
+  },
+  {
+    "inputs": [],
+    "name": "NotPositionOwner",
+    "type": "error"
+  },
+  {
+    "inputs": [],
+    "name": "OnlyFactory",
+    "type": "error"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "uint256",
+        "name": "attemptedScaledBalance",
+        "type": "uint256"
+      }
+    ],
+    "name": "OverflowedOnFittingBinBalances",
+    "type": "error"
+  },
+  {
+    "inputs": [],
+    "name": "PanicEmptyExtension",
+    "type": "error"
+  },
+  {
+    "inputs": [],
+    "name": "PanicInvalidExtensionIndex",
+    "type": "error"
+  },
+  {
+    "inputs": [],
+    "name": "PoolPaused",
+    "type": "error"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "bytes",
+        "name": "reason",
+        "type": "bytes"
+      }
+    ],
+    "name": "PriceProviderFailed",
+    "type": "error"
+  },
+  {
+    "inputs": [],
+    "name": "ReentrancyGuardReentrantCall",
+    "type": "error"
+  },
+  {
+    "inputs": [],
+    "name": "ReferencePriceOutOfRange",
+    "type": "error"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "uint8",
+        "name": "bits",
+        "type": "uint8"
+      },
+      {
+        "internalType": "int256",
+        "name": "value",
+        "type": "int256"
+      }
+    ],
+    "name": "SafeCastOverflowedIntDowncast",
+    "type": "error"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "uint8",
+        "name": "bits",
+        "type": "uint8"
+      },
+      {
+        "internalType": "uint256",
+        "name": "value",
+        "type": "uint256"
+      }
+    ],
+    "name": "SafeCastOverflowedUintDowncast",
+    "type": "error"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "uint256",
+        "name": "value",
+        "type": "uint256"
+      }
+    ],
+    "name": "SafeCastOverflowedUintToInt",
+    "type": "error"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "address",
+        "name": "token",
+        "type": "address"
+      }
+    ],
+    "name": "SafeERC20FailedOperation",
+    "type": "error"
+  },
+  {
+    "inputs": [],
+    "name": "SharesAmountTooLarge",
+    "type": "error"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "int256",
+        "name": "binIdx",
+        "type": "int256"
+      },
+      {
+        "internalType": "uint256",
+        "name": "sharesDelta",
+        "type": "uint256"
+      },
+      {
+        "internalType": "uint256",
+        "name": "minimalRequired",
+        "type": "uint256"
+      }
+    ],
+    "name": "SharesDeltaSmallerThanMinimalOperationalLiquidity",
+    "type": "error"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "int256",
+        "name": "amount0Delta",
+        "type": "int256"
+      },
+      {
+        "internalType": "int256",
+        "name": "amount1Delta",
+        "type": "int256"
+      }
+    ],
+    "name": "SimulateSwap",
+    "type": "error"
+  },
+  {
+    "anonymous": false,
+    "inputs": [
+      {
+        "indexed": false,
+        "internalType": "uint16",
+        "name": "bidAskRefAsymmetryX8",
+        "type": "uint16"
+      }
+    ],
+    "name": "BidAskRefAsymmetryUpdated",
+    "type": "event"
+  },
+  {
+    "anonymous": false,
+    "inputs": [
+      {
+        "indexed": true,
+        "internalType": "int16",
+        "name": "bin",
+        "type": "int16"
+      },
+      {
+        "indexed": false,
+        "internalType": "uint16",
+        "name": "addFeeBuyE6",
+        "type": "uint16"
+      },
+      {
+        "indexed": false,
+        "internalType": "uint16",
+        "name": "addFeeSellE6",
+        "type": "uint16"
+      }
+    ],
+    "name": "BinAdditionalFeesUpdated",
+    "type": "event"
+  },
+  {
+    "anonymous": false,
+    "inputs": [
+      {
+        "indexed": false,
+        "internalType": "int256",
+        "name": "binIdx",
+        "type": "int256"
+      },
+      {
+        "indexed": false,
+        "internalType": "Packed2Int128",
+        "name": "binDeltas",
+        "type": "uint256"
+      },
+      {
+        "indexed": false,
+        "internalType": "Packed2Uint128",
+        "name": "fees",
+        "type": "uint256"
+      }
+    ],
+    "name": "BinSwapped",
+    "type": "event"
+  },
+  {
+    "anonymous": false,
+    "inputs": [
+      {
+        "indexed": true,
+        "internalType": "address",
+        "name": "token",
+        "type": "address"
+      },
+      {
+        "indexed": true,
+        "internalType": "address",
+        "name": "destination",
+        "type": "address"
+      },
+      {
+        "indexed": false,
+        "internalType": "uint256",
+        "name": "amount",
+        "type": "uint256"
+      }
+    ],
+    "name": "FeeTransferFailed",
+    "type": "event"
+  },
+  {
+    "anonymous": false,
+    "inputs": [
+      {
+        "indexed": true,
+        "internalType": "address",
+        "name": "provider",
+        "type": "address"
+      },
+      {
+        "indexed": true,
+        "internalType": "uint80",
+        "name": "salt",
+        "type": "uint80"
+      },
+      {
+        "indexed": false,
+        "internalType": "int256[]",
+        "name": "binIdxs",
+        "type": "int256[]"
+      },
+      {
+        "components": [
+          {
+            "internalType": "int256",
+            "name": "delta0Scaled",
+            "type": "int256"
+          },
+          {
+            "internalType": "int256",
+            "name": "delta1Scaled",
+            "type": "int256"
+          }
+        ],
+        "indexed": false,
+        "internalType": "struct BinBalanceDelta[]",
+        "name": "binBalanceDeltas",
+        "type": "tuple[]"
+      },
+      {
+        "indexed": false,
+        "internalType": "uint256[]",
+        "name": "shares",
+        "type": "uint256[]"
+      }
+    ],
+    "name": "LiquidityAdded",
+    "type": "event"
+  },
+  {
+    "anonymous": false,
+    "inputs": [
+      {
+        "indexed": true,
+        "internalType": "address",
+        "name": "provider",
+        "type": "address"
+      },
+      {
+        "indexed": true,
+        "internalType": "uint80",
+        "name": "salt",
+        "type": "uint80"
+      },
+      {
+        "indexed": false,
+        "internalType": "int256[]",
+        "name": "binIdxs",
+        "type": "int256[]"
+      },
+      {
+        "components": [
+          {
+            "internalType": "int256",
+            "name": "delta0Scaled",
+            "type": "int256"
+          },
+          {
+            "internalType": "int256",
+            "name": "delta1Scaled",
+            "type": "int256"
+          }
+        ],
+        "indexed": false,
+        "internalType": "struct BinBalanceDelta[]",
+        "name": "binBalanceDeltas",
+        "type": "tuple[]"
+      },
+      {
+        "indexed": false,
+        "internalType": "uint256[]",
+        "name": "shares",
+        "type": "uint256[]"
+      }
+    ],
+    "name": "LiquidityRemoved",
+    "type": "event"
+  },
+  {
+    "anonymous": false,
+    "inputs": [
+      {
+        "indexed": false,
+        "internalType": "uint24",
+        "name": "notionalFeeE8",
+        "type": "uint24"
+      }
+    ],
+    "name": "NotionalFeeUpdated",
+    "type": "event"
+  },
+  {
+    "anonymous": false,
+    "inputs": [
+      {
+        "indexed": false,
+        "internalType": "uint8",
+        "name": "previousLevel",
+        "type": "uint8"
+      },
+      {
+        "indexed": false,
+        "internalType": "uint8",
+        "name": "newLevel",
+        "type": "uint8"
+      }
+    ],
+    "name": "PauseLevelUpdated",
+    "type": "event"
+  },
+  {
+    "anonymous": false,
+    "inputs": [
+      {
+        "indexed": true,
+        "internalType": "address",
+        "name": "newPriceProvider",
+        "type": "address"
+      }
+    ],
+    "name": "PriceProviderUpdated",
+    "type": "event"
+  },
+  {
+    "anonymous": false,
+    "inputs": [
+      {
+        "indexed": false,
+        "internalType": "uint256",
+        "name": "amount0ToProtocol",
+        "type": "uint256"
+      },
+      {
+        "indexed": false,
+        "internalType": "uint256",
+        "name": "amount1ToProtocol",
+        "type": "uint256"
+      },
+      {
+        "indexed": false,
+        "internalType": "uint256",
+        "name": "amount0ToAdmin",
+        "type": "uint256"
+      },
+      {
+        "indexed": false,
+        "internalType": "uint256",
+        "name": "amount1ToAdmin",
+        "type": "uint256"
+      }
+    ],
+    "name": "ProtocolFeesCollected",
+    "type": "event"
+  },
+  {
+    "anonymous": false,
+    "inputs": [
+      {
+        "indexed": false,
+        "internalType": "uint24",
+        "name": "spreadFeeE6",
+        "type": "uint24"
+      }
+    ],
+    "name": "SpreadFeeUpdated",
+    "type": "event"
+  },
+  {
+    "anonymous": false,
+    "inputs": [
+      {
+        "indexed": true,
+        "internalType": "address",
+        "name": "sender",
+        "type": "address"
+      },
+      {
+        "indexed": true,
+        "internalType": "address",
+        "name": "recipient",
+        "type": "address"
+      },
+      {
+        "indexed": false,
+        "internalType": "PackedSwapDetails",
+        "name": "details",
+        "type": "uint256"
+      },
+      {
+        "indexed": false,
+        "internalType": "Packed2Int128",
+        "name": "amountDeltas",
+        "type": "uint256"
+      },
+      {
+        "indexed": false,
+        "internalType": "Packed2Uint128",
+        "name": "platformFees",
+        "type": "uint256"
+      }
+    ],
+    "name": "Swap",
+    "type": "event"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "address",
+        "name": "owner",
+        "type": "address"
+      },
+      {
+        "internalType": "uint80",
+        "name": "salt",
+        "type": "uint80"
+      },
+      {
+        "components": [
+          {
+            "internalType": "int256[]",
+            "name": "binIdxs",
+            "type": "int256[]"
+          },
+          {
+            "internalType": "uint256[]",
+            "name": "shares",
+            "type": "uint256[]"
+          }
+        ],
+        "internalType": "struct LiquidityDelta",
+        "name": "deltas",
+        "type": "tuple"
+      },
+      {
+        "internalType": "bytes",
+        "name": "callbackData",
+        "type": "bytes"
+      },
+      {
+        "internalType": "bytes",
+        "name": "extensionData",
+        "type": "bytes"
+      }
+    ],
+    "name": "addLiquidity",
+    "outputs": [
+      {
+        "internalType": "uint256",
+        "name": "amount0Added",
+        "type": "uint256"
+      },
+      {
+        "internalType": "uint256",
+        "name": "amount1Added",
+        "type": "uint256"
+      }
+    ],
+    "stateMutability": "nonpayable",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "uint256",
+        "name": "protocolSpreadFeeE6",
+        "type": "uint256"
+      },
+      {
+        "internalType": "uint256",
+        "name": "adminSpreadFeeE6",
+        "type": "uint256"
+      },
+      {
+        "internalType": "uint256",
+        "name": "protocolNotionalFeeE8",
+        "type": "uint256"
+      },
+      {
+        "internalType": "uint256",
+        "name": "adminNotionalFeeE8",
+        "type": "uint256"
+      },
+      {
+        "internalType": "address",
+        "name": "adminFeeDestination",
+        "type": "address"
+      },
+      {
+        "internalType": "address",
+        "name": "protocolFeeDestination",
+        "type": "address"
+      }
+    ],
+    "name": "collectFees",
+    "outputs": [],
+    "stateMutability": "nonpayable",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "bytes32",
+        "name": "slot",
+        "type": "bytes32"
+      }
+    ],
+    "name": "extsload",
+    "outputs": [
+      {
+        "internalType": "bytes32",
+        "name": "",
+        "type": "bytes32"
+      }
+    ],
+    "stateMutability": "view",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "bytes32",
+        "name": "startSlot",
+        "type": "bytes32"
+      },
+      {
+        "internalType": "uint256",
+        "name": "nSlots",
+        "type": "uint256"
+      }
+    ],
+    "name": "extsload",
+    "outputs": [
+      {
+        "internalType": "bytes32[]",
+        "name": "",
+        "type": "bytes32[]"
+      }
+    ],
+    "stateMutability": "view",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "bytes32[]",
+        "name": "slots",
+        "type": "bytes32[]"
+      }
+    ],
+    "name": "extsload",
+    "outputs": [
+      {
+        "internalType": "bytes32[]",
+        "name": "",
+        "type": "bytes32[]"
+      }
+    ],
+    "stateMutability": "view",
+    "type": "function"
+  },
+  {
+    "inputs": [],
+    "name": "getImmutables",
+    "outputs": [
+      {
+        "components": [
+          {
+            "internalType": "address",
+            "name": "factory",
+            "type": "address"
+          },
+          {
+            "internalType": "address",
+            "name": "token0",
+            "type": "address"
+          },
+          {
+            "internalType": "address",
+            "name": "token1",
+            "type": "address"
+          },
+          {
+            "internalType": "uint256",
+            "name": "token0ScaleMultiplier",
+            "type": "uint256"
+          },
+          {
+            "internalType": "uint256",
+            "name": "token1ScaleMultiplier",
+            "type": "uint256"
+          },
+          {
+            "internalType": "uint256",
+            "name": "initialScaledToken0PerShareE18",
+            "type": "uint256"
+          },
+          {
+            "internalType": "uint256",
+            "name": "initialScaledToken1PerShareE18",
+            "type": "uint256"
+          },
+          {
+            "internalType": "uint256",
+            "name": "minimalOperationalLiquidity",
+            "type": "uint256"
+          },
+          {
+            "internalType": "address",
+            "name": "immutablePriceProvider",
+            "type": "address"
+          },
+          {
+            "internalType": "int256",
+            "name": "lowestBin",
+            "type": "int256"
+          },
+          {
+            "internalType": "int256",
+            "name": "highestBin",
+            "type": "int256"
+          },
+          {
+            "internalType": "address",
+            "name": "extension1",
+            "type": "address"
+          },
+          {
+            "internalType": "address",
+            "name": "extension2",
+            "type": "address"
+          },
+          {
+            "internalType": "address",
+            "name": "extension3",
+            "type": "address"
+          },
+          {
+            "internalType": "address",
+            "name": "extension4",
+            "type": "address"
+          },
+          {
+            "internalType": "address",
+            "name": "extension5",
+            "type": "address"
+          },
+          {
+            "internalType": "address",
+            "name": "extension6",
+            "type": "address"
+          },
+          {
+            "internalType": "address",
+            "name": "extension7",
+            "type": "address"
+          },
+          {
+            "internalType": "uint256",
+            "name": "beforeAddLiquidityOrder",
+            "type": "uint256"
+          },
+          {
+            "internalType": "uint256",
+            "name": "afterAddLiquidityOrder",
+            "type": "uint256"
+          },
+          {
+            "internalType": "uint256",
+            "name": "beforeRemoveLiquidityOrder",
+            "type": "uint256"
+          },
+          {
+            "internalType": "uint256",
+            "name": "afterRemoveLiquidityOrder",
+            "type": "uint256"
+          },
+          {
+            "internalType": "uint256",
+            "name": "beforeSwapOrder",
+            "type": "uint256"
+          },
+          {
+            "internalType": "uint256",
+            "name": "afterSwapOrder",
+            "type": "uint256"
+          }
+        ],
+        "internalType": "struct PoolImmutables",
+        "name": "",
+        "type": "tuple"
+      }
+    ],
+    "stateMutability": "view",
+    "type": "function"
+  },
+  {
+    "inputs": [],
+    "name": "getSellAndBuyPrices",
+    "outputs": [
+      {
+        "internalType": "uint128",
+        "name": "sellPriceX64",
+        "type": "uint128"
+      },
+      {
+        "internalType": "uint128",
+        "name": "buyPriceX64",
+        "type": "uint128"
+      }
+    ],
+    "stateMutability": "nonpayable",
+    "type": "function"
+  },
+  {
+    "inputs": [],
+    "name": "inSwap",
+    "outputs": [
+      {
+        "internalType": "address",
+        "name": "priceProvider_",
+        "type": "address"
+      }
+    ],
+    "stateMutability": "view",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "address",
+        "name": "owner",
+        "type": "address"
+      },
+      {
+        "internalType": "uint80",
+        "name": "salt",
+        "type": "uint80"
+      },
+      {
+        "components": [
+          {
+            "internalType": "int256[]",
+            "name": "binIdxs",
+            "type": "int256[]"
+          },
+          {
+            "internalType": "uint256[]",
+            "name": "shares",
+            "type": "uint256[]"
+          }
+        ],
+        "internalType": "struct LiquidityDelta",
+        "name": "deltas",
+        "type": "tuple"
+      },
+      {
+        "internalType": "bytes",
+        "name": "extensionData",
+        "type": "bytes"
+      }
+    ],
+    "name": "removeLiquidity",
+    "outputs": [
+      {
+        "internalType": "uint256",
+        "name": "amount0Removed",
+        "type": "uint256"
+      },
+      {
+        "internalType": "uint256",
+        "name": "amount1Removed",
+        "type": "uint256"
+      }
+    ],
+    "stateMutability": "nonpayable",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "uint16",
+        "name": "newBidAskRefAsymmetryX8",
+        "type": "uint16"
+      }
+    ],
+    "name": "setBidAskRefAsymmetryX8",
+    "outputs": [],
+    "stateMutability": "nonpayable",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "int16",
+        "name": "bin",
+        "type": "int16"
+      },
+      {
+        "internalType": "uint16",
+        "name": "addFeeBuyE6",
+        "type": "uint16"
+      },
+      {
+        "internalType": "uint16",
+        "name": "addFeeSellE6",
+        "type": "uint16"
+      }
+    ],
+    "name": "setBinAdditionalFees",
+    "outputs": [],
+    "stateMutability": "nonpayable",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "uint8",
+        "name": "newLevel",
+        "type": "uint8"
+      }
+    ],
+    "name": "setPause",
+    "outputs": [],
+    "stateMutability": "nonpayable",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "uint24",
+        "name": "newSpreadFeeE6",
+        "type": "uint24"
+      },
+      {
+        "internalType": "uint24",
+        "name": "newNotionalFeeE8",
+        "type": "uint24"
+      }
+    ],
+    "name": "setPoolFees",
+    "outputs": [],
+    "stateMutability": "nonpayable",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "address",
+        "name": "newPriceProvider",
+        "type": "address"
+      }
+    ],
+    "name": "setPriceProvider",
+    "outputs": [],
+    "stateMutability": "nonpayable",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "address",
+        "name": "sender",
+        "type": "address"
+      },
+      {
+        "internalType": "address",
+        "name": "recipient",
+        "type": "address"
+      },
+      {
+        "internalType": "bool",
+        "name": "zeroForOne",
+        "type": "bool"
+      },
+      {
+        "internalType": "int128",
+        "name": "amountSpecified",
+        "type": "int128"
+      },
+      {
+        "internalType": "uint128",
+        "name": "priceLimitX64",
+        "type": "uint128"
+      },
+      {
+        "internalType": "uint128",
+        "name": "bidPriceX64",
+        "type": "uint128"
+      },
+      {
+        "internalType": "uint128",
+        "name": "askPriceX64",
+        "type": "uint128"
+      },
+      {
+        "internalType": "uint128",
+        "name": "referencePriceX64",
+        "type": "uint128"
+      },
+      {
+        "internalType": "bytes",
+        "name": "extensionData",
+        "type": "bytes"
+      }
+    ],
+    "name": "simulateSwapAndRevert",
+    "outputs": [
+      {
+        "internalType": "int128",
+        "name": "",
+        "type": "int128"
+      },
+      {
+        "internalType": "int128",
+        "name": "",
+        "type": "int128"
+      }
+    ],
+    "stateMutability": "nonpayable",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "address",
+        "name": "recipient",
+        "type": "address"
+      },
+      {
+        "internalType": "bool",
+        "name": "zeroForOne",
+        "type": "bool"
+      },
+      {
+        "internalType": "int128",
+        "name": "amountSpecified",
+        "type": "int128"
+      },
+      {
+        "internalType": "uint128",
+        "name": "priceLimitX64",
+        "type": "uint128"
+      },
+      {
+        "internalType": "bytes",
+        "name": "callbackData",
+        "type": "bytes"
+      },
+      {
+        "internalType": "bytes",
+        "name": "extensionData",
+        "type": "bytes"
+      }
+    ],
+    "name": "swap",
+    "outputs": [
+      {
+        "internalType": "int128",
+        "name": "",
+        "type": "int128"
+      },
+      {
+        "internalType": "int128",
+        "name": "",
+        "type": "int128"
+      }
+    ],
+    "stateMutability": "nonpayable",
+    "type": "function"
+  }
+]

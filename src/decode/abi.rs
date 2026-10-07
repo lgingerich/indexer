@@ -511,7 +511,7 @@ mod tests {
     #[test]
     fn actual_swap_fixture_decodes() {
         let abi =
-            Abi::from_json(include_str!("../../abis/uniswap_v3_pool.json")).expect("pool ABI");
+            Abi::from_json(include_str!("../../abis/uniswap/v3/pool.json")).expect("pool ABI");
         let source: crate::wire::envelope::Envelope = serde_json::from_str(
             include_str!("../../examples/fixtures/uniswap_v3_swaps.ndjson")
                 .lines()

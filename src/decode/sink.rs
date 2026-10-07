@@ -120,14 +120,11 @@ mod tests {
     async fn matching_logs_add_records_and_bad_logs_keep_raw() {
         let registry = ContractRegistry::load(
             &crate::decode::RegistryConfig {
-                abi: vec![crate::decode::AbiEntry {
-                    name: "pool".into(),
-                    path: "abis/uniswap_v3_pool.json".into(),
-                }],
+                abis: Some("abis".into()),
                 contract: vec![crate::decode::ContractEntry {
                     chain: "base".into(),
                     address: "0xd0b53D9277642d899DF5C87A3966A349A798F224".into(),
-                    abi: "pool".into(),
+                    abi: "uniswap/v3/pool".into(),
                     protocol: "uniswap_v3".into(),
                     from_block: 0,
                     to_block: None,

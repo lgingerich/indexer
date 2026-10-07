@@ -33,7 +33,7 @@
 //!
 //! This example is self-contained on purpose: it takes no arguments and needs no network,
 //! because a demo that has to be configured is a demo that gets skipped. To decode a
-//! different contract, change `POOL`, `CHAIN`, and the ABI path in the registry below.
+//! different contract, change `POOL`, `CHAIN`, and the `abis` root in the registry below.
 //!
 //! To capture real input for it, run the indexer with `stdout = true` in `[ingest]`,
 //! which prints the stream instead of storing it:
@@ -52,7 +52,7 @@
 use std::process::ExitCode;
 
 use indexer::decode::Decoder;
-use indexer::decode::{AbiEntry, ContractEntry, ContractRegistry, RegistryConfig};
+use indexer::decode::{ContractEntry, ContractRegistry, RegistryConfig};
 use indexer::wire::envelope::Envelope;
 
 /// The pool these logs came from, and the address its ABI is registered against.
@@ -73,17 +73,14 @@ fn main() -> ExitCode {
     // exercises the same path the pipeline does rather than a stub.
     let registry = ContractRegistry::load(
         &RegistryConfig {
-            abi: vec![AbiEntry {
-                name: "uniswap_v3_pool".to_owned(),
-                path: std::path::PathBuf::from(concat!(
-                    env!("CARGO_MANIFEST_DIR"),
-                    "/abis/uniswap_v3_pool.json"
-                )),
-            }],
+            abis: Some(std::path::PathBuf::from(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/abis"
+            ))),
             contract: vec![ContractEntry {
                 chain: CHAIN.to_owned(),
                 address: POOL.to_owned(),
-                abi: "uniswap_v3_pool".to_owned(),
+                abi: "uniswap/v3/pool".to_owned(),
                 protocol: "uniswap_v3".to_owned(),
                 from_block: 0,
                 to_block: None,

@@ -237,7 +237,7 @@ mod tests {
 
     use crate::config::Settings;
     use crate::decode::DecodingSink;
-    use crate::decode::{AbiEntry, ContractEntry, ContractRegistry, RegistryConfig};
+    use crate::decode::{ContractEntry, ContractRegistry, RegistryConfig};
     use crate::ingest::pipeline::PipelineError;
     use crate::sink::duckdb::StoreError;
     use crate::sink::{self, DuckDbSink, EnvelopeSink as _, SinkError};
@@ -326,20 +326,17 @@ ws_url = "wss://example.invalid"
         const POOL: &str = "0xd0b53D9277642d899DF5C87A3966A349A798F224";
         let registry = ContractRegistry::load(
             &RegistryConfig {
-                abi: vec![AbiEntry {
-                    name: "uniswap_v3_pool".to_owned(),
-                    path: concat!(env!("CARGO_MANIFEST_DIR"), "/abis/uniswap_v3_pool.json").into(),
-                }],
+                abis: Some("abis".into()),
                 contract: vec![ContractEntry {
                     chain: "base".to_owned(),
                     address: POOL.to_owned(),
-                    abi: "uniswap_v3_pool".to_owned(),
+                    abi: "uniswap/v3/pool".to_owned(),
                     protocol: "uniswap_v3".to_owned(),
                     from_block: 0,
                     to_block: None,
                 }],
             },
-            ".",
+            env!("CARGO_MANIFEST_DIR"),
         )
         .expect("the registry loads");
         let swap: Envelope = serde_json::from_str(

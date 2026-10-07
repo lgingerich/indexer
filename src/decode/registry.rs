@@ -1,9 +1,12 @@
 //! An immutable catalog of contract ABIs and block-ranged registrations.
 //!
-//! Each `[[abi]]` names a file, loaded once and shared through [`Arc`]. Each
-//! `[[contract]]` identifies a chain, address, ABI name, and explicit protocol tag.
-//! Registrations apply from `from_block` (inclusive, default zero) to `to_block`
-//! (exclusive, omitted for no upper bound). Ranges for one chain/address cannot overlap.
+//! The `abis` directory is walked recursively and every `.json` file in it is loaded as
+//! an ABI, shared through [`Arc`]. A file's path under that root, without the extension,
+//! is its name — so `abis/uniswap/v3/pool.json` is `uniswap/v3/pool`, and a protocol's
+//! versions nest as directories. Each `[[contract]]` identifies a chain, address, ABI
+//! name, and explicit protocol tag. Registrations apply from `from_block` (inclusive,
+//! default zero) to `to_block` (exclusive, omitted for no upper bound). Ranges for one
+//! chain/address cannot overlap.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -16,16 +19,6 @@ use serde::Deserialize;
 use super::abi::{Abi, AbiError};
 use crate::wire::envelope::ChainId;
 
-/// One ABI file, named so a `[[contract]]` can reference it.
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct AbiEntry {
-    /// The name to reference it by, for example `uniswap_v3_pool`.
-    pub name: String,
-    /// The ABI file, relative to the directory [`ContractRegistry::load`] resolves against.
-    pub path: PathBuf,
-}
-
 /// One address's ABI and protocol over a half-open block range.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -34,7 +27,7 @@ pub struct ContractEntry {
     pub chain: String,
     /// The contract address.
     pub address: String,
-    /// The `[[abi]]` name it decodes with.
+    /// The ABI name it decodes with: a file's path under the `abis` root, without `.json`.
     pub abi: String,
     /// The protocol tag on decoded records, independent of the ABI name.
     pub protocol: String,
@@ -73,9 +66,10 @@ struct Registration {
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RegistryConfig {
-    /// The ABI files, named so a contract can reference one.
+    /// The directory walked for ABI files, relative to the registry file's directory.
+    /// Omitted means no ABI directory, so only the empty registry loads.
     #[serde(default)]
-    pub abi: Vec<AbiEntry>,
+    pub abis: Option<PathBuf>,
     /// The block-ranged contract registrations.
     #[serde(default)]
     pub contract: Vec<ContractEntry>,
@@ -102,31 +96,41 @@ impl ContractRegistry {
         Self::load(&config, path.parent().unwrap_or_else(|| Path::new(".")))
     }
 
-    /// Builds an immutable registry, resolving relative ABI paths against `base`.
+    /// Builds an immutable registry, resolving the ABI root and relative paths against `base`.
     ///
     /// # Errors
     ///
-    /// Rejects unreadable or malformed ABIs, duplicate ABI names, unknown ABI references,
-    /// invalid addresses, empty or reversed ranges, and overlapping ranges on one address.
+    /// Rejects an unreadable ABI directory, unreadable or malformed ABIs, unknown ABI
+    /// references, invalid addresses, empty or reversed ranges, and overlapping ranges on
+    /// one address.
     pub fn load(config: &RegistryConfig, base: impl AsRef<Path>) -> Result<Self, RegistryError> {
         let base = base.as_ref();
-        let mut by_name: HashMap<&str, Arc<Abi>> = HashMap::with_capacity(config.abi.len());
-        for entry in &config.abi {
-            if by_name.contains_key(entry.name.as_str()) {
-                return Err(RegistryError::DuplicateAbi {
-                    name: entry.name.clone(),
-                });
+        let mut by_name: HashMap<String, Arc<Abi>> = HashMap::new();
+        if let Some(abis) = &config.abis {
+            let root = base.join(abis);
+            let mut files = Vec::new();
+            collect_abis(&root, &mut files)?;
+            files.sort();
+            for path in files {
+                // A file's path under the root, without `.json`, is its name: the
+                // separators are deliberately kept, so a nested version is `v3/pool`.
+                let name = path
+                    .strip_prefix(&root)
+                    .unwrap_or(&path)
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                let name = name.strip_suffix(".json").unwrap_or(&name).to_owned();
+                let json =
+                    std::fs::read_to_string(&path).map_err(|source| RegistryError::AbiFile {
+                        path: path.display().to_string(),
+                        source,
+                    })?;
+                let abi = Abi::from_json(&json).map_err(|source| RegistryError::Abi {
+                    path: path.display().to_string(),
+                    source,
+                })?;
+                by_name.insert(name, Arc::new(abi));
             }
-            let path = base.join(&entry.path);
-            let json = std::fs::read_to_string(&path).map_err(|source| RegistryError::AbiFile {
-                path: path.display().to_string(),
-                source,
-            })?;
-            let abi = Abi::from_json(&json).map_err(|source| RegistryError::Abi {
-                path: path.display().to_string(),
-                source,
-            })?;
-            by_name.insert(&entry.name, Arc::new(abi));
         }
 
         let mut registry = Self::default();
@@ -206,6 +210,38 @@ impl ContractRegistry {
     }
 }
 
+/// Collects every `.json` file under `dir`, recursing into subdirectories.
+///
+/// The walk is deterministic: entries are read in directory order and the caller sorts
+/// the result, so discovery does not depend on the filesystem's ordering.
+fn collect_abis(dir: &Path, files: &mut Vec<PathBuf>) -> Result<(), RegistryError> {
+    let entries = std::fs::read_dir(dir).map_err(|source| RegistryError::AbiDirectory {
+        path: dir.display().to_string(),
+        source,
+    })?;
+    for entry in entries {
+        let entry = entry.map_err(|source| RegistryError::AbiDirectory {
+            path: dir.display().to_string(),
+            source,
+        })?;
+        let file_type = entry
+            .file_type()
+            .map_err(|source| RegistryError::AbiDirectory {
+                path: dir.display().to_string(),
+                source,
+            })?;
+        let path = entry.path();
+        // Symlinks are neither followed nor treated as files, so a link loop cannot make
+        // the walk recurse forever.
+        if file_type.is_dir() {
+            collect_abis(&path, files)?;
+        } else if file_type.is_file() && path.extension().is_some_and(|ext| ext == "json") {
+            files.push(path);
+        }
+    }
+    Ok(())
+}
+
 /// Why the registry could not be loaded.
 #[derive(Debug, thiserror::Error)]
 pub enum RegistryError {
@@ -233,6 +269,14 @@ pub enum RegistryError {
         /// The underlying I/O error.
         source: std::io::Error,
     },
+    /// The ABI root could not be walked.
+    #[error("read ABI directory {path}: {source}")]
+    AbiDirectory {
+        /// The directory that failed.
+        path: String,
+        /// The underlying I/O error.
+        source: std::io::Error,
+    },
     /// A named ABI file could not be parsed.
     #[error("invalid ABI at {path}: {source}")]
     Abi {
@@ -244,18 +288,12 @@ pub enum RegistryError {
     /// An entry's address did not parse.
     #[error(transparent)]
     Address(#[from] AddressError),
-    /// A contract references an ABI name that no ABI declares.
-    #[error("entry {entry:?} references ABI {name:?}, which no [[abi]] declares")]
+    /// A contract references an ABI name that no ABI in the walked directory declares.
+    #[error("entry {entry:?} references ABI {name:?}, which no ABI file under `abis` declares")]
     UnknownAbi {
         /// The registration as written.
         entry: String,
         /// The ABI name it referenced.
-        name: String,
-    },
-    /// Two ABI entries declare one name.
-    #[error("two [[abi]] entries are named {name:?}; a name must label one ABI")]
-    DuplicateAbi {
-        /// The name both entries claimed.
         name: String,
     },
     /// A registration's exclusive end is not greater than its inclusive start.
@@ -283,29 +321,24 @@ pub enum RegistryError {
 #[cfg(test)]
 #[expect(clippy::expect_used)]
 mod tests {
-    use std::error::Error as _;
     use std::path::PathBuf;
     use std::sync::Arc;
 
-    use super::{
-        AbiEntry, AbiError, ContractEntry, ContractRegistry, RegistryConfig, RegistryError,
-    };
+    use super::{ContractEntry, ContractRegistry, RegistryConfig, RegistryError};
     use crate::wire::envelope::ChainId;
 
     const POOL: &str = "0xd0b53D9277642d899DF5C87A3966A349A798F224";
 
+    /// A registry rooted at `abis` with one registration, sharing the shipped ABI tree.
     fn config(ranges: &[(u64, Option<u64>)]) -> RegistryConfig {
         RegistryConfig {
-            abi: vec![AbiEntry {
-                name: "pool_abi".to_owned(),
-                path: PathBuf::from("abis/uniswap_v3_pool.json"),
-            }],
+            abis: Some(PathBuf::from("abis")),
             contract: ranges
                 .iter()
                 .map(|&(from_block, to_block)| ContractEntry {
                     chain: "base".to_owned(),
                     address: POOL.to_owned(),
-                    abi: "pool_abi".to_owned(),
+                    abi: "uniswap/v3/pool".to_owned(),
                     protocol: "uniswap_v3".to_owned(),
                     from_block,
                     to_block,
@@ -403,42 +436,62 @@ mod tests {
         assert!(ContractRegistry::default().is_empty());
     }
 
+    /// A registration that references an ABI no file under the walked root declares is a
+    /// startup error, so a typo cannot silently decode nothing.
     #[test]
-    fn malformed_abi_keeps_name_path_and_concrete_source() {
-        let mut config = config(&[]);
-        config.abi[0].path = PathBuf::from("Cargo.toml");
-        let error = load(&config).expect_err("TOML is not ABI JSON");
-        assert!(matches!(
-            &error,
-            RegistryError::Abi { path, .. }
-                if path == &PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                        .join("Cargo.toml").display().to_string()
-        ));
-        assert!(
-            error
-                .source()
-                .expect("ABI source")
-                .downcast_ref::<AbiError>()
-                .is_some()
-        );
-    }
-
-    #[test]
-    fn unknown_and_duplicate_abi_names_are_rejected() {
+    fn an_unknown_abi_name_is_rejected() {
         let mut unknown = config(&[(0, None)]);
         unknown.contract[0].abi = "missing".to_owned();
         assert!(matches!(
             load(&unknown),
             Err(RegistryError::UnknownAbi { .. })
         ));
-        let mut duplicate = config(&[]);
-        duplicate.abi.push(AbiEntry {
-            name: "pool_abi".to_owned(),
-            path: PathBuf::from("missing.json"),
-        });
+    }
+
+    /// The shipped tree is walked recursively and a nested file is addressable by its path
+    /// under the root without the extension, separate from the flat names beside it.
+    #[test]
+    fn nested_abi_files_are_named_by_their_path_under_the_root() {
+        let root =
+            std::env::temp_dir().join(format!("indexer-abis-{}-{}", std::process::id(), line!()));
+        let nested = root.join("uniswap/v3");
+        std::fs::create_dir_all(&nested).expect("create nested ABI dir");
+        std::fs::write(
+            nested.join("pool.json"),
+            include_str!("../../abis/uniswap/v3/pool.json"),
+        )
+        .expect("write nested ABI");
+        // A file with another extension is not an ABI and must not be walked.
+        std::fs::write(root.join("notes.md"), "not an ABI").expect("write ignored file");
+
+        let config = RegistryConfig {
+            abis: Some(PathBuf::from(".")),
+            contract: vec![ContractEntry {
+                chain: "base".to_owned(),
+                address: POOL.to_owned(),
+                abi: "uniswap/v3/pool".to_owned(),
+                protocol: "uniswap_v3".to_owned(),
+                from_block: 0,
+                to_block: None,
+            }],
+        };
+        let registry = ContractRegistry::load(&config, &root).expect("nested ABI loads");
+        assert_eq!(registry.len(), 1);
+
+        std::fs::remove_dir_all(&root).expect("clean up");
+    }
+
+    /// An ABI root that is not there is a startup error naming the directory, rather than a
+    /// run that quietly decodes nothing.
+    #[test]
+    fn a_missing_abi_directory_is_rejected() {
+        let config = RegistryConfig {
+            abis: Some(PathBuf::from("no/such/abis")),
+            contract: Vec::new(),
+        };
         assert!(matches!(
-            load(&duplicate),
-            Err(RegistryError::DuplicateAbi { .. })
+            load(&config),
+            Err(RegistryError::AbiDirectory { .. })
         ));
     }
 

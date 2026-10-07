@@ -15,7 +15,5 @@ mod sink;
 
 pub use abi::{Abi, AbiError, DecodeError, DecodedEvent};
 pub use decoder::Decoder;
-pub use registry::{
-    AbiEntry, Contract, ContractEntry, ContractRegistry, RegistryConfig, RegistryError,
-};
+pub use registry::{Contract, ContractEntry, ContractRegistry, RegistryConfig, RegistryError};
 pub use sink::DecodingSink;

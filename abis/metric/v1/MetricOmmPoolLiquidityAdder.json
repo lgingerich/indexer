@@ -1,0 +1,724 @@
+[
+  {
+    "inputs": [
+      {
+        "internalType": "address",
+        "name": "factory",
+        "type": "address"
+      },
+      {
+        "internalType": "address",
+        "name": "weth",
+        "type": "address"
+      }
+    ],
+    "stateMutability": "nonpayable",
+    "type": "constructor"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "address",
+        "name": "target",
+        "type": "address"
+      }
+    ],
+    "name": "AddressEmptyCode",
+    "type": "error"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "int16",
+        "name": "curBinIdx",
+        "type": "int16"
+      },
+      {
+        "internalType": "uint104",
+        "name": "curPosInBin",
+        "type": "uint104"
+      },
+      {
+        "internalType": "int16",
+        "name": "minimalCurBin",
+        "type": "int16"
+      },
+      {
+        "internalType": "uint104",
+        "name": "minimalPosition",
+        "type": "uint104"
+      },
+      {
+        "internalType": "int16",
+        "name": "maximalCurBin",
+        "type": "int16"
+      },
+      {
+        "internalType": "uint104",
+        "name": "maximalPosition",
+        "type": "uint104"
+      }
+    ],
+    "name": "BinPositionOutOfBounds",
+    "type": "error"
+  },
+  {
+    "inputs": [],
+    "name": "CallbackContextNotActive",
+    "type": "error"
+  },
+  {
+    "inputs": [],
+    "name": "ETHTransferFailed",
+    "type": "error"
+  },
+  {
+    "inputs": [],
+    "name": "EmptyLiquidityDelta",
+    "type": "error"
+  },
+  {
+    "inputs": [],
+    "name": "FailedCall",
+    "type": "error"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "address",
+        "name": "token",
+        "type": "address"
+      },
+      {
+        "internalType": "uint256",
+        "name": "required",
+        "type": "uint256"
+      },
+      {
+        "internalType": "uint256",
+        "name": "available",
+        "type": "uint256"
+      }
+    ],
+    "name": "InsufficientToken",
+    "type": "error"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "uint256",
+        "name": "required",
+        "type": "uint256"
+      },
+      {
+        "internalType": "uint256",
+        "name": "available",
+        "type": "uint256"
+      }
+    ],
+    "name": "InsufficientWETH",
+    "type": "error"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "address",
+        "name": "caller",
+        "type": "address"
+      },
+      {
+        "internalType": "address",
+        "name": "expectedPool",
+        "type": "address"
+      }
+    ],
+    "name": "InvalidCallbackCaller",
+    "type": "error"
+  },
+  {
+    "inputs": [],
+    "name": "InvalidCallbackKind",
+    "type": "error"
+  },
+  {
+    "inputs": [],
+    "name": "InvalidFactory",
+    "type": "error"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "address",
+        "name": "pool",
+        "type": "address"
+      }
+    ],
+    "name": "InvalidPool",
+    "type": "error"
+  },
+  {
+    "inputs": [],
+    "name": "InvalidPositionOwner",
+    "type": "error"
+  },
+  {
+    "inputs": [],
+    "name": "InvalidWETH",
+    "type": "error"
+  },
+  {
+    "inputs": [],
+    "name": "LiquidityDeltaLengthMismatch",
+    "type": "error"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "uint256",
+        "name": "amount0Due",
+        "type": "uint256"
+      },
+      {
+        "internalType": "uint256",
+        "name": "amount1Due",
+        "type": "uint256"
+      }
+    ],
+    "name": "LiquidityProbe",
+    "type": "error"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "uint256",
+        "name": "amount0Due",
+        "type": "uint256"
+      },
+      {
+        "internalType": "uint256",
+        "name": "amount1Due",
+        "type": "uint256"
+      },
+      {
+        "internalType": "uint256",
+        "name": "maxAmount0",
+        "type": "uint256"
+      },
+      {
+        "internalType": "uint256",
+        "name": "maxAmount1",
+        "type": "uint256"
+      }
+    ],
+    "name": "MaxAmountExceeded",
+    "type": "error"
+  },
+  {
+    "inputs": [],
+    "name": "NotWETH",
+    "type": "error"
+  },
+  {
+    "inputs": [],
+    "name": "PayContextAlreadyActive",
+    "type": "error"
+  },
+  {
+    "inputs": [],
+    "name": "ReentrancyGuardReentrantCall",
+    "type": "error"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "address",
+        "name": "token",
+        "type": "address"
+      }
+    ],
+    "name": "SafeERC20FailedOperation",
+    "type": "error"
+  },
+  {
+    "inputs": [],
+    "name": "SharesRoundedToZero",
+    "type": "error"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "uint256",
+        "name": "length",
+        "type": "uint256"
+      }
+    ],
+    "name": "UnexpectedRevertLength",
+    "type": "error"
+  },
+  {
+    "inputs": [],
+    "name": "WeightedProbeInconclusive",
+    "type": "error"
+  },
+  {
+    "inputs": [],
+    "name": "ZeroWeight",
+    "type": "error"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "address",
+        "name": "pool",
+        "type": "address"
+      },
+      {
+        "internalType": "address",
+        "name": "owner",
+        "type": "address"
+      },
+      {
+        "internalType": "uint80",
+        "name": "salt",
+        "type": "uint80"
+      },
+      {
+        "components": [
+          {
+            "internalType": "int256[]",
+            "name": "binIdxs",
+            "type": "int256[]"
+          },
+          {
+            "internalType": "uint256[]",
+            "name": "shares",
+            "type": "uint256[]"
+          }
+        ],
+        "internalType": "struct LiquidityDelta",
+        "name": "deltas",
+        "type": "tuple"
+      },
+      {
+        "internalType": "uint256",
+        "name": "maxAmountToken0",
+        "type": "uint256"
+      },
+      {
+        "internalType": "uint256",
+        "name": "maxAmountToken1",
+        "type": "uint256"
+      },
+      {
+        "components": [
+          {
+            "internalType": "int16",
+            "name": "minimalCurBin",
+            "type": "int16"
+          },
+          {
+            "internalType": "uint104",
+            "name": "minimalPosition",
+            "type": "uint104"
+          },
+          {
+            "internalType": "int16",
+            "name": "maximalCurBin",
+            "type": "int16"
+          },
+          {
+            "internalType": "uint104",
+            "name": "maximalPosition",
+            "type": "uint104"
+          }
+        ],
+        "internalType": "struct IMetricOmmPoolLiquidityAdder.BinPositionBounds",
+        "name": "binPositionBounds",
+        "type": "tuple"
+      },
+      {
+        "internalType": "bytes",
+        "name": "extensionData",
+        "type": "bytes"
+      }
+    ],
+    "name": "addLiquidityExactShares",
+    "outputs": [
+      {
+        "internalType": "uint256",
+        "name": "amount0Added",
+        "type": "uint256"
+      },
+      {
+        "internalType": "uint256",
+        "name": "amount1Added",
+        "type": "uint256"
+      }
+    ],
+    "stateMutability": "payable",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "address",
+        "name": "pool",
+        "type": "address"
+      },
+      {
+        "internalType": "uint80",
+        "name": "salt",
+        "type": "uint80"
+      },
+      {
+        "components": [
+          {
+            "internalType": "int256[]",
+            "name": "binIdxs",
+            "type": "int256[]"
+          },
+          {
+            "internalType": "uint256[]",
+            "name": "shares",
+            "type": "uint256[]"
+          }
+        ],
+        "internalType": "struct LiquidityDelta",
+        "name": "deltas",
+        "type": "tuple"
+      },
+      {
+        "internalType": "uint256",
+        "name": "maxAmountToken0",
+        "type": "uint256"
+      },
+      {
+        "internalType": "uint256",
+        "name": "maxAmountToken1",
+        "type": "uint256"
+      },
+      {
+        "components": [
+          {
+            "internalType": "int16",
+            "name": "minimalCurBin",
+            "type": "int16"
+          },
+          {
+            "internalType": "uint104",
+            "name": "minimalPosition",
+            "type": "uint104"
+          },
+          {
+            "internalType": "int16",
+            "name": "maximalCurBin",
+            "type": "int16"
+          },
+          {
+            "internalType": "uint104",
+            "name": "maximalPosition",
+            "type": "uint104"
+          }
+        ],
+        "internalType": "struct IMetricOmmPoolLiquidityAdder.BinPositionBounds",
+        "name": "binPositionBounds",
+        "type": "tuple"
+      },
+      {
+        "internalType": "bytes",
+        "name": "extensionData",
+        "type": "bytes"
+      }
+    ],
+    "name": "addLiquidityExactShares",
+    "outputs": [
+      {
+        "internalType": "uint256",
+        "name": "amount0Added",
+        "type": "uint256"
+      },
+      {
+        "internalType": "uint256",
+        "name": "amount1Added",
+        "type": "uint256"
+      }
+    ],
+    "stateMutability": "payable",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "address",
+        "name": "pool",
+        "type": "address"
+      },
+      {
+        "internalType": "address",
+        "name": "owner",
+        "type": "address"
+      },
+      {
+        "internalType": "uint80",
+        "name": "salt",
+        "type": "uint80"
+      },
+      {
+        "components": [
+          {
+            "internalType": "int256[]",
+            "name": "binIdxs",
+            "type": "int256[]"
+          },
+          {
+            "internalType": "uint256[]",
+            "name": "shares",
+            "type": "uint256[]"
+          }
+        ],
+        "internalType": "struct LiquidityDelta",
+        "name": "weightDeltas",
+        "type": "tuple"
+      },
+      {
+        "internalType": "uint256",
+        "name": "maxAmountToken0",
+        "type": "uint256"
+      },
+      {
+        "internalType": "uint256",
+        "name": "maxAmountToken1",
+        "type": "uint256"
+      },
+      {
+        "components": [
+          {
+            "internalType": "int16",
+            "name": "minimalCurBin",
+            "type": "int16"
+          },
+          {
+            "internalType": "uint104",
+            "name": "minimalPosition",
+            "type": "uint104"
+          },
+          {
+            "internalType": "int16",
+            "name": "maximalCurBin",
+            "type": "int16"
+          },
+          {
+            "internalType": "uint104",
+            "name": "maximalPosition",
+            "type": "uint104"
+          }
+        ],
+        "internalType": "struct IMetricOmmPoolLiquidityAdder.BinPositionBounds",
+        "name": "binPositionBounds",
+        "type": "tuple"
+      },
+      {
+        "internalType": "bytes",
+        "name": "extensionData",
+        "type": "bytes"
+      }
+    ],
+    "name": "addLiquidityWeighted",
+    "outputs": [
+      {
+        "internalType": "uint256",
+        "name": "amount0Added",
+        "type": "uint256"
+      },
+      {
+        "internalType": "uint256",
+        "name": "amount1Added",
+        "type": "uint256"
+      }
+    ],
+    "stateMutability": "payable",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "address",
+        "name": "pool",
+        "type": "address"
+      },
+      {
+        "internalType": "uint80",
+        "name": "salt",
+        "type": "uint80"
+      },
+      {
+        "components": [
+          {
+            "internalType": "int256[]",
+            "name": "binIdxs",
+            "type": "int256[]"
+          },
+          {
+            "internalType": "uint256[]",
+            "name": "shares",
+            "type": "uint256[]"
+          }
+        ],
+        "internalType": "struct LiquidityDelta",
+        "name": "weightDeltas",
+        "type": "tuple"
+      },
+      {
+        "internalType": "uint256",
+        "name": "maxAmountToken0",
+        "type": "uint256"
+      },
+      {
+        "internalType": "uint256",
+        "name": "maxAmountToken1",
+        "type": "uint256"
+      },
+      {
+        "components": [
+          {
+            "internalType": "int16",
+            "name": "minimalCurBin",
+            "type": "int16"
+          },
+          {
+            "internalType": "uint104",
+            "name": "minimalPosition",
+            "type": "uint104"
+          },
+          {
+            "internalType": "int16",
+            "name": "maximalCurBin",
+            "type": "int16"
+          },
+          {
+            "internalType": "uint104",
+            "name": "maximalPosition",
+            "type": "uint104"
+          }
+        ],
+        "internalType": "struct IMetricOmmPoolLiquidityAdder.BinPositionBounds",
+        "name": "binPositionBounds",
+        "type": "tuple"
+      },
+      {
+        "internalType": "bytes",
+        "name": "extensionData",
+        "type": "bytes"
+      }
+    ],
+    "name": "addLiquidityWeighted",
+    "outputs": [
+      {
+        "internalType": "uint256",
+        "name": "amount0Added",
+        "type": "uint256"
+      },
+      {
+        "internalType": "uint256",
+        "name": "amount1Added",
+        "type": "uint256"
+      }
+    ],
+    "stateMutability": "payable",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "uint256",
+        "name": "amount0Delta",
+        "type": "uint256"
+      },
+      {
+        "internalType": "uint256",
+        "name": "amount1Delta",
+        "type": "uint256"
+      },
+      {
+        "internalType": "bytes",
+        "name": "callbackData",
+        "type": "bytes"
+      }
+    ],
+    "name": "metricOmmModifyLiquidityCallback",
+    "outputs": [],
+    "stateMutability": "nonpayable",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "bytes[]",
+        "name": "data",
+        "type": "bytes[]"
+      }
+    ],
+    "name": "multicall",
+    "outputs": [
+      {
+        "internalType": "bytes[]",
+        "name": "results",
+        "type": "bytes[]"
+      }
+    ],
+    "stateMutability": "payable",
+    "type": "function"
+  },
+  {
+    "inputs": [],
+    "name": "refundETH",
+    "outputs": [],
+    "stateMutability": "payable",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "address",
+        "name": "token",
+        "type": "address"
+      },
+      {
+        "internalType": "uint256",
+        "name": "amountMinimum",
+        "type": "uint256"
+      },
+      {
+        "internalType": "address",
+        "name": "recipient",
+        "type": "address"
+      }
+    ],
+    "name": "sweepToken",
+    "outputs": [],
+    "stateMutability": "payable",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "uint256",
+        "name": "amountMinimum",
+        "type": "uint256"
+      },
+      {
+        "internalType": "address",
+        "name": "recipient",
+        "type": "address"
+      }
+    ],
+    "name": "unwrapWETH9",
+    "outputs": [],
+    "stateMutability": "payable",
+    "type": "function"
+  },
+  {
+    "stateMutability": "payable",
+    "type": "receive"
+  }
+]

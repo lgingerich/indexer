@@ -387,6 +387,74 @@ attributes (`chain`, `sink`). Attributes that vary per block — hash, address, 
 create a series per event and are the one way to make this expensive; `cargo bench
 --bench hot_path` with the meter live is the check that indexing latency has not moved.
 
+### Factory child discovery
+
+A DEX factory — Uniswap V3's `Factory`, Metric's `MetricOmmPoolFactory` — *tells* you
+where its pools are: each emits a creation event naming the new pool. The registry does
+not listen. Every pool is a hand-written `[[contract]]` row, so a factory with ten
+thousand pools means ten thousand rows, and a pool created while the indexer runs is
+decoded only after someone edits the file. Discovery replaces the enumerated children
+with a rule.
+
+The creation event carries the child address as an argument, and the shape differs by
+factory — Uniswap V3's `PoolCreated.pool` is the fifth, non-indexed argument, while
+Metric's `PoolCreated.poolAddress` and `OracleProvider.PoolRegistered.pool` are earlier
+and indexed. So a rule names the argument *and* the event, and the loader resolves the
+position from the ABI rather than hardcoding an index:
+
+```toml
+[[contract]]                       # the factory itself is still a static registration
+chain = "base"
+address = "0x1F98431c8aD98523631AE4a59f267346ea31F984"
+abi = "uniswap/v3/factory"
+protocol = "uniswap_v3"
+
+[[factory]]                        # every child this event names is registered as seen
+chain = "base"
+address = "0x1F98431c8aD98523631AE4a59f267346ea31F984"
+abi = "uniswap/v3/factory"
+protocol = "uniswap_v3"
+event = "PoolCreated"
+child = "pool"                     # the argument naming the new address, by name
+child_abi = "uniswap/v3/pool"
+# child from_block is the creation block, not 0: a child cannot emit before it exists
+```
+
+`event` and `child` are validated against the ABI at load, the way `abi` is, so a missing
+name is a startup error rather than a rule that never fires. `protocol` stays explicit and
+is stamped on the child exactly as on a static registration. The factory's own address is
+still required — a rule has to know where to watch; it is the *children* whose addresses
+disappear from the file. This does not change the [key design](#the-contract-registry) for
+static rows, which remain explicit addresses.
+
+**Why it is not a small change.** The registry is frozen at startup and `Decoder` holds it
+by value; discovery makes it a growing, reorg-reversible index, and four consequences
+follow:
+
+- **The registry becomes mutable.** `Decoder::decode` takes `&mut self` and inserts the
+  child when the creation log is seen. Decode runs on one task, so `&mut` is enough — no
+  lock — but an insert must not invalidate lookups mid-block, so it is a sorted insert or
+  a block-boundary rebuild.
+- **Ordering is correctness, not convenience.** The child is inserted with
+  `from_block = log.block_number`, before the pool's own first logs are processed. Live
+  logs arrive in order within a block, so creation precedes swaps. Backfill is the trap: a
+  run starting *above* the factory's creation never sees the creation event and the pool
+  stays undecodable forever. A factory's `from_block`, and `start_block`, must sit below
+  where its children are created.
+- **Reorgs must un-discover.** A reorged-away creation has to remove its child, or the run
+  keeps decoding a pool that no longer exists — and the store keeps both fork branches, so
+  it would mint decoded rows for an orphaned pool. The hook already exists:
+  `Event::Reorg { orphaned_hashes }`. Each discovered child records its creation block
+  *hash*, and a reorg drops the children whose creation hash is orphaned; the replacement
+  block replays its own creation and re-adds them. Hashes, not heights, is what makes this
+  exact.
+- **Restart durability is deliberately unhandled for now.** Discovered children live only
+  in the process. Anything inside the reorg window is re-derived — startup refetches the
+  tail — but a pool created *below* the window is lost until the factory is replayed from
+  its creation block, which is expensive for a busy factory. A gitignored state file under
+  `[decode]`, loaded at startup and appended live, is the intended fix; it is a new durable
+  artifact and is not built.
+
 Also not built, and not on the path above: mempool ingestion and a Parquet archive.
 
 ## Run it
@@ -508,31 +576,36 @@ settings file is deployment topology (endpoints, paths), while the registry is a
 catalog of contracts that grows on its own schedule. Splitting them keeps a new protocol
 from churning the deployment diff.
 
-The registry file holds two lists, all data:
+The registry file points at an ABI directory and holds a list of registrations:
 
 ```toml
-[[abi]]
-name = "uniswap_v3_pool"
-path = "abis/uniswap_v3_pool.json"
+abis = "abis"                       # walked recursively; every .json file under it
 
 [[contract]]
 chain = "base"
 address = "0xd0b53D9277642d899DF5C87A3966A349A798F224"
-abi = "uniswap_v3_pool"
+abi = "uniswap/v3/pool"             # the file's path under `abis`, without `.json`
 protocol = "uniswap_v3"
 from_block = 0
 # to_block = 60000000     # optional exclusive bound
 ```
 
+**How an ABI is named.** `abis` is walked recursively and each `.json` file is one ABI,
+named by its path under the root without the extension: `abis/uniswap/v3/pool.json` is
+`uniswap/v3/pool`. Protocols and versions nest as directories (`abis/uniswap/v3/…`,
+`abis/uniswap/v4/…`) without any entry to keep in sync, and a `[[contract]]` `abi` is
+that name. A file that is not `.json` is ignored.
+
 **Why an ABI is named once.** A pool protocol like Uniswap V3 has thousands of pools
-sharing one ABI. The ABI is loaded and prepared once, content-addressed by `abi_id`,
-and shared; an address is a registration.
+sharing one ABI. Each walked ABI is loaded and prepared once, content-addressed by
+`abi_id`, and shared; an address is a registration.
 
 **Historical registrations.** `protocol` is required; `from_block` defaults to zero.
 An omitted `to_block` means no upper bound. Disjoint ranges for one `(chain, address)` support proxy
 upgrades: a historical log always uses its original block's registration. Overlapping
-ranges, invalid bounds, dangling ABI names, and malformed addresses are startup errors.
-ABI paths resolve relative to the registry file, not the working directory.
+ranges, invalid bounds, dangling ABI names, an unreadable ABI directory, and malformed
+addresses are startup errors. The `abis` root resolves relative to the registry file,
+not the working directory.
 
 Registrations are predefined and immutable. Factories do not discover or register child
 contracts during decoding; add each child's registration explicitly. Uniswap V4's
