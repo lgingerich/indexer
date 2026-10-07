@@ -535,49 +535,33 @@ datasets = ["log", "log"]
         );
     }
 
-    /// The shipped `indexer.toml` is an example an operator copies, so it must stay
-    /// valid: a moved key would otherwise break the file the README points at.
-    ///
-    /// Gated with the engine, because that file names `[sink.duckdb]` and a build without
-    /// the engine refuses the table by design.
-    #[cfg(feature = "duckdb")]
-    #[test]
-    fn the_repository_settings_file_parses() {
-        Settings::from_str(include_str!("../indexer.toml")).expect("indexer.toml parses");
-    }
-
     /// `indexer.example.toml` documents every key, so it must parse as shipped; it names
-    /// `[sink.stdout]`, which every build has.
+    /// `[sink.stdout]`, which every build has. It is the fixture rather than
+    /// `indexer.toml`, which is a deployment's own settings and changes with it.
     #[test]
     fn the_example_settings_file_parses() {
         Settings::from_str(include_str!("../indexer.example.toml"))
             .expect("indexer.example.toml parses");
     }
 
-    /// The fixture file yields the values each stage is built from — the endpoints, the
-    /// batch, and the resolved protocols path — so the seam between the file and the
+    /// The example file yields the values each stage is built from — the endpoints, the
+    /// named backend, and the empty decode catalog — so the seam between the file and the
     /// stages is exercised without a store.
-    #[cfg(feature = "duckdb")]
     #[test]
-    fn the_repository_file_yields_the_values_the_stages_are_built_from() {
-        use crate::sink::duckdb::DuckDbSettings;
-
-        let settings =
-            Settings::from_str(include_str!("../indexer.toml")).expect("indexer.toml parses");
+    fn the_example_file_yields_the_values_the_stages_are_built_from() {
+        let settings = Settings::from_str(include_str!("../indexer.example.toml"))
+            .expect("indexer.example.toml parses");
 
         assert_eq!(settings.ingest.chain, "base");
         assert!(!settings.ingest.http_url.expose().is_empty());
         assert!(!settings.ingest.ws_url.expose().is_empty());
-        let Sink::DuckDb(duckdb) = &settings.sink else {
+        let Sink::Stdout(_) = &settings.sink else {
             panic!("the table names the backend: {settings:?}");
         };
-        assert_eq!(
-            duckdb.batch_records,
-            DuckDbSettings::default().batch_records
-        );
-        // The fixture names `protocols`. Parsed from text it has no directory, so the
-        // path is left as written rather than resolved against the working directory.
-        assert_eq!(settings.protocols_path(), Some(PathBuf::from("protocols")));
+        // The file omits `datasets`, so the stages are built with all four.
+        assert_eq!(settings.ingest.datasets, crate::sink::Datasets::all());
+        // The file leaves `[decode]` commented out, so the catalog stays empty.
+        assert_eq!(settings.protocols_path(), None);
     }
 
     /// A protocols path resolves against the settings file's own directory, not the
