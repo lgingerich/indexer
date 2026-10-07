@@ -94,8 +94,7 @@ pub struct IngestSettings {
     /// The chain id stamped on every event. Required, and non-empty.
     #[serde(deserialize_with = "non_empty")]
     pub chain: String,
-    /// The JSON-RPC endpoint used for blocks, receipts, and the finalized block.
-    /// Required, and non-empty.
+    /// The JSON-RPC endpoint used for blocks and receipts. Required, and non-empty.
     #[serde(deserialize_with = "non_empty")]
     pub http_url: String,
     /// The WebSocket endpoint used for heads. Required, and non-empty.
@@ -111,6 +110,12 @@ pub struct IngestSettings {
     /// carry every log, so the filtered call would not run.
     #[serde(default)]
     pub log_addresses: Vec<alloy_primitives::Address>,
+    /// The first height to index. Omitted starts at the observed head, which skips
+    /// earlier history; a value indexes that height and every one after it before
+    /// following live heads. A value above the sampled head is a startup error rather
+    /// than a silent clamp.
+    #[serde(default)]
+    pub start_block: Option<u64>,
 }
 
 /// Where records go, and by which backend.

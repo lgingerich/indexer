@@ -8,7 +8,7 @@ use crate::wire::envelope::{Envelope, Event};
 
 /// Forwards every raw record and adds matching decoded logs.
 ///
-/// Registrations are immutable. Reorg and finality markers are forwarded unchanged;
+/// Registrations are immutable. Reorg markers are forwarded unchanged;
 /// this stage does not claim that append-only stored records are canonical.
 pub struct DecodingSink<K> {
     decoder: Decoder,

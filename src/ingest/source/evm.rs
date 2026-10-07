@@ -1,23 +1,26 @@
-//! An EVM block source: live heads over WebSocket, full blocks over JSON-RPC.
+//! An EVM block source: live heads over WebSocket, blocks over JSON-RPC.
 //!
 //! The two transports map onto the two roles in [`BlockSource`]. `newHeads` over
-//! WebSocket is the live path, and it is the only way to observe a head without
-//! paying a poll interval. JSON-RPC over HTTP is the pull path. Requirements worth
-//! stating because they are easy to get wrong:
+//! WebSocket is the live path: a notification carries the announced block's
+//! metadata, which the fetch path reuses instead of reading the same header again.
+//! JSON-RPC over HTTP is the pull path, and also fills gaps and backs off the live
+//! path. Requirements worth stating because they are easy to get wrong:
 //!
-//! - The selected datasets decide the batch. Transactions require full transaction
-//!   objects. Receipts come from `eth_getBlockReceipts`, and when logs are selected
-//!   too they are taken from those receipts. Logs alone use `eth_getLogs` for that
-//!   one height, optionally limited to a list of contract addresses. A header is
-//!   always fetched: the pipeline reads parent linkage from
-//!   it, whether or not the block row is stored. Every field the selected datasets
+//! - A block's metadata (identity, parent hash, timestamp) is reported separately
+//!   from its events, so parent linkage and dataset timestamps are available even
+//!   when the block row itself is not stored. The block row is emitted only when the
+//!   block dataset is selected.
+//! - The selected datasets decide the calls. Logs without receipts use `eth_getLogs`
+//!   for that one height, pinned to the announced hash when the notification
+//!   supplied it, optionally limited to a list of contract addresses; a validated
+//!   notification header then stands in for the header read. Transactions require
+//!   full transaction objects, and receipts come from `eth_getBlockReceipts` with
+//!   selected logs taken from those receipts. Every field the selected datasets
 //!   declare is carried across; a few the node also returns are not, and each
 //!   omission is named at the projection that makes it. Some nodes lack
 //!   `eth_getBlockReceipts` (some L2s, pre-Cancun Ethereum); it is answered with
 //!   `-32601` or null, and the source then fetches each receipt with
 //!   `eth_getTransactionReceipt` in batches of `RECEIPT_BATCH_LIMIT`.
-//! - Finality comes from the node's `finalized` block tag, so each chain's own
-//!   rules apply: about two epochs on Ethereum, L1 finality of the batch on an L2.
 //! - The calls are sent as one batch, so a block costs one round trip. They
 //!   still execute separately on the node, so a reorg between them can pair a
 //!   block with another fork's receipts or logs; every `blockHash` is checked.
@@ -44,7 +47,7 @@ use alloy_transport::TransportError;
 use futures_util::StreamExt;
 use serde::Deserialize;
 
-use super::{BlockId, BlockSource, FetchedBlock, HeadStream, METHOD_NOT_FOUND, SourceError};
+use super::{BlockMeta, BlockSource, FetchedBlock, HeadStream, METHOD_NOT_FOUND, SourceError};
 use crate::sink::Datasets;
 use crate::wire::datasets::evm::{Block, Log, Receipt, Transaction};
 use crate::wire::envelope::{ChainId, Event};
@@ -55,6 +58,12 @@ use crate::wire::envelope::{ChainId, Event};
 /// with `-32014` — so the per-transaction receipt fallback requests hashes in
 /// chunks this size. Ten is the smallest observed cap, so it is safe everywhere.
 const RECEIPT_BATCH_LIMIT: usize = 10;
+
+/// The method labels these calls are reported under, shared by the fetch path and
+/// the projection so an error names the same boundary wherever it is raised.
+const BLOCK: &str = "eth_getBlockByNumber";
+const RECEIPTS: &str = "eth_getBlockReceipts";
+const LOGS: &str = "eth_getLogs";
 
 /// A source that talks to one EVM chain over HTTP JSON-RPC and WebSocket.
 #[derive(Debug)]
@@ -70,10 +79,12 @@ pub struct EvmSource {
 impl EvmSource {
     /// Builds a source for `chain` that fetches `datasets`.
     ///
-    /// The header is still fetched when the block dataset is off: linkage needs it.
-    /// `log_addresses` limits `eth_getLogs` to those contracts. An empty list fetches
-    /// every log. A non-empty list is rejected unless logs are selected and receipts
-    /// are not, because that is the only batch that sends `eth_getLogs`.
+    /// A live notification's metadata stands in for the header only on the logs-only
+    /// live path; every other dataset still reads the block body, and the header is
+    /// what supplies linkage when no notification did. `log_addresses` limits
+    /// `eth_getLogs` to those contracts. An empty list fetches every log. A non-empty
+    /// list is rejected unless logs are selected and receipts are not, because that is
+    /// the only batch that sends `eth_getLogs`.
     ///
     /// # Errors
     ///
@@ -113,22 +124,42 @@ impl EvmSource {
     }
 }
 
-/// A block's identity fields, enough for a `newHeads` notification or the
-/// finalized block; every other header field is ignored.
+/// A block's header fields a `newHeads` notification carries: identity, parent
+/// linkage, and timestamp. Every other header field is ignored here.
 #[derive(Debug, Deserialize)]
-struct RpcBlockId {
+struct RpcBlockMeta {
     // A quantity on the wire; alloy's `quantity` handles the `0x` hex form and
     // rejects anything else. `B256`'s own `Deserialize` parses the hash.
     #[serde(with = "alloy_serde::quantity")]
     number: u64,
     hash: B256,
+    #[serde(rename = "parentHash")]
+    parent_hash: B256,
+    #[serde(with = "alloy_serde::quantity")]
+    timestamp: u64,
 }
 
-impl From<RpcBlockId> for BlockId {
-    fn from(block: RpcBlockId) -> Self {
+impl From<RpcBlockMeta> for BlockMeta {
+    fn from(block: RpcBlockMeta) -> Self {
         Self {
             height: block.number,
             hash: block.hash,
+            parent_hash: block.parent_hash,
+            timestamp: block.timestamp,
+        }
+    }
+}
+
+/// The identity, parent hash, and timestamp a fetched block is anchored to — the same
+/// fields [`From<RpcBlockMeta>`] reads off a notification, so one type answers both.
+impl From<&AnyRpcBlock> for BlockMeta {
+    fn from(block: &AnyRpcBlock) -> Self {
+        let header = &block.0.inner.header;
+        Self {
+            height: header.number,
+            hash: header.hash,
+            parent_hash: header.inner.parent_hash,
+            timestamp: header.inner.timestamp,
         }
     }
 }
@@ -158,8 +189,16 @@ fn transport(context: &'static str, source: TransportError) -> SourceError {
 /// accessors; only the transaction type falls back to a raw `u8`.
 #[derive(Debug, Clone)]
 pub struct RpcBatch {
+    /// The block metadata the projection is anchored to.
+    ///
+    /// Its identity is checked against the fetched block when one was fetched, so a
+    /// reused live notification and the HTTP response cannot silently disagree.
+    pub meta: BlockMeta,
     /// The block, from `eth_getBlockByNumber` with full transactions.
-    pub block: AnyRpcBlock,
+    ///
+    /// `None` when a validated live notification already supplied the metadata and
+    /// the selected datasets need nothing from the body — the logs-only case.
+    pub block: Option<AnyRpcBlock>,
     /// The block's receipts, from `eth_getBlockReceipts`.
     ///
     /// `None` when the node does not serve that method; the caller then has to
@@ -172,64 +211,107 @@ pub struct RpcBatch {
     /// `None` when logs are taken from [`Self::receipts`] instead, which is the
     /// case whenever receipts were fetched.
     pub logs: Option<Vec<RpcLog>>,
-    /// The chain's newest finalized block at request time.
-    pub finalized: BlockId,
 }
 
-/// Turns a parsed batch into ordered dataset events and the finality watermark.
+/// Turns a parsed batch into ordered dataset events and its metadata.
 ///
-/// Emits the block, then each transaction followed by its receipt and that
-/// receipt's logs, all in index order, so a consumer sees every transaction before
-/// its receipt and every receipt before its logs.
+/// Projects every row in the batch, whatever a deployment would have selected: the
+/// caller filters with [`Datasets::keeps`](crate::sink::Datasets::keeps) if it wants
+/// less. Order is the block row, then each transaction followed by its receipt and
+/// that receipt's logs, all in index order, so a consumer sees every transaction
+/// before its receipt and every receipt before its logs. A body is only required for
+/// the rows that read one, so a logs-only block with no fetched block still decodes.
 ///
 /// # Errors
 ///
-/// Returns [`SourceError::Malformed`] when the receipts do not belong to the block
-/// or do not line up with its transactions.
+/// Returns [`SourceError::Malformed`] when a body the rows read is absent, the
+/// receipts do not belong to the block, or they do not line up with its transactions.
 pub fn decode_block(batch: RpcBatch) -> Result<FetchedBlock, SourceError> {
     let RpcBatch {
+        meta,
         block,
         receipts,
         logs,
-        finalized,
     } = batch;
-    // The batched method is the only way receipts reach a pure decode; when a node
-    // lacks it, `fetch_block` fills them in per transaction before calling here.
-    let receipts =
-        receipts.ok_or_else(|| malformed("eth_getBlockReceipts", "receipts were not fetched"))?;
     Ok(FetchedBlock {
-        events: project(&block, Some(&receipts), logs.as_deref(), Datasets::all())?,
-        finalized,
+        meta,
+        events: project(
+            meta,
+            block.as_ref(),
+            receipts.as_deref(),
+            logs.as_deref(),
+            Datasets::all(),
+        )?,
     })
 }
 
-/// Projects a fetched block into dataset events, always leading with the header.
+/// Projects a fetched block into dataset events, anchored to `meta`.
 ///
-/// The loop is the full-dataset order: each transaction, then its receipt, then
-/// that receipt's logs. A push runs only when `datasets` names it. Logs fetched
-/// with `eth_getLogs` are appended after that loop, in the order the node returned.
+/// The block row is pushed only when the block dataset is selected; metadata is
+/// reported separately, so the pipeline keeps linkage and timestamps whether or not
+/// the row is stored. The order is each transaction, then its receipt, then that
+/// receipt's logs, all in block index order, with `eth_getLogs` rows appended after.
+/// A selected dataset whose body is absent is an error; a logs-only fetch that reused
+/// a notification has no body and appends only its hash-pinned logs.
 fn project(
-    block: &AnyRpcBlock,
+    meta: BlockMeta,
+    block: Option<&AnyRpcBlock>,
     receipts: Option<&[AnyTransactionReceipt]>,
     logs: Option<&[RpcLog]>,
     datasets: Datasets,
 ) -> Result<Vec<Event>, SourceError> {
-    const RECEIPTS: &str = "eth_getBlockReceipts";
+    // Anything but logs is projected from the block body, and receipts are validated
+    // against its transaction identities, so a missing body is an error rather than a
+    // silently empty projection. Logs alone need no body.
+    if (datasets.block || datasets.transaction || datasets.receipt) && block.is_none() {
+        return Err(malformed(BLOCK, "block was not fetched"));
+    }
     if datasets.receipt && receipts.is_none() {
         return Err(malformed(RECEIPTS, "receipts were not fetched"));
     }
-    let separate_logs = datasets.log && !datasets.receipt;
-    if separate_logs && logs.is_none() {
-        return Err(malformed("eth_getLogs", "logs were not fetched"));
+    if datasets.log && !datasets.receipt && logs.is_none() {
+        return Err(malformed(LOGS, "logs were not fetched"));
     }
 
+    let mut events = Vec::new();
+    if let Some(block) = block {
+        let header = &block.0.inner.header;
+        if header.number != meta.height || header.hash != meta.hash {
+            return Err(malformed(
+                BLOCK,
+                format!("block {} at {} is not {meta:?}", header.hash, header.number),
+            ));
+        }
+        if datasets.block {
+            events.push(Event::Block(Box::new(decode_header(block))));
+        }
+        append_body(&mut events, block, receipts, datasets, meta)?;
+    }
+    if let Some(logs) = logs {
+        for log in logs {
+            events.push(Event::Log(Box::new(filtered_log(
+                log,
+                meta.height,
+                meta.hash,
+                meta.timestamp,
+            )?)));
+        }
+    }
+    Ok(events)
+}
+
+/// Appends the transaction/receipt/log rows a fetched body carries.
+fn append_body(
+    events: &mut Vec<Event>,
+    block: &AnyRpcBlock,
+    receipts: Option<&[AnyTransactionReceipt]>,
+    datasets: Datasets,
+    meta: BlockMeta,
+) -> Result<(), SourceError> {
     let transactions = &block.0.inner.transactions;
     let full = transactions.as_transactions();
     if datasets.transaction && full.is_none() {
-        return Err(malformed(
-            "eth_getBlockByNumber",
-            "block returned transaction hashes only",
-        ));
+        return Err(malformed(BLOCK, "block returned transaction hashes only"));
     }
     let tx_hashes: Vec<B256> = transactions.hashes().collect();
     if let Some(receipts) = receipts
@@ -244,74 +326,72 @@ fn project(
             ),
         ));
     }
-
-    let number = block.0.inner.header.inner.number;
-    let hash = block.0.inner.header.hash;
-    let timestamp = block.0.inner.header.inner.timestamp;
-    let mut events = Vec::new();
-    events.push(Event::Block(Box::new(decode_header(block))));
-    if datasets.transaction || receipts.is_some() {
-        for (position, tx_hash) in tx_hashes.iter().copied().enumerate() {
-            let tx_index = position as u64;
-            if datasets.transaction {
-                let transaction = &full.ok_or_else(|| {
-                    malformed(
-                        "eth_getBlockByNumber",
-                        "block returned transaction hashes only",
-                    )
-                })?[position];
-                events.push(Event::Transaction(Box::new(decode_transaction(
-                    transaction,
+    if !datasets.transaction && receipts.is_none() {
+        return Ok(());
+    }
+    for (position, tx_hash) in tx_hashes.iter().copied().enumerate() {
+        let tx_index = position as u64;
+        if datasets.transaction {
+            let transaction = &full
+                .ok_or_else(|| malformed(BLOCK, "block returned transaction hashes only"))?
+                [position];
+            events.push(Event::Transaction(Box::new(decode_transaction(
+                transaction,
+                tx_index,
+                meta.height,
+                meta.timestamp,
+                meta.hash,
+            ))));
+        }
+        let Some(receipts) = receipts else {
+            continue;
+        };
+        let receipt = &receipts[position];
+        let receipt_block = receipt.block_hash.unwrap_or_default();
+        if receipt_block != meta.hash {
+            return Err(malformed(
+                RECEIPTS,
+                format!(
+                    "receipt belongs to block {receipt_block}, not {}; the chain reorganised mid-request",
+                    meta.hash
+                ),
+            ));
+        }
+        if receipt.transaction_index != Some(tx_index) || receipt.transaction_hash != tx_hash {
+            return Err(malformed(
+                RECEIPTS,
+                format!(
+                    "receipt {position} has transactionIndex {:?}, not {tx_index}",
+                    receipt.transaction_index
+                ),
+            ));
+        }
+        if datasets.receipt {
+            events.push(Event::Receipt(Box::new(decode_receipt(
+                receipt,
+                tx_hash,
+                tx_index,
+                meta.height,
+                meta.hash,
+                meta.timestamp,
+            ))));
+        }
+        if datasets.log {
+            for log in receipt.logs() {
+                // Logs nested in this receipt, as opposed to a separate `eth_getLogs`
+                // query; the label names the boundary an error at this site reports.
+                events.push(Event::Log(Box::new(log_record(
+                    log,
                     tx_index,
-                    number,
-                    timestamp,
-                    hash,
-                ))));
-            }
-            let Some(receipts) = receipts else {
-                continue;
-            };
-            let receipt = &receipts[position];
-            let receipt_block = receipt.block_hash.unwrap_or_default();
-            if receipt_block != hash {
-                return Err(malformed(
+                    meta.height,
+                    meta.hash,
+                    meta.timestamp,
                     RECEIPTS,
-                    format!(
-                        "receipt belongs to block {receipt_block}, not {hash}; the chain reorganised mid-request"
-                    ),
-                ));
-            }
-            if receipt.transaction_index != Some(tx_index) || receipt.transaction_hash != tx_hash {
-                return Err(malformed(
-                    RECEIPTS,
-                    format!(
-                        "receipt {position} has transactionIndex {:?}, not {tx_index}",
-                        receipt.transaction_index
-                    ),
-                ));
-            }
-            if datasets.receipt {
-                events.push(Event::Receipt(Box::new(decode_receipt(
-                    receipt, tx_hash, tx_index, number, hash, timestamp,
-                ))));
-            }
-            if datasets.log {
-                for log in receipt.logs() {
-                    events.push(Event::Log(Box::new(log_record(
-                        log, tx_index, number, hash, timestamp, RECEIPTS,
-                    )?)));
-                }
+                )?)));
             }
         }
     }
-    if separate_logs {
-        for log in logs.ok_or_else(|| malformed("eth_getLogs", "logs were not fetched"))? {
-            events.push(Event::Log(Box::new(filtered_log(
-                log, number, hash, timestamp,
-            )?)));
-        }
-    }
-    Ok(events)
+    Ok(())
 }
 
 /// One `eth_getLogs` row, checked against the header it was requested for.
@@ -321,7 +401,6 @@ fn filtered_log(
     block_hash: B256,
     block_timestamp: u64,
 ) -> Result<Log, SourceError> {
-    const LOGS: &str = "eth_getLogs";
     let got = log
         .block_hash
         .ok_or_else(|| malformed(LOGS, "log has no blockHash"))?;
@@ -561,52 +640,80 @@ impl BlockSource for EvmSource {
             .connect_ws(connect)
             .await
             .map_err(|source| transport("websocket connect", source))?;
-        // Only identity is needed. Subscribe through Alloy's client so the typed
-        // result stream retains malformed notifications rather than dropping them.
+        // Identity, parent hash, and timestamp, so a fetch for this height can reuse
+        // them instead of reading the same header again over HTTP. Subscribe through
+        // Alloy's client so the typed result stream retains malformed notifications
+        // rather than dropping them.
         let subscription = provider
-            .subscribe::<_, RpcBlockId>(("newHeads",))
+            .subscribe::<_, RpcBlockMeta>(("newHeads",))
             .await
             .map_err(|source| transport("eth_subscribe", source))?;
         let heads = subscription.into_result_stream().map(move |head| {
             // Keep the client's frontend alive for as long as the stream lives.
             let _keep_alive = &provider;
-            head.map(BlockId::from)
+            head.map(BlockMeta::from)
                 .map_err(|source| invalid_json("newHeads", source))
         });
         Ok(Box::pin(heads) as HeadStream)
     }
 
-    async fn fetch_block(&self, height: u64) -> Result<FetchedBlock, SourceError> {
-        let mut batch = self.fetch_batch(height).await?;
+    async fn fetch_block(
+        &self,
+        height: u64,
+        head: Option<&BlockMeta>,
+    ) -> Result<FetchedBlock, SourceError> {
+        // A live notification for this height already carries the metadata, and a
+        // logs-only fetch reads nothing else from the block body. Reuse it and skip
+        // the header read entirely; any other dataset needs the full block. A head
+        // for a different height is no use, so it is ignored rather than mistrusted.
+        let reuse = head.filter(|meta| meta.height == height && self.datasets.logs_only());
+        let (meta, block, mut receipts, logs) = if let Some(meta) = reuse {
+            let logs = self.fetch_logs(meta.hash).await?;
+            (*meta, None, None, Some(logs))
+        } else {
+            let RpcBatch {
+                meta,
+                block,
+                receipts,
+                logs,
+            } = self.fetch_batch(height).await?;
+            let block = block.ok_or_else(|| malformed(BLOCK, "block was not fetched"))?;
+            (meta, Some(block), receipts, logs)
+        };
         // Nodes that do not serve `eth_getBlockReceipts` (some L2s, and pre-Cancun
         // Ethereum) answer it with `METHOD_NOT_FOUND` or null. Fetch the receipts
         // by transaction hash instead, so the block still becomes events.
-        if self.datasets.receipt && batch.receipts.is_none() {
-            batch.receipts = Some(self.fetch_receipts(&batch.block).await?);
+        if self.datasets.receipt && receipts.is_none() {
+            let block = block
+                .as_ref()
+                .ok_or_else(|| malformed(RECEIPTS, "block was not fetched"))?;
+            receipts = Some(self.fetch_receipts(block).await?);
         }
         Ok(FetchedBlock {
+            meta,
             events: project(
-                &batch.block,
-                batch.receipts.as_deref(),
-                batch.logs.as_deref(),
+                meta,
+                block.as_ref(),
+                receipts.as_deref(),
+                logs.as_deref(),
                 self.datasets,
             )?,
-            finalized: batch.finalized,
         })
     }
 
-    async fn current_head(&self) -> Result<BlockId, SourceError> {
+    async fn current_head(&self) -> Result<BlockMeta, SourceError> {
         const CONTEXT: &str = "eth_getBlockByNumber(latest)";
-        // Hashes only, not full transactions: the caller wants where the chain is, and a
-        // full-transaction response is tens of KB on a busy chain for nothing.
-        let header: Option<RpcBlockId> = self
+        // Hashes only, not full transactions: startup wants where the chain is and the
+        // metadata a backfill target needs, and a full-transaction response is tens of
+        // KB on a busy chain for nothing.
+        let header: Option<RpcBlockMeta> = self
             .provider
             .client()
-            .request("eth_getBlockByNumber", ("latest", false))
+            .request(BLOCK, ("latest", false))
             .await
             .map_err(|source| transport(CONTEXT, source))?;
         header
-            .map(BlockId::from)
+            .map(BlockMeta::from)
             .ok_or_else(|| malformed(CONTEXT, "result was null"))
     }
 }
@@ -651,11 +758,13 @@ impl EvmSource {
         Ok(receipts)
     }
 
-    /// Fetches the header, the dataset calls this source needs, and finality, in one batch.
+    /// Fetches the dataset calls this source needs for one height, in one batch.
+    ///
+    /// The block is always read: its header supplies the metadata the projection is
+    /// anchored to, and the receipt fallback reads transaction hashes from it. When
+    /// a live notification already supplied the metadata and only logs are selected,
+    /// [`Self::fetch_logs`] is used instead and this block read is skipped.
     async fn fetch_batch(&self, height: u64) -> Result<RpcBatch, SourceError> {
-        const BLOCK: &str = "eth_getBlockByNumber";
-        const RECEIPTS: &str = "eth_getBlockReceipts";
-        const LOGS: &str = "eth_getLogs";
         let tag = alloy_rpc_types_eth::BlockNumberOrTag::Number(height);
         let mut filter = Filter::new().select(height);
         if !self.log_addresses.is_empty() {
@@ -666,7 +775,7 @@ impl EvmSource {
         let mut batch = alloy_rpc_client::BatchRequest::new(self.provider.client());
         // Full objects only when transactions are stored. Hashes still fill the
         // block row and the receipt fallback. Order matches the all-dataset batch
-        // the tests lock: block, then receipts, then logs, then finality.
+        // the tests lock: block, then receipts, then logs.
         let block = batch
             .add_call::<_, Option<AnyRpcBlock>>(BLOCK, &(tag, self.datasets.transaction))
             .map_err(|source| transport(BLOCK, source))?;
@@ -689,11 +798,6 @@ impl EvmSource {
         } else {
             None
         };
-        // ponytail: finality carries the transaction-hash list too. Poll the
-        // finalized tag on a timer if its bandwidth becomes material.
-        let finalized = batch
-            .add_call::<_, Option<RpcBlockId>>(BLOCK, &("finalized", false))
-            .map_err(|source| transport("finalized block", source))?;
         batch
             .send()
             .await
@@ -714,16 +818,27 @@ impl EvmSource {
             Some(logs) => Some(logs.await.map_err(|source| transport(LOGS, source))?),
             None => None,
         };
-        let finalized = finalized
-            .await
-            .map_err(|source| transport("finalized block", source))?
-            .ok_or_else(|| malformed("finalized block", "result was null"))?;
+        let meta = BlockMeta::from(&block);
         Ok(RpcBatch {
-            block,
+            meta,
+            block: Some(block),
             receipts,
             logs,
-            finalized: finalized.into(),
         })
+    }
+
+    /// Fetches one height's logs, pinned to `hash` so a reorg cannot silently answer
+    /// with the replacement branch: the query returns that block's logs or nothing.
+    async fn fetch_logs(&self, hash: B256) -> Result<Vec<RpcLog>, SourceError> {
+        let mut filter = Filter::new().at_block_hash(hash);
+        if !self.log_addresses.is_empty() {
+            filter = filter.address(self.log_addresses.clone());
+        }
+        self.provider
+            .client()
+            .request(LOGS, (filter,))
+            .await
+            .map_err(|source| transport(LOGS, source))
     }
 }
 
@@ -741,13 +856,17 @@ impl fmt::Display for EvmSource {
 #[expect(clippy::expect_used)]
 mod tests {
     use alloy_consensus::TxType;
+    use alloy_network::any::AnyRpcBlock;
     use alloy_primitives::{Address, B256};
     use serde_json::{Value, json};
 
     use super::{EvmSource, RpcBatch, decode_block};
-    use crate::ingest::source::{BlockSource, SourceError};
+    use crate::ingest::source::{BlockMeta, BlockSource, SourceError};
     use crate::sink::Datasets;
     use crate::wire::envelope::Event;
+
+    /// Matches the `block()` fixture's `timestamp`, so metadata and body agree.
+    const TIMESTAMP: u64 = 0x6530_a1b0;
 
     /// A real HTTP boundary: inspect requests and return replies in reverse order.
     fn rpc_server(
@@ -793,26 +912,27 @@ mod tests {
 
     fn primary_reply(request: &Value, block: &Value, receipts: &Value) -> Value {
         let calls = request.as_array().expect("primary request must be a batch");
-        assert_eq!(calls.len(), 3);
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0]["method"], "eth_getBlockByNumber");
         assert_eq!(calls[0]["params"], json!(["0x112a880", true]));
         assert_eq!(calls[1]["method"], "eth_getBlockReceipts");
         assert_eq!(calls[1]["params"], json!(["0x112a880"]));
-        assert_eq!(calls[2]["params"], json!(["finalized", false]));
         json!([
-            {"jsonrpc": "2.0", "id": calls[2]["id"], "result": {"number": "0x10", "hash": hash(0xf0)}},
-            {"jsonrpc": "2.0", "id": calls[1]["id"], "result": receipts},
             {"jsonrpc": "2.0", "id": calls[0]["id"], "result": block},
+            {"jsonrpc": "2.0", "id": calls[1]["id"], "result": receipts},
         ])
     }
 
     #[tokio::test]
-    async fn primary_fetch_is_one_three_call_batch_with_reversed_responses() {
+    async fn primary_fetch_is_one_two_call_batch_with_reversed_responses() {
         let (url, server) = rpc_server(1, |request| primary_reply(request, &block(), &receipts()));
         let source =
             EvmSource::new("ethereum", url, "ws://unused", Datasets::all(), &[]).expect("source");
-        let fetched = source.fetch_block(18_000_000).await.expect("fetch");
+        let fetched = source.fetch_block(18_000_000, None).await.expect("fetch");
         assert_eq!(fetched.events.len(), 7);
-        assert_eq!(fetched.finalized.height, 16);
+        // The header is reported as metadata, and no finalized call is made.
+        assert_eq!(fetched.meta.height, 18_000_000);
+        assert_eq!(fetched.meta.timestamp, TIMESTAMP);
         assert_eq!(server.join().expect("server").len(), 1);
     }
 
@@ -823,18 +943,16 @@ mod tests {
         let logs = receipts()[0]["logs"].clone();
         let (url, server) = rpc_server(1, move |request| {
             let calls = request.as_array().expect("batch");
-            assert_eq!(calls.len(), 3);
+            assert_eq!(calls.len(), 2);
             assert_eq!(calls[0]["method"], "eth_getBlockByNumber");
             assert_eq!(calls[0]["params"], json!(["0x112a880", false]));
             assert_eq!(calls[1]["method"], "eth_getLogs");
             assert_eq!(calls[1]["params"][0]["fromBlock"], "0x112a880");
             assert_eq!(calls[1]["params"][0]["toBlock"], "0x112a880");
             assert!(calls[1]["params"][0].get("address").is_none());
-            assert_eq!(calls[2]["params"], json!(["finalized", false]));
             json!([
-                {"jsonrpc": "2.0", "id": calls[2]["id"], "result": {"number": "0x10", "hash": hash(0xf0)}},
-                {"jsonrpc": "2.0", "id": calls[1]["id"], "result": logs},
                 {"jsonrpc": "2.0", "id": calls[0]["id"], "result": header},
+                {"jsonrpc": "2.0", "id": calls[1]["id"], "result": logs},
             ])
         });
         let source = EvmSource::new(
@@ -845,9 +963,93 @@ mod tests {
             &[],
         )
         .expect("source");
-        let fetched = source.fetch_block(18_000_000).await.expect("fetch");
+        let fetched = source.fetch_block(18_000_000, None).await.expect("fetch");
+        // The block is not stored, so no block event is emitted; the logs are.
         let kinds: Vec<&str> = fetched.events.iter().map(Event::kind).collect();
-        assert_eq!(kinds, ["block", "log", "log"]);
+        assert_eq!(kinds, ["log", "log"]);
+        assert_eq!(fetched.meta.height, 18_000_000);
+        server.join().expect("server");
+    }
+
+    #[tokio::test]
+    async fn a_reusable_head_skips_the_block_read_for_logs_only() {
+        let logs = receipts()[0]["logs"].clone();
+        // One request, one call: no block read, only the hash-pinned log query.
+        let (url, server) = rpc_server(1, move |request| {
+            assert_eq!(request["method"], "eth_getLogs");
+            assert_eq!(request["params"][0]["blockHash"], hash(0xab));
+            assert!(
+                request["params"][0].get("fromBlock").is_none(),
+                "a pinned query carries the hash, not a height range"
+            );
+            json!({"jsonrpc": "2.0", "id": request["id"], "result": logs})
+        });
+        let source = EvmSource::new(
+            "ethereum",
+            url,
+            "ws://unused",
+            serde_json::from_str(r#"["log"]"#).expect("datasets"),
+            &[],
+        )
+        .expect("source");
+        let head = BlockMeta {
+            height: 18_000_000,
+            hash: hash(0xab).parse().expect("hash"),
+            parent_hash: hash(0xaa).parse().expect("hash"),
+            timestamp: TIMESTAMP,
+        };
+        let fetched = source
+            .fetch_block(18_000_000, Some(&head))
+            .await
+            .expect("fetch");
+        let kinds: Vec<&str> = fetched.events.iter().map(Event::kind).collect();
+        assert_eq!(kinds, ["log", "log"]);
+        assert_eq!(fetched.meta.hash, hash(0xab).parse::<B256>().expect("hash"));
+        assert_eq!(fetched.meta.timestamp, head.timestamp);
+        server.join().expect("server");
+    }
+
+    /// A reusable head stands in for the header only when logs are the only thing
+    /// fetched. Anything else reads the block body, so a transaction dataset still
+    /// fetches it and still emits its rows — silently dropping them would index
+    /// transactions for history and not for live blocks.
+    #[tokio::test]
+    async fn a_reusable_head_still_reads_the_body_for_a_transaction_dataset() {
+        let logs = receipts()[0]["logs"].clone();
+        // One batch, two calls: the body is read even though a head was announced.
+        let (url, server) = rpc_server(1, move |request| {
+            let calls = request.as_array().expect("batch");
+            assert_eq!(calls.len(), 2);
+            assert_eq!(calls[0]["method"], "eth_getBlockByNumber");
+            json!([
+                {"jsonrpc": "2.0", "id": calls[0]["id"], "result": block()},
+                {"jsonrpc": "2.0", "id": calls[1]["id"], "result": logs},
+            ])
+        });
+        let source = EvmSource::new(
+            "ethereum",
+            url,
+            "ws://unused",
+            serde_json::from_str(r#"["transaction", "log"]"#).expect("datasets"),
+            &[],
+        )
+        .expect("source");
+        let head = BlockMeta {
+            height: 18_000_000,
+            hash: hash(0xab).parse().expect("hash"),
+            parent_hash: hash(0xaa).parse().expect("hash"),
+            timestamp: TIMESTAMP,
+        };
+        let fetched = source
+            .fetch_block(18_000_000, Some(&head))
+            .await
+            .expect("fetch");
+        let kinds: Vec<&str> = fetched.events.iter().map(Event::kind).collect();
+        assert_eq!(
+            kinds,
+            ["transaction", "transaction", "log", "log"],
+            "the body rows survive a reusable head"
+        );
         server.join().expect("server");
     }
 
@@ -875,9 +1077,8 @@ mod tests {
             expected.sort_unstable();
             assert_eq!(sent, expected);
             json!([
-                {"jsonrpc": "2.0", "id": calls[2]["id"], "result": {"number": "0x10", "hash": hash(0xf0)}},
-                {"jsonrpc": "2.0", "id": calls[1]["id"], "result": logs},
                 {"jsonrpc": "2.0", "id": calls[0]["id"], "result": header},
+                {"jsonrpc": "2.0", "id": calls[1]["id"], "result": logs},
             ])
         });
         let source = EvmSource::new(
@@ -888,9 +1089,9 @@ mod tests {
             &[want, other],
         )
         .expect("source");
-        let fetched = source.fetch_block(18_000_000).await.expect("fetch");
+        let fetched = source.fetch_block(18_000_000, None).await.expect("fetch");
         let kinds: Vec<&str> = fetched.events.iter().map(Event::kind).collect();
-        assert_eq!(kinds, ["block", "log", "log"]);
+        assert_eq!(kinds, ["log", "log"]);
         server.join().expect("server");
     }
 
@@ -919,7 +1120,7 @@ mod tests {
     async fn receipts_supply_logs_without_a_second_log_call() {
         let (url, server) = rpc_server(1, |request| {
             let calls = request.as_array().expect("batch");
-            assert_eq!(calls.len(), 3);
+            assert_eq!(calls.len(), 2);
             assert_eq!(calls[0]["params"], json!(["0x112a880", false]));
             assert_eq!(calls[1]["method"], "eth_getBlockReceipts");
             assert!(
@@ -927,9 +1128,8 @@ mod tests {
                 "logs come off the receipts"
             );
             json!([
-                {"jsonrpc": "2.0", "id": calls[2]["id"], "result": {"number": "0x10", "hash": hash(0xf0)}},
-                {"jsonrpc": "2.0", "id": calls[1]["id"], "result": receipts()},
                 {"jsonrpc": "2.0", "id": calls[0]["id"], "result": block()},
+                {"jsonrpc": "2.0", "id": calls[1]["id"], "result": receipts()},
             ])
         });
         let source = EvmSource::new(
@@ -940,24 +1140,22 @@ mod tests {
             &[],
         )
         .expect("source");
-        let fetched = source.fetch_block(18_000_000).await.expect("fetch");
+        let fetched = source.fetch_block(18_000_000, None).await.expect("fetch");
         let kinds: Vec<&str> = fetched.events.iter().map(Event::kind).collect();
-        assert_eq!(kinds, ["block", "receipt", "log", "log", "receipt"]);
+        assert_eq!(kinds, ["receipt", "log", "log", "receipt"]);
         server.join().expect("server");
     }
 
     #[tokio::test]
     async fn transactions_skip_the_receipt_call() {
         let (url, server) = rpc_server(1, |request| {
+            // One batch, one method: only the block is needed for the block and
+            // transaction datasets, so the receipt call is skipped.
             let calls = request.as_array().expect("batch");
-            assert_eq!(calls.len(), 2);
+            assert_eq!(calls.len(), 1);
             assert_eq!(calls[0]["method"], "eth_getBlockByNumber");
             assert_eq!(calls[0]["params"], json!(["0x112a880", true]));
-            assert_eq!(calls[1]["params"], json!(["finalized", false]));
-            json!([
-                {"jsonrpc": "2.0", "id": calls[1]["id"], "result": {"number": "0x10", "hash": hash(0xf0)}},
-                {"jsonrpc": "2.0", "id": calls[0]["id"], "result": block()},
-            ])
+            json!([{"jsonrpc": "2.0", "id": calls[0]["id"], "result": block()}])
         });
         let source = EvmSource::new(
             "ethereum",
@@ -967,7 +1165,7 @@ mod tests {
             &[],
         )
         .expect("source");
-        let fetched = source.fetch_block(18_000_000).await.expect("fetch");
+        let fetched = source.fetch_block(18_000_000, None).await.expect("fetch");
         let kinds: Vec<&str> = fetched.events.iter().map(Event::kind).collect();
         assert_eq!(kinds, ["block", "transaction", "transaction"]);
         server.join().expect("server");
@@ -1023,7 +1221,7 @@ mod tests {
             let source =
                 EvmSource::new("base", url, "ws://unused", Datasets::all(), &[]).expect("source");
             let fetched = source
-                .fetch_block(18_000_000)
+                .fetch_block(18_000_000, None)
                 .await
                 .expect("fallback fetch");
             assert_eq!(fetched.events.len(), 43);
@@ -1033,7 +1231,7 @@ mod tests {
                     .iter()
                     .map(|batch| batch.as_array().expect("batch").len())
                     .collect::<Vec<_>>(),
-                [3, 10, 10, 1]
+                [2, 10, 10, 1]
             );
             for (index, event) in fetched.events.iter().skip(1).step_by(2).enumerate() {
                 let Event::Transaction(transaction) = event else {
@@ -1066,12 +1264,15 @@ mod tests {
             });
             let source = EvmSource::new("ethereum", url, "ws://unused", Datasets::all(), &[])
                 .expect("source");
-            let error = source.fetch_block(18_000_000).await.expect_err("must fail");
+            let error = source
+                .fetch_block(18_000_000, None)
+                .await
+                .expect_err("must fail");
             if malformed {
                 assert!(matches!(
                     error,
                     SourceError::Transport {
-                        context: "finalized block",
+                        context: "eth_getBlockByNumber",
                         source: alloy_json_rpc::RpcError::DeserError { .. }
                     }
                 ));
@@ -1116,9 +1317,9 @@ mod tests {
                     .await
                     .expect("subscribe reply");
                 if index == 0 {
-                    socket.send(Message::text(json!({"jsonrpc": "2.0", "method": "eth_subscription", "params": {"subscription": id, "result": {"number": "invalid", "hash": hash(1)}}}).to_string())).await.expect("malformed head");
+                    socket.send(Message::text(json!({"jsonrpc": "2.0", "method": "eth_subscription", "params": {"subscription": id, "result": {"number": "invalid", "hash": hash(1), "parentHash": hash(0), "timestamp": "0x1"}}}).to_string())).await.expect("malformed head");
                 }
-                socket.send(Message::text(json!({"jsonrpc": "2.0", "method": "eth_subscription", "params": {"subscription": id, "result": {"number": format!("0x{:x}", index + 16), "hash": hash(1)}}}).to_string())).await.expect("head");
+                socket.send(Message::text(json!({"jsonrpc": "2.0", "method": "eth_subscription", "params": {"subscription": id, "result": {"number": format!("0x{:x}", index + 16), "hash": hash(1), "parentHash": hash(0), "timestamp": format!("0x{:x}", index + 1)}}}).to_string())).await.expect("head");
                 if index == 0 {
                     socket.close(None).await.expect("close for reconnect");
                 } else {
@@ -1268,18 +1469,19 @@ mod tests {
     }
 
     /// The typed projection input; RPC behavior is tested through the source below.
+    ///
+    /// The metadata is derived from the block fixture, so a fetched body and its
+    /// metadata agree, which is what [`project`] checks.
     fn batch(block: &Value, receipts: &Value) -> RpcBatch {
+        let parsed: AnyRpcBlock = serde_json::from_value(block.clone()).expect("block fixture");
+        let meta = BlockMeta::from(&parsed);
         RpcBatch {
-            block: serde_json::from_value(block.clone()).expect("block fixture"),
+            meta,
+            block: Some(parsed),
             receipts: Some(serde_json::from_value(receipts.clone()).expect("receipt fixture")),
             logs: None,
-            finalized: super::BlockId {
-                height: 17_999_936,
-                hash: B256::repeat_byte(0xf0),
-            },
         }
     }
-
     #[test]
     fn events_are_block_then_each_transaction_followed_by_its_receipt_and_logs() {
         let fetched = decode_block(batch(&block(), &receipts())).expect("batch decodes");
@@ -1390,10 +1592,12 @@ mod tests {
     }
 
     #[test]
-    fn finalized_block_comes_from_the_batch() {
+    fn metadata_is_reported_from_the_fetched_block() {
         let fetched = decode_block(batch(&block(), &receipts())).expect("batch decodes");
-        assert_eq!(fetched.finalized.height, 17_999_936);
-        assert_eq!(fetched.finalized.hash, B256::from([0xf0; 32]));
+        assert_eq!(fetched.meta.height, 18_000_000);
+        assert_eq!(fetched.meta.hash.to_string(), hash(0xab));
+        assert_eq!(fetched.meta.parent_hash.to_string(), hash(0xaa));
+        assert_eq!(fetched.meta.timestamp, TIMESTAMP);
     }
 
     #[test]
@@ -1436,7 +1640,7 @@ mod tests {
         let source =
             EvmSource::new("ethereum", url, "ws://unused", Datasets::all(), &[]).expect("source");
         let error = source
-            .fetch_block(18_000_000)
+            .fetch_block(18_000_000, None)
             .await
             .expect_err("missing logIndex");
         assert!(matches!(
@@ -1476,18 +1680,25 @@ mod tests {
     /// gets a clear error rather than a block of transaction events with no receipts.
     #[test]
     fn decode_block_requires_receipts() {
-        let batch = RpcBatch {
-            block: serde_json::from_value(block()).expect("block parses"),
-            receipts: None,
-            logs: None,
-            finalized: crate::ingest::source::BlockId {
-                height: 0,
-                hash: B256::ZERO,
-            },
-        };
+        let mut batch = batch(&block(), &receipts());
+        batch.receipts = None;
         let error = decode_block(batch).expect_err("missing receipts must fail");
         assert!(
             error.to_string().contains("receipts were not fetched"),
+            "{error}"
+        );
+    }
+
+    /// The decode boundary requires a body whenever a selected row reads one. Without
+    /// this, a caller supplying metadata but no block would get transaction rows
+    /// silently omitted rather than an error.
+    #[test]
+    fn decode_block_requires_a_body_when_a_dataset_reads_it() {
+        let mut batch = batch(&block(), &receipts());
+        batch.block = None;
+        let error = decode_block(batch).expect_err("missing block must fail");
+        assert!(
+            error.to_string().contains("block was not fetched"),
             "{error}"
         );
     }
@@ -1525,7 +1736,7 @@ mod tests {
         let source =
             EvmSource::new("base", url, "ws://unused", Datasets::all(), &[]).expect("source");
         let fetched = source
-            .fetch_block(18_000_000)
+            .fetch_block(18_000_000, None)
             .await
             .expect("OP deposit block decodes");
         server.join().expect("server");

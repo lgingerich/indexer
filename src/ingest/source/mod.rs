@@ -10,9 +10,11 @@
 //!   to the datasets the source was built with, which is what backfill and reorg
 //!   reconciliation need.
 //!
-//! A source also owns two things the generic pipeline must not hardcode: how to
-//! turn a chain's block into [`Event`]s, and what finality means for this chain,
-//! reported as [`FetchedBlock::finalized`]. Adding Solana, Reth `ExEx`, or a Bitcoin source means
+//! A source also owns how to turn a chain's block into [`Event`]s. It reports a
+//! block's [`BlockMeta`] separately from those events, so parent linkage and the
+//! block timestamp are available even when the block dataset is not stored: a
+//! live notification carries enough metadata to reuse, and a fetched block carries
+//! the authoritative header. Adding Solana, Reth `ExEx`, or a Bitcoin source means
 //! implementing this trait, not touching the pipeline.
 
 use std::future::Future;
@@ -27,38 +29,41 @@ pub use evm::EvmSource;
 
 use crate::wire::envelope::{ChainId, Event};
 
-/// A block's height and hash, without the rest of its contents.
+/// A block's identity and the header fields the pipeline needs without its events.
 ///
-/// Used for both a live head notification and the finalized-block watermark: in
-/// each case the pipeline needs only where the block is, not what is in it. The
-/// head's parent hash is not carried because linkage is checked on the fetched
-/// block's marker, not on the notification that prompted the fetch.
+/// Carried by both a live `newHeads` notification and a fetched block, so a single
+/// type covers every identity comparison the pipeline makes. The parent hash is what
+/// makes linkage checkable before a block's events exist, and the timestamp is stamped
+/// onto every dataset row for that block, so it is needed even when the block dataset
+/// itself is not stored.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct BlockId {
+pub struct BlockMeta {
     /// Block height, or slot on slot-based chains.
     pub height: u64,
     /// Block hash.
     pub hash: B256,
+    /// The block's parent hash, for linkage.
+    pub parent_hash: B256,
+    /// The block's timestamp, stamped onto its dataset rows.
+    pub timestamp: u64,
 }
 
-/// One block, already turned into events, plus the chain's finality when it was
-/// fetched.
+/// One block, already turned into events, with the metadata it was fetched under.
 #[derive(Debug)]
 pub struct FetchedBlock {
+    /// The block's identity, parent hash, and timestamp.
+    pub meta: BlockMeta,
     /// The block's events in publish order.
     ///
-    /// Either empty, or led by [`Event::Block`]. The pipeline reads parent linkage
-    /// from that marker to detect reorgs, so implementations must preserve it.
+    /// Empty when no selected dataset produced a row — an empty block, or a
+    /// logs-only block with no logs. The leading [`Event::Block`] appears only when
+    /// the block dataset is stored; the pipeline reads linkage from [`Self::meta`],
+    /// not from the events, so metadata is always present.
     pub events: Vec<Event>,
-    /// The chain's newest finalized block when this block was fetched.
-    ///
-    /// Each chain defines finality its own way, so the source reports it rather
-    /// than the pipeline counting confirmations.
-    pub finalized: BlockId,
 }
 
 /// Live heads, including decode errors; ends after transport recovery is exhausted.
-pub type HeadStream = Pin<Box<dyn Stream<Item = Result<BlockId, SourceError>> + Send>>;
+pub type HeadStream = Pin<Box<dyn Stream<Item = Result<BlockMeta, SourceError>> + Send>>;
 
 /// The JSON-RPC code for a method the node does not serve.
 ///
@@ -114,9 +119,18 @@ pub trait BlockSource: Send + Sync {
     fn chain(&self) -> &ChainId;
 
     /// Opens the live head subscription.
+    ///
+    /// A notification carries the announced block's [`BlockMeta`], which the fetch path
+    /// may reuse to avoid a redundant header read. Notifications are hints, not a
+    /// replay log: gaps are reconciled over HTTP.
     fn subscribe_heads(&self) -> impl Future<Output = Result<HeadStream, SourceError>> + Send;
 
-    /// Fetches the block at `height` with everything in it, as events.
+    /// Fetches the block at `height` with the datasets this source was built for.
+    ///
+    /// `head` is metadata already known for that height, from a live notification.
+    /// A source may reuse it when its selected datasets need no more than identity,
+    /// parent hash, and timestamp; it must fetch a full block when they do, and must
+    /// reject a fetched block whose identity disagrees with `head`.
     ///
     /// # Errors
     ///
@@ -124,17 +138,16 @@ pub trait BlockSource: Send + Sync {
     fn fetch_block(
         &self,
         height: u64,
+        head: Option<&BlockMeta>,
     ) -> impl Future<Output = Result<FetchedBlock, SourceError>> + Send;
 
     /// The chain's head as it is right now, fetched on demand.
     ///
-    /// The live path hears about heads through [`BlockSource::subscribe_heads`], but a
-    /// backfill runs for a long time and needs to ask where the chain has got to. Without
-    /// this it would aim at a fixed height set when it started, and chase a target that no
-    /// longer exists.
+    /// Used for startup and live reconciliation, never during backfill: backfill
+    /// captures its head once at startup and then reads concrete heights only.
     ///
     /// # Errors
     ///
     /// Returns a typed transport error or an absent head.
-    fn current_head(&self) -> impl Future<Output = Result<BlockId, SourceError>> + Send;
+    fn current_head(&self) -> impl Future<Output = Result<BlockMeta, SourceError>> + Send;
 }

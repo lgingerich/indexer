@@ -14,7 +14,6 @@
 use std::hint::black_box;
 use std::time::{Duration, Instant};
 
-use indexer::ingest::source::BlockId;
 use indexer::ingest::source::evm::{RpcBatch, decode_block};
 use indexer::wire::envelope::{ChainId, Envelope};
 use serde_json::json;
@@ -53,7 +52,7 @@ fn report(label: &str, samples: &mut [Duration], unit: &str) {
     }
 }
 
-/// Builds typed input for [`decode_block`]: full transactions, receipts, and finality.
+/// Builds typed input for [`decode_block`]: full transactions and receipts.
 ///
 /// Synthetic rather than captured so the benchmark can scale the input, and so the
 /// repository does not carry a multi-megabyte fixture. The field names and value
@@ -123,14 +122,22 @@ fn synthetic_batch(tx_count: usize, logs_per_tx: usize) -> RpcBatch {
             "logsBloom": format!("0x{}", "0".repeat(512)),
             "transactions": transactions,
     });
+    let parent_hash: alloy_primitives::B256 = format!("0x{:064x}", 0xdef)
+        .parse()
+        .expect("parent hash fixture");
+    let block_hash: alloy_primitives::B256 = format!("0x{:064x}", 0xabc)
+        .parse()
+        .expect("block hash fixture");
     RpcBatch {
-        block: serde_json::from_value(block).expect("block fixture"),
+        meta: indexer::ingest::source::BlockMeta {
+            height: 18_000_000,
+            hash: block_hash,
+            parent_hash,
+            timestamp: 0x6530_a1b0,
+        },
+        block: Some(serde_json::from_value(block).expect("block fixture")),
         receipts: Some(serde_json::from_value(json!(receipts)).expect("receipt fixture")),
         logs: None,
-        finalized: BlockId {
-            height: 17_999_936,
-            hash: alloy_primitives::B256::with_last_byte(0xf0),
-        },
     }
 }
 

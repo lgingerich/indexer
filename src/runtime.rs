@@ -47,7 +47,7 @@ use crate::ingest::pipeline::PipelineError;
 use crate::sink;
 #[cfg(feature = "duckdb")]
 use crate::sink::DuckDbSink;
-use crate::sink::{SelectingSink, SinkError, StdoutJsonSink};
+use crate::sink::{SinkError, StdoutJsonSink};
 
 /// Why the indexer stopped.
 ///
@@ -121,6 +121,7 @@ impl Pipeline {
             &settings.ingest.ws_url,
             &settings.ingest.datasets,
             &settings.ingest.log_addresses,
+            settings.ingest.start_block,
         )
         .map_err(PipelineError::from)?;
         let registry = settings.registry_path().map_or_else(
@@ -148,10 +149,7 @@ impl Pipeline {
         match &settings.sink {
             Sink::Stdout(_) => {
                 ingest
-                    .run(SelectingSink::new(
-                        &settings.ingest.datasets,
-                        DecodingSink::new(registry, StdoutJsonSink::new()),
-                    ))
+                    .run(DecodingSink::new(registry, StdoutJsonSink::new()))
                     .await?;
                 Ok(())
             }
@@ -162,12 +160,7 @@ impl Pipeline {
                 let batch_records = postgres.batch_records;
                 let storage =
                     tokio::spawn(async move { receiver.drain(&mut store, batch_records).await });
-                let ingest = ingest
-                    .run(SelectingSink::new(
-                        &settings.ingest.datasets,
-                        DecodingSink::new(registry, blocks),
-                    ))
-                    .await;
+                let ingest = ingest.run(DecodingSink::new(registry, blocks)).await;
                 finish(storage.await, ingest)
             }
             #[cfg(feature = "duckdb")]
@@ -185,12 +178,7 @@ impl Pipeline {
                 let storage =
                     tokio::spawn(async move { receiver.drain(&mut store, batch_records).await });
 
-                let ingest = ingest
-                    .run(SelectingSink::new(
-                        &settings.ingest.datasets,
-                        DecodingSink::new(registry, blocks),
-                    ))
-                    .await;
+                let ingest = ingest.run(DecodingSink::new(registry, blocks)).await;
 
                 // Ingest's half of the channel is gone by now, so storage drains what is
                 // queued and ends. The join order is [`finish`].

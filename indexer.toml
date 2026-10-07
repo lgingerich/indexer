@@ -10,8 +10,9 @@ chain = "base"
 http_url = "https://base-rpc.publicnode.com"
 ws_url = "wss://base-rpc.publicnode.com"
 # Datasets to fetch and store. Omitted means all four. Logs without receipts use
-# one eth_getLogs per height; a header is still read so linkage keeps working.
-# log_addresses limits that call to those contracts. Empty fetches every log, and
+# one eth_getLogs per height, reusing the live notification's metadata so no block
+# read is issued; every other dataset still reads the block body. log_addresses limits
+# that call to those contracts. Empty fetches every log, and
 # a non-empty list requires the log dataset without receipts.
 # datasets = ["block", "transaction", "receipt", "log"]
 # log_addresses = ["0x1111111111111111111111111111111111111111"]

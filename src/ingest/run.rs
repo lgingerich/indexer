@@ -19,6 +19,7 @@ pub struct Ingest {
     ws_url: String,
     datasets: Datasets,
     log_addresses: Vec<Address>,
+    start_block: Option<u64>,
 }
 
 impl Ingest {
@@ -26,7 +27,8 @@ impl Ingest {
     ///
     /// Both endpoints are required strings. A settings file that omits one never
     /// reaches here: serde rejects it first. `log_addresses` limits `eth_getLogs`;
-    /// an empty slice fetches every log.
+    /// an empty slice fetches every log. `start_block` selects the first height:
+    /// `None` starts at the observed head, `Some` indexes from that height.
     ///
     /// # Errors
     ///
@@ -38,6 +40,7 @@ impl Ingest {
         ws_url: impl Into<String>,
         datasets: &Datasets,
         log_addresses: &[Address],
+        start_block: Option<u64>,
     ) -> Result<Self, SourceError> {
         if !log_addresses.is_empty() && (!datasets.log || datasets.receipt) {
             return Err(SourceError::LogAddresses);
@@ -48,10 +51,11 @@ impl Ingest {
             ws_url: ws_url.into(),
             datasets: *datasets,
             log_addresses: log_addresses.to_vec(),
+            start_block,
         })
     }
 
-    /// Indexes the finalized anchor and unfinalized tail, then follows live heads.
+    /// Indexes from the selected start through the sampled head, then follows live heads.
     ///
     /// Source failures propagate without retries. Startup does not restore stored history.
     ///
@@ -67,6 +71,7 @@ impl Ingest {
             ws = %self.ws_url,
             datasets = %self.datasets,
             log_addresses = self.log_addresses.len(),
+            start_block = ?self.start_block,
             "ingest started"
         );
         let source = EvmSource::new(
@@ -76,6 +81,10 @@ impl Ingest {
             self.datasets,
             &self.log_addresses,
         )?;
-        Machine::new(source, sink).run().await
+        let machine = Machine::new(source, sink);
+        match self.start_block {
+            Some(from) => machine.backfill(from).await?.run().await,
+            None => machine.run().await,
+        }
     }
 }

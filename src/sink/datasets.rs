@@ -1,15 +1,15 @@
-//! Drops dataset events the deployment did not select.
+//! Which on-chain datasets a deployment fetches and stores.
 //!
-//! The source still leads every block with a header marker, because the pipeline
-//! reads parent linkage from it. This sink removes that marker, and any other
-//! dataset row, when it is not one of the selected datasets. Reorg and finality
-//! markers always pass.
+//! A block's metadata is reported separately from its events, so the selection is
+//! enforced where the events are projected: `src/ingest/source/evm.rs` reads only what
+//! the selected datasets need, which is what makes the logs-only fetch skip its block
+//! read. [`Datasets::keeps`] is the same answer as a predicate, for a consumer that
+//! decodes a whole batch itself and has to filter. Reorg markers always pass.
 
 use serde::de::{self, Unexpected};
 use serde::{Deserialize, Deserializer};
 
-use crate::sink::{EnvelopeSink, SinkError};
-use crate::wire::envelope::{Envelope, Event};
+use crate::wire::envelope::Event;
 
 /// Which on-chain datasets a deployment fetches and stores.
 ///
@@ -47,10 +47,13 @@ impl Datasets {
         }
     }
 
-    /// Whether this event is stored.
+    /// Whether this event is one of the selected datasets.
     ///
-    /// A decoded record is kept only when logs are, because it is produced from a log.
-    /// A reorg always passes.
+    /// The ingest source already projects only the selected datasets, so a pipeline
+    /// consumer has nothing to drop. This is the filter for a caller that decodes
+    /// through [`decode_block`](crate::ingest::source::evm::decode_block), which emits
+    /// every row in its batch regardless of selection. A decoded record is kept only
+    /// when logs are, because it is produced from a log. A reorg always passes.
     #[must_use]
     pub const fn keeps(self, event: &Event) -> bool {
         match event {
@@ -60,6 +63,17 @@ impl Datasets {
             Event::Log(_) | Event::Decoded(_) => self.log,
             Event::Reorg(_) => true,
         }
+    }
+
+    /// Whether logs are the only thing fetched: nothing selected reads the block body.
+    ///
+    /// This is the condition under which a live notification's metadata stands in for
+    /// the header and the block read is skipped. `block` and `transaction` are projected
+    /// from the body, and `receipt` needs the body's transaction identities, so each
+    /// rules the reuse out.
+    #[must_use]
+    pub const fn logs_only(self) -> bool {
+        self.log && !self.block && !self.transaction && !self.receipt
     }
 }
 
@@ -122,81 +136,51 @@ impl<'de> Deserialize<'de> for Datasets {
     }
 }
 
-/// Forwards only the events [`Datasets`] keeps.
-#[derive(Debug)]
-pub struct SelectingSink<K> {
-    datasets: Datasets,
-    inner: K,
-}
-
-impl<K> SelectingSink<K> {
-    /// Wraps `inner`, dropping dataset events `datasets` does not name.
-    #[must_use]
-    pub const fn new(datasets: &Datasets, inner: K) -> Self {
-        Self {
-            datasets: *datasets,
-            inner,
-        }
-    }
-}
-
-impl<K: EnvelopeSink> EnvelopeSink for SelectingSink<K> {
-    async fn publish(&mut self, envelope: Envelope) -> Result<(), SinkError> {
-        if self.datasets.keeps(&envelope.event) {
-            self.inner.publish(envelope).await?;
-        }
-        Ok(())
-    }
-
-    async fn flush(&mut self) -> Result<(), SinkError> {
-        self.inner.flush().await
-    }
-
-    fn observe_head(&mut self, height: u64) {
-        self.inner.observe_head(height);
-    }
-}
-
 #[cfg(test)]
 #[expect(clippy::expect_used)]
 mod tests {
-    use alloy_primitives::B256;
+    use alloy_primitives::{Address, B256, TxHash};
 
-    use super::{Datasets, SelectingSink};
-    use crate::sink::{EnvelopeSink as _, SinkError};
-    use crate::wire::envelope::{ChainId, Envelope, Event, Log, Reorg};
+    use super::Datasets;
+    use crate::wire::envelope::{Event, Log, Reorg};
 
-    struct Mem(Vec<&'static str>);
-
-    impl crate::sink::EnvelopeSink for Mem {
-        async fn publish(&mut self, envelope: Envelope) -> Result<(), SinkError> {
-            self.0.push(envelope.event.kind());
-            Ok(())
-        }
-    }
-
-    #[tokio::test]
-    async fn unselected_datasets_are_dropped_and_control_events_pass() {
+    /// `keeps` is the filter for a `decode_block` consumer, so its answer is the
+    /// contract: the selected datasets' events, decoded records with logs, and reorgs.
+    #[test]
+    fn keeps_selects_only_the_named_datasets() {
         let datasets: Datasets = serde_json::from_str(r#"["log"]"#).expect("datasets");
-        let mut sink = SelectingSink::new(&datasets, Mem(Vec::new()));
-        let chain = ChainId::new("base");
-        for event in [
-            Event::Block(Box::default()),
-            Event::Log(Box::new(Log {
-                block_number: 1,
-                block_hash: B256::ZERO,
-                ..Log::default()
-            })),
-            Event::Reorg(Reorg {
-                height: 1,
-                new_head_hash: B256::ZERO,
-                orphaned_hashes: vec![],
-            }),
-        ] {
-            sink.publish(Envelope::new(chain.clone(), event))
-                .await
-                .expect("publish");
-        }
-        assert_eq!(sink.inner.0, ["log", "reorg"]);
+        let block = Event::Block(Box::default());
+        let log = Event::Log(Box::new(Log {
+            block_number: 1,
+            block_hash: B256::ZERO,
+            ..Log::default()
+        }));
+        let decoded = Event::Decoded(Box::new(crate::wire::envelope::Decoded {
+            abi_id: B256::ZERO,
+            name: "Transfer".to_owned(),
+            address: Address::ZERO,
+            protocol: "erc20".to_owned(),
+            selector: B256::ZERO,
+            signature: "Transfer(address,address,uint256)".to_owned(),
+            anonymous: false,
+            transaction_hash: TxHash::ZERO,
+            transaction_index: 0,
+            log_index: 0,
+            indexed: Vec::new(),
+            body: Vec::new(),
+            block_number: 1,
+            block_hash: B256::ZERO,
+            block_timestamp: 0,
+        }));
+        let reorg = Event::Reorg(Reorg {
+            height: 1,
+            new_head_hash: B256::ZERO,
+            orphaned_hashes: vec![],
+        });
+
+        assert!(!datasets.keeps(&block), "block is not selected");
+        assert!(datasets.keeps(&log), "log is selected");
+        assert!(datasets.keeps(&decoded), "a decoded record follows its log");
+        assert!(datasets.keeps(&reorg), "a reorg always passes");
     }
 }

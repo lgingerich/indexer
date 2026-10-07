@@ -69,8 +69,9 @@ There is no factory discovery, network lookup, or runtime registry mutation.
 ### A reorg
 
 Height and parent-hash linkage are checked before publishing each block. Ingestion
-retains the unfinalized tail plus a finalized linkage anchor, with a fixed 4,096-block
-memory budget; insufficient capacity is an error rather than silent eviction.
+retains the most recent 4,096 accepted block identities as a sliding window, plus one
+predecessor kept only as a linkage floor. The window is a bounded recovery budget, not a
+finality claim: a fork deeper than it stops with an error rather than a guessed retraction.
 
 ```
 published     1 ─── 2 ─── 3
@@ -93,8 +94,8 @@ alongside their replacements. The same rule applies to every dataset row that ca
 of those block hashes, not only to the `block` table.
 
 A row's key carries the block's hash, so orphaned block 2 and replacement block 2' are
-different rows rather than one row overwritten. A fork older than the ring is an error
-rather than an empty retraction.
+different rows rather than one row overwritten. A fork older than the retained window is
+an error rather than an empty retraction.
 
 A replay of a row already stored updates that row. Both stores upsert on a unique
 `(chain, dedupe_key)`: the batch is loaded the same way, then merged, and the last copy
@@ -134,7 +135,7 @@ chain (replayable) ──▶ in flight on the channel ──▶ committed in Duc
 
 The channel holds no durable log. The chain is the record upstream and the store is
 the record downstream, so a restart should continue from the last committed height.
-That resume is not built: a restart replays from the node's current finalized anchor. See
+That resume is not built: a restart begins fresh at the sampled head. See
 [Not built yet](#not-built-yet).
 
 ## Layout
@@ -171,9 +172,11 @@ that matters most: `decode` must not depend on `ingest`.
   each block fetched over JSON-RPC in one batched request. `[ingest] datasets`
   chooses which of block, transaction, receipt, and log are fetched and stored;
   omitted, all four are. Logs without receipts use one `eth_getLogs` per height,
-  and `[ingest] log_addresses` limits that call to those contracts. A header is
-  still read for every height so linkage and finality keep working. See
-  `src/ingest/source/evm.rs`.
+  and `[ingest] log_addresses` limits that call to those contracts. A live `newHeads`
+  notification carries the head's identity, parent hash, and timestamp, so a logs-only
+  fetch reuses them and pins `eth_getLogs` to the announced hash instead of re-reading
+  the header; a block, transaction, or receipt dataset still fetches the body it needs.
+  See `src/ingest/source/evm.rs`.
 - **One event per dataset.** A `block` event, then for each transaction a
   `transaction` event, its `receipt` event, and its `log` events. Each dataset is a
   normalized table — a block references its transactions by hash, a receipt carries
@@ -188,7 +191,7 @@ that matters most: `decode` must not depend on `ingest`.
 - **A decode stage.** `src/decode::Decoder` prepares ABI layouts once and decodes each
   registered log against the ABI for its `(chain, address, block)`, inline in
   `DecodingSink`. Everything is forwarded as it arrived — decode adds records and removes
-  none — so a reorg or finality marker reaches the store exactly once, from ingest.
+  none — so a reorg marker reaches the store exactly once, from ingest.
   Decoded records carry the ABI content hash, protocol, and each argument's original
   position and complete ABI schema. Raw byte strings remain lossless, with readable
   text only when valid UTF-8.
@@ -196,25 +199,27 @@ that matters most: `decode` must not depend on `ingest`.
   `DuckDB` database: one typed table per dataset, with real columns rather than a JSON
   blob. What a dataset's columns *are* lives in `src/wire/row.rs`, not in the store, so a
   second store reuses the mapping instead of re-deriving it.
-- **Finality watermark.** Ingestion reads the node's `finalized` tag and keeps that
-  boundary in memory. On Base it trails the tip by about 600 blocks. Ingestion will not
-  reorganize that height, and it drops finalized identities from the undo window except
-  for one linkage anchor. The boundary is not written to the store.
+- **Sliding undo window, no finality assertion.** Ingestion keeps the most recent
+  4,096 accepted block identities plus one predecessor as a recovery floor. It does not
+  read the node's `finalized` tag and does not claim any height is irreversible. The
+  window caps how deep a fork reconciliation can reach; a deeper fork stops rather than
+  guessing. The identities are not written to the store.
 - **Reorg retraction.** Parent-hash linkage is checked on every block. A mismatch
   appends a `reorg` event whose `orphaned_hashes` name the block hashes that stopped
   being canonical, then appends the replacement branch under its own keys. Dataset tables
   keep both branches; a reader applies the `reorg` rows to see only the current chain.
-  The undo window retains the full unfinalized tail up to a fixed 4,096-block budget, and
-  finalized entries are discarded except for one linkage anchor. See `src/ingest/pipeline.rs`.
-- **Finalized backfill and catch-up.** The library can index earlier finalized history;
-  production starts at the source-finalized anchor and catches up before following live
-  heads. Decode runs on that path, so a historical log is stored raw and, when it matches,
-  decoded. Alloy keeps the WebSocket subscription independent of fetches and sink
-  delivery, and reconnects and resubscribes with bounded retries. Notifications are
-  wake-up hints: HTTP reconciliation fills gaps and resolves reorgs, with a 30-second
-  fallback when the subscription is silent. HTTP failures and exhausted subscription
-  recovery are terminal. A process restart still starts over at the current finalized
-  anchor.
+  The sliding window retains up to a fixed 4,096 identities. See `src/ingest/pipeline.rs`.
+- **Headless backfill, then live heads.** Startup samples the head once and captures it
+  as a backfill target; `[ingest] start_block` may request earlier inclusive history but
+  defaults to the head. Backfill then reads consecutive concrete heights and makes no
+  further discovery call — not even while reconciling a fork — until it reaches the
+  target, at which point live heads take over. Decode runs on both paths, so a historical
+  log is stored raw and, when it matches, decoded. Alloy keeps the WebSocket subscription
+  independent of fetches and sink delivery, and reconnects and resubscribes with bounded
+  retries. Live notifications are inputs and hints, not a replay log: a duplicate head is
+  skipped before any fetch, a gap is filled from the next height, and a 30-second timer
+  reconciles when the subscription is silent. HTTP failures and exhausted subscription
+  recovery are terminal. A process restart starts fresh at the sampled head.
 - **NDJSON to stdout.** See `src/sink/stdout.rs`; the `[sink.stdout]` backend prints the
   stream instead of storing it, and opens no store.
 - **A local `DuckDB` store**, behind the `duckdb` feature (on by default). Embedded and
@@ -226,8 +231,8 @@ anywhere, so `cargo run` alone runs the pipeline.
 
 ## Not built yet
 
-The running process starts at the node's finalized anchor, catches up through decode,
-and writes every row. These are the gaps that leaves.
+The running process samples the head, backfills through it, then follows live heads and
+writes every row. These are the gaps that leaves.
 
 ```
 resume from the store
@@ -241,18 +246,17 @@ deterministic within-batch dedupe
 ### Resume from the store
 
 **Crash-safe resume is not implemented and is deferred from the ingestion redesign.**
-Today, startup samples the node's current finalized anchor instead of restoring a
-storage checkpoint. The proposed design in [INGEST_DESIGN.md](INGEST_DESIGN.md) replaces
-that anchor with an explicit start and a sliding undo window, but it does not yet add
-persistent recovery. The behavior below distinguishes ordinary live reorg handling
-from what remains unsafe across a restart.
+Today, startup samples the node's current head and begins from there (or from
+`[ingest] start_block`) instead of restoring a storage checkpoint. The finalized anchor
+is replaced by an explicit start and a sliding undo window, and that part is implemented,
+but it does not yet add persistent recovery. The behavior below distinguishes ordinary
+live reorg handling from what remains unsafe across a restart.
 
 #### A block becomes orphaned while its logs are being fetched
 
-Suppose a WebSocket header announces block A at height H. In the proposed logs-only
-path, ingestion fetches logs pinned to A's hash and uses the header's identity,
-parent hash, and timestamp. Meanwhile, the node replaces A with block B at the same
-height.
+Suppose a WebSocket header announces block A at height H. In the logs-only live path,
+ingestion fetches logs pinned to A's hash and uses the header's identity, parent hash,
+and timestamp. Meanwhile, the node replaces A with block B at the same height.
 
 - If divergence is detected before A is published, discard the unpublished candidate
   and fetch B. There is no accepted A to retract.
@@ -268,7 +272,7 @@ its retained undo window. It does not require an extra canonical-block query bef
 every live commit: a reorg can occur after such a query anyway. It does require eventual
 reconciliation and downstream application of the committed orphan records. A fork
 outside retained recovery history must stop explicitly, not silently leave incorrect
-coverage. This fast path is planned, not implemented today.
+coverage. The logs-only live path uses exactly this rule.
 
 #### Where a crash breaks that recovery
 
@@ -368,7 +372,9 @@ stdout and anything downstream of it — so those hops share one schema.
 `[ingest] log_addresses` limits each `eth_getLogs` to those contracts. That call
 runs when logs are selected and receipts are not; with receipts, logs come from
 the receipts and an address list is refused at startup. Backfill still walks one
-height at a time. A wider `eth_getLogs` range for historical blocks is not built.
+height at a time — even a live notification reuses its header but fetches logs for
+that one height. A wider `eth_getLogs` range covering many historical blocks, and
+cross-block batching of the per-height block/receipt calls, are not built.
 A `logs` subscription is not the log source: it has no end-of-block marker.
 
 Also not built, and not on the path above: mempool ingestion and a Parquet archive.
@@ -444,8 +450,9 @@ the field:
 
 | Key | Default | Meaning |
 | --- | --- | --- |
-| `ingest.datasets` | block, transaction, receipt, log | Which datasets are fetched and stored. The header is still read for every height |
+| `ingest.datasets` | block, transaction, receipt, log | Which datasets are fetched and stored. A dataset that needs the block body still reads it; a logs-only live fetch reuses the notification header |
 | `ingest.log_addresses` | none | Contracts passed to `eth_getLogs`. Empty fetches every log. Valid only when `log` is selected and `receipt` is not |
+| `ingest.start_block` | the sampled head | First height to index. Absent starts live at the observed head; a value backfills that inclusive height forward before following live heads. A value above the sampled head is a startup error |
 | `sink.duckdb.batch_records` | `500` | Most records one store commit may cover; a backlog of blocks is folded into one commit up to this, and a block is never split |
 | `sink.duckdb.path` | `indexer.duckdb` | Path to the store |
 
