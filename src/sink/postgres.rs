@@ -22,16 +22,18 @@ use tokio_postgres::Client;
 use tokio_postgres::binary_copy::BinaryCopyInWriter;
 use tokio_postgres::types::{IsNull, ToSql, Type, to_sql_checked};
 
+use crate::config::Secret;
 use crate::sink::{EnvelopeSink, SinkError, last_per_key};
 use crate::wire::envelope::Envelope;
 use crate::wire::row::{ColumnType, ColumnValue, Row, Table, row_for};
 
 /// `PostgreSQL` connection and backlog batching settings for `[sink.postgres]`.
-#[derive(Deserialize)]
+#[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PostgresSettings {
-    /// `PostgreSQL` URL or keyword connection string. Required; never logged by this sink.
-    pub connection_string: String,
+    /// `PostgreSQL` URL or keyword connection string. Required; a [`Secret`], since it
+    /// carries the password, so a deployment names it as `{ env = "NAME" }`.
+    pub connection_string: Secret,
     /// Maximum records folded from queued blocks into one commit; blocks are never split.
     #[serde(default = "default_batch_records")]
     pub batch_records: usize,
@@ -39,15 +41,6 @@ pub struct PostgresSettings {
 
 const fn default_batch_records() -> usize {
     500
-}
-
-impl std::fmt::Debug for PostgresSettings {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("PostgresSettings")
-            .field("connection_string", &"[redacted]")
-            .field("batch_records", &self.batch_records)
-            .finish()
-    }
 }
 
 fn sql_type(kind: ColumnType) -> &'static str {
@@ -230,7 +223,7 @@ impl PostgresSink {
     pub async fn open(settings: &PostgresSettings) -> Result<Self, StoreError> {
         let connector = MakeTlsConnector::new(native_tls::TlsConnector::new()?);
         let (client, connection) =
-            tokio_postgres::connect(&settings.connection_string, connector).await?;
+            tokio_postgres::connect(settings.connection_string.expose(), connector).await?;
         let task = tokio::spawn(async move {
             if let Err(error) = connection.await {
                 tracing::error!(%error, "PostgreSQL connection stopped");

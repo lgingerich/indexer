@@ -7,6 +7,8 @@
 
 [ingest]
 chain = "base"
+# Public endpoints, so written as values. An endpoint carrying an API key names the
+# environment variable that holds it instead: http_url = { env = "INDEXER_HTTP_URL" }.
 http_url = "https://base-rpc.publicnode.com"
 ws_url = "wss://base-rpc.publicnode.com"
 # Datasets to fetch and store. Omitted means all four. Logs without receipts use

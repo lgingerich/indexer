@@ -117,8 +117,8 @@ impl Pipeline {
     pub(crate) fn from_settings(settings: &Settings) -> Result<Self, RuntimeError> {
         let ingest = Ingest::new(
             &settings.ingest.chain,
-            &settings.ingest.http_url,
-            &settings.ingest.ws_url,
+            settings.ingest.http_url.clone(),
+            settings.ingest.ws_url.clone(),
             &settings.ingest.datasets,
             &settings.ingest.log_addresses,
             settings.ingest.start_block,

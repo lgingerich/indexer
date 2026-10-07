@@ -43,7 +43,7 @@ use alloy_primitives::{Address, B256};
 use alloy_provider::{Provider, ProviderBuilder, RootProvider, WsConnect};
 use alloy_rpc_types_eth::Filter;
 use alloy_rpc_types_eth::Log as RpcLog;
-use alloy_transport::TransportError;
+use alloy_transport::{TransportError, TransportErrorKind};
 use futures_util::StreamExt;
 use serde::Deserialize;
 
@@ -108,7 +108,7 @@ impl EvmSource {
             .parse()
             .map_err(|source| SourceError::Transport {
                 context: "HTTP endpoint",
-                source: alloy_transport::TransportErrorKind::custom(source),
+                source: TransportErrorKind::custom(source),
             })?;
         let provider = ProviderBuilder::new()
             .disable_recommended_fillers()
@@ -175,7 +175,18 @@ fn invalid_json(context: &'static str, source: serde_json::Error) -> SourceError
     SourceError::Json { context, source }
 }
 
+/// The error for a failed call at `context`, without the request URL a reqwest error
+/// carries: a provider's URL usually holds its API key, and these errors are logged.
 fn transport(context: &'static str, source: TransportError) -> SourceError {
+    let source = match source {
+        RpcError::Transport(TransportErrorKind::Custom(error)) => RpcError::Transport(
+            TransportErrorKind::Custom(match error.downcast::<reqwest::Error>() {
+                Ok(error) => Box::new(error.without_url()),
+                Err(error) => error,
+            }),
+        ),
+        other => other,
+    };
     SourceError::Transport { context, source }
 }
 
@@ -1651,6 +1662,27 @@ mod tests {
             }
         ));
         server.join().expect("server");
+    }
+
+    /// A provider's URL holds its API key, and a failed request's error is logged with
+    /// `{:?}`, so neither rendering may carry the URL reqwest attaches.
+    #[tokio::test]
+    async fn a_transport_error_does_not_carry_the_endpoint_url() {
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .and_then(|listener| listener.local_addr())
+            .expect("a free port")
+            .port();
+        let url = format!("http://127.0.0.1:{port}/v2/secret-api-key");
+        let source =
+            EvmSource::new("ethereum", url, "ws://unused", Datasets::all(), &[]).expect("source");
+        let error = source
+            .fetch_block(1, None)
+            .await
+            .expect_err("nothing listens on the port");
+
+        assert!(matches!(error, SourceError::Transport { .. }), "{error:?}");
+        let printed = format!("{error} {error:?}");
+        assert!(!printed.contains("secret-api-key"), "{printed}");
     }
 
     /// An explicit `null` `logIndex` is the case the old fallback got wrong. alloy

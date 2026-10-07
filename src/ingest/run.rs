@@ -7,6 +7,7 @@
 use alloy_primitives::Address;
 use tracing::info;
 
+use crate::config::Secret;
 use crate::ingest::pipeline::{Machine, PipelineError};
 use crate::ingest::source::{EvmSource, SourceError};
 use crate::sink::{Datasets, EnvelopeSink};
@@ -15,8 +16,8 @@ use crate::sink::{Datasets, EnvelopeSink};
 #[derive(Debug)]
 pub struct Ingest {
     chain: String,
-    http_url: String,
-    ws_url: String,
+    http_url: Secret,
+    ws_url: Secret,
     datasets: Datasets,
     log_addresses: Vec<Address>,
     start_block: Option<u64>,
@@ -25,8 +26,9 @@ pub struct Ingest {
 impl Ingest {
     /// Builds an ingest stage for `chain` and its two endpoints.
     ///
-    /// Both endpoints are required strings. A settings file that omits one never
-    /// reaches here: serde rejects it first. `log_addresses` limits `eth_getLogs`;
+    /// Both endpoints are required [`Secret`]s, since a provider's URL usually carries
+    /// its API key. A settings file that omits one never reaches here: serde rejects it
+    /// first. `log_addresses` limits `eth_getLogs`;
     /// an empty slice fetches every log. `start_block` selects the first height:
     /// `None` starts at the observed head, `Some` indexes from that height.
     ///
@@ -36,8 +38,8 @@ impl Ingest {
     /// fetched with `eth_getLogs`.
     pub fn new(
         chain: impl Into<String>,
-        http_url: impl Into<String>,
-        ws_url: impl Into<String>,
+        http_url: Secret,
+        ws_url: Secret,
         datasets: &Datasets,
         log_addresses: &[Address],
         start_block: Option<u64>,
@@ -47,8 +49,8 @@ impl Ingest {
         }
         Ok(Self {
             chain: chain.into(),
-            http_url: http_url.into(),
-            ws_url: ws_url.into(),
+            http_url,
+            ws_url,
             datasets: *datasets,
             log_addresses: log_addresses.to_vec(),
             start_block,
@@ -67,8 +69,6 @@ impl Ingest {
     pub async fn run<S: EnvelopeSink>(self, sink: S) -> Result<(), PipelineError> {
         info!(
             chain = %self.chain,
-            http = %self.http_url,
-            ws = %self.ws_url,
             datasets = %self.datasets,
             log_addresses = self.log_addresses.len(),
             start_block = ?self.start_block,
@@ -76,8 +76,8 @@ impl Ingest {
         );
         let source = EvmSource::new(
             self.chain,
-            self.http_url,
-            self.ws_url,
+            self.http_url.expose(),
+            self.ws_url.expose(),
             self.datasets,
             &self.log_addresses,
         )?;

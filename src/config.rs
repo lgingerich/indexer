@@ -1,6 +1,6 @@
 //! The indexer's settings file, and the builders each stage takes.
 //!
-//! TOML, read once at startup. Two conventions carry the contract:
+//! TOML, read once at startup. Three conventions carry the contract:
 //!
 //! - **Required means no value could be right by accident.** A field with no
 //!   `#[serde(default)]` has no default, so serde refuses a document that omits it and
@@ -9,6 +9,10 @@
 //! - **A typo is a startup error, not a silent default.** Every table is
 //!   `deny_unknown_fields`, and an unknown [`Sink`] backend is refused rather than
 //!   falling back to another one.
+//! - **A secret is named, not written.** A [`Secret`] field takes `{ env = "NAME" }`, read
+//!   from the environment as the file loads, so the file stays in git while the platform
+//!   injects the value. A literal is accepted too, for a public endpoint or local
+//!   development.
 //!
 //! Where records end up. The backend is the table: `[sink.duckdb]` selects `DuckDB` and
 //! holds its settings, `[sink.stdout]` selects printing and takes none. Required,
@@ -22,7 +26,7 @@
 //! ```toml
 //! [ingest]
 //! chain = "base"
-//! http_url = "https://base-rpc.publicnode.com"
+//! http_url = "https://base-rpc.publicnode.com"   # or { env = "INDEXER_HTTP_URL" }
 //! ws_url = "wss://base-rpc.publicnode.com"
 //!
 //! [sink.duckdb]
@@ -63,6 +67,86 @@ where
     Ok(value)
 }
 
+/// A required, non-empty setting that is never logged: an RPC endpoint carrying an API
+/// key, or a database connection string carrying a password.
+///
+/// Written either as the value itself or as the environment variable that holds it:
+///
+/// ```toml
+/// http_url = "https://base-rpc.publicnode.com"   # the value, for a public or local one
+/// http_url = { env = "INDEXER_HTTP_URL" }        # read from the environment at load
+/// ```
+///
+/// The variable is read once, when the settings load, so a deployment missing one fails at
+/// startup naming it rather than at first use. The settings file names the variable and
+/// the platform's secret manager injects it, so the file stays in git and the indexer
+/// never depends on which manager that is. `Debug` prints `[redacted]`, so the settings
+/// can be logged whole.
+#[derive(Clone)]
+pub struct Secret(String);
+
+impl Secret {
+    /// The value, for the one call that has to hand it to a client. Never log it.
+    #[must_use]
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for Secret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("[redacted]")
+    }
+}
+
+impl<'de> Deserialize<'de> for Secret {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct FromEnv {
+            env: String,
+        }
+
+        #[derive(Deserialize)]
+        #[serde(
+            untagged,
+            expecting = "a non-empty string, or `{ env = \"NAME\" }` naming an environment variable"
+        )]
+        enum Written {
+            Value(String),
+            FromEnv(FromEnv),
+        }
+
+        let value = match Written::deserialize(deserializer)? {
+            Written::Value(value) => value,
+            // The variable's value is never put in an error: `VarError::NotUnicode`
+            // displays the bytes it rejected, which would print the secret.
+            Written::FromEnv(FromEnv { env }) => match std::env::var(&env) {
+                Ok(value) if value.trim().is_empty() => {
+                    return Err(de::Error::custom(format!(
+                        "environment variable `{env}` is empty"
+                    )));
+                }
+                Ok(value) => value,
+                Err(std::env::VarError::NotPresent) => {
+                    return Err(de::Error::custom(format!(
+                        "environment variable `{env}` is not set"
+                    )));
+                }
+                Err(std::env::VarError::NotUnicode(_)) => {
+                    return Err(de::Error::custom(format!(
+                        "environment variable `{env}` is not valid UTF-8"
+                    )));
+                }
+            },
+        };
+        if value.trim().is_empty() {
+            return Err(de::Error::custom("a secret setting cannot be empty"));
+        }
+        Ok(Self(value))
+    }
+}
+
 /// The whole settings file.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -94,12 +178,11 @@ pub struct IngestSettings {
     /// The chain id stamped on every event. Required, and non-empty.
     #[serde(deserialize_with = "non_empty")]
     pub chain: String,
-    /// The JSON-RPC endpoint used for blocks and receipts. Required, and non-empty.
-    #[serde(deserialize_with = "non_empty")]
-    pub http_url: String,
-    /// The WebSocket endpoint used for heads. Required, and non-empty.
-    #[serde(deserialize_with = "non_empty")]
-    pub ws_url: String,
+    /// The JSON-RPC endpoint used for blocks and receipts. Required; a [`Secret`], since
+    /// a provider's URL usually carries its API key.
+    pub http_url: Secret,
+    /// The WebSocket endpoint used for heads. Required; a [`Secret`], like `http_url`.
+    pub ws_url: Secret,
     /// Which datasets to fetch and store. Omitted means all four.
     #[serde(default)]
     pub datasets: crate::sink::Datasets,
@@ -461,6 +544,14 @@ datasets = ["log", "log"]
         Settings::from_str(include_str!("../indexer.toml")).expect("indexer.toml parses");
     }
 
+    /// `indexer.example.toml` documents every key, so it must parse as shipped; it names
+    /// `[sink.stdout]`, which every build has.
+    #[test]
+    fn the_example_settings_file_parses() {
+        Settings::from_str(include_str!("../indexer.example.toml"))
+            .expect("indexer.example.toml parses");
+    }
+
     /// The fixture file yields the values each stage is built from — the endpoints, the
     /// batch, and the resolved registry path — so the seam between the file and the
     /// stages is exercised without a store.
@@ -473,8 +564,8 @@ datasets = ["log", "log"]
             Settings::from_str(include_str!("../indexer.toml")).expect("indexer.toml parses");
 
         assert_eq!(settings.ingest.chain, "base");
-        assert!(!settings.ingest.http_url.is_empty());
-        assert!(!settings.ingest.ws_url.is_empty());
+        assert!(!settings.ingest.http_url.expose().is_empty());
+        assert!(!settings.ingest.ws_url.expose().is_empty());
         let Sink::DuckDb(duckdb) = &settings.sink else {
             panic!("the table names the backend: {settings:?}");
         };
@@ -584,7 +675,10 @@ datasets = ["log", "log"]
             panic!("expected PostgreSQL");
         };
         assert_eq!(postgres.batch_records, 1000);
-        assert_eq!(postgres.connection_string, "host=localhost dbname=indexer");
+        assert_eq!(
+            postgres.connection_string.expose(),
+            "host=localhost dbname=indexer"
+        );
         assert!(Settings::from_str(&format!("{input}\n[sink.stdout]\n")).is_err());
     }
 
@@ -642,6 +736,91 @@ ws_url = "wss://example.invalid"
         .expect_err("a blank chain is not a chain")
         .to_string();
         assert!(error.contains("chain"), "the error names it: {error}");
+    }
+
+    /// A secret is the value or the environment variable that holds it, and either way it
+    /// is never printed: a deployment logs its settings whole.
+    #[test]
+    fn a_secret_is_written_or_read_from_the_environment_and_never_printed() {
+        // `PATH` is set in every test process, and reading it needs no `unsafe` set_var.
+        let path = std::env::var("PATH").expect("PATH is set");
+        let settings = Settings::from_str(
+            r#"
+[ingest]
+chain = "base"
+http_url = "https://example.invalid/v2/literal-key"
+ws_url = { env = "PATH" }
+
+[sink.stdout]
+"#,
+        )
+        .expect("both forms parse");
+
+        assert_eq!(
+            settings.ingest.http_url.expose(),
+            "https://example.invalid/v2/literal-key"
+        );
+        assert_eq!(settings.ingest.ws_url.expose(), path);
+        let printed = format!("{settings:?}");
+        assert!(
+            !printed.contains("literal-key") && !printed.contains(&path),
+            "{printed}"
+        );
+    }
+
+    /// A deployment missing its secret fails at startup naming the variable, rather
+    /// than connecting to nothing.
+    #[test]
+    fn an_unset_secret_variable_is_a_startup_error_naming_it() {
+        let error = Settings::from_str(
+            r#"
+[ingest]
+chain = "base"
+http_url = { env = "INDEXER_TEST_SECRET_THAT_IS_NEVER_SET" }
+ws_url = "wss://example.invalid"
+
+[sink.stdout]
+"#,
+        )
+        .expect_err("an unset variable is not a value")
+        .to_string();
+        assert!(
+            error.contains("INDEXER_TEST_SECRET_THAT_IS_NEVER_SET") && error.contains("not set"),
+            "{error}"
+        );
+    }
+
+    /// A misspelled reference is refused rather than read as some other shape, and an
+    /// empty literal is no more a secret than an empty variable.
+    #[test]
+    fn a_malformed_or_empty_secret_is_rejected() {
+        let typo = Settings::from_str(
+            r#"
+[ingest]
+chain = "base"
+http_url = { evn = "INDEXER_HTTP_URL" }
+ws_url = "wss://example.invalid"
+
+[sink.stdout]
+"#,
+        )
+        .expect_err("a typo in the reference")
+        .to_string();
+        assert!(typo.contains("env = \"NAME\""), "{typo}");
+
+        let empty = Settings::from_str(
+            r#"
+[ingest]
+chain = "base"
+http_url = " "
+ws_url = "wss://example.invalid"
+
+[sink.stdout]
+"#,
+        )
+        .expect_err("an empty literal")
+        .to_string();
+        assert!(empty.contains("cannot be empty"), "{empty}");
     }
 
     /// So is an endpoint: a chain with nowhere to read is not a deployable state, and

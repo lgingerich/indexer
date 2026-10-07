@@ -443,8 +443,8 @@ the field:
 | Key | Meaning |
 | --- | --- |
 | `ingest.chain` | Chain id stamped on every event |
-| `ingest.http_url` | JSON-RPC endpoint for blocks and receipts |
-| `ingest.ws_url` | WebSocket endpoint for `newHeads` |
+| `ingest.http_url` | JSON-RPC endpoint for blocks and receipts. A [secret](#secrets) |
+| `ingest.ws_url` | WebSocket endpoint for `newHeads`. A [secret](#secrets) |
 | one `[sink.<backend>]` table | Which backend writes. `duckdb` persists; `stdout` prints and opens no store |
 
 **Defaulted** — correct for a standard deployment; override for a non-standard one:
@@ -471,6 +471,34 @@ An unknown key is a startup error naming the line and the key, so a misspelling 
 caught rather than silently leaving a setting at its default. An unknown backend is
 likewise an error rather than a silent fallback to another one, and naming two backends at
 once is an error rather than picking one.
+
+### Secrets
+
+The RPC endpoints (`ingest.http_url`, `ingest.ws_url`) and the PostgreSQL
+`connection_string` are secrets: a provider's URL usually carries its API key, and a
+connection string its password. Each is written either as the value or as the
+environment variable that holds it:
+
+```toml
+http_url = "https://base-rpc.publicnode.com"   # a public endpoint, written as its value
+ws_url = { env = "INDEXER_WS_URL" }             # read from the environment at startup
+```
+
+The variable is read once, as the settings load, so a deployment missing one stops at
+startup naming it. A secret is never logged: settings print it as `[redacted]`, the
+startup log omits the endpoints, and RPC errors drop the URL reqwest attaches to them.
+
+In production, the settings file names the variables and the platform's secret manager
+injects them into the process — on Cloudflare Containers, the Worker that starts the
+container passes Worker secrets or Secrets Store values as its environment. The
+indexer reads only the environment, so the same file and binary run under any manager.
+
+For local development, either:
+
+- export the variables: copy `.env.example` to `.env` (gitignored) and load it with
+  `set -a && . ./.env && set +a`, or `dotenv` in a direnv `.envrc`; or
+- write the values into a gitignored local settings file — any `*.local.toml`, e.g.
+  `cargo run -- indexer.local.toml`.
 
 ### The contract registry
 
@@ -555,14 +583,15 @@ Build with `cargo run --release --no-default-features --features postgres -- ind
 
 ```toml
 [sink.postgres]
-connection_string = "host=localhost port=5432 user=indexer dbname=indexer sslmode=require"
+connection_string = { env = "INDEXER_POSTGRES_URL" }
 batch_records = 500
 ```
 
-The connection string accepts PostgreSQL URL or keyword syntax. TLS uses the platform
-certificate store; use `sslmode=disable` only for trusted local connections. Connection
-strings are redacted from startup logs. The database must already exist, and the role
-needs permission to create and write the dataset tables in its configured search path.
+The connection string accepts PostgreSQL URL or keyword syntax, and is a
+[secret](#secrets) since it carries the password. TLS uses the platform certificate store;
+use `sslmode=disable` only for trusted local connections. The database must already
+exist, and the role needs permission to create and write the dataset tables in its
+configured search path.
 
 The sink creates the same six typed tables as DuckDB. Columns the chain always
 provides are `NOT NULL`; fields it can omit stay nullable. Each table has a unique
