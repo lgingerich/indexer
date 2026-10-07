@@ -376,6 +376,17 @@ that one height. A wider `eth_getLogs` range covering many historical blocks, an
 cross-block batching of the per-height block/receipt calls, are not built.
 A `logs` subscription is not the log source: it has no end-of-block marker.
 
+### OpenTelemetry metrics
+
+Metrics are not exported yet. Nothing synchronous should run per envelope: a record in
+`DecodingSink::publish` is paid per log on the ingest task, the one that has to stay ahead
+of the chain. Height, head, and lag become observable gauges reading the atomics ingest
+already writes; blocks, rows, and commit duration record once per commit in
+`ChannelReceiver::drain`, on the storage task. Instruments are built once with fixed
+attributes (`chain`, `sink`). Attributes that vary per block — hash, address, selector —
+create a series per event and are the one way to make this expensive; `cargo bench
+--bench hot_path` with the meter live is the check that indexing latency has not moved.
+
 Also not built, and not on the path above: mempool ingestion and a Parquet archive.
 
 ## Run it
