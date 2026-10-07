@@ -23,8 +23,10 @@
 //! # What it is not
 //!
 //! Not durable and not resumable: a crash loses whatever is in flight. That is safe only
-//! because the chain and the store are the record — the store's high-water mark says
-//! where to resume, and the node can serve the blocks after it.
+//! because the chain and the store are the record — every block's message ends with its
+//! `accepted_block` marker, which commits with the block's rows, so the store's ledger
+//! says where to resume, and the node can serve the blocks after it. See
+//! `crate::ingest::pipeline`.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};

@@ -45,8 +45,10 @@ use thiserror::Error;
 use tracing::info;
 
 use crate::decode::StoredContract;
-use crate::sink::{EnvelopeSink, InvalidAddress, SinkError, last_per_key, stored_contract};
-use crate::wire::envelope::{ChainId, Envelope};
+use crate::sink::{
+    EnvelopeSink, InvalidStoredValue, SinkError, last_per_key, stored_block, stored_contract,
+};
+use crate::wire::envelope::{AcceptedBlock, ChainId, Envelope};
 use crate::wire::row::{ColumnType, ColumnValue, Row, Table, row_for};
 /// The `DuckDB` file written when the settings name no path.
 const DEFAULT_PATH: &str = "indexer.duckdb";
@@ -258,11 +260,32 @@ impl DuckDbSink {
     }
 }
 
-/// The discovered contracts on chain `$1`, minus those created in a block a stored
-/// `reorg` names as orphaned. Only the columns a restart needs.
-const CONTRACTS: &str = "SELECT protocol, name, address FROM \"contract\" \
-    WHERE chain = $1 AND block_hash NOT IN \
-    (SELECT unnest(from_json(orphaned_hashes, '[\"VARCHAR\"]')) FROM \"reorg\" WHERE chain = $1)";
+/// The block hashes a stored `reorg` on chain `$1` names as orphaned.
+macro_rules! orphaned {
+    () => {
+        "(SELECT unnest(from_json(orphaned_hashes, '[\"VARCHAR\"]')) FROM \"reorg\" WHERE chain = $1)"
+    };
+}
+
+/// The discovered contracts on chain `$1`, minus those created in an orphaned block.
+/// Only the columns a restart needs.
+const CONTRACTS: &str = concat!(
+    "SELECT protocol, name, address, block_hash FROM \"contract\" \
+     WHERE chain = $1 AND block_hash NOT IN ",
+    orphaned!()
+);
+
+/// The newest `$2` accepted blocks on chain `$1` that no stored `reorg` orphans, newest
+/// first.
+const LEDGER: &str = concat!(
+    "SELECT height, hash, parent_hash, \"timestamp\" FROM \"accepted_block\" \
+     WHERE chain = $1 AND hash NOT IN ",
+    orphaned!(),
+    " ORDER BY height DESC LIMIT $2"
+);
+
+/// Drops chain `$1`'s accepted blocks below height `$2`.
+const PRUNE_LEDGER: &str = "DELETE FROM \"accepted_block\" WHERE chain = $1 AND height < $2";
 
 impl DuckDbSink {
     /// The contracts discovered on `chain` that this store holds, excluding any created in
@@ -280,15 +303,62 @@ impl DuckDbSink {
         let mut statement = self.connection.prepare(CONTRACTS).map_err(read)?;
         let rows = statement
             .query_map([chain.as_str()], |row| {
-                Ok((row.get(0)?, row.get(1)?, row.get::<_, String>(2)?))
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
             })
             .map_err(read)?;
         let mut contracts = Vec::new();
         for row in rows {
-            let (protocol, name, address) = row.map_err(read)?;
-            contracts.push(stored_contract(protocol, name, &address)?);
+            let (protocol, name, address, block_hash) = row.map_err(read)?;
+            contracts.push(stored_contract(protocol, name, &address, &block_hash)?);
         }
         Ok(contracts)
+    }
+
+    /// The newest `limit` accepted blocks on `chain` that no stored `reorg` orphans,
+    /// oldest first, after dropping every older row.
+    ///
+    /// Read once at startup, before the first write: the result is the undo window a
+    /// restart resumes from. Rows below the oldest one returned can never be read again,
+    /// so they are deleted here, which is what keeps the ledger from growing without
+    /// bound across restarts. Contiguity is not checked; the pipeline does that.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::Read`] when the query or the delete fails and
+    /// [`StoreError::Restore`] when a stored hash does not parse.
+    pub fn ledger(&self, chain: &ChainId, limit: usize) -> Result<Vec<AcceptedBlock>, StoreError> {
+        let read = |source| StoreError::Read { source };
+        let mut statement = self.connection.prepare(LEDGER).map_err(read)?;
+        let rows = statement
+            .query_map(
+                duckdb::params![chain.as_str(), u64::try_from(limit).unwrap_or(u64::MAX)],
+                |row| {
+                    Ok((
+                        row.get::<_, u64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, u64>(3)?,
+                    ))
+                },
+            )
+            .map_err(read)?;
+        let mut ledger = Vec::new();
+        for row in rows {
+            let (height, hash, parent_hash, timestamp) = row.map_err(read)?;
+            ledger.push(stored_block(height, &hash, &parent_hash, timestamp)?);
+        }
+        ledger.reverse();
+        if let Some(oldest) = ledger.first() {
+            self.connection
+                .execute(PRUNE_LEDGER, duckdb::params![chain.as_str(), oldest.height])
+                .map_err(read)?;
+        }
+        Ok(ledger)
     }
 }
 
@@ -393,15 +463,15 @@ pub enum StoreError {
         /// The engine's own reason.
         source: duckdb::Error,
     },
-    /// Stored contracts could not be read back at startup.
-    #[error("read stored contracts: {source}")]
+    /// Stored contracts or accepted blocks could not be read back at startup.
+    #[error("read stored state: {source}")]
     Read {
         /// The engine's own reason.
         source: duckdb::Error,
     },
-    /// A stored contract's address did not parse.
+    /// A value read back at startup did not parse.
     #[error(transparent)]
-    Restore(#[from] InvalidAddress),
+    Restore(#[from] InvalidStoredValue),
 }
 
 impl DuckDbSink {
@@ -422,7 +492,7 @@ impl DuckDbSink {
             .connection
             .transaction()
             .map_err(|source| StoreError::Begin { source })?;
-        // ponytail: seven fixed tables mean seven linear scans, with no grouping buffer.
+        // ponytail: eight fixed tables mean eight linear scans, with no grouping buffer.
         // Group at publish time only if the table count or profiling warrants it.
         for table in Table::ALL {
             let rows = last_per_key(&self.rows, table);
@@ -490,7 +560,7 @@ mod tests {
 
     use crate::sink::EnvelopeSink as _;
     use crate::wire::envelope::{
-        Block, ChainId, Contract, Envelope, Event, Log, Receipt, Reorg, Transaction,
+        AcceptedBlock, Block, ChainId, Contract, Envelope, Event, Log, Receipt, Reorg, Transaction,
     };
     use crate::wire::row::{Table, row_for};
 
@@ -591,6 +661,15 @@ mod tests {
                     height: 100,
                     new_head_hash: hash(0x55),
                     orphaned_hashes: vec![hash(0x66)],
+                }),
+            ),
+            Envelope::new(
+                chain(),
+                Event::AcceptedBlock(AcceptedBlock {
+                    height: 100,
+                    hash: hash(0x01),
+                    parent_hash: hash(0x02),
+                    timestamp: 1_700_000_000,
                 }),
             ),
         ]
@@ -796,7 +875,7 @@ mod tests {
         }
         sink.connection
             .execute_batch("DROP TABLE reorg")
-            .expect("remove the last table in the batch");
+            .expect("remove a late table in the batch");
 
         assert!(matches!(
             sink.flush().await,
@@ -956,6 +1035,67 @@ mod tests {
             .expect("replacement buffers");
         sink.flush().await.expect("replacement is its own row");
         assert_eq!(row_count(&sink, "log"), 2);
+    }
+
+    fn accepted(height: u64) -> AcceptedBlock {
+        AcceptedBlock {
+            height,
+            hash: hash(u8::try_from(height).expect("small heights")),
+            parent_hash: hash(u8::try_from(height - 1).expect("small heights")),
+            timestamp: 1_700_000_000 + height,
+        }
+    }
+
+    /// The ledger reads back the newest unorphaned accepted blocks of one chain, oldest
+    /// first, and drops that chain's rows below them.
+    #[tokio::test]
+    async fn the_ledger_reads_back_the_newest_canonical_window_and_prunes_below_it() {
+        let mut sink = sink();
+        assert!(sink.ledger(&chain(), 3).expect("empty").is_empty());
+        for height in 1..=10 {
+            sink.publish(Envelope::new(
+                chain(),
+                Event::AcceptedBlock(accepted(height)),
+            ))
+            .await
+            .expect("buffer");
+        }
+        sink.publish(Envelope::new(
+            ChainId::new("ethereum"),
+            Event::AcceptedBlock(accepted(1)),
+        ))
+        .await
+        .expect("buffer");
+        // Block 10 was orphaned, so the tip falls back to 9.
+        sink.publish(Envelope::new(
+            chain(),
+            Event::Reorg(Reorg {
+                height: 10,
+                new_head_hash: hash(0xee),
+                orphaned_hashes: vec![hash(10)],
+            }),
+        ))
+        .await
+        .expect("buffer");
+        sink.flush().await.expect("flush");
+
+        let ledger = sink.ledger(&chain(), 3).expect("read back");
+        assert_eq!(ledger, [accepted(7), accepted(8), accepted(9)]);
+        let remaining: Vec<u64> = sink
+            .connection
+            .prepare("SELECT height FROM accepted_block WHERE chain = 'base' ORDER BY height")
+            .expect("prepare")
+            .query_map([], |row| row.get(0))
+            .expect("query")
+            .collect::<Result<_, _>>()
+            .expect("rows");
+        assert_eq!(remaining, [7, 8, 9, 10], "the orphaned row above stays");
+        assert_eq!(
+            sink.ledger(&ChainId::new("ethereum"), 3)
+                .expect("read back"),
+            [accepted(1)],
+            "another chain's ledger is untouched"
+        );
     }
 
     /// Connecting twice to the same file must not fail on the existing tables.

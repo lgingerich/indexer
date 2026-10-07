@@ -712,20 +712,24 @@ impl BlockSource for EvmSource {
         })
     }
 
-    async fn current_head(&self) -> Result<BlockMeta, SourceError> {
-        const CONTEXT: &str = "eth_getBlockByNumber(latest)";
-        // Hashes only, not full transactions: startup wants where the chain is and the
-        // metadata a backfill target needs, and a full-transaction response is tens of
-        // KB on a busy chain for nothing.
+    async fn fetch_header(&self, height: Option<u64>) -> Result<BlockMeta, SourceError> {
+        const CONTEXT: &str = "eth_getBlockByNumber(header)";
+        let tag = height.map_or(
+            alloy_rpc_types_eth::BlockNumberOrTag::Latest,
+            alloy_rpc_types_eth::BlockNumberOrTag::Number,
+        );
+        // Hashes only, not full transactions: callers want an identity and the metadata
+        // a backfill target needs, and a full-transaction response is tens of KB on a
+        // busy chain for nothing.
         let header: Option<RpcBlockMeta> = self
             .provider
             .client()
-            .request(BLOCK, ("latest", false))
+            .request(BLOCK, (tag, false))
             .await
             .map_err(|source| transport(CONTEXT, source))?;
         header
             .map(BlockMeta::from)
-            .ok_or_else(|| malformed(CONTEXT, "result was null"))
+            .ok_or_else(|| malformed(CONTEXT, format!("no block at {tag}")))
     }
 }
 
@@ -945,6 +949,28 @@ mod tests {
         assert_eq!(fetched.meta.height, 18_000_000);
         assert_eq!(fetched.meta.timestamp, TIMESTAMP);
         assert_eq!(server.join().expect("server").len(), 1);
+    }
+
+    /// A header read is one call for the header alone, by height or for the head,
+    /// whatever datasets the source fetches.
+    #[tokio::test]
+    async fn a_header_read_is_one_hashes_only_call() {
+        for (height, param) in [
+            (Some(18_000_000), json!("0x112a880")),
+            (None, json!("latest")),
+        ] {
+            let (url, server) = rpc_server(1, move |request| {
+                assert_eq!(request["method"], "eth_getBlockByNumber");
+                assert_eq!(request["params"], json!([param, false]));
+                json!({"jsonrpc": "2.0", "id": request["id"], "result": block()})
+            });
+            let source = EvmSource::new("ethereum", url, "ws://unused", Datasets::all(), &[])
+                .expect("source");
+            let meta = source.fetch_header(height).await.expect("header");
+            assert_eq!(meta.height, 18_000_000);
+            assert_eq!(meta.timestamp, TIMESTAMP);
+            server.join().expect("server");
+        }
     }
 
     #[tokio::test]

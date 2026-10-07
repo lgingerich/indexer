@@ -9,7 +9,7 @@ use tracing::info;
 
 use crate::config::Secret;
 use crate::ingest::pipeline::{Machine, PipelineError};
-use crate::ingest::source::{EvmSource, SourceError};
+use crate::ingest::source::{BlockMeta, EvmSource, SourceError};
 use crate::sink::{Datasets, EnvelopeSink};
 
 /// Builds and runs the ingest stage.
@@ -29,8 +29,8 @@ impl Ingest {
     /// Both endpoints are required [`Secret`]s, since a provider's URL usually carries
     /// its API key. A settings file that omits one never reaches here: serde rejects it
     /// first. `log_addresses` limits `eth_getLogs`;
-    /// an empty slice fetches every log. `start_block` selects the first height:
-    /// `None` starts at the observed head, `Some` indexes from that height.
+    /// an empty slice fetches every log. `start_block` selects the first height of a
+    /// fresh run: `None` starts at the observed head, `Some` indexes from that height.
     ///
     /// # Errors
     ///
@@ -57,21 +57,30 @@ impl Ingest {
         })
     }
 
-    /// Indexes from the selected start through the sampled head, then follows live heads.
+    /// Indexes through the sampled head, then follows live heads.
     ///
-    /// Source failures propagate without retries. Startup does not restore stored history.
+    /// `ledger` is the accepted history a store read back, oldest first. Empty starts
+    /// fresh, at `start_block` or the head; otherwise the run resumes after the ledger's
+    /// tip, and a `start_block` is refused rather than silently ignored. Source failures
+    /// propagate without retries.
     ///
     /// # Errors
     ///
-    /// Returns an error when the subscription, a block fetch, or a publish fails, and
-    /// [`PipelineError::SubscriptionClosed`] when the subscription ends — a live indexer
-    /// should never stop.
-    pub async fn run<S: EnvelopeSink>(self, sink: S) -> Result<(), PipelineError> {
+    /// Returns an error when the subscription, a block fetch, or a publish fails,
+    /// [`PipelineError::StartWithHistory`] when both a ledger and `start_block` are given,
+    /// and [`PipelineError::SubscriptionClosed`] when the subscription ends — a live
+    /// indexer should never stop.
+    pub async fn run<S: EnvelopeSink>(
+        self,
+        sink: S,
+        ledger: Vec<BlockMeta>,
+    ) -> Result<(), PipelineError> {
         info!(
             chain = %self.chain,
             datasets = %self.datasets,
             log_addresses = self.log_addresses.len(),
             start_block = ?self.start_block,
+            restored = ledger.len(),
             "ingest started"
         );
         let source = EvmSource::new(
@@ -81,7 +90,7 @@ impl Ingest {
             self.datasets,
             &self.log_addresses,
         )?;
-        let machine = Machine::new(source, sink);
+        let machine = Machine::new(source, sink, ledger);
         match self.start_block {
             Some(from) => machine.backfill(from).await?.run().await,
             None => machine.run().await,

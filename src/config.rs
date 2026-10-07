@@ -193,10 +193,12 @@ pub struct IngestSettings {
     /// carry every log, so the filtered call would not run.
     #[serde(default)]
     pub log_addresses: Vec<alloy_primitives::Address>,
-    /// The first height to index. Omitted starts at the observed head, which skips
-    /// earlier history; a value indexes that height and every one after it before
-    /// following live heads. A value above the sampled head is a startup error rather
-    /// than a silent clamp.
+    /// The first height to index on an empty store. Omitted starts at the observed head,
+    /// which skips earlier history; a value indexes that height and every one after it
+    /// before following live heads. A value above the sampled head is a startup error
+    /// rather than a silent clamp. A store that already holds accepted blocks resumes
+    /// after them instead, and a value set alongside one is a startup error: remove it
+    /// once the first run has committed.
     #[serde(default)]
     pub start_block: Option<u64>,
 }

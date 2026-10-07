@@ -50,7 +50,7 @@ use std::fmt;
 use alloy_primitives::{Bytes, U256};
 
 use crate::wire::datasets::evm::{Block, Log, Receipt, Transaction};
-use crate::wire::envelope::{ChainId, Contract, Decoded, Event, Reorg};
+use crate::wire::envelope::{AcceptedBlock, ChainId, Contract, Decoded, Event, Reorg};
 
 /// One table a store persists.
 ///
@@ -76,14 +76,16 @@ pub enum Table {
     Contract,
     /// Reorg markers: which block hashes stopped being canonical.
     Reorg,
+    /// Accepted block identities: the ledger a restart resumes from.
+    AcceptedBlock,
 }
 
 impl Table {
     /// Every table, in the order a store would create them.
     ///
-    /// A `const` list rather than a derive: seven cases do not justify a dependency, and
+    /// A `const` list rather than a derive: eight cases do not justify a dependency, and
     /// a hand-written list is one a reader can check.
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
         Self::Block,
         Self::Transaction,
         Self::Receipt,
@@ -91,6 +93,7 @@ impl Table {
         Self::Decoded,
         Self::Contract,
         Self::Reorg,
+        Self::AcceptedBlock,
     ];
 
     /// The name a store files this table under.
@@ -107,6 +110,7 @@ impl Table {
             Self::Decoded => "decoded",
             Self::Contract => "contract",
             Self::Reorg => "reorg",
+            Self::AcceptedBlock => "accepted_block",
         }
     }
 
@@ -125,6 +129,7 @@ impl Table {
             Self::Decoded => cells_columns(&DECODED_CELLS),
             Self::Contract => cells_columns(&CONTRACT_CELLS),
             Self::Reorg => cells_columns(&REORG_CELLS),
+            Self::AcceptedBlock => cells_columns(&ACCEPTED_BLOCK_CELLS),
         };
         columns.extend(COMMON_COLUMNS);
         columns
@@ -418,6 +423,7 @@ pub fn row_for(chain: &ChainId, event: &Event) -> Row {
         Event::Decoded(d) => (Table::Decoded, decoded_cells(d)),
         Event::Contract(c) => (Table::Contract, contract_cells(c)),
         Event::Reorg(r) => (Table::Reorg, reorg_cells(r)),
+        Event::AcceptedBlock(a) => (Table::AcceptedBlock, accepted_block_cells(a)),
     };
     Row::new(table, cells.with_common(chain, &event.dedupe_key()))
 }
@@ -842,6 +848,29 @@ fn reorg_cells(r: &Reorg) -> Columns {
     )
 }
 
+/// The `accepted_block` table, as one cell per column: the identity and linkage a
+/// restart needs, and nothing else.
+const ACCEPTED_BLOCK_CELLS: [(Column, fn(&AcceptedBlock) -> ColumnValue); 4] = [
+    (Column::uint("height"), |a| ColumnValue::Uint(a.height)),
+    (Column::text("hash"), |a| ColumnValue::hex(a.hash)),
+    (Column::text("parent_hash"), |a| {
+        ColumnValue::hex(a.parent_hash)
+    }),
+    (Column::uint("timestamp"), |a| {
+        ColumnValue::Uint(a.timestamp)
+    }),
+];
+
+/// Builds the `accepted_block` table's cells for one accepted block.
+fn accepted_block_cells(a: &AcceptedBlock) -> Columns {
+    Columns(
+        ACCEPTED_BLOCK_CELLS
+            .iter()
+            .map(|(column, render)| (*column, render(a)))
+            .collect(),
+    )
+}
+
 #[cfg(test)]
 // The crate denies `expect`/`unwrap` to keep production paths honest; tests are
 // allowed them per the repository test style, since a failed expectation there
@@ -851,7 +880,7 @@ mod tests {
     use alloy_primitives::{Address, B256, TxHash};
 
     use crate::wire::envelope::{
-        Block, ChainId, Contract, Decoded, Event, Log, Receipt, Reorg, Transaction,
+        AcceptedBlock, Block, ChainId, Contract, Decoded, Event, Log, Receipt, Reorg, Transaction,
     };
 
     use super::{COMMON_COLUMNS, ColumnType, ColumnValue, Table, row_for};
@@ -927,6 +956,12 @@ mod tests {
                 height: 100,
                 new_head_hash: hash(0x01),
                 orphaned_hashes: vec![hash(0x02)],
+            }),
+            Event::AcceptedBlock(AcceptedBlock {
+                height: 100,
+                hash: hash(0x01),
+                parent_hash: hash(0x02),
+                timestamp: 1_700_000_000,
             }),
         ]
     }

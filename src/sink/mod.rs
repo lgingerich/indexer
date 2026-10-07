@@ -47,6 +47,8 @@ pub use stdout::{StdoutJsonSink, StdoutSettings};
 
 use thiserror::Error;
 
+#[cfg(any(feature = "duckdb", feature = "postgres"))]
+use crate::wire::envelope::AcceptedBlock;
 use crate::wire::envelope::Envelope;
 #[cfg(any(feature = "duckdb", feature = "postgres"))]
 use crate::wire::row::{Row, Table};
@@ -71,27 +73,60 @@ fn last_per_key(rows: &[Row], table: Table) -> Vec<&Row> {
 
 /// A stored discovered contract, as a store's query returns it.
 ///
-/// Only the address needs parsing: the protocol and name are matched against the catalog
-/// as text.
+/// Only the address and block hash need parsing: the protocol and name are matched
+/// against the catalog as text.
 #[cfg(any(feature = "duckdb", feature = "postgres"))]
 fn stored_contract(
     protocol: String,
     name: String,
     address: &str,
-) -> Result<crate::decode::StoredContract, InvalidAddress> {
+    block_hash: &str,
+) -> Result<crate::decode::StoredContract, InvalidStoredValue> {
     Ok(crate::decode::StoredContract {
         protocol,
         name,
-        address: address
-            .parse()
-            .map_err(|_| InvalidAddress(address.to_owned()))?,
+        address: parse_stored("contract.address", address)?,
+        block_hash: parse_stored("contract.block_hash", block_hash)?,
     })
 }
 
-/// A stored `contract.address` that is not a 20-byte `0x` hex address.
+/// A stored `accepted_block` row, as a store's query returns it.
+#[cfg(any(feature = "duckdb", feature = "postgres"))]
+fn stored_block(
+    height: u64,
+    hash: &str,
+    parent_hash: &str,
+    timestamp: u64,
+) -> Result<AcceptedBlock, InvalidStoredValue> {
+    Ok(AcceptedBlock {
+        height,
+        hash: parse_stored("accepted_block.hash", hash)?,
+        parent_hash: parse_stored("accepted_block.parent_hash", parent_hash)?,
+        timestamp,
+    })
+}
+
+/// Parses one stored text column, naming the column when it does not parse.
+#[cfg(any(feature = "duckdb", feature = "postgres"))]
+fn parse_stored<T: std::str::FromStr>(
+    column: &'static str,
+    value: &str,
+) -> Result<T, InvalidStoredValue> {
+    value.parse().map_err(|_| InvalidStoredValue {
+        column,
+        value: value.to_owned(),
+    })
+}
+
+/// A value read back at startup that does not parse as its column's type.
 #[derive(Debug, Error)]
-#[error("stored contract has an invalid address: {0:?}")]
-pub struct InvalidAddress(pub String);
+#[error("stored {column} is invalid: {value:?}")]
+pub struct InvalidStoredValue {
+    /// The table and column, for example `contract.address`.
+    pub column: &'static str,
+    /// The stored text.
+    pub value: String,
+}
 
 /// Receives envelopes in per-chain order, as the pipeline publishes them.
 ///

@@ -12,7 +12,7 @@
 //!   produces from a log — its typed arguments under their ABI names, or the contract a
 //!   factory's creation event names. They are datasets, not control signals, and each
 //!   always follows the log it came from.
-//! - **Control** ([`Reorg`]): a signal about the indexer's own state,
+//! - **Control** ([`Reorg`], [`AcceptedBlock`]): signals about the indexer's own state,
 //!   not records of a chain. They carry no verbatim payload and exist to drive a
 //!   consumer's state machine, so they are defined here.
 //!
@@ -118,6 +118,27 @@ pub struct Reorg {
     pub new_head_hash: B256,
     /// Hashes of the blocks that are no longer canonical, newest first.
     pub orphaned_hashes: Vec<B256>,
+}
+
+/// A block the pipeline accepted: the last envelope of every block's batch.
+///
+/// A control signal rather than a dataset. It is published for every block, empty ones
+/// included and whatever datasets are selected, so a store holding these rows has a
+/// contiguous, parent-linked record of what it committed. That record is what a restart
+/// resumes from; see `ingest::pipeline`. Because it rides in the block's own batch, it
+/// commits in the same transaction as the block's rows, never ahead of them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AcceptedBlock {
+    /// Block height.
+    #[serde(with = "alloy_serde::quantity")]
+    pub height: u64,
+    /// Block hash.
+    pub hash: B256,
+    /// The block's parent hash.
+    pub parent_hash: B256,
+    /// The block's timestamp.
+    #[serde(with = "alloy_serde::quantity")]
+    pub timestamp: u64,
 }
 
 /// One log decoded against a contract ABI, as typed arguments.
@@ -305,6 +326,8 @@ pub enum Event {
     Contract(Box<Contract>),
     /// A discontinuity in the published chain.
     Reorg(Reorg),
+    /// A block the pipeline accepted, published last in its batch.
+    AcceptedBlock(AcceptedBlock),
 }
 
 impl Event {
@@ -319,6 +342,7 @@ impl Event {
             Self::Decoded(_) => "decoded",
             Self::Contract(_) => "contract",
             Self::Reorg(_) => "reorg",
+            Self::AcceptedBlock(_) => "accepted_block",
         }
     }
 
@@ -345,6 +369,7 @@ impl Event {
             Self::Decoded(decoded) => decoded.dedupe_key(),
             Self::Contract(contract) => contract.dedupe_key(),
             Self::Reorg(reorg) => format!("{}:reorg", reorg.new_head_hash),
+            Self::AcceptedBlock(accepted) => format!("{}:accepted_block", accepted.hash),
         }
     }
 }
@@ -406,8 +431,8 @@ mod tests {
     use alloy_primitives::{Address, B256, TxHash, U256};
 
     use super::{
-        AbiType, Block, ChainId, Contract, Decoded, DecodedArg, Envelope, Event, Log, Receipt,
-        Reorg, SCHEMA_VERSION, Transaction, TypedValue,
+        AbiType, AcceptedBlock, Block, ChainId, Contract, Decoded, DecodedArg, Envelope, Event,
+        Log, Receipt, Reorg, SCHEMA_VERSION, Transaction, TypedValue,
     };
 
     fn contract(block_hash: B256) -> Contract {
@@ -695,6 +720,16 @@ mod tests {
             .dedupe_key(),
             format!("0x{block_hex}:reorg")
         );
+        assert_eq!(
+            Event::AcceptedBlock(AcceptedBlock {
+                height: 100,
+                hash: block_hash,
+                parent_hash: hash(0xdd),
+                timestamp: 1_700_000_000,
+            })
+            .dedupe_key(),
+            format!("0x{block_hex}:accepted_block")
+        );
     }
 
     /// A discovery inherits its creation log's block hash, so a creation in an orphaned
@@ -841,6 +876,12 @@ mod tests {
                 height: 1,
                 new_head_hash: hash(3),
                 orphaned_hashes: vec![hash(2)],
+            }),
+            Event::AcceptedBlock(AcceptedBlock {
+                height: 5,
+                hash: hash(5),
+                parent_hash: hash(4),
+                timestamp: 1_700_000_000,
             }),
         ];
         for event in variants {

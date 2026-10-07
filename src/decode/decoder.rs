@@ -36,15 +36,18 @@ pub struct StoredContract {
     pub name: String,
     /// The contract.
     pub address: Address,
+    /// The hash of the block whose creation log discovered it, so a reorg that orphans
+    /// that block after a restart still retracts it.
+    pub block_hash: B256,
 }
 
 /// One address in the contract set.
 #[derive(Debug, Clone, Copy)]
 struct Member {
     entry: EntryId,
-    /// The block hash of the creation log this run saw, which a reorg can orphan. `None`
-    /// for a seed, and for a restored contract: this run's undo window starts empty, so
-    /// it can never orphan a block from an earlier run.
+    /// The block hash of the creation log, which a reorg can orphan. `None` for a seed.
+    /// A restored contract keeps its stored block hash: a restart resumes with the
+    /// previous run's undo window, so a reorg can still orphan the block that created it.
     created: Option<B256>,
 }
 
@@ -88,7 +91,7 @@ impl Decoder {
                     address = %contract.address, "stored contract is no longer declared");
                 continue;
             };
-            added += usize::from(self.insert(contract.address, entry, None));
+            added += usize::from(self.insert(contract.address, entry, Some(contract.block_hash)));
         }
         added
     }
@@ -181,7 +184,7 @@ impl Decoder {
 
     /// Drops every contract created in one of `orphaned`, returning how many.
     ///
-    /// Seeds and restored contracts are never dropped. A scan over the set is fine:
+    /// Seeds are never dropped. A scan over the set is fine:
     /// reorgs are rare and the set is a hash map of a few hundred thousand entries at most.
     pub fn retract(&mut self, orphaned: &[B256]) -> usize {
         let before = self.contracts.len();
@@ -279,6 +282,7 @@ mod tests {
             protocol: "uniswap_v3".to_owned(),
             name: "UniswapV3Pool".to_owned(),
             address,
+            block_hash: B256::with_last_byte(3),
         }
     }
 
@@ -320,17 +324,25 @@ mod tests {
     }
 
     /// A reorg drops children created in orphaned blocks and nothing else; seeds and
-    /// restored contracts stay.
+    /// children of other blocks stay. A restored contract is retracted like one this run
+    /// discovered, since its creating block may sit in the resumed undo window.
     #[test]
     fn a_reorg_retracts_children_of_orphaned_blocks() {
         let mut decoder = decoder();
-        let (kept, dropped, restored) = (
+        let (kept, dropped, restored, restored_orphan) = (
             Address::from([0x01; 20]),
             Address::from([0x02; 20]),
             Address::from([0x03; 20]),
+            Address::from([0x04; 20]),
         );
         let (canonical, orphaned) = (B256::with_last_byte(1), B256::with_last_byte(2));
-        decoder.restore([stored(restored)]);
+        decoder.restore([
+            stored(restored),
+            StoredContract {
+                block_hash: orphaned,
+                ..stored(restored_orphan)
+            },
+        ]);
         decoder
             .decode(&pool_created(kept, canonical))
             .expect("decode");
@@ -339,9 +351,14 @@ mod tests {
             .expect("decode");
         let before = decoder.contracts();
 
-        assert_eq!(decoder.retract(&[orphaned, B256::ZERO]), 1);
-        assert_eq!(decoder.contracts(), before - 1);
-        for (pool, decodes) in [(kept, true), (dropped, false), (restored, true)] {
+        assert_eq!(decoder.retract(&[orphaned, B256::ZERO]), 2);
+        assert_eq!(decoder.contracts(), before - 2);
+        for (pool, decodes) in [
+            (kept, true),
+            (dropped, false),
+            (restored, true),
+            (restored_orphan, false),
+        ] {
             assert_eq!(
                 decoder.decode(&swap(pool)).expect("decode").is_some(),
                 decodes

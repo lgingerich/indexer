@@ -36,6 +36,7 @@ ordered events, each with its dataset's natural key
       │   block
       │   transaction, receipt, log, decoded, log, …
       │   transaction, receipt, …
+      │   accepted_block                  the block's identity, always last
       │
       ▼  flush, once
 one channel message
@@ -45,7 +46,10 @@ one DuckDB commit                         raw rows and decoded rows together
 ```
 
 A `reorg` marker, when there is one, is the first envelope of that message: the fork is
-recorded before the replacement block.
+recorded before the replacement block. An `accepted_block` marker is always the last: the
+block's height, hash, parent hash, and timestamp, published for every block — empty ones
+included, whatever datasets are selected — so it commits with the block's rows and is
+what a restart resumes from.
 
 ### What decode adds
 
@@ -140,9 +144,66 @@ chain (replayable) ──▶ in flight on the channel ──▶ committed in Duc
 ```
 
 The channel holds no durable log. The chain is the record upstream and the store is
-the record downstream, so a restart should continue from the last committed height.
-That resume is not built: a restart begins fresh at the sampled head. See
-[Not built yet](#not-built-yet).
+the record downstream, so a restart continues from the last block the store committed,
+and the node serves the blocks after it.
+
+### Resume from the store
+
+The store's `accepted_block` table is a ledger of every block it committed, one row per
+block, each written in the same transaction as that block's rows. At startup the newest
+4,097 rows whose hash no `reorg` row orphans are read back — the undo window plus its
+floor — and every older row for the chain is deleted, so the table stays bounded across
+restarts. Only the newest parent-linked run of those rows is kept; a gap below it is
+logged and the window starts above it.
+
+```
+stored ledger      … 98 ── 99 ── 100                 the restored tip is 100
+node, unchanged    … 98 ── 99 ── 100 ── 101 ── …     resume at 101
+node, forked       … 98 ── 99'── 100'── 101'── …     reorg { orphaned: [100, 99] },
+                                                     then 99', 100', 101', …
+```
+
+The restored tip's header is re-read from the node — one call for the header alone,
+since only its hash is compared. If the hash matches, indexing continues from the next
+height through the same split a fresh start uses: buried heights backfill, the tail goes
+through the reorg-aware path. Nothing the store already committed is fetched or written
+again; only blocks that were still in flight at the crash are. If the hash differs, the
+stored suffix was orphaned while nothing was running: the full block is fetched, and the
+ordinary fork walk finds the common ancestor inside the restored window, appends one
+`reorg` naming the stored hashes, and replays the replacements. Either way the first new
+block must link to the restored tip, so coverage from there forward has no gap. A fork
+deeper than the restored window stops with an error for an operator to resolve; history
+is never silently cleared. The window bounds how far below the stored tip a fork may
+reach, not how long the process was down: a week offline with a three-block reorg near
+the old tip resumes normally. Discovered contracts
+are restored with their creating block's hash, so that startup `reorg` also retracts a
+pool created in an orphaned block.
+
+How each crash point resolves:
+
+| Crash point | Store at restart | What startup does |
+| --- | --- | --- |
+| A block was queued, not committed | The ledger's tip is older | Replays from the tip |
+| A committed, its later `reorg` did not | A is in the ledger, with no marker | Finds A differs, appends the `reorg`, replays |
+| The `reorg` committed, replacements did not | A is excluded; the tip falls back to the ancestor | Resumes after the ancestor, fetching the replacements |
+| B committed, progress only in memory | The ledger includes B | Resumes after B |
+| A `PostgreSQL` commit's outcome is unknown | Whatever committed | Reads it; replaying a committed row upserts onto itself |
+
+`ingest.start_block` applies to an empty store only. Set alongside a non-empty ledger it
+is a startup error rather than a choice between the two, since starting elsewhere would
+recreate the gaps resume closes. `[sink.stdout]` has no store, so it always starts fresh.
+
+Resume guarantees contiguity from the restored tip forward, not before it: gaps that
+runs before resume existed left behind are not backfilled. And `MAX(block_number)` of a
+dataset is not a substitute for the ledger — empty blocks write no rows, orphaned
+branches can be higher, and a maximum proves nothing about contiguity.
+
+**Branch reacceptance is not handled.** `reorg.orphaned_hashes` is the only record of
+which hashes stopped being canonical, and readers — the ledger and contract read-back
+included — exclude every hash it ever names. If a previously orphaned hash later becomes
+canonical again, it stays excluded. For resume the cost is a re-fetch of that block; a
+general canonical reader would need ordered branch state or a maintained canonical
+mapping, which is not implemented.
 
 ## Layout
 
@@ -205,7 +266,8 @@ that matters most: `decode` must not depend on `ingest`.
   into a new contract in the set, live, and publishes it as a `contract` row in the same
   commit as the block that created it. A reorg retracts contracts created in orphaned
   blocks. At startup the store's `contract` rows are read back, so a restart keeps
-  decoding every pool a previous run discovered.
+  decoding every pool a previous run discovered, and resume replays the blocks missed
+  while down, so pools created then are discovered too.
 - **A local store.** The process writes every envelope, raw and decoded, into a local
   `DuckDB` database: one typed table per dataset, with real columns rather than a JSON
   blob. What a dataset's columns *are* lives in `src/wire/row.rs`, not in the store, so a
@@ -214,15 +276,16 @@ that matters most: `decode` must not depend on `ingest`.
   4,096 accepted block identities plus one predecessor as a recovery floor. It does not
   read the node's `finalized` tag and does not claim any height is irreversible. The
   window caps how deep a fork reconciliation can reach; a deeper fork stops rather than
-  guessing. The identities are not written to the store.
+  guessing. Each identity is also written to the store's `accepted_block` ledger, which
+  is what a restart restores the window from.
 - **Reorg retraction.** Parent-hash linkage is checked on every block. A mismatch
   appends a `reorg` event whose `orphaned_hashes` name the block hashes that stopped
   being canonical, then appends the replacement branch under its own keys. Dataset tables
   keep both branches; a reader applies the `reorg` rows to see only the current chain.
   The sliding window retains up to a fixed 4,096 identities. See `src/ingest/pipeline.rs`.
 - **Headless backfill, then live heads.** Startup samples the head once and captures it
-  as a backfill target; `[ingest] start_block` may request earlier inclusive history but
-  defaults to the head. Backfill then reads consecutive concrete heights and makes no
+  as a backfill target; on an empty store `[ingest] start_block` may request earlier
+  inclusive history but defaults to the head. Backfill then reads consecutive concrete heights and makes no
   further discovery call — not even while reconciling a fork — until it reaches the
   target, at which point live heads take over. Decode runs on both paths, so a historical
   log is stored raw and, when it matches, decoded. Alloy keeps the WebSocket subscription
@@ -230,7 +293,10 @@ that matters most: `decode` must not depend on `ingest`.
   retries. Live notifications are inputs and hints, not a replay log: a duplicate head is
   skipped before any fetch, a gap is filled from the next height, and a 30-second timer
   reconciles when the subscription is silent. HTTP failures and exhausted subscription
-  recovery are terminal. A process restart starts fresh at the sampled head.
+  recovery are terminal.
+- **Resume from the store.** A restart continues after the last block the store
+  committed, reconciling a fork that happened while it was down. See
+  [Resume from the store](#resume-from-the-store).
 - **NDJSON to stdout.** See `src/sink/stdout.rs`; the `[sink.stdout]` backend prints the
   stream instead of storing it, and opens no store.
 - **A local `DuckDB` store**, behind the `duckdb` feature (on by default). Embedded and
@@ -246,110 +312,12 @@ The running process samples the head, backfills through it, then follows live he
 writes every row. These are the gaps that leaves.
 
 ```
-resume from the store
 stored-log replay
 streaming aggregation
 Avro for a serialized envelope
 ranged log backfill
 signature-only decoding
 ```
-
-### Resume from the store
-
-**Crash-safe resume is not implemented and is deferred from the ingestion redesign.**
-Today, startup samples the node's current head and begins from there (or from
-`[ingest] start_block`) instead of restoring a storage checkpoint. The finalized anchor
-is replaced by an explicit start and a sliding undo window, and that part is implemented,
-but it does not yet add persistent recovery. The behavior below distinguishes ordinary
-live reorg handling from what remains unsafe across a restart.
-
-#### A block becomes orphaned while its logs are being fetched
-
-Suppose a WebSocket header announces block A at height H. In the logs-only live path,
-ingestion fetches logs pinned to A's hash and uses the header's identity, parent hash,
-and timestamp. Meanwhile, the node replaces A with block B at the same height.
-
-- If divergence is detected before A is published, discard the unpublished candidate
-  and fetch B. There is no accepted A to retract.
-- If A has already been accepted, retain its data. Reconciliation finds the common
-  ancestor, emits a `reorg` record naming A and any accepted descendants as orphaned,
-  then fetches and publishes the replacement branch, including B's logs.
-- A hash-pinned request must return A's logs or fail, not return B's logs paired with
-  A's header. A number-based fallback needs extra identity checks; an empty log result
-  alone cannot prove which branch was queried.
-
-This is correct provisional ingestion while the process can reconcile the fork inside
-its retained undo window. It does not require an extra canonical-block query before
-every live commit: a reorg can occur after such a query anyway. It does require eventual
-reconciliation and downstream application of the committed orphan records. A fork
-outside retained recovery history must stop explicitly, not silently leave incorrect
-coverage. The logs-only live path uses exactly this rule.
-
-#### Where a crash breaks that recovery
-
-Complete-block transactions prevent a partially committed set of selected datasets
-for one block. They do not make the process's undo ring durable, and they do not make
-an entire reorg and replacement replay one transaction.
-
-Consider these crash points:
-
-1. **A is only in memory or queued.** The channel has accepted the block, but storage
-   has not committed it. A crash loses that work. Recovery must replay from committed
-   coverage, not from the fetch cursor or channel-accepted tip.
-2. **A commits, but its orphan record does not.** The node has switched to B, yet the
-   database still contains A without a committed marker excluding it. A crash loses
-   the in-memory branch identities needed to identify that stored suffix. Restarting
-   at a newer height does not repair it, and merely upserting B keeps A under its
-   distinct fork-specific key. Readers can incorrectly include A until recovery
-   explicitly records the orphaned branch.
-3. **The orphan record commits, but replacements do not.** Readers can exclude A,
-   but the replacement branch is missing or only partially covered. Recovery must
-   know which replacement blocks actually committed and complete the replay; the
-   existence of the marker does not establish replacement coverage.
-4. **B commits, but progress exists only in memory.** Restarting must not skip unknown
-   gaps or infer that earlier blocks were committed just because B exists. Replaying
-   identical row keys is supported, but row deduplication alone cannot restore branch
-   state or repair missed orphan records.
-5. **The commit outcome is unknown after a connection failure.** A transaction may
-   have committed before its acknowledgement was lost. The current process stops;
-   future recovery must inspect durable state rather than assume either success or
-   rollback and blindly retry delivery.
-
-A logs-only database cannot use `MAX(block_number)` as a checkpoint. Empty blocks
-produce no log rows, orphan branches can contribute higher heights, and a maximum
-height does not prove contiguous coverage. Similarly, the in-memory tip can be ahead
-of committed storage by the queued blocks. The channel is not a durable log.
-
-#### What future crash-safe resume needs
-
-Persist contiguous committed coverage and a bounded block-identity ledger independently
-of dataset selection, including empty blocks. The ledger must retain the predecessor
-and undoable suffix needed to compare the stored branch with the node after restart.
-These are recovery identities, not assertions of official finality.
-
-Dataset rows, reorg records, and the checkpoint/ledger changes describing those rows
-must commit in the same storage transaction. Fetch-side progress must not advance the
-durable checkpoint, and bounded queued progress must not cause eviction of the only
-identities required to recover the committed branch.
-
-On startup, restore the committed identities, compare them with the source, find a
-retained common ancestor, and record any newly discovered orphaned suffix before
-replaying replacements and extending coverage. If that ancestor is no longer retained,
-stop for explicit recovery from an earlier known point. Do not silently clear history
-or claim automatic repair.
-
-Preserving all branch data remains the storage contract. Readers consult
-`reorg.orphaned_hashes`, scoped by chain, rather than expect an `orphaned` table or
-automatic row deletion. Until persistent reconciliation exists, those records may be
-incomplete after a crash, even though each committed block's rows are internally
-complete. Applying the existing markers cannot exclude a branch whose marker was
-never committed.
-
-A further reader limitation is branch reacceptance: if a previously orphaned hash later
-becomes canonical again, permanently excluding every historically orphaned hash is not
-sufficient. A general canonical reader needs ordered branch-state/reacceptance semantics
-or a maintained canonical mapping. That is separate from preserving the raw data and
-is not implemented by this restart analysis.
 
 ### Stored-log replay
 
@@ -477,7 +445,7 @@ the field:
 | --- | --- | --- |
 | `ingest.datasets` | block, transaction, receipt, log | Which datasets are fetched and stored. A dataset that needs the block body still reads it; a logs-only live fetch reuses the notification header |
 | `ingest.log_addresses` | none | Contracts passed to `eth_getLogs`. Empty fetches every log. Valid only when `log` is selected and `receipt` is not |
-| `ingest.start_block` | the sampled head | First height to index. Absent starts live at the observed head; a value backfills that inclusive height forward before following live heads. A value above the sampled head is a startup error |
+| `ingest.start_block` | the sampled head | First height to index on an empty store. Absent starts live at the observed head; a value backfills that inclusive height forward before following live heads. A value above the sampled head is a startup error, and so is a value when the store already holds blocks: a run resumes from the store |
 | `sink.duckdb.batch_records` | `500` | Most records one store commit may cover; a backlog of blocks is folded into one commit up to this, and a block is never split |
 | `sink.duckdb.path` | `indexer.duckdb` | Path to the store |
 
@@ -573,11 +541,11 @@ Rules chain: a discovered contract can have `created_by` children of its own.
 **Restarts.** The `contract` rows are the state: each commits in the same transaction as
 the block that created it, so the store never holds a block without its discoveries or
 the reverse. At startup the store's rows are read back, minus any created in a block a
-`reorg` row orphans. Two gaps remain until [resume from the store](#resume-from-the-store)
-is built, both from a run starting at the sampled head rather than where the last one
-stopped: a pool created while the process was down is not discovered, and neither is a
-pool created before the first run — list those as seeds. With `[sink.stdout]` there is no
-store, so each start begins from the seeds.
+`reorg` row orphans. A run [resumes from the store](#resume-from-the-store), so the
+blocks missed while the process was down are replayed and a pool created then is
+discovered; a reorg while it was down retracts a pool whose creating block it orphaned.
+A pool created before the first run is never seen — list those as seeds. With
+`[sink.stdout]` there is no store, so each start begins from the seeds.
 
 `ingest.log_addresses` turns discovery off, with a warning at startup. That filter is an
 explicit list fixed at startup, so a discovered contract's logs would never be fetched.
@@ -644,7 +612,7 @@ use `sslmode=disable` only for trusted local connections. The database must alre
 exist, and the role needs permission to create and write the dataset tables in its
 configured search path.
 
-The sink creates the same seven typed tables as DuckDB. Columns the chain always
+The sink creates the same eight typed tables as DuckDB. Columns the chain always
 provides are `NOT NULL`; fields it can omit stay nullable. Each table has a unique
 index on `(chain, dedupe_key)`. A flush bulk-loads with binary `COPY` into a temporary
 table, then upserts into the dataset table, in one transaction. Unsigned 64-bit fields
@@ -712,8 +680,10 @@ records — `decoded` and `contract` — are what the decode stage produces from
 typed ABI arguments, whose types travel with them so a consumer can rebuild a typed
 column without reading the ABI, and the contracts a factory created, modeled on the
 provenance columns of Allium's `dex.pools`. **Control
-signal** — `reorg` — drives a consumer's state machine and carries no
-payload. The line is one flat object: `chain`,
+signals** — `reorg` and `accepted_block` — drive a consumer's state machine and carry no
+payload: a `reorg` names the hashes that stopped being canonical, and an `accepted_block`
+closes each block with its identity, so a consumer sees where every block ends, even an
+empty one. The line is one flat object: `chain`,
 `v`, and the event's fields under its `type` tag. Consumers deduplicate on
 each event's `dedupe_key`. Each dataset's key comes from its
 natural key, so a transaction and its receipt (both keyed by the block hash and the

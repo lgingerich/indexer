@@ -24,8 +24,11 @@ use tokio_postgres::types::{IsNull, ToSql, Type, to_sql_checked};
 
 use crate::config::Secret;
 use crate::decode::StoredContract;
-use crate::sink::{EnvelopeSink, InvalidAddress, SinkError, last_per_key, stored_contract};
-use crate::wire::envelope::{ChainId, Envelope};
+use crate::sink::{
+    EnvelopeSink, InvalidStoredValue, SinkError, last_per_key, parse_stored, stored_block,
+    stored_contract,
+};
+use crate::wire::envelope::{AcceptedBlock, ChainId, Envelope};
 use crate::wire::row::{ColumnType, ColumnValue, Row, Table, row_for};
 
 /// `PostgreSQL` connection and backlog batching settings for `[sink.postgres]`.
@@ -61,6 +64,10 @@ fn pg_type(kind: ColumnType) -> Type {
         ColumnType::Document => Type::JSONB,
     }
 }
+
+/// The block hashes a stored `reorg` on chain `$1` names as orphaned.
+const ORPHANED: &str =
+    "(SELECT jsonb_array_elements_text(orphaned_hashes) FROM \"reorg\" WHERE chain = $1)";
 
 /// Table DDL rendered from [`Table::columns`]. `(chain, dedupe_key)` is unique so a
 /// replay can upsert.
@@ -210,8 +217,8 @@ impl ToSql for ColumnValue {
 pub struct PostgresSink {
     client: Client,
     rows: Vec<Row>,
-    plans: [CopyPlan; 7],
-    merges: [String; 7],
+    plans: [CopyPlan; Table::ALL.len()],
+    merges: [String; Table::ALL.len()],
     connection_task: Option<tokio::task::JoinHandle<()>>,
 }
 
@@ -273,17 +280,72 @@ impl PostgresSink {
         let rows = self
             .client
             .query(
-                "SELECT protocol, name, address FROM \"contract\" \
-                 WHERE chain = $1 AND block_hash NOT IN \
-                 (SELECT jsonb_array_elements_text(orphaned_hashes) FROM \"reorg\" WHERE chain = $1)",
+                &format!(
+                    "SELECT protocol, name, address, block_hash FROM \"contract\" \
+                     WHERE chain = $1 AND block_hash NOT IN {ORPHANED}"
+                ),
                 &[&chain.as_str()],
             )
             .await?;
         let mut contracts = Vec::with_capacity(rows.len());
         for row in rows {
-            contracts.push(stored_contract(row.get(0), row.get(1), row.get(2))?);
+            contracts.push(stored_contract(
+                row.get(0),
+                row.get(1),
+                row.get(2),
+                row.get(3),
+            )?);
         }
         Ok(contracts)
+    }
+
+    /// The newest `limit` accepted blocks on `chain` that no stored `reorg` orphans,
+    /// oldest first, after dropping every older row.
+    ///
+    /// Read once at startup, before the first write: the result is the undo window a
+    /// restart resumes from. Rows below the oldest one returned can never be read again,
+    /// so they are deleted here, which is what keeps the ledger from growing without
+    /// bound across restarts. Contiguity is not checked; the pipeline does that.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::Database`] when the query or the delete fails and
+    /// [`StoreError::Restore`] when a stored value does not parse.
+    pub async fn ledger(
+        &self,
+        chain: &ChainId,
+        limit: usize,
+    ) -> Result<Vec<AcceptedBlock>, StoreError> {
+        // `NUMERIC` has no `FromSql` without an extra crate, so heights cross as text.
+        let rows = self
+            .client
+            .query(
+                &format!(
+                    "SELECT height::TEXT, hash, parent_hash, \"timestamp\"::TEXT \
+                     FROM \"accepted_block\" WHERE chain = $1 AND hash NOT IN {ORPHANED} \
+                     ORDER BY height DESC LIMIT $2"
+                ),
+                &[&chain.as_str(), &i64::try_from(limit).unwrap_or(i64::MAX)],
+            )
+            .await?;
+        let mut ledger = Vec::with_capacity(rows.len());
+        for row in rows.iter().rev() {
+            ledger.push(stored_block(
+                parse_stored("accepted_block.height", row.get(0))?,
+                row.get(1),
+                row.get(2),
+                parse_stored("accepted_block.timestamp", row.get(3))?,
+            )?);
+        }
+        if let Some(oldest) = ledger.first() {
+            self.client
+                .execute(
+                    "DELETE FROM \"accepted_block\" WHERE chain = $1 AND height < $2::TEXT::NUMERIC",
+                    &[&chain.as_str(), &oldest.height.to_string()],
+                )
+                .await?;
+        }
+        Ok(ledger)
     }
 
     async fn write_batch(&mut self) -> Result<(), StoreError> {
@@ -291,7 +353,7 @@ impl PostgresSink {
             return Ok(());
         }
         let transaction = self.client.transaction().await?;
-        // ponytail: seven fixed tables mean seven linear scans. Group at publish time
+        // ponytail: eight fixed tables mean eight linear scans. Group at publish time
         // only if the number of datasets or profiling warrants a grouping buffer.
         for ((table, plan), merge) in Table::ALL.into_iter().zip(&self.plans).zip(&self.merges) {
             let rows = last_per_key(&self.rows, table);
@@ -349,9 +411,9 @@ pub enum StoreError {
     /// `PostgreSQL` connection, schema, COPY, or transaction failure.
     #[error("PostgreSQL storage: {0}")]
     Database(#[from] tokio_postgres::Error),
-    /// A stored contract's address did not parse.
+    /// A value read back at startup did not parse.
     #[error(transparent)]
-    Restore(#[from] InvalidAddress),
+    Restore(#[from] InvalidStoredValue),
 }
 
 #[cfg(test)]
@@ -502,6 +564,7 @@ mod tests {
                 protocol: contract.protocol,
                 name: contract.name,
                 address: contract.address,
+                block_hash: contract.block_hash,
             }]
         );
 
@@ -515,6 +578,84 @@ mod tests {
             .expect("publish");
         sink.flush().await.expect("commit");
         assert!(sink.contracts(&chain).await.expect("read back").is_empty());
+
+        sink.client
+            .batch_execute(&format!("DROP SCHEMA \"{schema}\" CASCADE"))
+            .await
+            .expect("drop test schema");
+        drop(sink);
+        task.abort();
+    }
+
+    /// The ledger reads back the newest unorphaned accepted blocks of one chain, oldest
+    /// first, and drops that chain's rows below them.
+    #[tokio::test]
+    #[ignore = "requires INDEXER_TEST_POSTGRES_URL pointing to PostgreSQL 18"]
+    async fn the_ledger_reads_back_the_newest_canonical_window_and_prunes_below_it() {
+        use crate::wire::envelope::AcceptedBlock;
+
+        let url = std::env::var("INDEXER_TEST_POSTGRES_URL").expect("test database URL");
+        let (client, connection) = tokio_postgres::connect(&url, tokio_postgres::NoTls)
+            .await
+            .expect("connect");
+        let task = tokio::spawn(connection);
+        let schema = format!("ledger_test_{}", std::process::id());
+        client
+            .batch_execute(&format!(
+                "CREATE SCHEMA \"{schema}\"; SET search_path TO \"{schema}\""
+            ))
+            .await
+            .expect("test schema");
+        let mut sink = PostgresSink::new(client).await.expect("sink");
+        let chain = ChainId::new("base");
+        let accepted = |height: u64| AcceptedBlock {
+            height,
+            hash: B256::with_last_byte(u8::try_from(height).expect("small heights")),
+            parent_hash: B256::with_last_byte(u8::try_from(height - 1).expect("small heights")),
+            timestamp: 1_700_000_000 + height,
+        };
+        assert!(sink.ledger(&chain, 3).await.expect("empty").is_empty());
+        for height in 1..=10 {
+            sink.publish(Envelope::new(
+                chain.clone(),
+                Event::AcceptedBlock(accepted(height)),
+            ))
+            .await
+            .expect("publish");
+        }
+        sink.publish(Envelope::new(
+            ChainId::new("ethereum"),
+            Event::AcceptedBlock(accepted(1)),
+        ))
+        .await
+        .expect("publish");
+        sink.publish(Envelope::new(
+            chain.clone(),
+            Event::Reorg(Reorg {
+                height: 10,
+                new_head_hash: B256::with_last_byte(0xee),
+                orphaned_hashes: vec![accepted(10).hash],
+            }),
+        ))
+        .await
+        .expect("publish");
+        sink.flush().await.expect("commit");
+
+        assert_eq!(
+            sink.ledger(&chain, 3).await.expect("read back"),
+            [accepted(7), accepted(8), accepted(9)]
+        );
+        assert_eq!(
+            count(&sink, Table::AcceptedBlock).await,
+            5,
+            "7 through 10 on base, and ethereum's row"
+        );
+        assert_eq!(
+            sink.ledger(&ChainId::new("ethereum"), 3)
+                .await
+                .expect("read back"),
+            [accepted(1)]
+        );
 
         sink.client
             .batch_execute(&format!("DROP SCHEMA \"{schema}\" CASCADE"))

@@ -9,6 +9,8 @@
 //! - [`BlockSource::fetch_block`] is the *pull* path. It fetches one block, limited
 //!   to the datasets the source was built with, which is what backfill and reorg
 //!   reconciliation need.
+//! - [`BlockSource::fetch_header`] reads one header, at a height or the head, for when
+//!   only a block's identity is needed: sampling the head, and checking a restored tip.
 //!
 //! A source also owns how to turn a chain's block into [`Event`]s. It reports a
 //! block's [`BlockMeta`] separately from those events, so parent linkage and the
@@ -27,7 +29,7 @@ use thiserror::Error;
 pub mod evm;
 pub use evm::EvmSource;
 
-use crate::wire::envelope::{ChainId, Event};
+use crate::wire::envelope::{AcceptedBlock, ChainId, Event};
 
 /// A block's identity and the header fields the pipeline needs without its events.
 ///
@@ -46,6 +48,28 @@ pub struct BlockMeta {
     pub parent_hash: B256,
     /// The block's timestamp, stamped onto its dataset rows.
     pub timestamp: u64,
+}
+
+impl From<AcceptedBlock> for BlockMeta {
+    fn from(accepted: AcceptedBlock) -> Self {
+        Self {
+            height: accepted.height,
+            hash: accepted.hash,
+            parent_hash: accepted.parent_hash,
+            timestamp: accepted.timestamp,
+        }
+    }
+}
+
+impl From<BlockMeta> for AcceptedBlock {
+    fn from(meta: BlockMeta) -> Self {
+        Self {
+            height: meta.height,
+            hash: meta.hash,
+            parent_hash: meta.parent_hash,
+            timestamp: meta.timestamp,
+        }
+    }
 }
 
 /// One block, already turned into events, with the metadata it was fetched under.
@@ -141,13 +165,21 @@ pub trait BlockSource: Send + Sync {
         head: Option<&BlockMeta>,
     ) -> impl Future<Output = Result<FetchedBlock, SourceError>> + Send;
 
-    /// The chain's head as it is right now, fetched on demand.
+    /// One block's header as [`BlockMeta`], fetched on demand: the block at `height`, or
+    /// the chain's head as it is right now when `height` is `None`.
     ///
-    /// Used for startup and live reconciliation, never during backfill: backfill
-    /// captures its head once at startup and then reads concrete heights only.
+    /// Reads the header alone — no transactions, receipts, or logs — so it is the
+    /// cheap way to learn a block's identity. The head form is used for startup and
+    /// live reconciliation, never during backfill: backfill captures its head once at
+    /// startup and then reads concrete heights only. The height form checks a restored
+    /// tip against the source before resuming.
     ///
     /// # Errors
     ///
-    /// Returns a typed transport error or an absent head.
-    fn current_head(&self) -> impl Future<Output = Result<BlockMeta, SourceError>> + Send;
+    /// Returns a typed transport error, or a malformed-data error when the source has
+    /// no block there.
+    fn fetch_header(
+        &self,
+        height: Option<u64>,
+    ) -> impl Future<Output = Result<BlockMeta, SourceError>> + Send;
 }

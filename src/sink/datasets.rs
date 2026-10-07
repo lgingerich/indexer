@@ -4,7 +4,7 @@
 //! enforced where the events are projected: `src/ingest/source/evm.rs` reads only what
 //! the selected datasets need, which is what makes the logs-only fetch skip its block
 //! read. [`Datasets::keeps`] is the same answer as a predicate, for a consumer that
-//! decodes a whole batch itself and has to filter. Reorg markers always pass.
+//! decodes a whole batch itself and has to filter. Control signals always pass.
 
 use serde::de::{self, Unexpected};
 use serde::{Deserialize, Deserializer};
@@ -54,7 +54,8 @@ impl Datasets {
     /// through [`decode_block`](crate::ingest::source::evm::decode_block), which emits
     /// every row in its batch regardless of selection. A decoded record or discovered
     /// contract is kept only when logs are, because each is produced from a log. A
-    /// reorg always passes.
+    /// reorg or accepted-block marker always passes: they are control signals, not
+    /// datasets.
     #[must_use]
     pub const fn keeps(self, event: &Event) -> bool {
         match event {
@@ -62,7 +63,7 @@ impl Datasets {
             Event::Transaction(_) => self.transaction,
             Event::Receipt(_) => self.receipt,
             Event::Log(_) | Event::Decoded(_) | Event::Contract(_) => self.log,
-            Event::Reorg(_) => true,
+            Event::Reorg(_) | Event::AcceptedBlock(_) => true,
         }
     }
 
