@@ -30,6 +30,9 @@ use thiserror::Error;
 pub mod evm;
 mod retry;
 pub use evm::EvmSource;
+// The simulation builds its client the way `evm::http_client` does, over its own node.
+#[cfg(all(test, feature = "duckdb"))]
+pub(crate) use retry::{NetworkError, RetryLayer};
 
 use crate::wire::envelope::{AcceptedBlock, ChainId, Event};
 

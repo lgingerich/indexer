@@ -45,5 +45,9 @@ pub mod decode;
 pub mod ingest;
 /// Assembles the configured ingest, decode, and sink pipeline.
 pub mod runtime;
+#[cfg(all(test, feature = "duckdb"))]
+// Test code: a failed expectation means the harness itself is wrong.
+#[expect(clippy::expect_used)]
+mod sim;
 pub mod sink;
 pub mod wire;
