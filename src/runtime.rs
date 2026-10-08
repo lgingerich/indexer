@@ -22,8 +22,9 @@
 //! # What the settings decide
 //!
 //! - **Ingest** follows the chain `[ingest]` names. It is required, so it always runs.
-//! - **Decode** uses the protocol manifests `[decode] protocols` names. An absent or empty
-//!   catalog decodes nothing, which is a legitimate way to run and is said at startup.
+//! - **Decode** uses the protocol manifests `[decode] protocols` names. Leaving it out
+//!   decodes nothing, which is a legitimate way to run and is said at startup; a directory
+//!   with no manifest in it is a startup error.
 //!   Contracts a previous run discovered are read back from the store before ingest
 //!   starts, so a restart decodes them; `[sink.stdout]` has no store and starts with the
 //!   manifests' seeds only.
@@ -42,6 +43,8 @@
 //! reported ahead of ingest's, since a dead store is the cause and a failed send the
 //! symptom.
 
+use std::sync::Arc;
+
 use thiserror::Error;
 use tracing::{info, warn};
 
@@ -59,6 +62,7 @@ use crate::sink::{SinkError, StdoutJsonSink};
 #[cfg(any(feature = "duckdb", feature = "postgres"))]
 use crate::wire::envelope::AcceptedBlock;
 use crate::wire::envelope::ChainId;
+use crate::wire::row::Schema;
 
 /// Why the indexer stopped.
 ///
@@ -115,6 +119,8 @@ pub enum RuntimeError {
 pub(crate) struct Pipeline {
     ingest: Ingest,
     decoder: Decoder,
+    /// Every table a store creates: the dataset tables and each decoded event's.
+    schema: Arc<Schema>,
 }
 
 impl Pipeline {
@@ -148,6 +154,7 @@ impl Pipeline {
         }
         Ok(Self {
             ingest,
+            schema: Arc::new(catalog.schema().clone()),
             decoder: Decoder::new(catalog),
         })
     }
@@ -160,17 +167,22 @@ impl Pipeline {
     /// [`RuntimeError::Ingest`] or [`RuntimeError::Storage`] when a part fails. Each
     /// carries that part's own error, because "storage stopped" says nothing about why.
     pub(crate) async fn run(self, settings: &Settings) -> Result<(), RuntimeError> {
-        let Self { ingest, decoder } = self;
-        if !settings.ingest.datasets.log && decoder.contracts() > 0 {
-            warn!("log dataset is not selected; registered contracts will not decode");
+        let Self {
+            ingest,
+            decoder,
+            schema,
+        } = self;
+        if !settings.ingest.datasets.logs && decoder.contracts() > 0 {
+            warn!("`logs` dataset is not selected; registered contracts will not decode");
         }
 
         // The settings' backend is the branch, so a backend this build does not have is
         // already a startup error and each arm here opens exactly what it named.
         match &settings.sink {
             Sink::Stdout(_) => {
-                // No store, so nothing to restore: a run starts fresh from the manifests'
-                // seeds.
+                // No store, so no tables and nothing to restore: a run starts fresh from the
+                // manifests' seeds.
+                drop(schema);
                 ingest
                     .run(
                         DecodingSink::new(decoder, StdoutJsonSink::new()),
@@ -181,7 +193,8 @@ impl Pipeline {
             }
             #[cfg(feature = "postgres")]
             Sink::Postgres(postgres) => {
-                let mut store = sink::PostgresSink::open(postgres).await?;
+                let mut store =
+                    sink::PostgresSink::open(postgres, schema, &settings.ingest.chain).await?;
                 let chain = ChainId::new(&settings.ingest.chain);
                 let decoder = restore(decoder, &chain, store.contracts(&chain).await?);
                 let ledger = ledger(&chain, store.ledger(&chain, LEDGER_WINDOW).await?);
@@ -196,7 +209,7 @@ impl Pipeline {
             Sink::DuckDb(duckdb) => {
                 // Open the store before ingest starts, so a bad path fails at startup
                 // rather than after the first block.
-                let mut store = DuckDbSink::open(duckdb)?;
+                let mut store = DuckDbSink::open(duckdb, schema, &settings.ingest.chain)?;
                 let chain = ChainId::new(&settings.ingest.chain);
                 let decoder = restore(decoder, &chain, store.contracts(&chain)?);
                 let ledger = ledger(&chain, store.ledger(&chain, LEDGER_WINDOW)?);
@@ -299,6 +312,7 @@ mod tests {
     use alloy_primitives::{Address, B256, keccak256};
 
     use std::collections::HashMap;
+    use std::sync::Arc;
 
     use crate::config::Settings;
     use crate::decode::{Catalog, Decoder, DecodingSink, StoredContract};
@@ -307,6 +321,7 @@ mod tests {
     use crate::sink::duckdb::StoreError;
     use crate::sink::{self, DuckDbSink, EnvelopeSink as _, SinkError};
     use crate::wire::envelope::{ChainId, Envelope, Event, Log, Reorg};
+    use crate::wire::row::Schema;
 
     use super::{LEDGER_WINDOW, Pipeline, RuntimeError, finish, ledger};
 
@@ -340,13 +355,13 @@ ws_url = "wss://example.invalid"
     fn a_failed_store_is_reported_ahead_of_the_closed_send() {
         let connection = duckdb::Connection::open_in_memory().expect("open in-memory DuckDB");
         connection
-            .execute_batch("CREATE TABLE block (not_a_column INTEGER)")
+            .execute_batch("CREATE TABLE blocks (not_a_column INTEGER)")
             .expect("schema");
         let source = connection
-            .execute("INSERT INTO block VALUES (1, 2)", [])
+            .execute("INSERT INTO blocks VALUES (1, 2)", [])
             .expect_err("two values cannot fit one column");
         let storage = Ok(Err(SinkError::Store(StoreError::Append {
-            table: "block",
+            table: "blocks".to_owned(),
             source,
         })));
         let ingest = Err(PipelineError::Sink(SinkError::StorageClosed));
@@ -354,8 +369,9 @@ ws_url = "wss://example.invalid"
         let error = finish(storage, ingest).expect_err("the store rejected the batch");
         assert!(
             matches!(
-                error,
-                RuntimeError::Storage(SinkError::Store(StoreError::Append { table: "block", .. }))
+                &error,
+                RuntimeError::Storage(SinkError::Store(StoreError::Append { table, .. }))
+                    if table == "blocks"
             ),
             "the append error must be the one reported, not the closed send: {error:?}"
         );
@@ -385,7 +401,7 @@ ws_url = "wss://example.invalid"
 
         let filtered = SETTINGS.replace(
             "ws_url = \"wss://example.invalid\"",
-            "ws_url = \"wss://example.invalid\"\ndatasets = [\"log\"]\n\
+            "ws_url = \"wss://example.invalid\"\ndatasets = [\"logs\"]\n\
              log_addresses = [\"0x1111111111111111111111111111111111111111\"]",
         );
         let settings = Settings::from_str(&format!("{filtered}{decode}")).expect("settings parse");
@@ -399,6 +415,12 @@ ws_url = "wss://example.invalid"
             .expect("decode")
             .expect("the factory still decodes");
         assert!(decoding.discovered.is_empty(), "discovery is off");
+    }
+
+    /// The shipped protocols' schema, which a store opens with to hold what [`decoder`]
+    /// decodes.
+    fn schema() -> Arc<Schema> {
+        sink::fixtures::schema()
     }
 
     fn decoder() -> Decoder {
@@ -451,7 +473,7 @@ ws_url = "wss://example.invalid"
 
     fn count(reader: &duckdb::Connection, table: &str) -> i64 {
         reader
-            .query_row(&format!("SELECT count(*) FROM \"{table}\""), [], |row| {
+            .query_row(&format!("SELECT count(*) FROM base.{table}"), [], |row| {
                 row.get(0)
             })
             .expect("count")
@@ -470,7 +492,7 @@ ws_url = "wss://example.invalid"
 
         let connection = duckdb::Connection::open_in_memory().expect("open in-memory DuckDB");
         let reader = connection.try_clone().expect("a second handle");
-        let mut store = DuckDbSink::new(connection).expect("create tables");
+        let mut store = DuckDbSink::new(connection, schema(), "base").expect("create tables");
         let (blocks, receiver) = sink::channel::ChannelSink::new();
         let storage = tokio::spawn(async move { receiver.drain(&mut store, 500).await });
 
@@ -487,17 +509,25 @@ ws_url = "wss://example.invalid"
         // One table per dataset: the raw logs, their decodes, and the discovery.
         assert_eq!(
             [
-                count(&reader, "log"),
-                count(&reader, "decoded"),
-                count(&reader, "contract")
+                count(&reader, "logs"),
+                count(&reader, "decoded_logs"),
+                count(&reader, "contracts")
             ],
             [2, 2, 1]
+        );
+        // And each decode in its event's own typed table.
+        assert_eq!(
+            [
+                count(&reader, "uniswap_v3_uniswap_v3_factory_pool_created"),
+                count(&reader, "uniswap_v3_pool_swap")
+            ],
+            [1, 1]
         );
         // The decoded rows key back to the raw logs they came from.
         let orphans: i64 = reader
             .query_row(
-                "SELECT count(*) FROM decoded d WHERE NOT EXISTS \
-                 (SELECT 1 FROM log l WHERE starts_with(d.dedupe_key, l.dedupe_key))",
+                "SELECT count(*) FROM base.decoded_logs d WHERE NOT EXISTS \
+                 (SELECT 1 FROM base.logs l WHERE starts_with(d.dedupe_key, l.dedupe_key))",
                 [],
                 |row| row.get(0),
             )
@@ -505,7 +535,8 @@ ws_url = "wss://example.invalid"
         assert_eq!(orphans, 0);
 
         // A restart: a fresh decoder knows the pool once the store's rows are restored.
-        let mut store = DuckDbSink::new(reader.try_clone().expect("handle")).expect("reopen");
+        let mut store =
+            DuckDbSink::new(reader.try_clone().expect("handle"), schema(), "base").expect("reopen");
         let stored = store.contracts(&chain).expect("read back");
         assert_eq!(
             stored,
@@ -537,7 +568,7 @@ ws_url = "wss://example.invalid"
             .expect("publish");
         store.flush().await.expect("flush");
         assert!(store.contracts(&chain).expect("read back").is_empty());
-        assert_eq!(count(&reader, "contract"), 0);
+        assert_eq!(count(&reader, "contracts"), 0);
     }
 
     /// A fixed chain: the head and, per height, the block's identity and its events. Its
@@ -624,7 +655,8 @@ ws_url = "wss://example.invalid"
     /// holds, index `chain` to its head through decode and the storage channel, then stop
     /// and let storage drain, as a crash after the last commit would leave it.
     async fn run_once(connection: &duckdb::Connection, chain: FakeChain, start: Option<u64>) {
-        let mut store = DuckDbSink::new(connection.try_clone().expect("handle")).expect("open");
+        let mut store = DuckDbSink::new(connection.try_clone().expect("handle"), schema(), "base")
+            .expect("open");
         let id = chain.chain.clone();
         let mut decoder = decoder();
         decoder.restore(store.contracts(&id).expect("contracts"));
@@ -645,7 +677,7 @@ ws_url = "wss://example.invalid"
 
     fn heights(reader: &duckdb::Connection) -> Vec<(u64, String)> {
         reader
-            .prepare("SELECT height, hash FROM accepted_block ORDER BY height, hash")
+            .prepare("SELECT height, hash FROM base.accepted_blocks ORDER BY height, hash")
             .expect("prepare")
             .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
             .expect("query")
@@ -676,9 +708,9 @@ ws_url = "wss://example.invalid"
         run_once(&connection, grown, None).await;
         let ledger: Vec<u64> = heights(&connection).iter().map(|(h, _)| *h).collect();
         assert_eq!(ledger, [1, 2, 3, 4, 5, 6], "resumed after 4 with no gap");
-        assert_eq!(count(&connection, "reorg"), 0);
+        assert_eq!(count(&connection, "reorgs"), 0);
         assert_eq!(
-            count(&connection, "contract"),
+            count(&connection, "contracts"),
             1,
             "created while down, discovered"
         );
@@ -690,7 +722,9 @@ ws_url = "wss://example.invalid"
         run_once(&connection, forked, None).await;
 
         let orphaned: String = connection
-            .query_row("SELECT orphaned_hashes FROM reorg", [], |row| row.get(0))
+            .query_row("SELECT orphaned_hashes FROM base.reorgs", [], |row| {
+                row.get(0)
+            })
             .expect("one reorg");
         let expected: Vec<String> = [6, 5]
             .map(|height| format!("{:#x}", block_hash(0xa0, height)))
@@ -699,12 +733,12 @@ ws_url = "wss://example.invalid"
             serde_json::from_str::<Vec<String>>(&orphaned).expect("hash list"),
             expected
         );
-        assert_eq!(count(&connection, "reorg"), 1);
+        assert_eq!(count(&connection, "reorgs"), 1);
         assert_eq!(
             [
-                count(&connection, "log"),
-                count(&connection, "decoded"),
-                count(&connection, "contract")
+                count(&connection, "logs"),
+                count(&connection, "decoded_logs"),
+                count(&connection, "contracts")
             ],
             [1, 0, 0],
             "the creation went with its orphaned block; only the undecoded swap remains"
@@ -714,7 +748,8 @@ ws_url = "wss://example.invalid"
             7,
             "the orphaned blocks left the ledger"
         );
-        let store = DuckDbSink::new(connection.try_clone().expect("handle")).expect("open");
+        let store = DuckDbSink::new(connection.try_clone().expect("handle"), schema(), "base")
+            .expect("open");
         let chain = ChainId::new("base");
         assert!(store.contracts(&chain).expect("contracts").is_empty());
         let canonical = store.ledger(&chain, LEDGER_WINDOW).expect("ledger");
@@ -739,7 +774,8 @@ ws_url = "wss://example.invalid"
     async fn a_start_height_with_a_stored_ledger_is_refused() {
         let connection = duckdb::Connection::open_in_memory().expect("open in-memory DuckDB");
         run_once(&connection, FakeChain::new(3, 0xa0), Some(1)).await;
-        let store = DuckDbSink::new(connection.try_clone().expect("handle")).expect("open");
+        let store = DuckDbSink::new(connection.try_clone().expect("handle"), schema(), "base")
+            .expect("open");
         let chain = ChainId::new("base");
         let restored = ledger(&chain, store.ledger(&chain, LEDGER_WINDOW).expect("ledger"));
         let machine = Machine::new(FakeChain::new(5, 0xa0), store, restored);

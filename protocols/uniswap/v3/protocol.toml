@@ -2,6 +2,10 @@
 #
 # Every pool comes from the factory's `PoolCreated`, so pools are discovered rather than
 # listed: a pool created while the indexer runs decodes from its creating block.
+#
+# The pool's `table` key keeps its event table names within 63 bytes: its `Swap` is
+# `uniswap_v3_pool_swap`, and `increase_observation_cardinality_next` would overflow
+# under the default `uniswap_v3_uniswap_v3_pool_` prefix.
 protocol = "uniswap_v3"
 
 [[contract]]
@@ -10,6 +14,7 @@ addresses = { base = ["0x33128a8fC17869897dcE68Ed026d694621f6FDfD"] }
 
 [[contract]]
 abi = ["UniswapV3Pool.json"]
+table = "pool"
 created_by = [{ contract = "UniswapV3Factory", event = "PoolCreated", param = "pool" }]
 # Seeds: busy pools created before any run, so a short run decodes swaps out of the box.
 # The second is the pool `examples/decode_logs.rs` decodes.

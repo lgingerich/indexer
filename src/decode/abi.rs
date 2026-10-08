@@ -117,6 +117,31 @@ impl Abi {
         Ok(())
     }
 
+    /// Every event, with its inputs in declaration order: what an event table is
+    /// generated from.
+    pub(crate) fn events(&self) -> impl Iterator<Item = EventSpec<'_>> {
+        self.events.values().map(|event| {
+            let mut inputs: Vec<InputSpec<'_>> = event
+                .indexed
+                .iter()
+                .map(|argument| (argument, true))
+                .chain(event.body.iter().map(|argument| (argument, false)))
+                .map(|(argument, indexed)| InputSpec {
+                    name: &argument.name,
+                    position: argument.position,
+                    ty: &argument.ty,
+                    indexed,
+                })
+                .collect();
+            inputs.sort_by_key(|input| input.position);
+            EventSpec {
+                id: event.id,
+                name: &event.name,
+                inputs,
+            }
+        })
+    }
+
     /// The keys of every event declared under `name`.
     pub(crate) fn events_named(&self, name: &str) -> Vec<EventKey> {
         self.events
@@ -185,6 +210,30 @@ fn topic_count(log: &Log) -> usize {
         .iter()
         .take_while(|topic| topic.is_some())
         .count()
+}
+
+/// One event of an [`Abi`], as the catalog turns it into a table.
+#[derive(Debug)]
+pub(crate) struct EventSpec<'a> {
+    /// The definition's identity; see [`Abi`].
+    pub(crate) id: B256,
+    /// The event name.
+    pub(crate) name: &'a str,
+    /// Every input, in declaration order.
+    pub(crate) inputs: Vec<InputSpec<'a>>,
+}
+
+/// One input of an [`EventSpec`].
+#[derive(Debug)]
+pub(crate) struct InputSpec<'a> {
+    /// The input name; may be empty.
+    pub(crate) name: &'a str,
+    /// The position among all inputs.
+    pub(crate) position: usize,
+    /// The resolved type.
+    pub(crate) ty: &'a DynSolType,
+    /// Whether it is a topic.
+    pub(crate) indexed: bool,
 }
 
 impl PreparedEvent {
@@ -637,7 +686,7 @@ mod tests {
     #[test]
     fn actual_swap_fixture_decodes() {
         let abi = Abi::from_json(include_str!(
-            "../../protocols/uniswap_v3/UniswapV3Pool.json"
+            "../../protocols/uniswap/v3/UniswapV3Pool.json"
         ))
         .expect("pool ABI");
         let source: crate::wire::envelope::Envelope = serde_json::from_str(

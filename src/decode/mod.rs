@@ -19,6 +19,6 @@ mod decoder;
 mod sink;
 
 pub use abi::{Abi, AbiError, DecodeError, DecodedEvent};
-pub use catalog::{Catalog, CatalogError};
+pub use catalog::{Catalog, CatalogError, MAX_TABLE_NAME};
 pub use decoder::{Decoder, Decoding, StoredContract};
 pub use sink::DecodingSink;

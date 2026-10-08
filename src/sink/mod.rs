@@ -53,10 +53,13 @@ use crate::wire::envelope::Envelope;
 #[cfg(any(feature = "duckdb", feature = "postgres"))]
 use crate::wire::envelope::Event;
 #[cfg(any(feature = "duckdb", feature = "postgres"))]
-use crate::wire::row::{Row, Table, row_for};
+use crate::wire::row::{Row, Schema, TableId, row_for};
 
 /// What a store has been handed since its last commit: the rows to write, and the
 /// blocks a buffered `reorg` retracted.
+///
+/// A decoded record is two rows: its generic `decoded_logs` row, and its event's typed row,
+/// from the run's [`Schema`].
 ///
 /// A store holds only the canonical chain. A `reorg` orphans blocks that are either
 /// already committed or still in this buffer — blocks are published in order and the
@@ -72,20 +75,36 @@ use crate::wire::row::{Row, Table, row_for};
 /// with the rows, and a retry of a committed batch deletes nothing and upserts onto
 /// itself.
 #[cfg(any(feature = "duckdb", feature = "postgres"))]
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct Batch {
     /// Rows to upsert, in publish order.
     rows: Vec<Row>,
     /// Orphaned block hashes to delete from the store, as `0x` hex, by chain.
     orphaned: std::collections::BTreeMap<String, std::collections::BTreeSet<String>>,
+    /// Every table the run writes, which renders each envelope's rows.
+    schema: std::sync::Arc<Schema>,
 }
 
 #[cfg(any(feature = "duckdb", feature = "postgres"))]
 impl Batch {
-    /// Buffers one envelope's row. A `reorg` first drops every buffered row of the
+    /// An empty batch writing into `schema`.
+    fn new(schema: std::sync::Arc<Schema>) -> Self {
+        Self {
+            rows: Vec::new(),
+            orphaned: std::collections::BTreeMap::new(),
+            schema,
+        }
+    }
+
+    /// Buffers one envelope's rows. A `reorg` first drops every buffered row of the
     /// blocks it orphans and records them for deletion; its own row is kept as the
     /// record of the retraction.
-    fn push(&mut self, envelope: &Envelope) {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SinkError::UnknownEvent`] for a decoded record no event table holds,
+    /// which means it was decoded against a different catalog than the store opened with.
+    fn push(&mut self, envelope: &Envelope) -> Result<(), SinkError> {
         if let Event::Reorg(reorg) = &envelope.event
             && !reorg.orphaned_hashes.is_empty()
         {
@@ -103,25 +122,40 @@ impl Batch {
                 .or_default()
                 .extend(hashes);
         }
+        if let Event::Decoded(decoded) = &envelope.event {
+            let row = self
+                .schema
+                .event_row(&envelope.chain, decoded)
+                .ok_or_else(|| SinkError::UnknownEvent {
+                    protocol: decoded.protocol.clone(),
+                    contract: decoded.contract.clone(),
+                    event: decoded.name.clone(),
+                })?;
+            self.rows.push(row);
+        }
         self.rows.push(row_for(&envelope.chain, &envelope.event));
+        Ok(())
     }
 
-    /// The rows of `table` a store should load: the last buffered copy of each
+    /// The rows each table should load: the last buffered copy of each
     /// `(chain, dedupe_key)`, in publish order.
     ///
     /// A store's merge must not see a key twice — both engines refuse to update one
     /// conflict row twice in a statement — and "last" means last published, which only
     /// the buffer knows; the staging table's physical order does not promise it.
-    fn last_per_key(&self, table: Table) -> Vec<&Row> {
+    fn by_table(&self) -> std::collections::HashMap<TableId, Vec<&Row>> {
         let mut seen = std::collections::HashSet::new();
-        let mut kept: Vec<&Row> = self
-            .rows
-            .iter()
-            .rev()
-            .filter(|row| row.table() == table && seen.insert((row.chain(), row.dedupe_key())))
-            .collect();
-        kept.reverse();
-        kept
+        let mut tables: std::collections::HashMap<TableId, Vec<&Row>> =
+            std::collections::HashMap::new();
+        for row in self.rows.iter().rev() {
+            if seen.insert((row.table(), row.chain(), row.dedupe_key())) {
+                tables.entry(row.table()).or_default().push(row);
+            }
+        }
+        for rows in tables.values_mut() {
+            rows.reverse();
+        }
+        tables
     }
 
     /// Whether there is nothing to commit. A `reorg` always buffers its own row, so a
@@ -135,6 +169,12 @@ impl Batch {
         self.rows.clear();
         self.orphaned.clear();
     }
+}
+
+/// `name` as a quoted SQL identifier, for a database schema named at runtime.
+#[cfg(any(feature = "duckdb", feature = "postgres"))]
+fn quote_identifier(name: &str) -> String {
+    format!("\"{}\"", name.replace('"', "\"\""))
 }
 
 /// A stored discovered contract, as a store's query returns it.
@@ -156,7 +196,7 @@ fn stored_contract(
     })
 }
 
-/// A stored `accepted_block` row, as a store's query returns it.
+/// A stored `accepted_blocks` row, as a store's query returns it.
 #[cfg(any(feature = "duckdb", feature = "postgres"))]
 fn stored_block(
     height: u64,
@@ -257,6 +297,17 @@ pub enum SinkError {
     /// gone. A channel sink reports this when the receiving half was dropped.
     #[error("storage has stopped, so the batch cannot be delivered")]
     StorageClosed,
+    /// A decoded record names an event no event table holds: it was decoded against a
+    /// different catalog than the store was opened with.
+    #[error("no event table holds {protocol}.{contract}.{event}")]
+    UnknownEvent {
+        /// The record's protocol.
+        protocol: String,
+        /// The record's contract.
+        contract: String,
+        /// The record's event name.
+        event: String,
+    },
     /// Rendering the envelope for a transport failed.
     #[error("serialize envelope: {0}")]
     Serialize(#[from] serde_json::Error),
@@ -274,4 +325,47 @@ pub enum SinkError {
     #[cfg(feature = "postgres")]
     #[error(transparent)]
     Postgres(#[from] postgres::StoreError),
+}
+
+/// Fixtures the store tests share: the shipped catalog's event tables, and a real decoded
+/// record to write into them.
+#[cfg(all(test, any(feature = "duckdb", feature = "postgres")))]
+#[expect(clippy::expect_used)]
+pub(crate) mod fixtures {
+    use std::sync::Arc;
+
+    use crate::decode::{Catalog, Decoder};
+    use crate::wire::envelope::{ChainId, Decoded, Envelope, Event};
+    use crate::wire::row::Schema;
+
+    fn catalog() -> Catalog {
+        Catalog::load(
+            format!("{}/protocols", env!("CARGO_MANIFEST_DIR")),
+            &ChainId::new("base"),
+        )
+        .expect("shipped protocols load")
+    }
+
+    /// The shipped protocols' schema: the dataset tables and their event tables.
+    pub(crate) fn schema() -> Arc<Schema> {
+        Arc::new(catalog().schema().clone())
+    }
+
+    /// The first real Uniswap V3 `Swap` in the fixtures, decoded against the shipped
+    /// catalog: a seeded pool, so it decodes with no discovery.
+    pub(crate) fn decoded_swap() -> Decoded {
+        let line = include_str!("../../examples/fixtures/uniswap_v3_swaps.ndjson")
+            .lines()
+            .next()
+            .expect("a fixture line");
+        let envelope: Envelope = serde_json::from_str(line).expect("a published envelope");
+        let Event::Log(log) = envelope.event else {
+            panic!("the fixture is a log");
+        };
+        Decoder::new(catalog())
+            .decode(&log)
+            .expect("decodes")
+            .expect("a seeded pool's swap")
+            .decoded
+    }
 }

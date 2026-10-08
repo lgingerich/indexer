@@ -179,6 +179,13 @@ pub struct Decoded {
     /// reasons the decoder should not care about. The decoder supplies the protocol as
     /// a fact; the projection supplies the dataset.
     pub protocol: String,
+    /// Which of the protocol's contracts emitted it, from its manifest, for example
+    /// `UniswapV3Pool`.
+    ///
+    /// With the protocol and the event, this names the one typed table the record is
+    /// also stored in: two contracts of a protocol may emit the same event, and each
+    /// gets its own table.
+    pub contract: String,
     /// The event selector, `keccak256` of its signature.
     ///
     /// [`B256::ZERO`] for an anonymous event, which has no selector in `topic0`. A
@@ -474,6 +481,7 @@ mod tests {
             name: "Swap".to_owned(),
             address: Address::from([0xd0; 20]),
             protocol: "uniswap_v3".to_owned(),
+            contract: "UniswapV3Pool".to_owned(),
             event_id: hash(0x08),
             selector: hash(0x07),
             signature: "Swap(address,address,int256,int256,uint160,uint128,int24)".to_owned(),
@@ -610,6 +618,7 @@ mod tests {
             name: "Swap".to_owned(),
             address: Address::from([0xd0; 20]),
             protocol: "uniswap_v3".to_owned(),
+            contract: "UniswapV3Pool".to_owned(),
             event_id: hash(0x08),
             selector: hash(0x07),
             signature: "Swap(address,address,int256)".to_owned(),
@@ -688,6 +697,7 @@ mod tests {
                 name: "Swap".to_owned(),
                 address: Address::from([0xd0; 20]),
                 protocol: "uniswap_v3".to_owned(),
+                contract: "UniswapV3Pool".to_owned(),
                 event_id: hash(0x08),
                 selector,
                 signature: "Swap(address)".to_owned(),
@@ -837,6 +847,7 @@ mod tests {
                 name: "Transfer".to_owned(),
                 address: Address::from([0x22; 20]),
                 protocol: "erc20".to_owned(),
+                contract: "Token".to_owned(),
                 event_id: hash(0x08),
                 selector: hash(0x07),
                 signature: "Transfer(address,address,uint256)".to_owned(),

@@ -14,7 +14,7 @@
 //!
 //! A source also owns how to turn a chain's block into [`Event`]s. It reports a
 //! block's [`BlockMeta`] separately from those events, so parent linkage and the
-//! block timestamp are available even when the block dataset is not stored: a
+//! block timestamp are available even when the `blocks` dataset is not stored: a
 //! live notification carries enough metadata to reuse, and a fetched block carries
 //! the authoritative header. Adding Solana, Reth `ExEx`, or a Bitcoin source means
 //! implementing this trait, not touching the pipeline.
@@ -36,7 +36,7 @@ use crate::wire::envelope::{AcceptedBlock, ChainId, Event};
 /// Carried by both a live `newHeads` notification and a fetched block, so a single
 /// type covers every identity comparison the pipeline makes. The parent hash is what
 /// makes linkage checkable before a block's events exist, and the timestamp is stamped
-/// onto every dataset row for that block, so it is needed even when the block dataset
+/// onto every dataset row for that block, so it is needed even when the `blocks` dataset
 /// itself is not stored.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BlockMeta {
@@ -81,7 +81,7 @@ pub struct FetchedBlock {
     ///
     /// Empty when no selected dataset produced a row — an empty block, or a
     /// logs-only block with no logs. The leading [`Event::Block`] appears only when
-    /// the block dataset is stored; the pipeline reads linkage from [`Self::meta`],
+    /// the `blocks` dataset is stored; the pipeline reads linkage from [`Self::meta`],
     /// not from the events, so metadata is always present.
     pub events: Vec<Event>,
 }
@@ -132,7 +132,7 @@ pub enum SourceError {
     /// `eth_getLogs` is the filtered call, and it runs only when logs are selected
     /// and receipts are not. With receipts, logs are taken from those receipts.
     #[error(
-        "log addresses apply to eth_getLogs, which runs when the log dataset is selected and receipts are not"
+        "log addresses apply to eth_getLogs, which runs when the `logs` dataset is selected and receipts are not"
     )]
     LogAddresses,
 }

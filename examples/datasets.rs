@@ -206,6 +206,7 @@ fn decoded() -> Envelope {
         address: CONTRACT,
         // From the protocol manifest that listed the address, not from the ABI.
         protocol: "uniswap_v3".to_owned(),
+        contract: "UniswapV3Pool".to_owned(),
         event_id: hash(0x08),
         selector: hash(0x07),
         signature: "Swap(address,address,int256,int256,uint160,uint128,int24)".to_owned(),

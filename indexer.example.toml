@@ -24,7 +24,7 @@ ws_url = "wss://base-rpc.publicnode.com"
 # Which datasets to fetch and store: any combination of these four, but not empty.
 # Omitted means all four. Logs without receipts use one eth_getLogs per height;
 # every other dataset reads the block body.
-# datasets = ["block", "transaction", "receipt", "log"]
+# datasets = ["blocks", "transactions", "receipts", "logs"]
 
 # Contracts `eth_getLogs` is limited to. Sent only when logs are selected and
 # receipts are not (receipts already carry every log, so any other combination is

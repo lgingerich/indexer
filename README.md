@@ -98,13 +98,13 @@ stored
 ```
 
 The store holds only the current chain. A `reorg` deletes every row of the blocks it
-orphans — from `block`, `transaction`, `receipt`, `log`, `decoded`, `contract`, and
-`accepted_block` — in the same transaction that writes the `reorg` row and the
+orphans — from `blocks`, `transactions`, `receipts`, `logs`, `decoded_logs`, `contracts`, and
+`accepted_blocks` — in the same transaction that writes the `reorgs` row and the
 replacements, so no commit ever shows both branches or neither. A dataset query needs no
-filter. The `reorg` row stays as the record of what was retracted.
+filter. The `reorgs` row stays as the record of what was retracted.
 
 Each table names the column its block is found by (`Table::block_hash_column`: `hash`
-for `block` and `accepted_block`, `block_hash` elsewhere), and the delete goes by that
+for `blocks` and `accepted_blocks`, `block_hash` elsewhere), and the delete goes by that
 column, not by `dedupe_key`. An orphaned block is either already committed or still
 buffered in the same batch — blocks are published in order and the storage channel is
 FIFO — so the store drops the buffered rows when the `reorg` arrives and deletes the
@@ -165,7 +165,7 @@ and the node serves the blocks after it.
 
 ### Resume from the store
 
-The store's `accepted_block` table is a ledger of every block it committed, one row per
+The store's `accepted_blocks` table is a ledger of every block it committed, one row per
 block, each written in the same transaction as that block's rows. At startup the newest
 4,097 rows are read back — an orphaned block's row was deleted by its `reorg` — the undo window plus its
 floor — and every older row for the chain is deleted, so the table stays bounded across
@@ -226,8 +226,8 @@ src/
 ├── main.rs         the process boundary: logging, the settings path, the exit code
 ├── runtime.rs      assembles the pipeline the settings describe, and runs it
 ├── config.rs       typed settings — layer configuration, not string lookups
-├── wire/           the wire contract: envelope, events, dataset records, and the rows a
-│                   store persists. Pure data.
+├── wire/           the wire contract: envelope, events, dataset records, the rows a
+│                   store persists, and each decoded event's typed table. Pure data.
 ├── ingest/         block sources and the reorg-aware pipeline.
 ├── decode/         protocol manifests, the log decoder and its contract set, factory
 │                   discovery, and the live decoding sink.
@@ -252,7 +252,7 @@ that matters most: `decode` must not depend on `ingest`.
   and `[ingest] log_addresses` limits that call to those contracts. A live `newHeads`
   notification carries the head's identity, parent hash, and timestamp, so a logs-only
   fetch reuses them and pins `eth_getLogs` to the announced hash instead of re-reading
-  the header; a block, transaction, or receipt dataset still fetches the body it needs.
+  the header; a block, transaction, or `receipts` dataset still fetches the body it needs.
   See `src/ingest/source/evm.rs`.
 - **One event per dataset.** A `block` event, then for each transaction a
   `transaction` event, its `receipt` event, and its `log` events. Each dataset is a
@@ -274,24 +274,24 @@ that matters most: `decode` must not depend on `ingest`.
 - **Factory discovery.** A manifest's `created_by` rule turns a factory's creation event
   into a new contract in the set, live, and publishes it as a `contract` row in the same
   commit as the block that created it. A reorg retracts contracts created in orphaned
-  blocks. At startup the store's `contract` rows are read back, so a restart keeps
+  blocks. At startup the store's `contracts` rows are read back, so a restart keeps
   decoding every pool a previous run discovered, and resume replays the blocks missed
   while down, so pools created then are discovered too.
 - **A local store.** The process writes every envelope, raw and decoded, into a local
   `DuckDB` database: one typed table per dataset, with real columns rather than a JSON
-  blob. What a dataset's columns *are* lives in `src/wire/row.rs`, not in the store, so a
+  blob, and one per decoded event, with a column per argument. What a dataset's columns *are* lives in `src/wire/row.rs`, not in the store, so a
   second store reuses the mapping instead of re-deriving it.
 - **Sliding undo window, no finality assertion.** Ingestion keeps the most recent
   4,096 accepted block identities plus one predecessor as a recovery floor. It does not
   read the node's `finalized` tag and does not claim any height is irreversible. The
   window caps how deep a fork reconciliation can reach; a deeper fork stops rather than
-  guessing. Each identity is also written to the store's `accepted_block` ledger, which
+  guessing. Each identity is also written to the store's `accepted_blocks` ledger, which
   is what a restart restores the window from.
 - **Reorg retraction.** Parent-hash linkage is checked on every block. A mismatch
   appends a `reorg` event whose `orphaned_hashes` name the block hashes that stopped
   being canonical, then appends the replacement branch under its own keys. The store
   deletes the orphaned blocks' rows in the same transaction, so its tables hold only the
-  current chain and the `reorg` rows are the history of what was retracted.
+  current chain and the `reorgs` rows are the history of what was retracted.
   The sliding window retains up to a fixed 4,096 identities. See `src/ingest/pipeline.rs`.
 - **Headless backfill, then live heads.** Startup samples the head once and captures it
   as a backfill target; on an empty store `[ingest] start_block` may request earlier
@@ -327,6 +327,7 @@ streaming aggregation
 Avro for a serialized envelope
 ranged log backfill
 signature-only decoding
+event table and schema limitations
 ```
 
 ### Stored-log replay
@@ -389,6 +390,44 @@ one. The catalog already keys events by selector and topic count, so a
 those records would carry no protocol, since a matching signature says nothing about who
 emitted it — anyone can deploy a contract that emits a lookalike `Swap`. Not built.
 
+### Event table and schema limitations
+
+Known gaps in the [event tables](#protocol-manifests) and the store schemas, none of them
+handled yet:
+
+- **An event declared twice under one name stops startup.** A proxy upgrade lists each
+  version's ABI under one contract, and when an upgrade changes an event's argument
+  types, the old and new definitions both exist, both named `Swap`, and both want the
+  table `{protocol}_{contract}_swap`. That is a duplicate-name error, and there is no way
+  around it but dropping one version's ABI — losing either the logs before the upgrade
+  or the ones after. A Solidity overload in one ABI fails the same way. The fix, when a
+  contract needs it, is a suffix on later definitions or a per-event name in the
+  manifest.
+- **Tables are created, never migrated.** A store creates a missing table and leaves an
+  existing one alone. An ABI edited in place — a renamed or retyped argument — changes
+  the columns the indexer writes, so the next write to that table fails; drop the table
+  first. The same holds for dataset tables when a release changes their columns: the
+  `decoded_logs` table gained a `contract` column, so a store created before that must be
+  re-created.
+- **Older PostgreSQL tables lack a primary key.** Tables created before `(chain,
+  dedupe_key)` became the primary key keep a `UNIQUE` constraint instead, which logical
+  replication does not accept as a replica identity, so a reorg's delete fails once such
+  a table is in a publication. Re-create the store.
+- **Long names need a manual `table` key.** A name past 63 bytes is a startup error, so
+  a contract with long event names needs a `table` key chosen by hand; there is no
+  automatic shortening.
+- **Documents keep the wire encoding.** Array and tuple arguments, and every argument in
+  `decoded_logs`, are JSON in the published form, where integers are `0x` hex strings.
+  PostgreSQL cannot cast a 256-bit hex string to `NUMERIC` without a helper function, so
+  arithmetic on a value inside a document is awkward. Scalar arguments have typed columns
+  and are not affected.
+- **A `string` argument may be `NULL`.** A string whose bytes are not valid UTF-8, or that
+  holds a NUL, which PostgreSQL rejects in text, is `NULL` in its event table. The raw log
+  keeps the exact bytes.
+- **DuckDB's `BIGNUM` is exact only for sums and additions.** Multiplying a `BIGNUM` by
+  another type returns a `DOUBLE`; cast first when precision matters. PostgreSQL's
+  `NUMERIC` stays exact.
+
 Also not built, and not on the path above: mempool ingestion and a Parquet archive.
 
 ## Run it
@@ -399,8 +438,9 @@ decode run together in one task and storage in another; a part that ends for goo
 process, because continuing without it would leave a stream that looks alive but is not.
 
 - **`[ingest]` is required** — it names the chain to follow.
-- **Decode uses `[decode] protocols`.** An absent or empty catalog decodes nothing, which
-  is a legitimate way to run and is said at startup.
+- **Decode uses `[decode] protocols`.** Leaving it out decodes nothing, which is a
+  legitimate way to run and is said at startup; a directory with no manifest in it is a
+  startup error.
 - **Storage is the `[sink.<backend>]` table.** With `[sink.stdout]` no store is
   opened and the stream is printed instead.
 
@@ -453,17 +493,17 @@ the field:
 
 | Key | Default | Meaning |
 | --- | --- | --- |
-| `ingest.datasets` | block, transaction, receipt, log | Which datasets are fetched and stored. A dataset that needs the block body still reads it; a logs-only live fetch reuses the notification header |
-| `ingest.log_addresses` | none | Contracts passed to `eth_getLogs`. Empty fetches every log. Valid only when `log` is selected and `receipt` is not |
+| `ingest.datasets` | blocks, transactions, receipts, logs | Which datasets are fetched and stored. A dataset that needs the block body still reads it; a logs-only live fetch reuses the notification header |
+| `ingest.log_addresses` | none | Contracts passed to `eth_getLogs`. Empty fetches every log. Valid only when `logs` is selected and `receipts` is not |
 | `ingest.start_block` | the sampled head | First height to index on an empty store. Absent starts live at the observed head; a value backfills that inclusive height forward before following live heads. A value above the sampled head is a startup error, and so is a value when the store already holds blocks: a run resumes from the store |
 | `sink.duckdb.batch_records` | `500` | Most records one store commit may cover; a backlog of blocks is folded into one commit up to this, and a block is never split |
-| `sink.duckdb.path` | `indexer.duckdb` | Path to the store |
+| `sink.duckdb.path` | `indexer.duckdb` | Path to the store. Tables live in a schema named for the chain: `base.logs` |
 
 **Optional tables:**
 
 | Key | Meaning |
 | --- | --- |
-| `decode.protocols` | Path to the protocol manifests directory, relative to the settings file. Absent means nothing is decoded |
+| `decode.protocols` | Path to the protocol manifests directory, relative to the settings file: the whole tree, a group such as `protocols/uniswap`, or one protocol. Absent means nothing is decoded; a directory with no manifest in it is a startup error |
 | `sink.duckdb.settings` | Any other DuckDB setting, passed straight through |
 
 `RUST_LOG` is still read from the environment, because a log filter is not deployment
@@ -511,15 +551,26 @@ the repository is a working example. It is deliberately not part of `indexer.tom
 settings file is deployment topology (endpoints, paths), while the manifests are a catalog
 of protocols that grows on its own schedule.
 
-Each protocol is a directory holding a `protocol.toml` and the ABI files it names:
+Each protocol is a directory holding a `protocol.toml` and the ABI files it names. They
+can sit at any depth, so versions live under their protocol; a directory without a
+manifest only groups others:
 
 ```
 protocols/
-  uniswap_v3/
-    protocol.toml
-    UniswapV3Factory.json
-    UniswapV3Pool.json
+  uniswap/
+    v3/
+      protocol.toml
+      UniswapV3Factory.json
+      UniswapV3Pool.json
+    v4/
+      protocol.toml
+      PoolManager.json
 ```
+
+`[decode] protocols` may name the whole tree, a group (`protocols/uniswap` loads v3 and
+v4), or one protocol (`protocols/uniswap/v4`); every manifest under it loads. A
+manifest's `protocol` value is its name — on decoded records and in table names — so
+where it sits, and which directory the setting names, never changes what it writes.
 
 ```toml
 protocol = "uniswap_v3"
@@ -530,6 +581,7 @@ addresses = { base = ["0x33128a8fC17869897dcE68Ed026d694621f6FDfD"] }
 
 [[contract]]
 abi = ["UniswapV3Pool.json"]
+table = "pool"                     # only because a default name passes 63 bytes
 created_by = [{ contract = "UniswapV3Factory", event = "PoolCreated", param = "pool" }]
 addresses = { base = ["0xd0b53D9277642d899DF5C87A3966A349A798F224"] }   # optional seeds
 ```
@@ -547,10 +599,10 @@ event and parameter are resolved against the parent's ABI at load — Uniswap V3
 `PoolCreated.pool` is the fifth, non-indexed argument, Metric's `poolAddress` the first,
 indexed one — and the parameter must be an `address`, so a typo is a startup error
 rather than a rule that never fires. A discovered contract decodes from its creation log
-onward, and its row in `contract` records the factory, the creation log, and the block.
+onward, and its row in `contracts` records the factory, the creation log, and the block.
 Rules chain: a discovered contract can have `created_by` children of its own.
 
-**Restarts.** The `contract` rows are the state: each commits in the same transaction as
+**Restarts.** The `contracts` rows are the state: each commits in the same transaction as
 the block that created it, so the store never holds a block without its discoveries or
 the reverse. At startup the store's rows are read back; one created in a block a `reorg`
 orphaned was deleted with that block. A run [resumes from the store](#resume-from-the-store), so the
@@ -572,6 +624,44 @@ file, so adding or editing another event in the file leaves existing rows' keys 
 
 Uniswap V4's `PoolManager` is a single seed: its pools are `bytes32` ids inside one
 contract, not deployed contracts, so there is nothing to discover.
+
+**Event tables.** Every decoded record is stored twice: in the generic `decoded_logs` table,
+with its arguments as documents, and in its event's own typed table, with one column per
+argument. A table is named `{protocol}_{contract}_{event}`: the manifest's `protocol`,
+the contract's name in `snake_case` — or its `table` key, when it has one — and the
+event's name in `snake_case`:
+
+```
+uniswap_v3_pool_swap
+  address, transaction_hash, transaction_index, log_index,
+  sender, recipient, amount0, amount1, sqrt_price_x96, liquidity, tick,
+  block_number, block_hash, block_timestamp, chain, dedupe_key
+```
+
+| ABI type | PostgreSQL | DuckDB |
+| --- | --- | --- |
+| `uint8` – `uint64` | `NUMERIC(20,0)` | `UBIGINT` |
+| `int8` – `int64` | `BIGINT` | `BIGINT` |
+| wider integers | `NUMERIC(78,0)` | `BIGNUM` |
+| `bool` | `BOOLEAN` | `BOOLEAN` |
+| `address`, `bytesN`, `bytes`, `function` | `TEXT`, `0x` hex | `VARCHAR`, `0x` hex |
+| `string` | `TEXT`; `NULL` when not valid UTF-8 or holding a NUL | same |
+| arrays, tuples | `JSONB`, as in `decoded_logs` | `JSON`, as in `decoded_logs` |
+| an indexed `string`, `bytes`, array, or tuple | its topic hash, as text | same |
+
+Wide integers are exact, so `sum(amount0)` needs no cast. In DuckDB, `BIGNUM` sums and
+adds exactly, but multiplying it by another type turns the result into a `DOUBLE`; cast
+first when that matters. Argument names become `snake_case` (`sqrtPriceX96` is
+`sqrt_price_x96`); an unnamed argument is `arg{n}`, and one that repeats an earlier column
+gets `_{n}` appended. A row's key is the decoded record's `dedupe_key`, and a reorg
+deletes it with the rest of its block.
+
+A table name may be at most 63 bytes, PostgreSQL's limit, past which it would silently
+truncate the name; a longer one is a startup error asking for a shorter `table`. So is
+a name produced twice: two contracts given the same `table`, or one contract declaring
+two events by one name. Tables are created at startup and never altered. See
+[event table and schema limitations](#event-table-and-schema-limitations) for what that
+leaves unhandled.
 
 ### What decode does not do
 
@@ -621,12 +711,19 @@ batch_records = 500
 The connection string accepts PostgreSQL URL or keyword syntax, and is a
 [secret](#secrets) since it carries the password. TLS uses the platform certificate store;
 use `sslmode=disable` only for trusted local connections. The database must already
-exist, and the role needs permission to create and write the dataset tables in its
-configured search path.
+exist, and the role needs permission to create a schema in it and tables in that schema.
 
-The sink creates the same eight typed tables as DuckDB. Columns the chain always
+Tables live in a schema named for the chain — `base.logs`, `base.uniswap_v3_pool_swap` —
+created at startup if missing and set as the session's `search_path`. Processes indexing
+different chains can share one database without sharing tables, and a chain is dropped
+or re-indexed with `DROP SCHEMA base CASCADE`. Every row still carries its `chain`
+column, so rows unioned across chains stay self-describing. DuckDB does the same within
+its file.
+
+The sink creates the same tables as DuckDB: the eight dataset tables, and the
+[event tables](#protocol-manifests). Columns the chain always
 provides are `NOT NULL`; fields it can omit stay nullable. Each table's primary key is
-`(chain, dedupe_key)`, and every table but `reorg` is indexed on its block hash for
+`(chain, dedupe_key)`, and every table but `reorgs` is indexed on its block hash for
 [reorg deletes](#a-reorg). A flush bulk-loads with binary `COPY` into a temporary
 table, then upserts into the dataset table, in one transaction. Unsigned 64-bit fields
 use `NUMERIC(20,0)`, hex values use `TEXT`, booleans use `BOOLEAN`, and documents use
@@ -635,11 +732,16 @@ migrated. Failed batches remain buffered. A lost connection during commit can le
 the outcome unknown; retrying is not exactly-once. Restart recovery remains unimplemented,
 as with the DuckDB sink.
 
-The PostgreSQL integration check creates a private schema on a PostgreSQL 18 server:
+For logical replication (CDC) into a streaming engine, publish the chain's schema, so
+event tables a new manifest adds are included as they are created:
+`CREATE PUBLICATION base FOR TABLES IN SCHEMA base`, one per chain or one listing
+several.
+
+The PostgreSQL integration checks create a private schema on a PostgreSQL 18 server:
 
 ```bash
 INDEXER_TEST_POSTGRES_URL='host=localhost user=indexer dbname=indexer sslmode=disable' \
-  cargo nextest run --all-features --run-ignored only -E 'test(sink::postgres::tests::copy_is_atomic)'
+  cargo nextest run --all-features --run-ignored only -E 'test(sink::postgres::tests::)'
 ```
 
 ### Other client settings
@@ -656,8 +758,8 @@ max_memory = "1GB"
 They live under the `DuckDB` table because they are DuckDB's, and no other backend would
 know what to do with them. Anything unrecognized is an error from DuckDB naming the
 setting, so a typo is caught at startup rather than silently ignored. Every envelope
-lands in its dataset's own typed table — `block`, `transaction`, `receipt`, `log`,
-`decoded`, `contract`, `reorg` — with real columns rather than a JSON blob, so a
+lands in its dataset's own typed table — `blocks`, `transactions`, `receipts`, `logs`,
+`decoded_logs`, `contracts`, `reorgs`, `accepted_blocks` — with real columns rather than a JSON blob, so a
 consumer filters and joins on values. The schema is generated from the row headers in
 `src/wire/row.rs`, so a column added to a dataset appears without anyone editing the
 DDL.

@@ -38,8 +38,9 @@
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 
-use duckdb::types::{ToSql, ToSqlOutput, ValueRef};
+use duckdb::types::{ToSql, ToSqlOutput, Value, ValueRef};
 use duckdb::{Connection, appender_params_from_iter};
 use serde::Deserialize;
 use thiserror::Error;
@@ -47,10 +48,11 @@ use tracing::info;
 
 use crate::decode::StoredContract;
 use crate::sink::{
-    Batch, EnvelopeSink, InvalidStoredValue, SinkError, stored_block, stored_contract,
+    Batch, EnvelopeSink, InvalidStoredValue, SinkError, quote_identifier, stored_block,
+    stored_contract,
 };
 use crate::wire::envelope::{AcceptedBlock, ChainId, Envelope};
-use crate::wire::row::{ColumnType, ColumnValue, Table};
+use crate::wire::row::{ColumnType, ColumnValue, Schema, TableDef};
 /// The `DuckDB` file written when the settings name no path.
 const DEFAULT_PATH: &str = "indexer.duckdb";
 
@@ -120,6 +122,10 @@ fn sql_type(kind: ColumnType) -> &'static str {
         // `UBIGINT`, not `BIGINT`: block numbers and gas *amounts* are unsigned, and a
         // signed 64-bit column cannot hold the top half of the range.
         ColumnType::Uint => "UBIGINT",
+        ColumnType::Int => "BIGINT",
+        // Arbitrary precision, so a `uint256` or `int256` argument is exact and sums
+        // without a cast. `HUGEINT` stops at 128 bits.
+        ColumnType::BigInt => "BIGNUM",
         // `VARCHAR` of `0x` hex, for a hash and for a price alike. `HUGEINT` would hold
         // a price numerically, but then a price read from this column would not equal
         // the same price in a raw RPC response, and hex is the encoding the node sends.
@@ -129,62 +135,124 @@ fn sql_type(kind: ColumnType) -> &'static str {
     }
 }
 
+/// A table's name as SQL.
+fn quoted(table: &TableDef) -> String {
+    format!("\"{}\"", table.name)
+}
+
 /// A `CREATE TABLE IF NOT EXISTS` for one table, generated from its header.
 ///
 /// Generated rather than written out, because a hand-written DDL and a row header are two
 /// statements of the same fact. Nullability comes from [`Column::required`](crate::wire::row::Column::required).
 /// `(chain, dedupe_key)` is unique so a replay can upsert.
-fn create_table(table: Table) -> String {
+fn create_table(table: &TableDef) -> String {
     let columns = table
-        .columns()
+        .columns
         .iter()
         .map(|column| {
             let nullability = if column.required { " NOT NULL" } else { "" };
-            format!("{} {}{nullability}", column.name, sql_type(column.kind))
+            format!("\"{}\" {}{nullability}", column.name, sql_type(column.kind))
         })
         .collect::<Vec<_>>()
         .join(", ");
-    format!("CREATE TABLE IF NOT EXISTS \"{table}\" ({columns}, UNIQUE (chain, dedupe_key))")
+    format!(
+        "CREATE TABLE IF NOT EXISTS {} ({columns}, UNIQUE (chain, dedupe_key))",
+        quoted(table)
+    )
 }
 
-fn staging_table(table: Table) -> String {
-    format!("staging_{table}")
-}
-
-/// Merges the staging table into the dataset table.
+/// Merges the staging table into its table.
 ///
-/// The staging table holds each key once (see `last_per_key`), so `ON CONFLICT` only
+/// The staging table holds each key once (see `Batch::by_table`), so `ON CONFLICT` only
 /// updates a row an earlier flush already wrote.
-fn upsert_sql(table: Table) -> String {
-    let columns = table.columns();
-    let names = columns
+fn upsert_sql(table: &TableDef, staging: &str) -> String {
+    let names = table
+        .columns
         .iter()
         .map(|column| format!("\"{}\"", column.name))
         .collect::<Vec<_>>()
         .join(", ");
-    let assignments = columns
+    let assignments = table
+        .columns
         .iter()
         .filter(|column| column.name != "chain" && column.name != "dedupe_key")
         .map(|column| format!("\"{name}\" = EXCLUDED.\"{name}\"", name = column.name))
         .collect::<Vec<_>>()
         .join(", ");
-    let staging = staging_table(table);
     format!(
-        "INSERT INTO \"{table}\" ({names}) SELECT {names} FROM \"{staging}\" \
-         ON CONFLICT (\"chain\", \"dedupe_key\") DO UPDATE SET {assignments}"
+        "INSERT INTO {} ({names}) SELECT {names} FROM main.\"{staging}\" \
+         ON CONFLICT (\"chain\", \"dedupe_key\") DO UPDATE SET {assignments}",
+        quoted(table)
     )
+}
+
+/// Deletes chain `$1`'s rows of block `$2`, for a table whose rows belong to a block.
+///
+/// One block per statement rather than a list parameter: a reorg names a handful of
+/// blocks, and a scalar parameter needs nothing from the driver's list support.
+fn delete_block_sql(table: &TableDef) -> Option<String> {
+    table.block_hash_column.map(|column| {
+        format!(
+            "DELETE FROM {} WHERE chain = $1 AND \"{column}\" = $2",
+            quoted(table)
+        )
+    })
+}
+
+/// One table, with every statement a flush runs against it rendered once.
+#[derive(Debug)]
+struct Prepared {
+    def: TableDef,
+    /// The table a flush appends into, named by position so a 63-byte table name cannot
+    /// push it past the identifier limit.
+    staging: String,
+    create_staging: String,
+    merge: String,
+    delete: Option<String>,
+}
+
+impl Prepared {
+    fn new(position: usize, def: TableDef) -> Self {
+        let staging = format!("staging_{position}");
+        Self {
+            // A temporary table is invisible to the appender, which looks up `main`.
+            // The staging table is created and dropped in the flush's transaction.
+            create_staging: format!(
+                "CREATE OR REPLACE TABLE main.\"{staging}\" AS SELECT * FROM {} WHERE false",
+                quoted(&def)
+            ),
+            merge: format!(
+                "{};\nDROP TABLE main.\"{staging}\"",
+                upsert_sql(&def, &staging)
+            ),
+            delete: delete_block_sql(&def),
+            staging,
+            def,
+        }
+    }
 }
 
 // The engine conversion belongs at this boundary; text and JSON borrow the buffered
 // row rather than cloning its strings for every append.
 impl ToSql for ColumnValue {
     fn to_sql(&self) -> duckdb::Result<ToSqlOutput<'_>> {
-        Ok(ToSqlOutput::Borrowed(match self {
-            Self::Null => ValueRef::Null,
-            Self::Uint(number) => ValueRef::UBigInt(*number),
-            Self::Text(text) | Self::Document(text) => ValueRef::Text(text.as_bytes()),
-            Self::Bool(flag) => ValueRef::Boolean(*flag),
-        }))
+        Ok(match self {
+            Self::Null => ToSqlOutput::Borrowed(ValueRef::Null),
+            Self::Uint(number) => ToSqlOutput::Borrowed(ValueRef::UBigInt(*number)),
+            Self::Int(number) => ToSqlOutput::Borrowed(ValueRef::BigInt(*number)),
+            // Decimal text, which the engine casts into the `BIGNUM` column exactly.
+            Self::BigInt {
+                negative,
+                magnitude,
+            } => ToSqlOutput::Owned(Value::Text(format!(
+                "{}{magnitude}",
+                if *negative { "-" } else { "" }
+            ))),
+            Self::Text(text) | Self::Document(text) => {
+                ToSqlOutput::Borrowed(ValueRef::Text(text.as_bytes()))
+            }
+            Self::Bool(flag) => ToSqlOutput::Borrowed(ValueRef::Boolean(*flag)),
+        })
     }
 }
 
@@ -198,6 +266,7 @@ impl ToSql for ColumnValue {
 pub struct DuckDbSink {
     connection: Connection,
     batch: Batch,
+    tables: Vec<Prepared>,
 }
 
 impl std::fmt::Debug for DuckDbSink {
@@ -221,7 +290,11 @@ impl DuckDbSink {
     /// Returns [`StoreError::Setting`] when an engine setting is rejected,
     /// [`StoreError::Open`] when the database cannot be opened, and
     /// [`StoreError::Schema`] when the tables cannot be created.
-    pub fn open(settings: &DuckDbSettings) -> Result<Self, StoreError> {
+    pub fn open(
+        settings: &DuckDbSettings,
+        schema: Arc<Schema>,
+        database_schema: &str,
+    ) -> Result<Self, StoreError> {
         let mut config = duckdb::Config::default();
         for (key, value) in &settings.settings {
             config = config
@@ -238,49 +311,65 @@ impl DuckDbSink {
             }
         })?;
         info!(store = %settings.path.display(), "storage opened");
-        Self::new(connection)
+        Self::new(connection, schema, database_schema)
     }
 
-    /// Takes ownership of `connection` and ensures every table exists.
+    /// Takes ownership of `connection` and ensures every table in `schema` exists, in the
+    /// database schema `database_schema`.
     ///
-    /// Use this when supplying an existing connection rather than settings to [`open`](Self::open).
-    /// Existing tables are reused, not migrated or validated against the current schema.
+    /// A run names that schema for its chain — `base.logs` — as `PostgreSQL` does. It is
+    /// created if missing and becomes the connection's default, so every statement after
+    /// names tables unqualified. Use this when supplying an existing connection rather
+    /// than settings to [`open`](Self::open). Existing tables are reused, not migrated or
+    /// validated against the current schema.
     ///
     /// # Errors
     ///
-    /// Returns [`StoreError::Schema`] if the tables cannot be created.
-    pub fn new(connection: Connection) -> Result<Self, StoreError> {
-        let ddl = Table::ALL.map(create_table).join(";\n") + ";";
+    /// Returns [`StoreError::Schema`] if the schema or tables cannot be created.
+    pub fn new(
+        connection: Connection,
+        schema: Arc<Schema>,
+        database_schema: &str,
+    ) -> Result<Self, StoreError> {
+        let quoted = quote_identifier(database_schema);
+        connection
+            .execute_batch(&format!(
+                "CREATE SCHEMA IF NOT EXISTS {quoted}; USE {quoted}"
+            ))
+            .map_err(|source| StoreError::Schema { source })?;
+        let tables: Vec<Prepared> = schema
+            .tables()
+            .iter()
+            .enumerate()
+            .map(|(position, def)| Prepared::new(position, def.clone()))
+            .collect();
+        let ddl = tables
+            .iter()
+            .map(|table| create_table(&table.def))
+            .collect::<Vec<_>>()
+            .join(";\n")
+            + ";";
         connection
             .execute_batch(&ddl)
             .map_err(|source| StoreError::Schema { source })?;
         Ok(Self {
             connection,
-            batch: Batch::default(),
+            batch: Batch::new(schema),
+            tables,
         })
     }
 }
 
 /// The discovered contracts on chain `$1`. Only the columns a restart needs.
 const CONTRACTS: &str =
-    "SELECT protocol, name, address, block_hash FROM \"contract\" WHERE chain = $1";
+    "SELECT protocol, name, address, block_hash FROM \"contracts\" WHERE chain = $1";
 
 /// The newest `$2` accepted blocks on chain `$1`, newest first.
-const LEDGER: &str = "SELECT height, hash, parent_hash, \"timestamp\" FROM \"accepted_block\" \
+const LEDGER: &str = "SELECT height, hash, parent_hash, \"timestamp\" FROM \"accepted_blocks\" \
      WHERE chain = $1 ORDER BY height DESC LIMIT $2";
 
-/// Deletes chain `$1`'s rows of block `$2`, for a table whose rows belong to a block.
-///
-/// One block per statement rather than a list parameter: a reorg names a handful of
-/// blocks, and a scalar parameter needs nothing from the driver's list support.
-fn delete_block_sql(table: Table) -> Option<String> {
-    table
-        .block_hash_column()
-        .map(|column| format!("DELETE FROM \"{table}\" WHERE chain = $1 AND \"{column}\" = $2"))
-}
-
 /// Drops chain `$1`'s accepted blocks below height `$2`.
-const PRUNE_LEDGER: &str = "DELETE FROM \"accepted_block\" WHERE chain = $1 AND height < $2";
+const PRUNE_LEDGER: &str = "DELETE FROM \"accepted_blocks\" WHERE chain = $1 AND height < $2";
 
 impl DuckDbSink {
     /// The contracts discovered on `chain` that this store holds. One created in a block a
@@ -360,8 +449,7 @@ impl DuckDbSink {
 
 impl EnvelopeSink for DuckDbSink {
     async fn publish(&mut self, envelope: Envelope) -> Result<(), SinkError> {
-        self.batch.push(&envelope);
-        Ok(())
+        self.batch.push(&envelope)
     }
 
     async fn flush(&mut self) -> Result<(), SinkError> {
@@ -401,8 +489,8 @@ pub enum StoreError {
         /// The engine's own reason.
         source: duckdb::Error,
     },
-    /// The dataset tables could not be created.
-    #[error("create dataset tables: {source}")]
+    /// The tables could not be created.
+    #[error("create tables: {source}")]
     Schema {
         /// The engine's own reason.
         source: duckdb::Error,
@@ -411,7 +499,7 @@ pub enum StoreError {
     #[error("open appender for {table}: {source}")]
     Appender {
         /// Which table's appender failed to open.
-        table: &'static str,
+        table: String,
         /// The engine's own reason.
         source: duckdb::Error,
     },
@@ -419,7 +507,7 @@ pub enum StoreError {
     #[error("append a {table} row: {source}")]
     Append {
         /// Which table rejected the row.
-        table: &'static str,
+        table: String,
         /// The engine's own reason.
         source: duckdb::Error,
     },
@@ -427,7 +515,7 @@ pub enum StoreError {
     #[error("delete orphaned {table} rows: {source}")]
     Delete {
         /// Which table's delete failed.
-        table: &'static str,
+        table: String,
         /// The engine's own reason.
         source: duckdb::Error,
     },
@@ -435,7 +523,7 @@ pub enum StoreError {
     #[error("prepare {table} upsert: {source}")]
     Prepare {
         /// Which table's staging table failed.
-        table: &'static str,
+        table: String,
         /// The engine's own reason.
         source: duckdb::Error,
     },
@@ -443,7 +531,7 @@ pub enum StoreError {
     #[error("upsert {table}: {source}")]
     Upsert {
         /// Which table rejected the merge.
-        table: &'static str,
+        table: String,
         /// The engine's own reason.
         source: duckdb::Error,
     },
@@ -451,7 +539,7 @@ pub enum StoreError {
     #[error("flush {table}: {source}")]
     Flush {
         /// Which table's flush failed.
-        table: &'static str,
+        table: String,
         /// The engine's own reason.
         source: duckdb::Error,
     },
@@ -499,67 +587,60 @@ impl DuckDbSink {
             .map_err(|source| StoreError::Begin { source })?;
         // Deletes before upserts, so a block orphaned and then canonical again within
         // this batch is deleted and rewritten rather than rewritten and deleted.
-        for table in Table::ALL {
-            let Some(delete) = delete_block_sql(table) else {
+        for table in &self.tables {
+            let Some(delete) = &table.delete else {
                 continue;
             };
             for (chain, hashes) in &self.batch.orphaned {
                 for hash in hashes {
                     transaction
-                        .execute(&delete, duckdb::params![chain, hash])
+                        .execute(delete, duckdb::params![chain, hash])
                         .map_err(|source| StoreError::Delete {
-                            table: table.name(),
+                            table: table.def.name.clone(),
                             source,
                         })?;
                 }
             }
         }
-        // ponytail: eight fixed tables mean eight linear scans, with no grouping buffer.
-        // Group at publish time only if the table count or profiling warrants it.
-        for table in Table::ALL {
-            let rows = self.batch.last_per_key(table);
-            if rows.is_empty() {
+        let mut grouped = self.batch.by_table();
+        for table in &self.tables {
+            let Some(rows) = grouped.remove(&table.def.id) else {
                 continue;
-            }
-            let staging = staging_table(table);
-            // A temporary table is invisible to the appender, which looks up `main`.
-            // The staging table is created and dropped in this transaction.
+            };
+            let name = || table.def.name.clone();
             transaction
-                .execute_batch(&format!(
-                    "CREATE OR REPLACE TABLE \"{staging}\" AS SELECT * FROM \"{table}\" WHERE false"
-                ))
+                .execute_batch(&table.create_staging)
                 .map_err(|source| StoreError::Prepare {
-                    table: table.name(),
+                    table: name(),
                     source,
                 })?;
             // The appender borrows the transaction, so it drops before the upsert.
             {
-                let mut appender =
-                    transaction
-                        .appender(&staging)
-                        .map_err(|source| StoreError::Appender {
-                            table: table.name(),
-                            source,
-                        })?;
+                let mut appender = transaction.appender(&table.staging).map_err(|source| {
+                    StoreError::Appender {
+                        table: name(),
+                        source,
+                    }
+                })?;
                 for row in rows {
                     // Iterator parameters also support tables wider than 32 columns.
                     appender
                         .append_row(appender_params_from_iter(row.values()))
                         .map_err(|source| StoreError::Append {
-                            table: table.name(),
+                            table: name(),
                             source,
                         })?;
                 }
                 // Flush errors must be observed; Drop cannot report them.
                 appender.flush().map_err(|source| StoreError::Flush {
-                    table: table.name(),
+                    table: name(),
                     source,
                 })?;
             }
             transaction
-                .execute_batch(&format!("{};\nDROP TABLE \"{staging}\"", upsert_sql(table)))
+                .execute_batch(&table.merge)
                 .map_err(|source| StoreError::Upsert {
-                    table: table.name(),
+                    table: name(),
                     source,
                 })?;
         }
@@ -584,13 +665,26 @@ mod tests {
     use crate::wire::envelope::{
         AcceptedBlock, Block, ChainId, Contract, Envelope, Event, Log, Receipt, Reorg, Transaction,
     };
-    use crate::wire::row::{Table, row_for};
+    use std::sync::Arc;
+
+    use crate::wire::row::{Schema, Table, row_for};
 
     use super::DuckDbSink;
 
+    /// The `reorgs` table's DDL, to recreate it after a test drops it.
+    fn reorg_ddl() -> String {
+        super::create_table(
+            Schema::default()
+                .tables()
+                .iter()
+                .find(|table| table.id == Table::Reorg.into())
+                .expect("the reorg table"),
+        )
+    }
+
     fn sink() -> DuckDbSink {
         let connection = Connection::open_in_memory().expect("open in-memory DuckDB");
-        DuckDbSink::new(connection).expect("create dataset tables")
+        DuckDbSink::new(connection, Arc::default(), "base").expect("create dataset tables")
     }
 
     fn hash(byte: u8) -> B256 {
@@ -705,10 +799,10 @@ mod tests {
     }
 
     /// One event lands in its own table, and nowhere else. The point of dropping the
-    /// single `events` table: a log is a row of typed columns in `log`, not a row with
+    /// single `events` table: a log is a row of typed columns in `logs`, not a row with
     /// most of them null.
     ///
-    /// The fixture has no decoded record, so `decoded` is expected to be empty rather than
+    /// The fixture has no decoded record, so `decoded_logs` is expected to be empty rather than
     /// to hold one; the decode stage's own output is covered in `decode` and `runtime`.
     #[tokio::test]
     async fn each_event_kind_lands_in_its_own_table() {
@@ -745,7 +839,7 @@ mod tests {
             .connection
             .query_row(
                 "SELECT log_index, transaction_index, address, topic0, block_number, \
-                 block_hash, dedupe_key, chain FROM log",
+                 block_hash, dedupe_key, chain FROM logs",
                 [],
                 |row| {
                     Ok((
@@ -782,7 +876,7 @@ mod tests {
 
         let price: String = sink
             .connection
-            .query_row("SELECT gas_price FROM transaction", [], |row| row.get(0))
+            .query_row("SELECT gas_price FROM transactions", [], |row| row.get(0))
             .expect("the price reads back");
         let expected = u128::from(u64::MAX) + 1;
         assert_eq!(price, format!("{expected:#x}"));
@@ -804,7 +898,7 @@ mod tests {
         let declared: i64 = sink
             .connection
             .query_row(
-                "SELECT count(*) FROM duckdb_columns() WHERE table_name = 'block'",
+                "SELECT count(*) FROM duckdb_columns() WHERE table_name = 'blocks'",
                 [],
                 |row| row.get(0),
             )
@@ -826,7 +920,7 @@ mod tests {
             .connection
             .query_row(
                 "SELECT number, hash, parent_hash, timestamp, gas_limit, gas_used, \
-                 transaction_count FROM block",
+                 transaction_count FROM blocks",
                 [],
                 |row| {
                     Ok((
@@ -862,7 +956,7 @@ mod tests {
         let present: i64 = sink
             .connection
             .query_row(
-                "SELECT count(*) FROM block WHERE withdrawals_root IS NOT NULL",
+                "SELECT count(*) FROM blocks WHERE withdrawals_root IS NOT NULL",
                 [],
                 |row| row.get(0),
             )
@@ -882,11 +976,11 @@ mod tests {
             every_kind().len(),
             "buffered but not written"
         );
-        assert_eq!(row_count(&sink, "log"), 0);
+        assert_eq!(row_count(&sink, "logs"), 0);
 
         sink.flush().await.expect("batch flushes");
         assert_eq!(sink.batch.rows.len(), 0, "the buffers are cleared");
-        assert_eq!(row_count(&sink, "log"), 1);
+        assert_eq!(row_count(&sink, "logs"), 1);
     }
 
     #[tokio::test]
@@ -896,15 +990,13 @@ mod tests {
             sink.publish(envelope).await.expect("row buffers");
         }
         sink.connection
-            .execute_batch("DROP TABLE reorg")
+            .execute_batch("DROP TABLE reorgs")
             .expect("remove a late table in the batch");
 
         assert!(matches!(
             sink.flush().await,
-            Err(crate::sink::SinkError::Store(super::StoreError::Prepare {
-                table: "reorg",
-                ..
-            }))
+            Err(crate::sink::SinkError::Store(super::StoreError::Prepare { table, .. }))
+                if table == "reorgs"
         ));
         assert_eq!(
             sink.batch.rows.len(),
@@ -919,7 +1011,7 @@ mod tests {
         }
 
         sink.connection
-            .execute_batch(&super::create_table(Table::Reorg))
+            .execute_batch(&reorg_ddl())
             .expect("restore the missing table");
         sink.flush()
             .await
@@ -937,10 +1029,12 @@ mod tests {
     #[tokio::test]
     async fn a_deferred_constraint_failure_keeps_the_batch_and_rolls_back() {
         let mut sink = sink();
-        let constrained = super::create_table(Table::Reorg)
-            .replace("height UBIGINT", "height UBIGINT CHECK (height < 1)");
+        let constrained = reorg_ddl().replace(
+            "\"height\" UBIGINT",
+            "\"height\" UBIGINT CHECK (height < 1)",
+        );
         sink.connection
-            .execute_batch(&format!("DROP TABLE reorg; {constrained}"))
+            .execute_batch(&format!("DROP TABLE reorgs; {constrained}"))
             .expect("constrain the reorg table");
         for height in 0..2 {
             sink.publish(Envelope::new(
@@ -957,22 +1051,17 @@ mod tests {
 
         assert!(matches!(
             sink.flush().await,
-            Err(crate::sink::SinkError::Store(super::StoreError::Upsert {
-                table: "reorg",
-                ..
-            }))
+            Err(crate::sink::SinkError::Store(super::StoreError::Upsert { table, .. }))
+                if table == "reorgs"
         ));
-        assert_eq!(row_count(&sink, "reorg"), 0);
+        assert_eq!(row_count(&sink, "reorgs"), 0);
         assert_eq!(sink.batch.rows.len(), 2);
 
         sink.connection
-            .execute_batch(&format!(
-                "DROP TABLE reorg; {}",
-                super::create_table(Table::Reorg)
-            ))
+            .execute_batch(&format!("DROP TABLE reorgs; {}", reorg_ddl()))
             .expect("remove the constraint");
         sink.flush().await.expect("retry the whole batch");
-        assert_eq!(row_count(&sink, "reorg"), 2);
+        assert_eq!(row_count(&sink, "reorgs"), 2);
         assert_eq!(sink.batch.rows.len(), 0);
     }
 
@@ -994,7 +1083,7 @@ mod tests {
         }
         sink.flush().await.expect("batch flushes");
 
-        assert_eq!(row_count(&sink, "reorg"), 5);
+        assert_eq!(row_count(&sink, "reorgs"), 5);
     }
 
     /// A batch that holds a key twice keeps its last copy, a later flush of the same key
@@ -1026,7 +1115,7 @@ mod tests {
             .await
             .expect("a repeated key in one batch is one row");
 
-        assert_eq!(row_count(&sink, "log"), 1);
+        assert_eq!(row_count(&sink, "logs"), 1);
         assert_eq!(log_timestamp(&sink), 5, "the later copy in the batch wins");
 
         // The same key in a later flush updates the stored row, not appends a second —
@@ -1038,7 +1127,7 @@ mod tests {
             .expect("redelivery buffers");
         sink.flush().await.expect("a redelivery updates the row");
         assert_eq!(
-            row_count(&sink, "log"),
+            row_count(&sink, "logs"),
             1,
             "a replay never appends a second"
         );
@@ -1059,7 +1148,7 @@ mod tests {
         sink.flush()
             .await
             .expect("the reorg and its replacement commit");
-        assert_eq!(row_count(&sink, "log"), 1, "only the replacement remains");
+        assert_eq!(row_count(&sink, "logs"), 1, "only the replacement remains");
         assert_eq!(log_timestamp(&sink), 9);
     }
 
@@ -1076,7 +1165,7 @@ mod tests {
         )
     }
 
-    /// Every table but `reorg`, with how many rows it holds.
+    /// Every table but `reorgs`, with how many rows it holds.
     fn block_tables(sink: &DuckDbSink) -> Vec<(Table, i64)> {
         Table::ALL
             .into_iter()
@@ -1120,7 +1209,7 @@ mod tests {
             );
         }
         assert_eq!(
-            row_count(&sink, "reorg"),
+            row_count(&sink, "reorgs"),
             3,
             "two fixture markers and this one"
         );
@@ -1144,7 +1233,7 @@ mod tests {
         for (table, rows) in block_tables(&sink) {
             assert_eq!(rows, 0, "{table} never sees the orphaned block");
         }
-        assert_eq!(row_count(&sink, "reorg"), 2);
+        assert_eq!(row_count(&sink, "reorgs"), 2);
     }
 
     /// A block orphaned and then canonical again is stored, whether its return arrives in
@@ -1165,7 +1254,7 @@ mod tests {
         };
         let stored_blocks = |sink: &DuckDbSink| -> Vec<String> {
             sink.connection
-                .prepare("SELECT block_hash FROM log ORDER BY block_hash")
+                .prepare("SELECT block_hash FROM logs ORDER BY block_hash")
                 .expect("prepare")
                 .query_map([], |row| row.get(0))
                 .expect("query")
@@ -1188,8 +1277,12 @@ mod tests {
         assert_eq!(stored_blocks(&sink), [format!("{:#x}", hash(0xaa))]);
 
         // Within one batch, with A already committed.
-        let mut sink = DuckDbSink::new(Connection::open_in_memory().expect("open DuckDB"))
-            .expect("create dataset tables");
+        let mut sink = DuckDbSink::new(
+            Connection::open_in_memory().expect("open DuckDB"),
+            Arc::default(),
+            "base",
+        )
+        .expect("create dataset tables");
         sink.publish(log(0xaa)).await.expect("row buffers");
         sink.flush().await.expect("A commits");
         for envelope in [reorg(&[0xaa]), log(0xbb), reorg(&[0xbb]), log(0xaa)] {
@@ -1209,13 +1302,13 @@ mod tests {
         store(&mut sink).await;
         sink.publish(reorg(&[0x01])).await.expect("reorg buffers");
         sink.connection
-            .execute_batch("DROP TABLE reorg")
+            .execute_batch("DROP TABLE reorgs")
             .expect("remove a table the batch writes");
         assert!(sink.flush().await.is_err(), "the commit fails");
-        assert_eq!(row_count(&sink, "log"), 1, "the delete rolled back");
+        assert_eq!(row_count(&sink, "logs"), 1, "the delete rolled back");
 
         sink.connection
-            .execute_batch(&super::create_table(Table::Reorg))
+            .execute_batch(&reorg_ddl())
             .expect("restore the missing table");
         sink.flush().await.expect("the retry commits");
         for (table, rows) in block_tables(&sink) {
@@ -1269,7 +1362,7 @@ mod tests {
         assert_eq!(ledger, [accepted(7), accepted(8), accepted(9)]);
         let remaining: Vec<u64> = sink
             .connection
-            .prepare("SELECT height FROM accepted_block WHERE chain = 'base' ORDER BY height")
+            .prepare("SELECT height FROM accepted_blocks WHERE chain = 'base' ORDER BY height")
             .expect("prepare")
             .query_map([], |row| row.get(0))
             .expect("query")
@@ -1284,6 +1377,108 @@ mod tests {
         );
     }
 
+    /// A decoded record lands in `decoded_logs` and in its event's own table, where every
+    /// argument is a typed column: wide integers exact and signed, so they sum without a
+    /// cast. A reorg deletes the typed row with the rest of its block.
+    #[tokio::test]
+    async fn a_decoded_record_lands_in_its_typed_event_table() {
+        let mut sink = DuckDbSink::new(
+            Connection::open_in_memory().expect("open DuckDB"),
+            crate::sink::fixtures::schema(),
+            "base",
+        )
+        .expect("create dataset and event tables");
+        let swap = crate::sink::fixtures::decoded_swap();
+        let block = swap.block_hash;
+        sink.publish(Envelope::new(chain(), Event::Decoded(Box::new(swap))))
+            .await
+            .expect("row buffers");
+        sink.flush().await.expect("batch commits");
+
+        assert_eq!(row_count(&sink, "decoded_logs"), 1);
+        assert_eq!(row_count(&sink, "uniswap_v3_pool_swap"), 1);
+        let (amount0, amount1, sqrt_price, liquidity, tick, sender): (
+            String,
+            String,
+            String,
+            String,
+            i64,
+            String,
+        ) = sink
+            .connection
+            .query_row(
+                "SELECT amount0::VARCHAR, amount1::VARCHAR, sqrt_price_x96::VARCHAR, \
+                 liquidity::VARCHAR, tick, sender FROM uniswap_v3_pool_swap",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
+            )
+            .expect("the swap reads back");
+        assert_eq!(amount0, "-3180585820646654");
+        assert_eq!(amount1, "8586564");
+        assert_eq!(sqrt_price, "4115542941155561242646778");
+        assert_eq!(liquidity, "1367693693161775005");
+        assert_eq!(tick, -197_317);
+        assert_eq!(sender, "0x6ff5693b99212da76ad316178a184ab56d299b43");
+        let total: String = sink
+            .connection
+            .query_row(
+                "SELECT (sum(sqrt_price_x96) + sum(liquidity))::VARCHAR FROM uniswap_v3_pool_swap",
+                [],
+                |row| row.get(0),
+            )
+            .expect("arithmetic on the column");
+        // `BIGNUM` sums and adds exactly; multiplying it by an integer becomes a `DOUBLE`.
+        assert_eq!(total, "4115544308849254404421783", "exact, not a float");
+
+        sink.publish(Envelope::new(
+            chain(),
+            Event::Reorg(Reorg {
+                height: 1,
+                new_head_hash: hash(0x56),
+                orphaned_hashes: vec![block],
+            }),
+        ))
+        .await
+        .expect("reorg buffers");
+        sink.flush().await.expect("the reorg commits");
+        assert_eq!(row_count(&sink, "uniswap_v3_pool_swap"), 0);
+        assert_eq!(row_count(&sink, "decoded_logs"), 0);
+    }
+
+    /// Two chains sharing a database write to their own schemas, so each keeps its own
+    /// tables.
+    #[tokio::test]
+    async fn each_chain_writes_to_its_own_schema() {
+        let connection = Connection::open_in_memory().expect("open DuckDB");
+        for name in ["base", "ethereum"] {
+            let handle = connection.try_clone().expect("a second handle");
+            let mut sink = DuckDbSink::new(handle, Arc::default(), name).expect("open");
+            let mut envelope = every_kind().remove(0);
+            envelope.chain = ChainId::new(name);
+            sink.publish(envelope).await.expect("row buffers");
+            sink.flush().await.expect("batch commits");
+        }
+        for name in ["base", "ethereum"] {
+            let chains: Vec<String> = connection
+                .prepare(&format!("SELECT chain FROM {name}.blocks"))
+                .expect("prepare")
+                .query_map([], |row| row.get(0))
+                .expect("query")
+                .collect::<Result<_, _>>()
+                .expect("rows");
+            assert_eq!(chains, [name], "{name}.block holds only its chain");
+        }
+    }
+
     /// Connecting twice to the same file must not fail on the existing tables.
     #[tokio::test]
     async fn new_is_idempotent() {
@@ -1291,6 +1486,8 @@ mod tests {
         let open = || {
             DuckDbSink::new(
                 Connection::open(path.to_string_lossy().into_owned()).expect("open temp database"),
+                crate::sink::fixtures::schema(),
+                "base",
             )
             .expect("create or reuse the dataset tables")
         };
@@ -1313,7 +1510,7 @@ mod tests {
         let event = Event::Log(Box::new(log));
         let row = row_for(&chain(), &event);
 
-        assert_eq!(row.table(), Table::Log);
+        assert_eq!(row.table(), Table::Log.into());
         assert_eq!(row.chain(), "base");
         assert_eq!(row.dedupe_key(), event.dedupe_key());
         assert_eq!(row.values().len(), row.columns().len());
@@ -1329,7 +1526,7 @@ mod tests {
 
     fn log_timestamp(sink: &DuckDbSink) -> u64 {
         sink.connection
-            .query_row("SELECT block_timestamp FROM log", [], |row| row.get(0))
+            .query_row("SELECT block_timestamp FROM logs", [], |row| row.get(0))
             .expect("timestamp reads back")
     }
 }

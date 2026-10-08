@@ -15,8 +15,8 @@ ws_url = "wss://base-rpc.publicnode.com"
 # one eth_getLogs per height, reusing the live notification's metadata so no block
 # read is issued; every other dataset still reads the block body. log_addresses limits
 # that call to those contracts. Empty fetches every log, and
-# a non-empty list requires the log dataset without receipts.
-# datasets = ["block", "transaction", "receipt", "log"]
+# a non-empty list requires the `logs` dataset without receipts.
+# datasets = ["blocks", "transactions", "receipts", "logs"]
 # log_addresses = ["0x1111111111111111111111111111111111111111"]
 
 # A remote PostgreSQL 18 database, written with transactional binary COPY and
@@ -31,4 +31,4 @@ batch_records = 500
 # so the catalog grows without churning these settings. Absent means nothing is decoded,
 # which is a legitimate way to run and is said at startup.
 [decode]
-protocols = "protocols"
+protocols = "protocols/metric"

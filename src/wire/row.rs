@@ -45,12 +45,16 @@
 //! column that otherwise holds its real type, because `NULL` and "no such field" are
 //! different questions and only one of them is answered by the column's type.
 
+use std::borrow::Cow;
+use std::collections::HashMap;
 use std::fmt;
+use std::sync::Arc;
 
-use alloy_primitives::{Bytes, U256};
+use alloy_primitives::{B256, Bytes, U256};
 
 use crate::wire::datasets::evm::{Block, Log, Receipt, Transaction};
-use crate::wire::envelope::{AcceptedBlock, ChainId, Contract, Decoded, Event, Reorg};
+use crate::wire::envelope::{AcceptedBlock, ChainId, Contract, Decoded, DecodedArg, Event, Reorg};
+use crate::wire::typed::TypedValue;
 
 /// One table a store persists.
 ///
@@ -98,19 +102,20 @@ impl Table {
 
     /// The name a store files this table under.
     ///
-    /// Singular, matching the dataset names rather than SQL's usual plural, so the table,
-    /// the Rust type, and the event's `type` tag all say the same word.
+    /// Plural, as Allium names its tables (`blocks`, `logs`, `decoded.logs`), while the
+    /// Rust type and the event's `type` tag name one record. The decoded records' table is
+    /// `decoded_logs`, since a run's tables share one schema.
     #[must_use]
     pub const fn name(self) -> &'static str {
         match self {
-            Self::Block => "block",
-            Self::Transaction => "transaction",
-            Self::Receipt => "receipt",
-            Self::Log => "log",
-            Self::Decoded => "decoded",
-            Self::Contract => "contract",
-            Self::Reorg => "reorg",
-            Self::AcceptedBlock => "accepted_block",
+            Self::Block => "blocks",
+            Self::Transaction => "transactions",
+            Self::Receipt => "receipts",
+            Self::Log => "logs",
+            Self::Decoded => "decoded_logs",
+            Self::Contract => "contracts",
+            Self::Reorg => "reorgs",
+            Self::AcceptedBlock => "accepted_blocks",
         }
     }
 
@@ -140,7 +145,7 @@ impl Table {
     ///
     /// This is what a store deletes by when a reorg orphans a block: every row of every
     /// table that answers `Some` is retracted with its block. Exhaustive, so a new table
-    /// cannot be added without deciding whether a reorg removes its rows. `reorg` answers
+    /// cannot be added without deciding whether a reorg removes its rows. `reorgs` answers
     /// `None` because its rows are the record of what was retracted, not part of a block.
     #[must_use]
     pub const fn block_hash_column(self) -> Option<&'static str> {
@@ -165,16 +170,19 @@ impl fmt::Display for Table {
 /// Shared by every per-table arm of [`Table::columns`], so the header is derived from the
 /// same cells the row is.
 fn cells_columns<C>(cells: &[(Column, C)]) -> Vec<Column> {
-    cells.iter().map(|(column, _)| *column).collect()
+    cells.iter().map(|(column, _)| column.clone()).collect()
 }
 
 /// One column of a table: its name and what it stores.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Column {
     /// The name, which is the field's own — a chain field keeps its chain name
     /// (`from_address` rather than `from`, since `from` is a SQL keyword), and a store may
     /// rename it.
-    pub name: &'static str,
+    ///
+    /// Borrowed for a dataset table, whose columns are declared in this file; owned for
+    /// a decoded event's table, whose columns come from an ABI at startup.
+    pub name: Cow<'static, str>,
     /// What the column holds.
     pub kind: ColumnType,
     /// Whether every row has a value.
@@ -186,39 +194,48 @@ pub struct Column {
 
 impl Column {
     /// A text column, the shape of every hash and address.
-    const fn text(name: &'static str) -> Self {
+    pub(crate) const fn text(name: &'static str) -> Self {
         Self::new(name, ColumnType::Text)
     }
 
     /// An unsigned 64-bit column, for a number, an index, or a gas figure.
-    const fn uint(name: &'static str) -> Self {
+    pub(crate) const fn uint(name: &'static str) -> Self {
         Self::new(name, ColumnType::Uint)
     }
 
     /// A boolean column.
-    const fn boolean(name: &'static str) -> Self {
+    pub(crate) const fn boolean(name: &'static str) -> Self {
         Self::new(name, ColumnType::Bool)
     }
 
     /// A document column, for a value that does not flatten.
-    const fn document(name: &'static str) -> Self {
+    pub(crate) const fn document(name: &'static str) -> Self {
         Self::new(name, ColumnType::Document)
     }
 
     const fn new(name: &'static str, kind: ColumnType) -> Self {
         Self {
-            name,
+            name: Cow::Borrowed(name),
             kind,
             required: true,
         }
     }
 
-    /// Marks a column whose renderer can return [`ColumnValue::Null`].
-    const fn optional(self) -> Self {
+    /// A column whose name is only known at runtime: a decoded event's argument.
+    #[must_use]
+    pub fn named(name: String, kind: ColumnType, required: bool) -> Self {
         Self {
-            required: false,
-            ..self
+            name: Cow::Owned(name),
+            kind,
+            required,
         }
+    }
+
+    /// Marks a column whose renderer can return [`ColumnValue::Null`].
+    #[must_use]
+    pub(crate) const fn optional(mut self) -> Self {
+        self.required = false;
+        self
     }
 }
 
@@ -232,6 +249,15 @@ pub enum ColumnType {
     /// `u64` in both `alloy-consensus` and `alloy-rpc-types-eth`. A store using a signed
     /// 64-bit column would lose the top half of the range.
     Uint,
+    /// A 64-bit signed integer: a decoded `int8` through `int64`, such as a Uniswap tick.
+    Int,
+    /// An exact integer wider than 64 bits, up to 256 and signed or not: a decoded
+    /// `uint256` amount or `int256` delta.
+    ///
+    /// Numeric rather than hex text, unlike the chain's own wide values, because these are
+    /// what a consumer sums: a store keeps them in an exact arbitrary-precision type
+    /// (`NUMERIC(78,0)` in `PostgreSQL`, `BIGNUM` in `DuckDB`) so aggregates need no cast.
+    BigInt,
     /// A `0x` hex quantity or a fixed-width hash: a block or transaction hash, an address,
     /// and every price in wei.
     ///
@@ -268,6 +294,15 @@ pub enum ColumnValue {
     Null,
     /// A 64-bit unsigned integer.
     Uint(u64),
+    /// A 64-bit signed integer.
+    Int(i64),
+    /// An integer of any width up to 256 bits, signed or not, held exactly.
+    BigInt {
+        /// Whether the value is below zero.
+        negative: bool,
+        /// The absolute value.
+        magnitude: U256,
+    },
     /// Text in the node's own encoding: lowercase `0x` hex.
     Text(String),
     /// A boolean.
@@ -373,10 +408,245 @@ fn json<T: serde::Serialize>(value: &T) -> String {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Columns(Vec<(Column, ColumnValue)>);
 
+/// Which table a row belongs to: a dataset table, or a decoded event's table by its
+/// position among the [`Schema`]'s event tables.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum TableId {
+    /// A dataset table.
+    Dataset(Table),
+    /// A decoded event's table.
+    Event(usize),
+}
+
+impl From<Table> for TableId {
+    fn from(table: Table) -> Self {
+        Self::Dataset(table)
+    }
+}
+
+/// One table a store creates and writes.
+#[derive(Debug, Clone)]
+pub struct TableDef {
+    /// Which table this is; rows name it by the same id.
+    pub id: TableId,
+    /// The table's name.
+    pub name: String,
+    /// The columns, in order, ending with [`COMMON_COLUMNS`].
+    pub columns: Arc<[Column]>,
+    /// The column naming each row's block, which a reorg deletes by; `None` for a table
+    /// whose rows belong to no block.
+    pub block_hash_column: Option<&'static str>,
+}
+
+/// Every table a run writes: the dataset tables, then one typed table per decoded event,
+/// generated from the ABIs at startup.
+///
+/// An event's table has the log's columns, then one column per argument, in ABI order,
+/// then the block's columns:
+///
+/// ```text
+/// uniswap_v3_pool_swap
+///   address, transaction_hash, transaction_index, log_index,
+///   sender, recipient, amount0, amount1, sqrt_price_x96, liquidity, tick,
+///   block_number, block_hash, block_timestamp, chain, dedupe_key
+/// ```
+///
+/// An argument's column is its name in `snake_case`; an unnamed argument is `arg{n}`, and
+/// a name that repeats an earlier column gets `_{n}` appended. A row's key is the decoded
+/// record's own `dedupe_key`.
+#[derive(Debug, Clone)]
+pub struct Schema {
+    tables: Vec<TableDef>,
+    /// Each event table's position in `tables`, by the record's protocol, contract, and
+    /// event definition.
+    events: HashMap<(String, String, B256), usize>,
+}
+
+impl Default for Schema {
+    /// The dataset tables alone.
+    fn default() -> Self {
+        let tables = Table::ALL
+            .map(|table| TableDef {
+                id: table.into(),
+                name: table.name().to_owned(),
+                columns: table.columns().into(),
+                block_hash_column: table.block_hash_column(),
+            })
+            .to_vec();
+        Self {
+            tables,
+            events: HashMap::new(),
+        }
+    }
+}
+
+impl Schema {
+    /// Every table, dataset tables first.
+    #[must_use]
+    pub fn tables(&self) -> &[TableDef] {
+        &self.tables
+    }
+
+    /// Adds the table for one event, whose arguments are `params` in ABI order with
+    /// their ABI names. Returns `false`, adding nothing, when a table is already named
+    /// `name`.
+    pub fn add_event(
+        &mut self,
+        (protocol, contract, event_id): (&str, &str, B256),
+        name: String,
+        params: Vec<Column>,
+    ) -> bool {
+        if self.tables.iter().any(|table| table.name == name) {
+            return false;
+        }
+        let mut columns = vec![
+            Column::text("address"),
+            Column::text("transaction_hash"),
+            Column::uint("transaction_index"),
+            Column::uint("log_index"),
+        ];
+        let trailing = [
+            Column::uint("block_number"),
+            Column::text("block_hash"),
+            Column::uint("block_timestamp"),
+        ];
+        for (position, param) in params.into_iter().enumerate() {
+            let mut column = snake_case(&param.name);
+            if column.is_empty() {
+                column = format!("arg{position}");
+            }
+            if columns
+                .iter()
+                .chain(&trailing)
+                .chain(&COMMON_COLUMNS)
+                .any(|existing| existing.name == column.as_str())
+            {
+                column = format!("{column}_{position}");
+            }
+            columns.push(Column::named(column, param.kind, param.required));
+        }
+        columns.extend(trailing);
+        columns.extend(COMMON_COLUMNS);
+        let index = self.events.len();
+        self.events.insert(
+            (protocol.to_owned(), contract.to_owned(), event_id),
+            self.tables.len(),
+        );
+        self.tables.push(TableDef {
+            id: TableId::Event(index),
+            name,
+            columns: columns.into(),
+            block_hash_column: Some("block_hash"),
+        });
+        true
+    }
+
+    /// A decoded record's row in its event's table, or `None` when no table holds its
+    /// event — which a record decoded against the same catalog never is.
+    #[must_use]
+    pub fn event_row(&self, chain: &ChainId, decoded: &Decoded) -> Option<Row> {
+        let key = (
+            decoded.protocol.clone(),
+            decoded.contract.clone(),
+            decoded.event_id,
+        );
+        let table = &self.tables[*self.events.get(&key)?];
+        let mut arguments: Vec<&DecodedArg> = decoded.indexed.iter().chain(&decoded.body).collect();
+        arguments.sort_by_key(|argument| argument.position);
+        let mut values = vec![
+            ColumnValue::hex(decoded.address),
+            ColumnValue::hex(decoded.transaction_hash),
+            ColumnValue::Uint(decoded.transaction_index),
+            ColumnValue::Uint(decoded.log_index),
+        ];
+        values.extend(
+            arguments
+                .iter()
+                .zip(&table.columns[4..])
+                .map(|(argument, column)| cell(column.kind, argument)),
+        );
+        values.extend([
+            ColumnValue::Uint(decoded.block_number),
+            ColumnValue::hex(decoded.block_hash),
+            ColumnValue::Uint(decoded.block_timestamp),
+            ColumnValue::Text(chain.as_str().to_owned()),
+            ColumnValue::Text(decoded.dedupe_key()),
+        ]);
+        Some(Row {
+            table: table.id,
+            columns: Arc::clone(&table.columns),
+            values,
+        })
+    }
+}
+
+/// `sqrtPriceX96` as `sqrt_price_x96`: words split at a lower-to-upper change and before
+/// the last capital of a run, lowercased, with leading underscores dropped and anything
+/// but letters and digits replaced by `_`.
+#[must_use]
+pub fn snake_case(name: &str) -> String {
+    let chars: Vec<char> = name.trim_start_matches('_').chars().collect();
+    let mut out = String::with_capacity(chars.len() + 4);
+    for (index, &c) in chars.iter().enumerate() {
+        if c.is_ascii_uppercase() && index > 0 {
+            let previous = chars[index - 1];
+            let next_is_lower = chars.get(index + 1).is_some_and(char::is_ascii_lowercase);
+            if previous.is_ascii_lowercase()
+                || previous.is_ascii_digit()
+                || (previous.is_ascii_uppercase() && next_is_lower)
+            {
+                out.push('_');
+            }
+        }
+        out.push(if c.is_ascii_alphanumeric() {
+            c.to_ascii_lowercase()
+        } else {
+            '_'
+        });
+    }
+    out
+}
+
+/// One decoded argument's cell, in the column type its table declares.
+///
+/// The decoder has already checked each value against its declared width, so a `uint64`
+/// fits [`ColumnValue::Uint`] and an `int64` fits [`ColumnValue::Int`]. A `string` that is
+/// not text, or holds a NUL `PostgreSQL` would reject, is null; the raw log keeps its
+/// bytes. Arrays and tuples are documents in the same form the `decoded_logs` table uses.
+fn cell(kind: ColumnType, argument: &DecodedArg) -> ColumnValue {
+    match (kind, &argument.value) {
+        (ColumnType::Uint, TypedValue::Uint { value, .. }) => {
+            ColumnValue::Uint(value.saturating_to())
+        }
+        (ColumnType::Int, TypedValue::Int { value, .. }) => ColumnValue::Int(value.as_i64()),
+        (ColumnType::BigInt, TypedValue::Uint { value, .. }) => ColumnValue::BigInt {
+            negative: false,
+            magnitude: *value,
+        },
+        (ColumnType::BigInt, TypedValue::Int { value, .. }) => ColumnValue::BigInt {
+            negative: value.is_negative(),
+            magnitude: value.unsigned_abs(),
+        },
+        (ColumnType::Bool, TypedValue::Bool { value }) => ColumnValue::Bool(*value),
+        (ColumnType::Text, TypedValue::Address { value }) => ColumnValue::hex(value),
+        (ColumnType::Text, TypedValue::IndexedHash { value }) => ColumnValue::hex(value),
+        (ColumnType::Text, TypedValue::Function { value }) => ColumnValue::hex(value),
+        (ColumnType::Text, TypedValue::FixedBytes { value, .. } | TypedValue::Bytes { value }) => {
+            ColumnValue::bytes(value)
+        }
+        (ColumnType::Text, TypedValue::String { text, .. }) => text
+            .as_ref()
+            .filter(|text| !text.contains('\0'))
+            .map_or(ColumnValue::Null, |text| ColumnValue::Text(text.clone())),
+        (ColumnType::Document, value) => ColumnValue::document(value),
+        _ => ColumnValue::Null,
+    }
+}
+
 impl Row {
     /// Which table this row belongs to.
     #[must_use]
-    pub const fn table(&self) -> Table {
+    pub const fn table(&self) -> TableId {
         self.table
     }
 
@@ -392,7 +662,7 @@ impl Row {
             .columns
             .iter()
             .position(|col| col.name == column)
-            .unwrap_or_else(|| panic!("{column} is a column of the {} table", self.table));
+            .unwrap_or_else(|| panic!("{column} is a column of the {:?} table", self.table));
         &self.values[index]
     }
 
@@ -422,12 +692,15 @@ impl Row {
     }
 
     /// The hash of the block this row belongs to, from
-    /// [`Table::block_hash_column`]; `None` for a table whose rows belong to no block.
+    /// [`Table::block_hash_column`] or an event table's `block_hash`; `None` for a table
+    /// whose rows belong to no block.
     #[must_use]
     pub fn block_hash(&self) -> Option<&str> {
-        self.table
-            .block_hash_column()
-            .map(|column| self.text(column))
+        let column = match self.table {
+            TableId::Dataset(table) => table.block_hash_column(),
+            TableId::Event(_) => Some("block_hash"),
+        };
+        column.map(|column| self.text(column))
     }
 }
 
@@ -459,18 +732,18 @@ pub fn row_for(chain: &ChainId, event: &Event) -> Row {
 /// them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Row {
-    table: Table,
-    columns: Vec<Column>,
+    table: TableId,
+    columns: Arc<[Column]>,
     values: Vec<ColumnValue>,
 }
 
 impl Row {
     /// Builds a row from its table's cells, splitting them into the header and the values.
     fn new(table: Table, cells: Columns) -> Self {
-        let (columns, values) = cells.0.into_iter().unzip();
+        let (columns, values): (Vec<_>, _) = cells.0.into_iter().unzip();
         Self {
-            table,
-            columns,
+            table: table.into(),
+            columns: columns.into(),
             values,
         }
     }
@@ -503,7 +776,7 @@ impl Columns {
     }
 }
 
-/// The `block` table, as one cell per column.
+/// The `blocks` table, as one cell per column.
 const BLOCK_CELLS: [(Column, fn(&Block) -> ColumnValue); 25] = [
     (Column::uint("number"), |b| ColumnValue::Uint(b.number)),
     (Column::text("hash"), |b| ColumnValue::hex(b.hash)),
@@ -572,17 +845,17 @@ const BLOCK_CELLS: [(Column, fn(&Block) -> ColumnValue); 25] = [
     }),
 ];
 
-/// Builds the `block` table's cells for one block.
+/// Builds the `blocks` table's cells for one block.
 fn block_cells(b: &Block) -> Columns {
     Columns(
         BLOCK_CELLS
             .iter()
-            .map(|(column, render)| (*column, render(b)))
+            .map(|(column, render)| (column.clone(), render(b)))
             .collect(),
     )
 }
 
-/// The `transaction` table, as one cell per column.
+/// The `transactions` table, as one cell per column.
 const TRANSACTION_CELLS: [(Column, fn(&Transaction) -> ColumnValue); 20] = [
     (Column::text("hash"), |t| ColumnValue::hex(t.hash)),
     (Column::uint("nonce"), |t| ColumnValue::Uint(t.nonce)),
@@ -634,17 +907,17 @@ const TRANSACTION_CELLS: [(Column, fn(&Transaction) -> ColumnValue); 20] = [
     }),
 ];
 
-/// Builds the `transaction` table's cells for one transaction.
+/// Builds the `transactions` table's cells for one transaction.
 fn transaction_cells(t: &Transaction) -> Columns {
     Columns(
         TRANSACTION_CELLS
             .iter()
-            .map(|(column, render)| (*column, render(t)))
+            .map(|(column, render)| (column.clone(), render(t)))
             .collect(),
     )
 }
 
-/// The `receipt` table, as one cell per column.
+/// The `receipts` table, as one cell per column.
 const RECEIPT_CELLS: [(Column, fn(&Receipt) -> ColumnValue); 17] = [
     (Column::text("transaction_hash"), |r| {
         ColumnValue::hex(r.transaction_hash)
@@ -693,17 +966,17 @@ const RECEIPT_CELLS: [(Column, fn(&Receipt) -> ColumnValue); 17] = [
     }),
 ];
 
-/// Builds the `receipt` table's cells for one receipt.
+/// Builds the `receipts` table's cells for one receipt.
 fn receipt_cells(r: &Receipt) -> Columns {
     Columns(
         RECEIPT_CELLS
             .iter()
-            .map(|(column, render)| (*column, render(r)))
+            .map(|(column, render)| (column.clone(), render(r)))
             .collect(),
     )
 }
 
-/// The `log` table, as one cell per column.
+/// The `logs` table, as one cell per column.
 const LOG_CELLS: [(Column, fn(&Log) -> ColumnValue); 13] = [
     (Column::uint("log_index"), |l| {
         ColumnValue::Uint(l.log_index)
@@ -740,17 +1013,17 @@ const LOG_CELLS: [(Column, fn(&Log) -> ColumnValue); 13] = [
     }),
 ];
 
-/// Builds the `log` table's cells for one log.
+/// Builds the `logs` table's cells for one log.
 fn log_cells(l: &Log) -> Columns {
     Columns(
         LOG_CELLS
             .iter()
-            .map(|(column, render)| (*column, render(l)))
+            .map(|(column, render)| (column.clone(), render(l)))
             .collect(),
     )
 }
 
-/// The `decoded` table, as one cell per column.
+/// The `decoded_logs` table, as one cell per column.
 ///
 /// The two documents hold what varies per event — the indexed and non-indexed arguments —
 /// while everything that identifies the row is a typed column: a store can key, join,
@@ -758,11 +1031,14 @@ fn log_cells(l: &Log) -> Columns {
 /// `block_timestamp`, and `log_index` without parsing the record. The argument *values*
 /// still vary in type per event, so they stay documents; the identity does not, and keeping
 /// it locked in a document would force every query back through JSON.
-const DECODED_CELLS: [(Column, fn(&Decoded) -> ColumnValue); 15] = [
+const DECODED_CELLS: [(Column, fn(&Decoded) -> ColumnValue); 16] = [
     (Column::text("name"), |d| ColumnValue::Text(d.name.clone())),
     (Column::text("address"), |d| ColumnValue::hex(d.address)),
     (Column::text("protocol"), |d| {
         ColumnValue::Text(d.protocol.clone())
+    }),
+    (Column::text("contract"), |d| {
+        ColumnValue::Text(d.contract.clone())
     }),
     (Column::text("selector"), |d| ColumnValue::hex(d.selector)),
     (Column::text("event_id"), |d| ColumnValue::hex(d.event_id)),
@@ -796,17 +1072,17 @@ const DECODED_CELLS: [(Column, fn(&Decoded) -> ColumnValue); 15] = [
     }),
 ];
 
-/// Builds the `decoded` table's cells for one decoded record.
+/// Builds the `decoded_logs` table's cells for one decoded record.
 fn decoded_cells(d: &Decoded) -> Columns {
     Columns(
         DECODED_CELLS
             .iter()
-            .map(|(column, render)| (*column, render(d)))
+            .map(|(column, render)| (column.clone(), render(d)))
             .collect(),
     )
 }
 
-/// The `contract` table, as one cell per column.
+/// The `contracts` table, as one cell per column.
 ///
 /// The provenance columns of Allium's `dex.pools`, generalized past pools: what was
 /// created, by which factory, and where its creation log sits.
@@ -839,17 +1115,17 @@ const CONTRACT_CELLS: [(Column, fn(&Contract) -> ColumnValue); 10] = [
     }),
 ];
 
-/// Builds the `contract` table's cells for one discovered contract.
+/// Builds the `contracts` table's cells for one discovered contract.
 fn contract_cells(c: &Contract) -> Columns {
     Columns(
         CONTRACT_CELLS
             .iter()
-            .map(|(column, render)| (*column, render(c)))
+            .map(|(column, render)| (column.clone(), render(c)))
             .collect(),
     )
 }
 
-/// The `reorg` table, as one cell per column.
+/// The `reorgs` table, as one cell per column.
 ///
 /// `orphaned_hashes` is a document rather than a set of rows, and it is the one event
 /// where the list *is* the payload: it names every block hash that stopped being
@@ -865,17 +1141,17 @@ const REORG_CELLS: [(Column, fn(&Reorg) -> ColumnValue); 3] = [
     }),
 ];
 
-/// Builds the `reorg` table's cells for one reorg.
+/// Builds the `reorgs` table's cells for one reorg.
 fn reorg_cells(r: &Reorg) -> Columns {
     Columns(
         REORG_CELLS
             .iter()
-            .map(|(column, render)| (*column, render(r)))
+            .map(|(column, render)| (column.clone(), render(r)))
             .collect(),
     )
 }
 
-/// The `accepted_block` table, as one cell per column: the identity and linkage a
+/// The `accepted_blocks` table, as one cell per column: the identity and linkage a
 /// restart needs, and nothing else.
 const ACCEPTED_BLOCK_CELLS: [(Column, fn(&AcceptedBlock) -> ColumnValue); 4] = [
     (Column::uint("height"), |a| ColumnValue::Uint(a.height)),
@@ -888,12 +1164,12 @@ const ACCEPTED_BLOCK_CELLS: [(Column, fn(&AcceptedBlock) -> ColumnValue); 4] = [
     }),
 ];
 
-/// Builds the `accepted_block` table's cells for one accepted block.
+/// Builds the `accepted_blocks` table's cells for one accepted block.
 fn accepted_block_cells(a: &AcceptedBlock) -> Columns {
     Columns(
         ACCEPTED_BLOCK_CELLS
             .iter()
-            .map(|(column, render)| (*column, render(a)))
+            .map(|(column, render)| (column.clone(), render(a)))
             .collect(),
     )
 }
@@ -904,13 +1180,37 @@ fn accepted_block_cells(a: &AcceptedBlock) -> Columns {
 // means the fixture or setup is wrong.
 #[expect(clippy::expect_used)]
 mod tests {
-    use alloy_primitives::{Address, B256, TxHash};
+    use alloy_primitives::{Address, B256, Bytes, I256, TxHash, U256};
 
     use crate::wire::envelope::{
-        AcceptedBlock, Block, ChainId, Contract, Decoded, Event, Log, Receipt, Reorg, Transaction,
+        AcceptedBlock, Block, ChainId, Contract, Decoded, DecodedArg, Event, Log, Receipt, Reorg,
+        Transaction,
     };
+    use crate::wire::typed::{AbiType, TypedValue};
 
-    use super::{COMMON_COLUMNS, ColumnType, ColumnValue, Table, row_for};
+    use super::{COMMON_COLUMNS, ColumnType, ColumnValue, Schema, Table, TableId, row_for};
+
+    /// A decoded record with no arguments, for a test to fill in.
+    fn decoded() -> Decoded {
+        Decoded {
+            event_id: hash(0x08),
+            name: "E".to_owned(),
+            address: Address::from([0xd0; 20]),
+            protocol: "p".to_owned(),
+            contract: "C".to_owned(),
+            selector: hash(0x07),
+            signature: "E()".to_owned(),
+            anonymous: false,
+            transaction_hash: TxHash::from([0x11; 32]),
+            transaction_index: 3,
+            log_index: 7,
+            indexed: Vec::new(),
+            body: Vec::new(),
+            block_number: 100,
+            block_hash: hash(0x01),
+            block_timestamp: 1_700_000_000,
+        }
+    }
 
     fn hash(byte: u8) -> B256 {
         B256::from([byte; 32])
@@ -954,6 +1254,7 @@ mod tests {
                 name: "Swap".to_owned(),
                 address: Address::from([0xd0; 20]),
                 protocol: "uniswap_v3".to_owned(),
+                contract: "UniswapV3Pool".to_owned(),
                 event_id: hash(0x08),
                 selector: hash(0x07),
                 signature: "Swap(address)".to_owned(),
@@ -1007,14 +1308,16 @@ mod tests {
         }
     }
 
-    /// Every table but `reorg` names its block, by a text column it really has, so a
+    /// Every table but `reorgs` names its block, by a text column it really has, so a
     /// reorg retracts its rows. A table that answered `None` by mistake would keep an
     /// orphaned branch forever.
     #[test]
     fn every_table_but_reorg_names_its_block() {
         for event in every_kind() {
             let row = row_for(&chain(), &event);
-            let table = row.table();
+            let TableId::Dataset(table) = row.table() else {
+                panic!("a dataset event is a dataset row");
+            };
             if table == Table::Reorg {
                 assert_eq!(row.block_hash(), None, "a reorg belongs to no block");
                 continue;
@@ -1056,30 +1359,30 @@ mod tests {
     #[test]
     fn only_fields_the_chain_can_omit_are_optional() {
         let optional = [
-            ("block", "withdrawals_root"),
-            ("block", "total_difficulty"),
-            ("block", "size"),
-            ("block", "base_fee_per_gas"),
-            ("block", "blob_gas_used"),
-            ("block", "excess_blob_gas"),
-            ("block", "parent_beacon_block_root"),
-            ("transaction", "to_address"),
-            ("transaction", "gas_price"),
-            ("transaction", "max_fee_per_gas"),
-            ("transaction", "max_priority_fee_per_gas"),
-            ("transaction", "max_fee_per_blob_gas"),
-            ("transaction", "chain_id"),
-            ("transaction", "access_list"),
-            ("transaction", "blob_versioned_hashes"),
-            ("transaction", "authorization_list"),
-            ("receipt", "to_address"),
-            ("receipt", "contract_address"),
-            ("receipt", "blob_gas_used"),
-            ("receipt", "blob_gas_price"),
-            ("log", "topic0"),
-            ("log", "topic1"),
-            ("log", "topic2"),
-            ("log", "topic3"),
+            ("blocks", "withdrawals_root"),
+            ("blocks", "total_difficulty"),
+            ("blocks", "size"),
+            ("blocks", "base_fee_per_gas"),
+            ("blocks", "blob_gas_used"),
+            ("blocks", "excess_blob_gas"),
+            ("blocks", "parent_beacon_block_root"),
+            ("transactions", "to_address"),
+            ("transactions", "gas_price"),
+            ("transactions", "max_fee_per_gas"),
+            ("transactions", "max_priority_fee_per_gas"),
+            ("transactions", "max_fee_per_blob_gas"),
+            ("transactions", "chain_id"),
+            ("transactions", "access_list"),
+            ("transactions", "blob_versioned_hashes"),
+            ("transactions", "authorization_list"),
+            ("receipts", "to_address"),
+            ("receipts", "contract_address"),
+            ("receipts", "blob_gas_used"),
+            ("receipts", "blob_gas_price"),
+            ("logs", "topic0"),
+            ("logs", "topic1"),
+            ("logs", "topic2"),
+            ("logs", "topic3"),
         ];
         let mut found = 0;
         for table in Table::ALL {
@@ -1087,7 +1390,7 @@ mod tests {
                 if !column.required {
                     found += 1;
                     assert!(
-                        optional.contains(&(table.name(), column.name)),
+                        optional.contains(&(table.name(), column.name.as_ref())),
                         "{table}.{} is optional without being a field the chain can omit",
                         column.name
                     );
@@ -1115,6 +1418,10 @@ mod tests {
                     // A `Uint` column holds a number or nothing; every other variant is
                     // a contradiction, including a document.
                     ColumnType::Uint => matches!(value, ColumnValue::Uint(_) | ColumnValue::Null),
+                    ColumnType::Int => matches!(value, ColumnValue::Int(_) | ColumnValue::Null),
+                    ColumnType::BigInt => {
+                        matches!(value, ColumnValue::BigInt { .. } | ColumnValue::Null)
+                    }
                     ColumnType::Text => matches!(value, ColumnValue::Text(_) | ColumnValue::Null),
                     ColumnType::Bool => matches!(value, ColumnValue::Bool(_) | ColumnValue::Null),
                     ColumnType::Document => {
@@ -1123,7 +1430,7 @@ mod tests {
                 };
                 assert!(
                     compatible,
-                    "the {} table's {column:?} column is {:?} but the value is {value:?}",
+                    "the {:?} table's {column:?} column is {:?} but the value is {value:?}",
                     row.table(),
                     column.kind
                 );
@@ -1265,6 +1572,7 @@ mod tests {
             name: "Swap".to_owned(),
             address: Address::from([0xd0; 20]),
             protocol: "uniswap_v3".to_owned(),
+            contract: "UniswapV3Pool".to_owned(),
             event_id: hash(0x08),
             selector: hash(0x07),
             signature: "Swap(address)".to_owned(),
@@ -1312,5 +1620,152 @@ mod tests {
         let a = row_for(&chain(), &Event::Log(Box::new(orphaned)));
         let b = row_for(&chain(), &Event::Log(Box::new(replacement)));
         assert_ne!(a.dedupe_key(), b.dedupe_key());
+    }
+
+    #[test]
+    fn names_become_snake_case() {
+        for (name, snake) in [
+            ("sqrtPriceX96", "sqrt_price_x96"),
+            ("amount0", "amount0"),
+            ("ETHAmount", "eth_amount"),
+            ("UniswapV3Pool", "uniswap_v3_pool"),
+            ("_from", "from"),
+        ] {
+            assert_eq!(super::snake_case(name), snake, "{name}");
+        }
+    }
+
+    fn arg(position: usize, name: &str, value: TypedValue) -> DecodedArg {
+        DecodedArg {
+            position,
+            name: name.to_owned(),
+            abi_type: AbiType {
+                kind: String::new(),
+                components: Vec::new(),
+            },
+            value,
+        }
+    }
+
+    /// A schema with one event table, `p_c_e`, for event `0x09…` of contract `p.C`.
+    fn event_schema() -> Schema {
+        let column = |name: &str, kind| super::Column::named(name.to_owned(), kind, true);
+        let mut schema = Schema::default();
+        assert!(schema.add_event(
+            ("p", "C", hash(0x09)),
+            "p_c_e".to_owned(),
+            vec![
+                column("amount", ColumnType::BigInt),
+                column("tick", ColumnType::Int),
+                column("", ColumnType::Uint),
+                column("blockHash", ColumnType::Text),
+                super::Column::named("note".to_owned(), ColumnType::Text, false),
+                column("ids", ColumnType::Document),
+            ],
+        ));
+        schema
+    }
+
+    /// An event's table gets a column per argument named from the ABI: unnamed ones by
+    /// position, and one repeating a log column with its position appended. A name is
+    /// taken once.
+    #[test]
+    fn an_event_table_names_a_column_per_argument() {
+        let mut schema = event_schema();
+        let table = schema.tables().last().expect("the event table");
+        let names: Vec<&str> = table.columns.iter().map(|c| c.name.as_ref()).collect();
+        assert_eq!(
+            names[4..10],
+            ["amount", "tick", "arg2", "block_hash_3", "note", "ids"]
+        );
+        assert!(!schema.add_event(("p", "C", hash(0x0a)), "p_c_e".to_owned(), Vec::new()));
+    }
+
+    /// A decoded record fills its event's table: wide integers exact with their sign, a
+    /// string that is not storable text as null, an array as a document.
+    #[test]
+    fn a_decoded_record_fills_its_event_table() {
+        let schema = event_schema();
+        let id = hash(0x09);
+        let decoded = Decoded {
+            event_id: id,
+            protocol: "p".to_owned(),
+            contract: "C".to_owned(),
+            indexed: vec![arg(
+                3,
+                "blockHash",
+                TypedValue::IndexedHash { value: hash(0x07) },
+            )],
+            body: vec![
+                arg(
+                    0,
+                    "amount",
+                    TypedValue::Int {
+                        value: I256::MIN,
+                        bits: 256,
+                    },
+                ),
+                arg(
+                    1,
+                    "tick",
+                    TypedValue::Int {
+                        value: I256::try_from(-197_317).expect("fits"),
+                        bits: 24,
+                    },
+                ),
+                arg(
+                    2,
+                    "",
+                    TypedValue::Uint {
+                        value: U256::from(3000),
+                        bits: 24,
+                    },
+                ),
+                arg(
+                    4,
+                    "note",
+                    TypedValue::String {
+                        value: Bytes::from_static(b"a\0b"),
+                        text: Some("a\0b".to_owned()),
+                    },
+                ),
+                arg(
+                    5,
+                    "ids",
+                    TypedValue::Array {
+                        value: vec![TypedValue::Bool { value: true }],
+                    },
+                ),
+            ],
+            ..decoded()
+        };
+        let row = schema
+            .event_row(&chain(), &decoded)
+            .expect("the event has a table");
+        assert_eq!(row.table(), TableId::Event(0));
+        assert_eq!(row.dedupe_key(), decoded.dedupe_key());
+        assert_eq!(
+            row.value("amount"),
+            &ColumnValue::BigInt {
+                negative: true,
+                magnitude: I256::MIN.unsigned_abs(),
+            }
+        );
+        assert_eq!(row.value("tick"), &ColumnValue::Int(-197_317));
+        assert_eq!(row.value("arg2"), &ColumnValue::Uint(3000));
+        assert_eq!(row.text("block_hash_3"), format!("{:#x}", hash(0x07)));
+        assert_eq!(
+            row.value("note"),
+            &ColumnValue::Null,
+            "PostgreSQL rejects a NUL"
+        );
+        assert!(matches!(row.value("ids"), ColumnValue::Document(_)));
+        assert_eq!(row.text("block_hash"), format!("{:#x}", decoded.block_hash));
+
+        let other = Decoded {
+            contract: "Other".to_owned(),
+            ..decoded
+        };
+        assert!(schema.event_row(&chain(), &other).is_none());
     }
 }

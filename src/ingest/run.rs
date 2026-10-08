@@ -44,7 +44,7 @@ impl Ingest {
         log_addresses: &[Address],
         start_block: Option<u64>,
     ) -> Result<Self, SourceError> {
-        if !log_addresses.is_empty() && (!datasets.log || datasets.receipt) {
+        if !log_addresses.is_empty() && (!datasets.logs || datasets.receipts) {
             return Err(SourceError::LogAddresses);
         }
         Ok(Self {

@@ -144,6 +144,7 @@ impl Decoder {
             name: event.name,
             address: log.address,
             protocol: entry.protocol.clone(),
+            contract: entry.name.clone(),
             event_id: event.id,
             selector: event.selector,
             signature: event.signature,

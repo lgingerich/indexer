@@ -9,7 +9,7 @@
 //! - A block's metadata (identity, parent hash, timestamp) is reported separately
 //!   from its events, so parent linkage and dataset timestamps are available even
 //!   when the block row itself is not stored. The block row is emitted only when the
-//!   block dataset is selected.
+//!   `blocks` dataset is selected.
 //! - The selected datasets decide the calls. Logs without receipts use `eth_getLogs`
 //!   for that one height, pinned to the announced hash when the notification
 //!   supplied it, optionally limited to a list of contract addresses; a validated
@@ -97,7 +97,7 @@ impl EvmSource {
         datasets: Datasets,
         log_addresses: &[Address],
     ) -> Result<Self, SourceError> {
-        if !log_addresses.is_empty() && (!datasets.log || datasets.receipt) {
+        if !log_addresses.is_empty() && (!datasets.logs || datasets.receipts) {
             return Err(SourceError::LogAddresses);
         }
         let client = reqwest::Client::builder()
@@ -258,7 +258,7 @@ pub fn decode_block(batch: RpcBatch) -> Result<FetchedBlock, SourceError> {
 
 /// Projects a fetched block into dataset events, anchored to `meta`.
 ///
-/// The block row is pushed only when the block dataset is selected; metadata is
+/// The block row is pushed only when the `blocks` dataset is selected; metadata is
 /// reported separately, so the pipeline keeps linkage and timestamps whether or not
 /// the row is stored. The order is each transaction, then its receipt, then that
 /// receipt's logs, all in block index order, with `eth_getLogs` rows appended after.
@@ -274,13 +274,13 @@ fn project(
     // Anything but logs is projected from the block body, and receipts are validated
     // against its transaction identities, so a missing body is an error rather than a
     // silently empty projection. Logs alone need no body.
-    if (datasets.block || datasets.transaction || datasets.receipt) && block.is_none() {
+    if (datasets.blocks || datasets.transactions || datasets.receipts) && block.is_none() {
         return Err(malformed(BLOCK, "block was not fetched"));
     }
-    if datasets.receipt && receipts.is_none() {
+    if datasets.receipts && receipts.is_none() {
         return Err(malformed(RECEIPTS, "receipts were not fetched"));
     }
-    if datasets.log && !datasets.receipt && logs.is_none() {
+    if datasets.logs && !datasets.receipts && logs.is_none() {
         return Err(malformed(LOGS, "logs were not fetched"));
     }
 
@@ -293,7 +293,7 @@ fn project(
                 format!("block {} at {} is not {meta:?}", header.hash, header.number),
             ));
         }
-        if datasets.block {
+        if datasets.blocks {
             events.push(Event::Block(Box::new(decode_header(block))));
         }
         append_body(&mut events, block, receipts, datasets, meta)?;
@@ -321,7 +321,7 @@ fn append_body(
 ) -> Result<(), SourceError> {
     let transactions = &block.0.inner.transactions;
     let full = transactions.as_transactions();
-    if datasets.transaction && full.is_none() {
+    if datasets.transactions && full.is_none() {
         return Err(malformed(BLOCK, "block returned transaction hashes only"));
     }
     let tx_hashes: Vec<B256> = transactions.hashes().collect();
@@ -337,12 +337,12 @@ fn append_body(
             ),
         ));
     }
-    if !datasets.transaction && receipts.is_none() {
+    if !datasets.transactions && receipts.is_none() {
         return Ok(());
     }
     for (position, tx_hash) in tx_hashes.iter().copied().enumerate() {
         let tx_index = position as u64;
-        if datasets.transaction {
+        if datasets.transactions {
             let transaction = &full
                 .ok_or_else(|| malformed(BLOCK, "block returned transaction hashes only"))?
                 [position];
@@ -377,7 +377,7 @@ fn append_body(
                 ),
             ));
         }
-        if datasets.receipt {
+        if datasets.receipts {
             events.push(Event::Receipt(Box::new(decode_receipt(
                 receipt,
                 tx_hash,
@@ -387,7 +387,7 @@ fn append_body(
                 meta.timestamp,
             ))));
         }
-        if datasets.log {
+        if datasets.logs {
             for log in receipt.logs() {
                 // Logs nested in this receipt, as opposed to a separate `eth_getLogs`
                 // query; the label names the boundary an error at this site reports.
@@ -440,7 +440,7 @@ fn filtered_log(
     )
 }
 
-/// Flattens a block header and its transaction hashes into the block dataset.
+/// Flattens a block header and its transaction hashes into the `blocks` dataset.
 ///
 /// Two header fields the node returns are not carried, because the dataset has no column
 /// for either and a half-present field is worse than an absent one: `mix_hash`, which
@@ -480,7 +480,7 @@ fn decode_header(block: &AnyRpcBlock) -> Block {
     }
 }
 
-/// Flattens one RPC transaction into the transaction dataset.
+/// Flattens one RPC transaction into the `transactions` dataset.
 ///
 /// Every field comes from the standard `alloy_consensus::Transaction` accessors,
 /// which work for Ethereum and non-Ethereum types alike (an OP deposit reads its
@@ -546,7 +546,7 @@ fn known_max_fee_per_gas(transaction: &AnyRpcTransaction) -> Option<u128> {
     TransactionResponse::max_fee_per_gas(transaction)
 }
 
-/// Flattens one RPC receipt into the receipt dataset, without its logs.
+/// Flattens one RPC receipt into the `receipts` dataset, without its logs.
 fn decode_receipt(
     receipt: &AnyTransactionReceipt,
     transaction_hash: B256,
@@ -576,7 +576,7 @@ fn decode_receipt(
     }
 }
 
-/// Flattens one RPC log into the log dataset.
+/// Flattens one RPC log into the `logs` dataset.
 ///
 /// A log's identity is its transaction hash and its index in the block, and both are
 /// required for the dataset's `dedupe_key` to mean anything: two logs in the same
@@ -694,7 +694,7 @@ impl BlockSource for EvmSource {
         // Nodes that do not serve `eth_getBlockReceipts` (some L2s, and pre-Cancun
         // Ethereum) answer it with `METHOD_NOT_FOUND` or null. Fetch the receipts
         // by transaction hash instead, so the block still becomes events.
-        if self.datasets.receipt && receipts.is_none() {
+        if self.datasets.receipts && receipts.is_none() {
             let block = block
                 .as_ref()
                 .ok_or_else(|| malformed(RECEIPTS, "block was not fetched"))?;
@@ -792,9 +792,9 @@ impl EvmSource {
         // block row and the receipt fallback. Order matches the all-dataset batch
         // the tests lock: block, then receipts, then logs.
         let block = batch
-            .add_call::<_, Option<AnyRpcBlock>>(BLOCK, &(tag, self.datasets.transaction))
+            .add_call::<_, Option<AnyRpcBlock>>(BLOCK, &(tag, self.datasets.transactions))
             .map_err(|source| transport(BLOCK, source))?;
-        let receipts = if self.datasets.receipt {
+        let receipts = if self.datasets.receipts {
             Some(
                 batch
                     .add_call::<_, Option<Vec<AnyTransactionReceipt>>>(RECEIPTS, &(tag,))
@@ -803,7 +803,7 @@ impl EvmSource {
         } else {
             None
         };
-        let separate_logs = self.datasets.log && !self.datasets.receipt;
+        let separate_logs = self.datasets.logs && !self.datasets.receipts;
         let logs = if separate_logs {
             Some(
                 batch
@@ -996,7 +996,7 @@ mod tests {
             "ethereum",
             url,
             "ws://unused",
-            serde_json::from_str(r#"["log"]"#).expect("datasets"),
+            serde_json::from_str(r#"["logs"]"#).expect("datasets"),
             &[],
         )
         .expect("source");
@@ -1025,7 +1025,7 @@ mod tests {
             "ethereum",
             url,
             "ws://unused",
-            serde_json::from_str(r#"["log"]"#).expect("datasets"),
+            serde_json::from_str(r#"["logs"]"#).expect("datasets"),
             &[],
         )
         .expect("source");
@@ -1047,7 +1047,7 @@ mod tests {
     }
 
     /// A reusable head stands in for the header only when logs are the only thing
-    /// fetched. Anything else reads the block body, so a transaction dataset still
+    /// fetched. Anything else reads the block body, so a `transactions` dataset still
     /// fetches it and still emits its rows — silently dropping them would index
     /// transactions for history and not for live blocks.
     #[tokio::test]
@@ -1067,7 +1067,7 @@ mod tests {
             "ethereum",
             url,
             "ws://unused",
-            serde_json::from_str(r#"["transaction", "log"]"#).expect("datasets"),
+            serde_json::from_str(r#"["transactions", "logs"]"#).expect("datasets"),
             &[],
         )
         .expect("source");
@@ -1122,7 +1122,7 @@ mod tests {
             "ethereum",
             url,
             "ws://unused",
-            serde_json::from_str(r#"["log"]"#).expect("datasets"),
+            serde_json::from_str(r#"["logs"]"#).expect("datasets"),
             &[want, other],
         )
         .expect("source");
@@ -1147,7 +1147,7 @@ mod tests {
             "ethereum",
             "http://unused",
             "ws://unused",
-            serde_json::from_str(r#"["block"]"#).expect("datasets"),
+            serde_json::from_str(r#"["blocks"]"#).expect("datasets"),
             &addresses,
         );
         assert!(matches!(without_logs, Err(SourceError::LogAddresses)));
@@ -1173,7 +1173,7 @@ mod tests {
             "ethereum",
             url,
             "ws://unused",
-            serde_json::from_str(r#"["receipt", "log"]"#).expect("datasets"),
+            serde_json::from_str(r#"["receipts", "logs"]"#).expect("datasets"),
             &[],
         )
         .expect("source");
@@ -1186,8 +1186,8 @@ mod tests {
     #[tokio::test]
     async fn transactions_skip_the_receipt_call() {
         let (url, server) = rpc_server(1, |request| {
-            // One batch, one method: only the block is needed for the block and
-            // transaction datasets, so the receipt call is skipped.
+            // One batch, one method: only the block is needed for the `blocks` and
+            // `transactions` datasets, so the receipt call is skipped.
             let calls = request.as_array().expect("batch");
             assert_eq!(calls.len(), 1);
             assert_eq!(calls[0]["method"], "eth_getBlockByNumber");
@@ -1198,7 +1198,7 @@ mod tests {
             "ethereum",
             url,
             "ws://unused",
-            serde_json::from_str(r#"["block", "transaction"]"#).expect("datasets"),
+            serde_json::from_str(r#"["blocks", "transactions"]"#).expect("datasets"),
             &[],
         )
         .expect("source");
@@ -1416,7 +1416,7 @@ mod tests {
     }
 
     /// A block as `eth_getBlockByNumber` returns it with full transactions, so it
-    /// carries every header field the block dataset reads.
+    /// carries every header field the `blocks` dataset reads.
     fn block() -> Value {
         json!({
             "number": "0x112a880",

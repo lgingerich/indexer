@@ -20,13 +20,13 @@ use crate::wire::envelope::Event;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Datasets {
     /// Store block headers.
-    pub block: bool,
+    pub blocks: bool,
     /// Store transactions. The node is asked for full transaction objects.
-    pub transaction: bool,
+    pub transactions: bool,
     /// Store receipts. Logs selected alongside receipts are taken from them.
-    pub receipt: bool,
+    pub receipts: bool,
     /// Store logs.
-    pub log: bool,
+    pub logs: bool,
 }
 
 impl Default for Datasets {
@@ -40,10 +40,10 @@ impl Datasets {
     #[must_use]
     pub const fn all() -> Self {
         Self {
-            block: true,
-            transaction: true,
-            receipt: true,
-            log: true,
+            blocks: true,
+            transactions: true,
+            receipts: true,
+            logs: true,
         }
     }
 
@@ -59,10 +59,10 @@ impl Datasets {
     #[must_use]
     pub const fn keeps(self, event: &Event) -> bool {
         match event {
-            Event::Block(_) => self.block,
-            Event::Transaction(_) => self.transaction,
-            Event::Receipt(_) => self.receipt,
-            Event::Log(_) | Event::Decoded(_) | Event::Contract(_) => self.log,
+            Event::Block(_) => self.blocks,
+            Event::Transaction(_) => self.transactions,
+            Event::Receipt(_) => self.receipts,
+            Event::Log(_) | Event::Decoded(_) | Event::Contract(_) => self.logs,
             Event::Reorg(_) | Event::AcceptedBlock(_) => true,
         }
     }
@@ -70,29 +70,29 @@ impl Datasets {
     /// Whether logs are the only thing fetched: nothing selected reads the block body.
     ///
     /// This is the condition under which a live notification's metadata stands in for
-    /// the header and the block read is skipped. `block` and `transaction` are projected
-    /// from the body, and `receipt` needs the body's transaction identities, so each
+    /// the header and the block read is skipped. `blocks` and `transactions` are projected
+    /// from the body, and `receipts` needs the body's transaction identities, so each
     /// rules the reuse out.
     #[must_use]
     pub const fn logs_only(self) -> bool {
-        self.log && !self.block && !self.transaction && !self.receipt
+        self.logs && !self.blocks && !self.transactions && !self.receipts
     }
 }
 
 impl std::fmt::Display for Datasets {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let mut names = Vec::new();
-        if self.block {
-            names.push("block");
+        if self.blocks {
+            names.push("blocks");
         }
-        if self.transaction {
-            names.push("transaction");
+        if self.transactions {
+            names.push("transactions");
         }
-        if self.receipt {
-            names.push("receipt");
+        if self.receipts {
+            names.push("receipts");
         }
-        if self.log {
-            names.push("log");
+        if self.logs {
+            names.push("logs");
         }
         write!(f, "{}", names.join(","))
     }
@@ -107,25 +107,25 @@ impl<'de> Deserialize<'de> for Datasets {
         if names.is_empty() {
             return Err(de::Error::invalid_value(
                 Unexpected::Seq,
-                &"one or more of `block`, `transaction`, `receipt`, `log`",
+                &"one or more of `blocks`, `transactions`, `receipts`, `logs`",
             ));
         }
         let mut datasets = Self {
-            block: false,
-            transaction: false,
-            receipt: false,
-            log: false,
+            blocks: false,
+            transactions: false,
+            receipts: false,
+            logs: false,
         };
         for name in &names {
             let slot = match name.as_str() {
-                "block" => &mut datasets.block,
-                "transaction" => &mut datasets.transaction,
-                "receipt" => &mut datasets.receipt,
-                "log" => &mut datasets.log,
+                "blocks" => &mut datasets.blocks,
+                "transactions" => &mut datasets.transactions,
+                "receipts" => &mut datasets.receipts,
+                "logs" => &mut datasets.logs,
                 other => {
                     return Err(de::Error::unknown_variant(
                         other,
-                        &["block", "transaction", "receipt", "log"],
+                        &["blocks", "transactions", "receipts", "logs"],
                     ));
                 }
             };
@@ -150,7 +150,7 @@ mod tests {
     /// contract: the selected datasets' events, decoded records with logs, and reorgs.
     #[test]
     fn keeps_selects_only_the_named_datasets() {
-        let datasets: Datasets = serde_json::from_str(r#"["log"]"#).expect("datasets");
+        let datasets: Datasets = serde_json::from_str(r#"["logs"]"#).expect("datasets");
         let block = Event::Block(Box::default());
         let log = Event::Log(Box::new(Log {
             block_number: 1,
@@ -162,6 +162,7 @@ mod tests {
             name: "Transfer".to_owned(),
             address: Address::ZERO,
             protocol: "erc20".to_owned(),
+            contract: "Token".to_owned(),
             selector: B256::ZERO,
             signature: "Transfer(address,address,uint256)".to_owned(),
             anonymous: false,

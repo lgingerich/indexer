@@ -1,11 +1,14 @@
 # Metric OMM v1. See `src/decode/catalog.rs` for the manifest format.
 #
-# No deployment addresses are listed yet, so nothing here decodes until a chain's
-# addresses are added. Pools come from the factory's `PoolCreated` once it is.
+# Base addresses are listed for every contract whose ABI declares events. Pools are not
+# listed: they come from the factory's `PoolCreated`, so every pool decodes from its
+# creating block. Contracts without events, and `OracleProvider`, have no address.
 protocol = "metric_v1"
 
 [[contract]]
 abi = ["MetricOmmPoolFactory.json"]
+table = "factory"
+addresses = { base = ["0x2a53833cc95548cf52c7b159110e22D3a9018f32"] }
 
 [[contract]]
 abi = ["MetricOmmPool.json"]
@@ -19,6 +22,7 @@ abi = ["MetricOmmPoolLiquidityAdder.json"]
 
 [[contract]]
 abi = ["MetricOmmSimpleRouter.json"]
+addresses = { base = ["0x3c6c4fC94f1493b9d76C5e4C4CdEdB444D3CC0A2"] }
 
 [[contract]]
 abi = ["MetricOmmSwapQuoter.json"]
@@ -31,12 +35,18 @@ abi = ["PriceProvider.json"]
 
 [[contract]]
 abi = ["DepositAllowlistExtension.json"]
+addresses = { base = ["0x65FBa4Ee8f50772aB384f19e5520DdA420B1B47D"] }
 
 [[contract]]
 abi = ["SwapAllowlistExtension.json"]
+addresses = { base = ["0x4Ca8d78873f0a66445CC05f9A1E705f1a58A6582"] }   # retired
 
 [[contract]]
 abi = ["OracleValueStopLossExtension.json"]
+table = "stop_loss"
+addresses = { base = ["0xE4038fA09f0bB9963068afaF97BE0c045155090D"] }
 
 [[contract]]
 abi = ["PriceVelocityGuardExtension.json"]
+table = "velocity_guard"
+addresses = { base = ["0xEbc53e61078976118E384f110c262A263decB84B"] }

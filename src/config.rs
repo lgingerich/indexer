@@ -419,7 +419,7 @@ ws_url = "wss://example.invalid"
 chain = "base"
 http_url = "https://example.invalid"
 ws_url = "wss://example.invalid"
-datasets = ["log"]
+datasets = ["logs"]
 log_addresses = ["0x1111111111111111111111111111111111111111"]
 
 [sink.stdout]
@@ -455,15 +455,15 @@ log_addresses = ["not-an-address"]
 chain = "base"
 http_url = "https://example.invalid"
 ws_url = "wss://example.invalid"
-datasets = ["log", "block"]
+datasets = ["logs", "blocks"]
 
 [sink.stdout]
 "#,
         )
         .expect("subset parses");
-        assert!(selected.ingest.datasets.log && selected.ingest.datasets.block);
-        assert!(!selected.ingest.datasets.transaction);
-        assert!(!selected.ingest.datasets.receipt);
+        assert!(selected.ingest.datasets.logs && selected.ingest.datasets.blocks);
+        assert!(!selected.ingest.datasets.transactions);
+        assert!(!selected.ingest.datasets.receipts);
 
         let empty = Settings::from_str(
             r#"
@@ -489,14 +489,14 @@ datasets = []
 chain = "base"
 http_url = "https://example.invalid"
 ws_url = "wss://example.invalid"
-datasets = ["blocks"]
+datasets = ["block"]
 
 [sink.stdout]
 "#,
         )
         .expect_err("unknown dataset")
         .to_string();
-        assert!(unknown.contains("blocks"), "{unknown}");
+        assert!(unknown.contains("block"), "{unknown}");
 
         let duplicate = Settings::from_str(
             r#"
@@ -504,7 +504,7 @@ datasets = ["blocks"]
 chain = "base"
 http_url = "https://example.invalid"
 ws_url = "wss://example.invalid"
-datasets = ["log", "log"]
+datasets = ["logs", "logs"]
 
 [sink.stdout]
 "#,
