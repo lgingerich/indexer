@@ -41,12 +41,14 @@ use alloy_network::eip2718::Typed2718 as _;
 use alloy_network::{AnyNetwork, TransactionResponse};
 use alloy_primitives::{Address, B256};
 use alloy_provider::{Provider, ProviderBuilder, RootProvider, WsConnect};
+use alloy_rpc_client::ClientBuilder;
 use alloy_rpc_types_eth::Filter;
 use alloy_rpc_types_eth::Log as RpcLog;
 use alloy_transport::{TransportError, TransportErrorKind};
 use futures_util::StreamExt;
 use serde::Deserialize;
 
+use super::retry::RetryLayer;
 use super::{BlockMeta, BlockSource, FetchedBlock, HeadStream, METHOD_NOT_FOUND, SourceError};
 use crate::sink::Datasets;
 use crate::wire::datasets::evm::{Block, Log, Receipt, Transaction};
@@ -86,6 +88,9 @@ impl EvmSource {
     /// list is rejected unless logs are selected and receipts are not, because that is
     /// the only batch that sends `eth_getLogs`.
     ///
+    /// HTTP requests are paced and retried to fit the provider's rate limit, which is
+    /// learned from its refusals rather than configured.
+    ///
     /// # Errors
     ///
     /// Returns [`SourceError::LogAddresses`] when addresses are set but `eth_getLogs`
@@ -113,7 +118,11 @@ impl EvmSource {
         let provider = ProviderBuilder::new()
             .disable_recommended_fillers()
             .network::<AnyNetwork>()
-            .connect_reqwest(client, url);
+            .connect_client(
+                ClientBuilder::default()
+                    .layer(RetryLayer::default())
+                    .http_with_client(client, url),
+            );
         Ok(Self {
             chain: chain.into(),
             ws_url: ws_url.into(),
@@ -1691,8 +1700,9 @@ mod tests {
     }
 
     /// A provider's URL holds its API key, and a failed request's error is logged with
-    /// `{:?}`, so neither rendering may carry the URL reqwest attaches.
-    #[tokio::test]
+    /// `{:?}`, so neither rendering may carry the URL reqwest attaches. A refused
+    /// connection is retried with backoff first; paused time skips those waits.
+    #[tokio::test(start_paused = true)]
     async fn a_transport_error_does_not_carry_the_endpoint_url() {
         let port = std::net::TcpListener::bind("127.0.0.1:0")
             .and_then(|listener| listener.local_addr())

@@ -28,7 +28,7 @@ alloy-consensus = "1.8.3"
 alloy-json-rpc = "1.8.3"
 alloy-provider = { version = "=1.8.3", default-features = false, features = ["reqwest", "reqwest-native-tls", "ws"] }
 alloy-transport = "=1.8.3"
-alloy-rpc-client = { version = "=1.8.3", default-features = false }
+alloy-rpc-client = { version = "=1.8.3", default-features = false, features = ["reqwest"] }
 # `any` types (`AnyRpcBlock`/`AnyRpcTransaction`) are alloy's catch-all for networks
 # whose transaction types fall outside Ethereum's 0-4: an OP-stack deposit (`0x7e`)
 # or Arbitrum retry (`0x6a`) otherwise fails the whole block. See `ingest::source`.
@@ -65,6 +65,8 @@ toml = { version = "1.1.6", features = ["parse"] }
 tokio = { version = "1.53.1", features = ["io-std", "io-util", "macros", "rt-multi-thread", "signal", "sync", "time"] }
 # Alloy 1.8.3 uses tungstenite 0.28 and enables rustls. Unifying native-tls
 # makes tungstenite prefer platform TLS while retaining Alloy's required features.
+# The retry layer around the RPC transport is a tower `Layer`, as alloy's own are.
+tower = { version = "0.5.3", default-features = false, features = ["util"] }
 tokio-tungstenite = { version = "0.28", default-features = false, features = ["connect", "native-tls"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", default-features = false, features = ["env-filter", "fmt", "json"] }

@@ -27,6 +27,7 @@ use futures_util::Stream;
 use thiserror::Error;
 
 pub mod evm;
+mod retry;
 pub use evm::EvmSource;
 
 use crate::wire::envelope::{AcceptedBlock, ChainId, Event};
