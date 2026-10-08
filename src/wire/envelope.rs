@@ -3,8 +3,7 @@
 //! [`Event`] is the union of everything the indexer publishes, and it holds two
 //! kinds of thing:
 //!
-//! - **Datasets** ([`Event::Block`], [`Event::Transaction`], [`Event::Receipt`],
-//!   [`Event::Log`]): durable on-chain records, re-exported from [`crate::wire::datasets`].
+//! - **Datasets** ([`Event::Block`], [`Event::Transaction`], [`Event::Log`]): durable on-chain records, re-exported from [`crate::wire::datasets`].
 //!   Each carries its own identity fields and dedupe key. Their shape is per-chain,
 //!   so the EVM records live in [`crate::wire::datasets::evm`]; Solana's would be a sibling
 //!   module and a variant here.
@@ -55,7 +54,7 @@ use std::fmt;
 use alloy_primitives::{Address, B256, TxHash};
 use serde::{Deserialize, Serialize};
 
-pub use crate::wire::datasets::evm::{Block, DecodedArg, Log, Receipt, Transaction, log_key};
+pub use crate::wire::datasets::evm::{Block, DecodedArg, Log, Transaction, log_key};
 pub use crate::wire::typed::{AbiComponent, AbiType, TypedValue};
 
 /// The version of the envelope's wire shape.
@@ -313,7 +312,7 @@ impl Contract {
 
 /// Everything the indexer publishes, tagged by `type` on the wire.
 ///
-/// The dataset payloads are boxed: a [`Block`] or [`Receipt`] carries a 256-byte bloom
+/// The dataset payloads are boxed: a [`Block`] or [`Transaction`] carries a 256-byte bloom
 /// filter, and without boxing every [`Log`] event — the overwhelming majority on a
 /// busy block — would be padded to that size in memory and on the stack.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -321,10 +320,8 @@ impl Contract {
 pub enum Event {
     /// A block, from `eth_getBlockByNumber`.
     Block(Box<Block>),
-    /// A transaction, from its block's `transactions` array.
+    /// A transaction, from its block's `transactions` array, joined to its receipt.
     Transaction(Box<Transaction>),
-    /// A transaction receipt, from `eth_getTransactionReceipt`.
-    Receipt(Box<Receipt>),
     /// A log, from its receipt's `logs` array.
     Log(Box<Log>),
     /// A log decoded against a contract ABI. Only the decode stage produces this.
@@ -344,7 +341,6 @@ impl Event {
         match self {
             Self::Block(_) => "block",
             Self::Transaction(_) => "transaction",
-            Self::Receipt(_) => "receipt",
             Self::Log(_) => "log",
             Self::Decoded(_) => "decoded",
             Self::Contract(_) => "contract",
@@ -371,7 +367,6 @@ impl Event {
         match self {
             Self::Block(block) => block.dedupe_key(),
             Self::Transaction(transaction) => transaction.dedupe_key(),
-            Self::Receipt(receipt) => receipt.dedupe_key(),
             Self::Log(log) => log.dedupe_key(),
             Self::Decoded(decoded) => decoded.dedupe_key(),
             Self::Contract(contract) => contract.dedupe_key(),
@@ -439,7 +434,7 @@ mod tests {
 
     use super::{
         AbiType, AcceptedBlock, Block, ChainId, Contract, Decoded, DecodedArg, Envelope, Event,
-        Log, Receipt, Reorg, SCHEMA_VERSION, Transaction, TypedValue,
+        Log, Reorg, SCHEMA_VERSION, Transaction, TypedValue,
     };
 
     fn contract(block_hash: B256) -> Contract {
@@ -592,23 +587,6 @@ mod tests {
         assert_ne!(orphaned.dedupe_key(), replacement.dedupe_key());
     }
 
-    /// The same for a receipt: re-including a transaction yields a second receipt from
-    /// the replacement block, and the two are physically different rows.
-    #[test]
-    fn a_receipt_and_its_replacement_in_a_reorg_do_not_share_a_key() {
-        let orphaned = Receipt {
-            transaction_hash: TxHash::from([0x01; 32]),
-            transaction_index: 0,
-            block_number: 100,
-            block_hash: hash(0xaa),
-            ..Receipt::default()
-        };
-        let mut replacement = orphaned.clone();
-        replacement.block_hash = hash(0xbb);
-
-        assert_ne!(orphaned.dedupe_key(), replacement.dedupe_key());
-    }
-
     /// A decoded record inherits its log's key, so the same collision cannot reappear
     /// one layer up — a re-decode of an orphaned log keeps its own row rather than
     /// landing on the replacement's decode.
@@ -670,16 +648,6 @@ mod tests {
             }
             .dedupe_key(),
             format!("0x{block_hex}:0x{tx_hex}:tx")
-        );
-        assert_eq!(
-            Receipt {
-                block_number: 100,
-                block_hash,
-                transaction_hash: tx,
-                ..Receipt::default()
-            }
-            .dedupe_key(),
-            format!("0x{block_hex}:0x{tx_hex}:receipt")
         );
         assert_eq!(
             Log {
@@ -805,8 +773,8 @@ mod tests {
         assert_eq!(value["block_number"], "0x18cba80");
     }
 
-    /// The round trip an envelope takes through a sink and back. `Transaction` and
-    /// `Receipt` carry `u128` fee fields, which serde's `flatten` buffering cannot
+    /// The round trip an envelope takes through a sink and back. `Transaction` carries
+    /// `u128` fee fields, which serde's `flatten` buffering cannot
     /// deserialize unless those fields use the quantity encoding — this test is what
     /// pins that, and it is the only test here that is not tied to one event shape.
     #[test]
@@ -826,15 +794,10 @@ mod tests {
                 max_fee_per_gas: Some(u128::MAX),
                 max_priority_fee_per_gas: Some(u128::MAX),
                 max_fee_per_blob_gas: Some(u128::MAX),
+                receipt_effective_gas_price: u128::MAX,
+                receipt_blob_gas_price: Some(u128::MAX),
                 block_number: 5,
                 ..Transaction::default()
-            })),
-            Event::Receipt(Box::new(Receipt {
-                transaction_hash: TxHash::from([0x11; 32]),
-                effective_gas_price: u128::MAX,
-                blob_gas_price: Some(u128::MAX),
-                block_number: 5,
-                ..Receipt::default()
             })),
             Event::Log(Box::new(Log {
                 log_index: 1,

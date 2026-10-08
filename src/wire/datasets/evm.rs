@@ -6,15 +6,14 @@
 //! | Dataset | RPC source | Natural key |
 //! | --- | --- | --- |
 //! | [`Block`] | `eth_getBlockByNumber` | `hash` |
-//! | [`Transaction`] | the block's `transactions` array | `(block_hash, hash)` |
-//! | [`Receipt`] | `eth_getBlockReceipts` / `eth_getTransactionReceipt` | `(block_hash, transaction_hash)` |
+//! | [`Transaction`] | the block's `transactions` array, joined to its receipt | `(block_hash, hash)` |
 //! | [`Log`] | a receipt's `logs` array | `(block_hash, transaction_hash, log_index)` |
 //!
 //! Every key is the hashes that identify the row plus a dataset tag. The block's
 //! **hash**, not its number: a height says where a block sat, the hash says *which*
 //! block sat there, and only the second tells two rows apart. A reorg replaces the block
 //! at a height with a different one. A transaction re-included there keeps its signed
-//! hash, and its receipt and logs sit at the same height, in the same transaction, at
+//! hash, and its logs sit at the same height, in the same transaction, at
 //! the same index — so a key built without the block hash would name two physically
 //! distinct rows identically. Inclusion fields on the transaction itself
 //! (`transaction_index`, `block_timestamp`, the effective `gas_price`) differ the same way.
@@ -135,7 +134,13 @@ impl Block {
     }
 }
 
-/// One transaction, from its block's `transactions` array.
+/// One transaction, from its block's `transactions` array, joined to its receipt.
+///
+/// A receipt is the transaction's execution result, exactly one per inclusion and keyed
+/// the same way, so it is not a table of its own: its fields are carried here with
+/// Allium's `receipt_` prefix, as in `ethereum.raw.transactions`. The receipt's copies
+/// of the transaction's own fields (hash, index, sender, recipient, type) are not
+/// repeated, and its `logs` are published as their own [`Log`] dataset.
 ///
 /// Natural key is `(block_hash, hash)`. The transaction hash identifies the signed
 /// transaction. The block hash keeps a re-included copy in a replacement block as its
@@ -224,6 +229,38 @@ pub struct Transaction {
     pub blob_versioned_hashes: Option<Vec<B256>>,
     /// Authorization list; EIP-7702.
     pub authorization_list: Option<Vec<SignedAuthorization>>,
+    /// Success status of the transaction, from its receipt.
+    pub receipt_status: bool,
+    /// Gas used by this transaction alone.
+    #[serde(with = "alloy_serde::quantity")]
+    pub receipt_gas_used: u64,
+    /// Total gas used in the block when this transaction was executed.
+    #[serde(with = "alloy_serde::quantity")]
+    pub receipt_cumulative_gas_used: u64,
+    /// Effective gas price paid, in wei.
+    #[serde(with = "alloy_serde::quantity")]
+    pub receipt_effective_gas_price: u128,
+    /// Address of the created contract, if this was a deployment.
+    pub receipt_contract_address: Option<Address>,
+    /// Bloom filter for this transaction's logs.
+    pub receipt_logs_bloom: Bloom,
+    /// Blob gas used; EIP-4844.
+    #[serde(
+        default,
+        with = "alloy_serde::quantity::opt",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub receipt_blob_gas_used: Option<u64>,
+    /// Blob gas price paid, in wei; EIP-4844.
+    #[serde(
+        default,
+        with = "alloy_serde::quantity::opt",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub receipt_blob_gas_price: Option<u128>,
+    /// Number of logs emitted by this transaction.
+    #[serde(with = "alloy_serde::quantity")]
+    pub log_count: u64,
     /// Block timestamp, denormalized for time-based partitioning.
     #[serde(with = "alloy_serde::quantity")]
     pub block_timestamp: u64,
@@ -242,87 +279,6 @@ impl Transaction {
     #[must_use]
     pub fn dedupe_key(&self) -> String {
         format!("{}:{}:tx", self.block_hash, self.hash)
-    }
-}
-
-/// A transaction receipt, from `eth_getBlockReceipts` or `eth_getTransactionReceipt`.
-///
-/// Natural key is `(block_hash, transaction_hash)`: exactly one receipt exists per
-/// transaction per block that contains it, so the key separates dataset kinds with a
-/// `:receipt` suffix. `logs` are published as their own [`Log`] dataset, so a receipt
-/// holds only the receipt-scalar fields.
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
-pub struct Receipt {
-    /// Hash of the transaction this receipt belongs to.
-    pub transaction_hash: TxHash,
-    /// Position of that transaction within its block.
-    #[serde(with = "alloy_serde::quantity")]
-    pub transaction_index: u64,
-    /// Address of the sending party.
-    pub from: Address,
-    /// Address of the receiving party; `None` for a contract creation.
-    pub to: Option<Address>,
-    /// Success status of the transaction.
-    pub status: bool,
-    /// Transaction type, mirrored from the transaction.
-    ///
-    /// The raw `u8`, for the same reason as [`Transaction::transaction_type`]:
-    /// non-Ethereum chains use types outside 0-4.
-    #[serde(with = "alloy_serde::quantity")]
-    pub transaction_type: u8,
-    /// Gas used by this transaction alone.
-    #[serde(with = "alloy_serde::quantity")]
-    pub gas_used: u64,
-    /// Total gas used in the block when this transaction was executed.
-    #[serde(with = "alloy_serde::quantity")]
-    pub cumulative_gas_used: u64,
-    /// Effective gas price paid, in wei.
-    #[serde(with = "alloy_serde::quantity")]
-    pub effective_gas_price: u128,
-    /// Address of the created contract, if this was a deployment.
-    pub contract_address: Option<Address>,
-    /// Bloom filter for this receipt's logs.
-    pub logs_bloom: Bloom,
-    /// Blob gas used; EIP-4844.
-    #[serde(
-        default,
-        with = "alloy_serde::quantity::opt",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub blob_gas_used: Option<u64>,
-    /// Blob gas price; EIP-4844.
-    #[serde(
-        default,
-        with = "alloy_serde::quantity::opt",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub blob_gas_price: Option<u128>,
-    /// Number of logs emitted by this transaction.
-    #[serde(with = "alloy_serde::quantity")]
-    pub log_count: u64,
-    /// Timestamp of the block containing this receipt's transaction, denormalized from
-    /// its header.
-    ///
-    /// Carried on every dataset that outlives its block, because a store partitions
-    /// and clusters on time rather than height, and reaching it otherwise means
-    /// joining back to a [`Block`] that may not be in the same batch.
-    #[serde(with = "alloy_serde::quantity")]
-    pub block_timestamp: u64,
-    /// Height of the block containing this receipt's transaction.
-    #[serde(with = "alloy_serde::quantity")]
-    pub block_number: u64,
-    /// Hash of the block containing this receipt's transaction.
-    pub block_hash: BlockHash,
-}
-
-impl Receipt {
-    /// A key that is stable across redelivery and unique per receipt.
-    ///
-    /// Carries the block hash: a re-included transaction gets a second receipt from the
-    /// replacement block, and the two are different rows.
-    #[must_use]
-    pub fn dedupe_key(&self) -> String {
-        format!("{}:{}:receipt", self.block_hash, self.transaction_hash)
     }
 }
 

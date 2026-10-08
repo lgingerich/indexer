@@ -13,7 +13,7 @@
 [ingest]
 # The chain id stamped on every event. Required.
 chain = "base"
-# JSON-RPC endpoint for blocks and receipts. Required; a secret. A public endpoint can
+# JSON-RPC endpoint for blocks, receipts, and logs. Required; a secret. A public endpoint can
 # be written as its value; one carrying an API key is named by its variable.
 http_url = "https://base-rpc.publicnode.com"
 # http_url = { env = "INDEXER_HTTP_URL" }
@@ -21,10 +21,11 @@ http_url = "https://base-rpc.publicnode.com"
 ws_url = "wss://base-rpc.publicnode.com"
 # ws_url = { env = "INDEXER_WS_URL" }
 
-# Which datasets to fetch and store: any combination of these four, but not empty.
-# Omitted means all four. Logs without receipts use one eth_getLogs per height;
-# every other dataset reads the block body.
-# datasets = ["blocks", "transactions", "receipts", "logs"]
+# Which datasets to fetch and store: any combination of these three, but not empty.
+# Omitted means all three. Transactions include their receipts, and logs selected
+# with them come from those receipts. Logs without transactions use one eth_getLogs
+# per height; every other dataset reads the block body.
+# datasets = ["blocks", "transactions", "logs"]
 
 # First height to index on an empty store. Omitted starts at the observed head,
 # skipping earlier history; a value indexes that height onward before following live

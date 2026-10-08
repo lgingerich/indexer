@@ -28,7 +28,7 @@
 //!   per-record (`topic0`..`topic3`, `to`, `withdrawals_root`). A consumer must tolerate
 //!   a missing key, not only a null one.
 //! - `logs_bloom` is `"0x…"` hex — 512 characters of it, because a bloom filter is 256
-//!   bytes and does not compress. It is most of a block's and a receipt's line.
+//!   bytes and does not compress. It is most of a block's and a transaction's line.
 //!
 //! This is a fixture generator, not a decoder: the values are hand-filled to exercise the
 //! encoding (a negative `int256` in the decoded record, a `uint160` and an `int24` whose
@@ -44,8 +44,8 @@ use std::process::ExitCode;
 
 use alloy_primitives::{Address, B256, Bloom, Bytes, I256, TxHash, U256};
 use indexer::wire::envelope::{
-    Block, ChainId, Contract, Decoded, DecodedArg, Envelope, Event, Log, Receipt, Reorg,
-    Transaction, TypedValue,
+    Block, ChainId, Contract, Decoded, DecodedArg, Envelope, Event, Log, Reorg, Transaction,
+    TypedValue,
 };
 
 /// The chain these are from.
@@ -92,7 +92,6 @@ fn envelopes() -> Vec<Envelope> {
     vec![
         block(),
         transaction(),
-        receipt(),
         log(),
         decoded(),
         contract(),
@@ -129,8 +128,8 @@ fn block() -> Envelope {
     })))
 }
 
-/// An EIP-1559 transaction: `gas_price` is left out, because the key is omitted rather
-/// than null when it does not apply.
+/// A successful EIP-1559 transaction joined to its receipt: `gas_price` is left out,
+/// because the key is omitted rather than null when it does not apply.
 fn transaction() -> Envelope {
     envelope(Event::Transaction(Box::new(Transaction {
         hash: TX_HASH,
@@ -148,32 +147,17 @@ fn transaction() -> Envelope {
         // an OP-stack deposit is `0x7e` and an Arbitrum retry `0x6a`.
         transaction_type: 2,
         chain_id: Some(1),
-        block_timestamp: TIMESTAMP,
-        block_number: BLOCK_NUMBER,
-        block_hash: BLOCK_HASH,
-        ..Transaction::default()
-    })))
-}
-
-/// A successful receipt, with the contract-creation fields absent.
-fn receipt() -> Envelope {
-    envelope(Event::Receipt(Box::new(Receipt {
-        transaction_hash: TX_HASH,
-        transaction_index: 0,
-        from: Address::from([0x55; 20]),
-        to: Some(CONTRACT),
-        status: true,
-        transaction_type: 2,
-        gas_used: 21_000,
-        cumulative_gas_used: 21_000,
-        effective_gas_price: 1_500_000_000,
-        contract_address: None,
-        logs_bloom: Bloom::ZERO,
+        receipt_status: true,
+        receipt_gas_used: 21_000,
+        receipt_cumulative_gas_used: 21_000,
+        receipt_effective_gas_price: 1_500_000_000,
+        receipt_contract_address: None,
+        receipt_logs_bloom: Bloom::ZERO,
         log_count: 1,
         block_timestamp: TIMESTAMP,
         block_number: BLOCK_NUMBER,
         block_hash: BLOCK_HASH,
-        ..Receipt::default()
+        ..Transaction::default()
     })))
 }
 

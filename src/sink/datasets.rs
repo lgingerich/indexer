@@ -13,18 +13,17 @@ use crate::wire::envelope::Event;
 
 /// Which on-chain datasets a deployment fetches and stores.
 ///
-/// Absent from the settings file means all four. An empty list is rejected:
+/// Absent from the settings file means all three. An empty list is rejected:
 /// a run that stores nothing is not a deployment. The flags are independent:
 /// any combination is valid, so this is not a state machine.
-#[expect(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Datasets {
     /// Store block headers.
     pub blocks: bool,
-    /// Store transactions. The node is asked for full transaction objects.
+    /// Store transactions, each joined to its receipt. The node is asked for full
+    /// transaction objects and the block's receipts, and logs selected alongside are
+    /// taken from those receipts rather than fetched again.
     pub transactions: bool,
-    /// Store receipts. Logs selected alongside receipts are taken from them.
-    pub receipts: bool,
     /// Store logs.
     pub logs: bool,
 }
@@ -42,7 +41,6 @@ impl Datasets {
         Self {
             blocks: true,
             transactions: true,
-            receipts: true,
             logs: true,
         }
     }
@@ -61,21 +59,9 @@ impl Datasets {
         match event {
             Event::Block(_) => self.blocks,
             Event::Transaction(_) => self.transactions,
-            Event::Receipt(_) => self.receipts,
             Event::Log(_) | Event::Decoded(_) | Event::Contract(_) => self.logs,
             Event::Reorg(_) | Event::AcceptedBlock(_) => true,
         }
-    }
-
-    /// Whether logs are the only thing fetched: nothing selected reads the block body.
-    ///
-    /// This is the condition under which a live notification's metadata stands in for
-    /// the header and the block read is skipped. `blocks` and `transactions` are projected
-    /// from the body, and `receipts` needs the body's transaction identities, so each
-    /// rules the reuse out.
-    #[must_use]
-    pub const fn logs_only(self) -> bool {
-        self.logs && !self.blocks && !self.transactions && !self.receipts
     }
 }
 
@@ -87,9 +73,6 @@ impl std::fmt::Display for Datasets {
         }
         if self.transactions {
             names.push("transactions");
-        }
-        if self.receipts {
-            names.push("receipts");
         }
         if self.logs {
             names.push("logs");
@@ -107,25 +90,23 @@ impl<'de> Deserialize<'de> for Datasets {
         if names.is_empty() {
             return Err(de::Error::invalid_value(
                 Unexpected::Seq,
-                &"one or more of `blocks`, `transactions`, `receipts`, `logs`",
+                &"one or more of `blocks`, `transactions`, `logs`",
             ));
         }
         let mut datasets = Self {
             blocks: false,
             transactions: false,
-            receipts: false,
             logs: false,
         };
         for name in &names {
             let slot = match name.as_str() {
                 "blocks" => &mut datasets.blocks,
                 "transactions" => &mut datasets.transactions,
-                "receipts" => &mut datasets.receipts,
                 "logs" => &mut datasets.logs,
                 other => {
                     return Err(de::Error::unknown_variant(
                         other,
-                        &["blocks", "transactions", "receipts", "logs"],
+                        &["blocks", "transactions", "logs"],
                     ));
                 }
             };

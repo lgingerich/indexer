@@ -11,10 +11,11 @@ chain = "base"
 # environment variable that holds it instead: http_url = { env = "INDEXER_HTTP_URL" }.
 http_url = "https://8453.rpc.thirdweb.com"
 ws_url = "wss://base-rpc.publicnode.com"
-# Datasets to fetch and store. Omitted means all four. Logs without receipts use
-# one eth_getLogs per height, reusing the live notification's metadata so no block
-# read is issued; every other dataset still reads the block body.
-# datasets = ["blocks", "transactions", "receipts", "logs"]
+# Datasets to fetch and store. Omitted means all three. Transactions include their
+# receipts, and logs selected with them come from those receipts. Logs without
+# transactions use one eth_getLogs per height, reusing the live notification's
+# metadata so no block read is issued; every other dataset still reads the block body.
+# datasets = ["blocks", "transactions", "logs"]
 datasets = ["logs"]
 start_block = 52266840
 

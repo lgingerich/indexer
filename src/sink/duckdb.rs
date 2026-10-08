@@ -325,7 +325,7 @@ mod tests {
 
     use crate::sink::EnvelopeSink as _;
     use crate::wire::envelope::{
-        AcceptedBlock, Block, ChainId, Contract, Envelope, Event, Log, Receipt, Reorg, Transaction,
+        AcceptedBlock, Block, ChainId, Contract, Envelope, Event, Log, Reorg, Transaction,
     };
     use std::sync::Arc;
 
@@ -387,22 +387,12 @@ mod tests {
                     // A wei price above `u64::MAX`, which is ~18.4 ETH — so this also
                     // checks the 128-bit columns are not truncated to 64.
                     gas_price: Some(u128::from(u64::MAX) + 1),
-                    block_number: 100,
-                    block_hash: hash(0x01),
-                    ..Transaction::default()
-                })),
-            ),
-            Envelope::new(
-                chain(),
-                Event::Receipt(Box::new(Receipt {
-                    transaction_hash: TxHash::from([0x11; 32]),
-                    transaction_index: 3,
-                    status: true,
-                    gas_used: 21_000,
+                    receipt_status: true,
+                    receipt_gas_used: 21_000,
                     log_count: 1,
                     block_number: 100,
                     block_hash: hash(0x01),
-                    ..Receipt::default()
+                    ..Transaction::default()
                 })),
             ),
             Envelope::new(

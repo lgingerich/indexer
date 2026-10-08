@@ -61,7 +61,7 @@ kind = "iceberg"
 finality = "finalized"    # append-only; never sees a reorg
 
 [[route]]
-tables = ["blocks", "transactions", "receipts", "logs"]
+tables = ["blocks", "transactions", "logs"]
 to = ["lake"]
 
 [[route]]

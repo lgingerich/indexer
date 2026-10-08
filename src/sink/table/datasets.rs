@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use crate::wire::envelope::{
-    AcceptedBlock, Block, ChainId, Contract, Decoded, Event, Log, Receipt, Reorg, Transaction,
+    AcceptedBlock, Block, ChainId, Contract, Decoded, Event, Log, Reorg, Transaction,
 };
 
 use super::{
@@ -129,32 +129,22 @@ fn transactions() -> Result<Dataset<Transaction>, TableError> {
         .col_ref("access_list", |t| &t.access_list)
         .col_ref("blob_versioned_hashes", |t| &t.blob_versioned_hashes)
         .col_ref("authorization_list", |t| &t.authorization_list)
+        .col("receipt_status", |t| t.receipt_status)
+        .col("receipt_gas_used", |t| t.receipt_gas_used)
+        .col("receipt_cumulative_gas_used", |t| {
+            t.receipt_cumulative_gas_used
+        })
+        .col("receipt_effective_gas_price", |t| {
+            t.receipt_effective_gas_price
+        })
+        .col("receipt_contract_address", |t| t.receipt_contract_address)
+        .col("receipt_logs_bloom", |t| t.receipt_logs_bloom)
+        .col("receipt_blob_gas_used", |t| t.receipt_blob_gas_used)
+        .col("receipt_blob_gas_price", |t| t.receipt_blob_gas_price)
+        .col("log_count", |t| t.log_count)
         .col("block_timestamp", |t| Timestamp(t.block_timestamp))
         .col("block_number", |t| t.block_number)
         .col("block_hash", |t| t.block_hash)
-        .reorg_by("block_hash")
-        .build()
-}
-
-fn receipts() -> Result<Dataset<Receipt>, TableError> {
-    DatasetBuilder::<Receipt>::new(Table::Receipt)
-        .col("transaction_hash", |r| r.transaction_hash)
-        .col("transaction_index", |r| r.transaction_index)
-        .col("from_address", |r| r.from)
-        .col("to_address", |r| r.to)
-        .col("status", |r| r.status)
-        .col("transaction_type", |r| r.transaction_type)
-        .col("gas_used", |r| r.gas_used)
-        .col("cumulative_gas_used", |r| r.cumulative_gas_used)
-        .col("effective_gas_price", |r| r.effective_gas_price)
-        .col("contract_address", |r| r.contract_address)
-        .col("logs_bloom", |r| r.logs_bloom)
-        .col("blob_gas_used", |r| r.blob_gas_used)
-        .col("blob_gas_price", |r| r.blob_gas_price)
-        .col("log_count", |r| r.log_count)
-        .col("block_timestamp", |r| Timestamp(r.block_timestamp))
-        .col("block_number", |r| r.block_number)
-        .col("block_hash", |r| r.block_hash)
         .reorg_by("block_hash")
         .build()
 }
@@ -245,7 +235,6 @@ fn accepted_blocks() -> Result<Dataset<AcceptedBlock>, TableError> {
 pub(super) struct Datasets {
     blocks: Dataset<Block>,
     transactions: Dataset<Transaction>,
-    receipts: Dataset<Receipt>,
     logs: Dataset<Log>,
     decoded_logs: Dataset<Decoded>,
     contracts: Dataset<Contract>,
@@ -265,7 +254,6 @@ impl Datasets {
         Ok(Self {
             blocks: blocks()?,
             transactions: transactions()?,
-            receipts: receipts()?,
             logs: logs()?,
             decoded_logs: decoded_logs()?,
             contracts: contracts()?,
@@ -279,7 +267,6 @@ impl Datasets {
         match table {
             Table::Block => &self.blocks.def,
             Table::Transaction => &self.transactions.def,
-            Table::Receipt => &self.receipts.def,
             Table::Log => &self.logs.def,
             Table::Decoded => &self.decoded_logs.def,
             Table::Contract => &self.contracts.def,
@@ -294,7 +281,6 @@ impl Datasets {
         match event {
             Event::Block(b) => self.blocks.row(b, chain, key),
             Event::Transaction(t) => self.transactions.row(t, chain, key),
-            Event::Receipt(r) => self.receipts.row(r, chain, key),
             Event::Log(l) => self.logs.row(l, chain, key),
             Event::Decoded(d) => self.decoded_logs.row(d, chain, key),
             Event::Contract(c) => self.contracts.row(c, chain, key),
@@ -310,7 +296,7 @@ mod tests {
     use alloy_primitives::{Address, B256, TxHash, U256};
 
     use crate::wire::envelope::{
-        AcceptedBlock, Block, ChainId, Contract, Decoded, Event, Log, Receipt, Reorg, Transaction,
+        AcceptedBlock, Block, ChainId, Contract, Decoded, Event, Log, Reorg, Transaction,
     };
 
     use std::sync::Arc;
@@ -374,12 +360,6 @@ mod tests {
                 block_number: 100,
                 block_hash: hash(0x01),
                 ..Transaction::default()
-            })),
-            Event::Receipt(Box::new(Receipt {
-                transaction_hash: TxHash::from([0x11; 32]),
-                block_number: 100,
-                block_hash: hash(0x01),
-                ..Receipt::default()
             })),
             Event::Log(Box::new(Log {
                 log_index: 7,
@@ -495,10 +475,9 @@ mod tests {
             ("transactions", "access_list"),
             ("transactions", "blob_versioned_hashes"),
             ("transactions", "authorization_list"),
-            ("receipts", "to_address"),
-            ("receipts", "contract_address"),
-            ("receipts", "blob_gas_used"),
-            ("receipts", "blob_gas_price"),
+            ("transactions", "receipt_contract_address"),
+            ("transactions", "receipt_blob_gas_used"),
+            ("transactions", "receipt_blob_gas_price"),
             ("logs", "topic0"),
             ("logs", "topic1"),
             ("logs", "topic2"),
@@ -535,8 +514,8 @@ mod tests {
             (Table::Transaction, "max_fee_per_gas"),
             (Table::Transaction, "max_priority_fee_per_gas"),
             (Table::Transaction, "max_fee_per_blob_gas"),
-            (Table::Receipt, "effective_gas_price"),
-            (Table::Receipt, "blob_gas_price"),
+            (Table::Transaction, "receipt_effective_gas_price"),
+            (Table::Transaction, "receipt_blob_gas_price"),
         ] {
             assert_eq!(kind(table, wide), ColumnType::BigInt, "{table}.{wide}");
         }
@@ -546,7 +525,7 @@ mod tests {
             (Table::Block, "base_fee_per_gas"),
             (Table::Transaction, "gas"),
             (Table::Transaction, "nonce"),
-            (Table::Receipt, "cumulative_gas_used"),
+            (Table::Transaction, "receipt_cumulative_gas_used"),
             (Table::Log, "log_index"),
         ] {
             assert_eq!(kind(table, amount), ColumnType::Uint, "{table}.{amount}");
@@ -554,7 +533,6 @@ mod tests {
         for (table, time) in [
             (Table::Block, "timestamp"),
             (Table::Transaction, "block_timestamp"),
-            (Table::Receipt, "block_timestamp"),
             (Table::Log, "block_timestamp"),
             (Table::Decoded, "block_timestamp"),
             (Table::Contract, "block_timestamp"),

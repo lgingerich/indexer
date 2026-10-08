@@ -111,10 +111,8 @@ impl Column {
 pub enum Table {
     /// Block headers and metadata.
     Block,
-    /// Transactions, from their block's array.
+    /// Transactions, from their block's array, each joined to its receipt.
     Transaction,
-    /// Transaction receipts.
-    Receipt,
     /// Logs, one row per log.
     Log,
     /// Decoded event records, whose arguments ride as documents in their raw ABI form.
@@ -129,10 +127,9 @@ pub enum Table {
 
 impl Table {
     /// Every dataset table, in the order a store creates them.
-    pub const ALL: [Self; 8] = [
+    pub const ALL: [Self; 7] = [
         Self::Block,
         Self::Transaction,
-        Self::Receipt,
         Self::Log,
         Self::Decoded,
         Self::Contract,
@@ -146,7 +143,6 @@ impl Table {
         match self {
             Self::Block => "blocks",
             Self::Transaction => "transactions",
-            Self::Receipt => "receipts",
             Self::Log => "logs",
             Self::Decoded => "decoded_logs",
             Self::Contract => "contracts",

@@ -34,8 +34,8 @@ JSON-RPC batch: block + receipts          one request, nothing the node returns 
 ordered events, each with its dataset's natural key
       │
       │   block
-      │   transaction, receipt, log, decoded, log, …
-      │   transaction, receipt, …
+      │   transaction, log, decoded, log, …
+      │   transaction, …
       │   accepted_block                  the block's identity, always last
       │
       ▼  flush, once
@@ -59,7 +59,7 @@ can decode.
 ```
 envelope
    │
-   ├─ block, transaction, receipt ─────────▶ forwarded as it arrived
+   ├─ block, transaction ──────────────────▶ forwarded as it arrived
    ├─ reorg ───────────────────────────────▶ forwarded; contracts created in the
    │                                          orphaned blocks stop decoding
    └─ log
@@ -90,7 +90,7 @@ new head           └─── 2'          2' builds on 1, not on 2
 published, in order
   block 1, block 2, block 3
   reorg { height: 2, orphaned_hashes: [3, 2] }
-  block 2', and its transactions, receipts, logs, and decoded rows
+  block 2', and its transactions, logs, and decoded rows
 
 stored
   block 1, block 2'                 and each one's rows
@@ -98,7 +98,7 @@ stored
 ```
 
 The store holds only the current chain. A `reorg` deletes every row of the blocks it
-orphans — from `blocks`, `transactions`, `receipts`, `logs`, `decoded_logs`, `contracts`, and
+orphans — from `blocks`, `transactions`, `logs`, `decoded_logs`, `contracts`, and
 `accepted_blocks` — in the same transaction that writes the `reorgs` row and the
 replacements, so no commit ever shows both branches or neither. A dataset query needs no
 filter. The `reorgs` row stays as the record of what was retracted.
@@ -247,18 +247,21 @@ that matters most: `decode` must not depend on `ingest`.
 
 - **EVM ingestion.** Live heads over WebSocket (`eth_subscribe`/`newHeads`), and
   each block fetched over JSON-RPC in one batched request. `[ingest] datasets`
-  chooses which of block, transaction, receipt, and log are fetched and stored;
-  omitted, all four are. Logs without receipts use one `eth_getLogs` per height. A
-  live `newHeads` notification carries the head's identity, parent hash, and
+  chooses which of block, transaction, and log are fetched and stored; omitted, all
+  three are. Transactions fetch the block's receipts too, and logs selected alongside
+  come from those receipts. Logs without transactions use one `eth_getLogs` per
+  height. A live `newHeads` notification carries the head's identity, parent hash, and
   timestamp, so a logs-only fetch reuses them and pins `eth_getLogs` to the announced
-  hash instead of re-reading the header; a block, transaction, or `receipts` dataset
-  still fetches the body it needs.
-  See `src/ingest/source/evm.rs`.
+  hash instead of re-reading the header; a block or transaction dataset still fetches
+  the body it needs. The whole choice is one table, `FetchPlan`, in
+  `src/ingest/source/evm.rs`.
 - **One event per dataset.** A `block` event, then for each transaction a
-  `transaction` event, its `receipt` event, and its `log` events. Each dataset is a
-  normalized table — a block references its transactions by hash, a receipt carries
-  only the count of its logs — so no field is published twice and a row maps to a
-  persistence row. See `src/wire/datasets/evm.rs`.
+  `transaction` event and its `log` events. A transaction carries its receipt's fields
+  with Allium's `receipt_` prefix, as `ethereum.raw.transactions` does, since there is
+  exactly one receipt per transaction. Each dataset is a normalized table — a block
+  references its transactions by hash, a transaction carries only the count of its
+  logs — so no field is published twice and a row maps to a persistence row. See
+  `src/wire/datasets/evm.rs`.
 - **A key per event.** Every event exposes a `dedupe_key` derived from its natural key:
   the hashes that identify the row plus a dataset tag. A key that descends from a block
   carries the block's *hash*, not its number — so a log in an orphaned block and the same
@@ -363,7 +366,7 @@ stdout and anything downstream of it — so those hops share one schema.
 
 ### Ranged log backfill
 
-Logs without receipts come from one `eth_getLogs` per height, and backfill walks one
+Logs without transactions come from one `eth_getLogs` per height, and backfill walks one
 height at a time — even a live notification reuses its header but fetches logs for
 that one height. A wider `eth_getLogs` range covering many historical blocks, and
 cross-block batching of the per-height block/receipt calls, are not built.
@@ -482,7 +485,7 @@ the field:
 | Key | Meaning |
 | --- | --- |
 | `ingest.chain` | Chain id stamped on every event |
-| `ingest.http_url` | JSON-RPC endpoint for blocks and receipts. A [secret](#secrets) |
+| `ingest.http_url` | JSON-RPC endpoint for blocks, receipts, and logs. A [secret](#secrets) |
 | `ingest.ws_url` | WebSocket endpoint for `newHeads`. A [secret](#secrets) |
 | one `[sink.<backend>]` table | Which backend writes. `duckdb` persists; `stdout` prints and opens no store |
 
@@ -490,7 +493,7 @@ the field:
 
 | Key | Default | Meaning |
 | --- | --- | --- |
-| `ingest.datasets` | blocks, transactions, receipts, logs | Which datasets are fetched and stored. A dataset that needs the block body still reads it; a logs-only live fetch reuses the notification header |
+| `ingest.datasets` | blocks, transactions, logs | Which datasets are fetched and stored. Transactions include their receipts, and logs selected with them come from those receipts. A dataset that needs the block body still reads it; a logs-only live fetch reuses the notification header |
 | `ingest.start_block` | the sampled head | First height to index on an empty store. Absent starts live at the observed head; a value backfills that inclusive height forward before following live heads. A value above the sampled head is a startup error, and so is a value when the store already holds blocks: a run resumes from the store |
 | `sink.duckdb.batch_records` | `500` | Most records one store commit may cover; a backlog of blocks is folded into one commit up to this, and a block is never split |
 | `sink.duckdb.path` | `indexer.duckdb` | Path to the store. Tables live in a schema named for the chain: `base.logs` |
@@ -756,7 +759,7 @@ max_memory = "1GB"
 They live under the `DuckDB` table because they are DuckDB's, and no other backend would
 know what to do with them. Anything unrecognized is an error from DuckDB naming the
 setting, so a typo is caught at startup rather than silently ignored. Every envelope
-lands in its dataset's own typed table — `blocks`, `transactions`, `receipts`, `logs`,
+lands in its dataset's own typed table — `blocks`, `transactions`, `logs`,
 `decoded_logs`, `contracts`, `reorgs`, `accepted_blocks` — with real columns rather than a JSON blob, so a
 consumer filters and joins on values. As in Allium's raw tables, chain integers are
 numbers (`BIGNUM` beyond 64 bits), times are `TIMESTAMP`s, and hashes and addresses are
@@ -785,8 +788,7 @@ or a field or variant being removed. Adding an optional field or a new event var
 does not bump it, which is why consumers must skip an unknown `type` and ignore
 unknown fields.
 
-Events fall into three kinds. **Datasets** — `block`, `transaction`, `receipt`, `log`
-— are durable on-chain records, defined per chain in `src/wire/datasets/evm.rs`. Each
+Events fall into three kinds. **Datasets** — `block`, `transaction`, `log` — are durable on-chain records, defined per chain in `src/wire/datasets/evm.rs`. Each
 is a normalized table with a natural key and fully deconstructed fields, the same
 decomposition of the chain's datasets, so a row maps straight to a
 persistence row; children are referenced by scalar key, never embedded. **Derived**
@@ -800,9 +802,8 @@ closes each block with its identity, so a consumer sees where every block ends, 
 empty one. The line is one flat object: `chain`,
 `v`, and the event's fields under its `type` tag. Consumers deduplicate on
 each event's `dedupe_key`. Each dataset's key comes from its
-natural key, so a transaction and its receipt (both keyed by the block hash and the
-transaction hash) stay distinct by their dataset tag — and a key that descends from a
-block carries the block hash, so the two branches of a reorg are separate rows.
+natural key, and a key that descends from a block carries the block hash, so the two
+branches of a reorg are separate rows.
 
 `src/sink/table/` declares the tables a store persists: each column's name and type, read
 from the record's field, and the indexes and reorg column. The definitions are one answer
@@ -847,7 +848,7 @@ backend, which prints the stream instead of storing it, and change the address, 
 cargo bench
 ```
 
-`benches/hot_path.rs` measures typed block/receipt projection and envelope
+`benches/hot_path.rs` measures typed block/transaction/receipt projection and envelope
 serialisation. Alloy's transport and JSON-RPC decoding are not included; typed inputs
 are prepared outside the timed projection. End-to-end latency is dominated by the
 network and is not reproducible off-line. It is hand-rolled and dependency-free so

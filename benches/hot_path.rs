@@ -144,9 +144,9 @@ fn synthetic_batch(tx_count: usize, logs_per_tx: usize) -> RpcBatch {
 fn main() {
     for (tx_count, logs_per_tx) in [(100_usize, 2_usize), (500, 4), (2000, 5)] {
         let body = synthetic_batch(tx_count, logs_per_tx);
-        // One event per thing: the block, then each transaction, its receipt, and
-        // its logs.
-        let expected = 1 + tx_count * (2 + logs_per_tx);
+        // One event per thing: the block, then each transaction (joined to its
+        // receipt) and its logs.
+        let expected = 1 + tx_count * (1 + logs_per_tx);
         let events = decode_block(body.clone())
             .expect("benchmark fixture decodes")
             .events;

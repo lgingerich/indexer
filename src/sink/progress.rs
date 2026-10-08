@@ -106,9 +106,6 @@ impl CommitStats {
             Event::Transaction(transaction) => {
                 self.observe_block(transaction.block_number, transaction.block_hash);
             }
-            Event::Receipt(receipt) => {
-                self.observe_block(receipt.block_number, receipt.block_hash);
-            }
             Event::Log(log) => self.observe_block(log.block_number, log.block_hash),
             Event::Decoded(decoded) => self.observe_block(decoded.block_number, decoded.block_hash),
             Event::Contract(contract) => {

@@ -178,7 +178,7 @@ pub struct IngestSettings {
     /// The chain id stamped on every event. Required, and non-empty.
     #[serde(deserialize_with = "non_empty")]
     pub chain: String,
-    /// The JSON-RPC endpoint used for blocks and receipts. Required; a [`Secret`], since
+    /// The JSON-RPC endpoint used for blocks, receipts, and logs. Required; a [`Secret`], since
     /// a provider's URL usually carries its API key.
     pub http_url: Secret,
     /// The WebSocket endpoint used for heads. Required; a [`Secret`], like `http_url`.
@@ -416,7 +416,6 @@ datasets = ["logs", "blocks"]
         .expect("subset parses");
         assert!(selected.ingest.datasets.logs && selected.ingest.datasets.blocks);
         assert!(!selected.ingest.datasets.transactions);
-        assert!(!selected.ingest.datasets.receipts);
 
         let empty = Settings::from_str(
             r#"
