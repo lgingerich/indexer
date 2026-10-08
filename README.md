@@ -226,12 +226,12 @@ src/
 ├── main.rs         the process boundary: logging, the settings path, the exit code
 ├── runtime.rs      assembles the pipeline the settings describe, and runs it
 ├── config.rs       typed settings — layer configuration, not string lookups
-├── wire/           the wire contract: envelope, events, dataset records, the rows a
-│                   store persists, and each decoded event's typed table. Pure data.
+├── wire/           the wire contract: envelope, events, and dataset records. Pure data.
 ├── ingest/         block sources and the reorg-aware pipeline.
 ├── decode/         protocol manifests, the log decoder and its contract set, factory
 │                   discovery, and the live decoding sink.
-└── sink/           where envelopes go: the sink trait, the decode→storage channel, the store, stdout.
+└── sink/           where envelopes go: the sink trait, the decode→storage channel, the
+                    table definitions, the SQL renderer, the shared store, and stdout.
 ```
 
 `wire` depends on `alloy` and `serde` and on nothing else in the tree. `decode`
@@ -279,8 +279,10 @@ that matters most: `decode` must not depend on `ingest`.
   while down, so pools created then are discovered too.
 - **A local store.** The process writes every envelope, raw and decoded, into a local
   `DuckDB` database: one typed table per dataset, with real columns rather than a JSON
-  blob, and one per decoded event, with a column per argument. What a dataset's columns *are* lives in `src/wire/row.rs`, not in the store, so a
-  second store reuses the mapping instead of re-deriving it.
+  blob, and one per decoded event, with a column per argument. What a table's columns
+  *are* lives in `src/sink/table/`, declared once from the record's fields; the SQL is
+  rendered from those definitions in `src/sink/sql.rs`, and both stores share one write
+  path in `src/sink/store.rs`, so a store is only its engine.
 - **Sliding undo window, no finality assertion.** Ingestion keeps the most recent
   4,096 accepted block identities plus one predecessor as a recovery floor. It does not
   read the node's `finalized` tag and does not claim any height is irreversible. The
@@ -404,16 +406,10 @@ handled yet:
   or the ones after. A Solidity overload in one ABI fails the same way. The fix, when a
   contract needs it, is a suffix on later definitions or a per-event name in the
   manifest.
-- **Tables are created, never migrated.** A store creates a missing table and leaves an
-  existing one alone. An ABI edited in place — a renamed or retyped argument — changes
-  the columns the indexer writes, so the next write to that table fails; drop the table
-  first. The same holds for dataset tables when a release changes their columns: the
-  `decoded_logs` table gained a `contract` column, so a store created before that must be
-  re-created.
-- **Older PostgreSQL tables lack a primary key.** Tables created before `(chain,
-  dedupe_key)` became the primary key keep a `UNIQUE` constraint instead, which logical
-  replication does not accept as a replica identity, so a reorg's delete fails once such
-  a table is in a publication. Re-create the store.
+- **Tables are created, never migrated.** A store creates a missing table and checks an
+  existing one against its definition at startup: a missing, extra, or retyped column —
+  from an ABI edited in place, or a release that changed a dataset — stops the run with
+  the table and column named. Drop the table, or the chain's schema, and restart.
 - **Long names need a manual `table` key.** A name past 63 bytes is a startup error, so
   a contract with long event names needs a `table` key chosen by hand; there is no
   automatic shortening.
@@ -733,9 +729,10 @@ provides are `NOT NULL`; fields it can omit stay nullable. Each table's primary 
 `(chain, dedupe_key)`, and every table but `reorgs` is indexed on its block hash for
 [reorg deletes](#a-reorg). A flush bulk-loads with binary `COPY` into a temporary
 table, then upserts into the dataset table, in one transaction. Unsigned 64-bit fields
-use `NUMERIC(20,0)`, hex values use `TEXT`, booleans use `BOOLEAN`, and documents use
-`JSONB`. A replay updates the existing row. Columns of an existing table are not
-migrated. Failed batches remain buffered. A lost connection during commit can leave
+use `NUMERIC(20,0)`, wider integers — wei amounts, prices, difficulty — `NUMERIC(78,0)`,
+times `TIMESTAMP` (UTC), hashes and addresses `0x` hex `TEXT`, booleans `BOOLEAN`, and
+documents `JSONB`. A replay updates the existing row. Columns of an existing table are
+not migrated. Failed batches remain buffered. A lost connection during commit can leave
 the outcome unknown; retrying is not exactly-once. Restart recovery remains unimplemented,
 as with the DuckDB sink.
 
@@ -767,9 +764,10 @@ know what to do with them. Anything unrecognized is an error from DuckDB naming 
 setting, so a typo is caught at startup rather than silently ignored. Every envelope
 lands in its dataset's own typed table — `blocks`, `transactions`, `receipts`, `logs`,
 `decoded_logs`, `contracts`, `reorgs`, `accepted_blocks` — with real columns rather than a JSON blob, so a
-consumer filters and joins on values. The schema is generated from the row headers in
-`src/wire/row.rs`, so a column added to a dataset appears without anyone editing the
-DDL.
+consumer filters and joins on values. As in Allium's raw tables, chain integers are
+numbers (`BIGNUM` beyond 64 bits), times are `TIMESTAMP`s, and hashes and addresses are
+`0x` hex. The schema is generated from the table definitions in `src/sink/table/`, so a
+column added to a dataset appears without anyone editing the DDL.
 
 Configuration is a typed struct in `src/config.rs`, not a string lookup scattered through
 each layer, so a layer can be constructed in a test with no environment at all.
@@ -812,10 +810,10 @@ natural key, so a transaction and its receipt (both keyed by the block hash and 
 transaction hash) stay distinct by their dataset tag — and a key that descends from a
 block carries the block hash, so the two branches of a reorg are separate rows.
 
-`src/wire/row.rs` renders a dataset as the rows a store persists: the table, its columns
-with their types, and the values in that order. The mapping is one answer for every
-store, so a `ClickHouse` sink and a `DuckDB` one read the same headers and produce
-different DDL rather than each deciding what a log is.
+`src/sink/table/` declares the tables a store persists: each column's name and type, read
+from the record's field, and the indexes and reorg column. The definitions are one answer
+for every store, so a `ClickHouse` sink and a `DuckDB` one read the same tables and
+render different DDL rather than each deciding what a log is.
 
 Identity uses `alloy_primitives::{B256, BlockHash, TxHash}`, encoded as lowercase
 `0x` hex, and quantity fields encode as `0x` hex via `alloy-serde`. The wire shape

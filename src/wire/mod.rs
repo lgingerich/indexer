@@ -8,13 +8,9 @@
 //!   [`envelope::Event`], with the schema version.
 //! - [`datasets`] are the durable records an event may carry, one normalized table
 //!   per dataset.
-//! - [`row`] renders a dataset as the storage-agnostic rows a store persists, so the
-//!   mapping from a log to its columns is decided once rather than per store, and holds
-//!   the [`row::Schema`]: the dataset tables plus a typed table per decoded event.
 //! - [`typed`] is the typed form of a decoded ABI argument, which is what a decoded
 //!   record carries instead of opaque bytes.
 
 pub mod datasets;
 pub mod envelope;
-pub mod row;
 pub mod typed;

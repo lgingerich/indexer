@@ -16,7 +16,9 @@
 //! - `datasets` — which datasets a run fetches and keeps.
 //! - `duckdb` — an embedded `DuckDB` database.
 //! - `postgres` — a remote `PostgreSQL` 18 database with asynchronous transactional COPY.
-//!   Both stores upsert on `(chain, dedupe_key)`.
+//! - [`table`] — the tables a store persists, declared once; `sql` renders their
+//!   statements, and [`store`] is the write path both stores share. Both upsert on
+//!   `(chain, dedupe_key)`.
 //! - [`stdout`] — newline-delimited JSON, for watching the stream.
 //!
 //! Stores take a connection or open one from their own settings, so client settings
@@ -35,7 +37,12 @@ pub mod duckdb;
 pub mod postgres;
 #[cfg(any(feature = "duckdb", feature = "postgres"))]
 mod progress;
+#[cfg(any(feature = "duckdb", feature = "postgres"))]
+pub mod sql;
 pub mod stdout;
+#[cfg(any(feature = "duckdb", feature = "postgres"))]
+pub mod store;
+pub mod table;
 
 #[cfg(feature = "postgres")]
 pub use postgres::{PostgresSettings, PostgresSink};
@@ -44,195 +51,12 @@ pub use datasets::Datasets;
 #[cfg(feature = "duckdb")]
 pub use duckdb::{DuckDbSettings, DuckDbSink};
 pub use stdout::{StdoutJsonSink, StdoutSettings};
+#[cfg(any(feature = "duckdb", feature = "postgres"))]
+pub use store::{InvalidStoredValue, Operation, SqlStore, StoreError};
 
 use thiserror::Error;
 
-#[cfg(any(feature = "duckdb", feature = "postgres"))]
-use crate::wire::envelope::AcceptedBlock;
 use crate::wire::envelope::Envelope;
-#[cfg(any(feature = "duckdb", feature = "postgres"))]
-use crate::wire::envelope::Event;
-#[cfg(any(feature = "duckdb", feature = "postgres"))]
-use crate::wire::row::{Row, Schema, TableId, row_for};
-
-/// What a store has been handed since its last commit: the rows to write, and the
-/// blocks a buffered `reorg` retracted.
-///
-/// A decoded record is two rows: its generic `decoded_logs` row, and its event's typed row,
-/// from the run's [`Schema`].
-///
-/// A store holds only the canonical chain. A `reorg` orphans blocks that are either
-/// already committed or still in this buffer — blocks are published in order and the
-/// storage channel is FIFO, so an orphaned block can never arrive after its `reorg`.
-/// [`push`](Self::push) drops the buffered ones at once, and the store deletes the
-/// committed ones by [`Table::block_hash_column`] in the same transaction that writes
-/// [`rows`](Self::rows), before writing them. Deleting first is what makes a block that
-/// returns — orphaned, then canonical again in a later `reorg` — end up stored: its
-/// rows, published again after the `reorg` that orphaned it, are written after the
-/// delete.
-///
-/// Both are cleared only after a commit succeeds, so a failed commit retries the deletes
-/// with the rows, and a retry of a committed batch deletes nothing and upserts onto
-/// itself.
-#[cfg(any(feature = "duckdb", feature = "postgres"))]
-#[derive(Debug)]
-struct Batch {
-    /// Rows to upsert, in publish order.
-    rows: Vec<Row>,
-    /// Orphaned block hashes to delete from the store, as `0x` hex, by chain.
-    orphaned: std::collections::BTreeMap<String, std::collections::BTreeSet<String>>,
-    /// Every table the run writes, which renders each envelope's rows.
-    schema: std::sync::Arc<Schema>,
-}
-
-#[cfg(any(feature = "duckdb", feature = "postgres"))]
-impl Batch {
-    /// An empty batch writing into `schema`.
-    fn new(schema: std::sync::Arc<Schema>) -> Self {
-        Self {
-            rows: Vec::new(),
-            orphaned: std::collections::BTreeMap::new(),
-            schema,
-        }
-    }
-
-    /// Buffers one envelope's rows. A `reorg` first drops every buffered row of the
-    /// blocks it orphans and records them for deletion; its own row is kept as the
-    /// record of the retraction.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`SinkError::UnknownEvent`] for a decoded record no event table holds,
-    /// which means it was decoded against a different catalog than the store opened with.
-    fn push(&mut self, envelope: &Envelope) -> Result<(), SinkError> {
-        if let Event::Reorg(reorg) = &envelope.event
-            && !reorg.orphaned_hashes.is_empty()
-        {
-            let chain = envelope.chain.as_str();
-            let hashes: std::collections::BTreeSet<String> = reorg
-                .orphaned_hashes
-                .iter()
-                .map(|hash| format!("{hash:#x}"))
-                .collect();
-            self.rows.retain(|row| {
-                row.chain() != chain || !row.block_hash().is_some_and(|h| hashes.contains(h))
-            });
-            self.orphaned
-                .entry(chain.to_owned())
-                .or_default()
-                .extend(hashes);
-        }
-        if let Event::Decoded(decoded) = &envelope.event {
-            let row = self
-                .schema
-                .event_row(&envelope.chain, decoded)
-                .ok_or_else(|| SinkError::UnknownEvent {
-                    protocol: decoded.protocol.clone(),
-                    contract: decoded.contract.clone(),
-                    event: decoded.name.clone(),
-                })?;
-            self.rows.push(row);
-        }
-        self.rows.push(row_for(&envelope.chain, &envelope.event));
-        Ok(())
-    }
-
-    /// The rows each table should load: the last buffered copy of each
-    /// `(chain, dedupe_key)`, in publish order.
-    ///
-    /// A store's merge must not see a key twice — both engines refuse to update one
-    /// conflict row twice in a statement — and "last" means last published, which only
-    /// the buffer knows; the staging table's physical order does not promise it.
-    fn by_table(&self) -> std::collections::HashMap<TableId, Vec<&Row>> {
-        let mut seen = std::collections::HashSet::new();
-        let mut tables: std::collections::HashMap<TableId, Vec<&Row>> =
-            std::collections::HashMap::new();
-        for row in self.rows.iter().rev() {
-            if seen.insert((row.table(), row.chain(), row.dedupe_key())) {
-                tables.entry(row.table()).or_default().push(row);
-            }
-        }
-        for rows in tables.values_mut() {
-            rows.reverse();
-        }
-        tables
-    }
-
-    /// Whether there is nothing to commit. A `reorg` always buffers its own row, so a
-    /// batch with deletions is never empty.
-    fn is_empty(&self) -> bool {
-        self.rows.is_empty()
-    }
-
-    /// Forgets everything, once a commit has made it durable.
-    fn clear(&mut self) {
-        self.rows.clear();
-        self.orphaned.clear();
-    }
-}
-
-/// `name` as a quoted SQL identifier, for a database schema named at runtime.
-#[cfg(any(feature = "duckdb", feature = "postgres"))]
-fn quote_identifier(name: &str) -> String {
-    format!("\"{}\"", name.replace('"', "\"\""))
-}
-
-/// A stored discovered contract, as a store's query returns it.
-///
-/// Only the address and block hash need parsing: the protocol and name are matched
-/// against the catalog as text.
-#[cfg(any(feature = "duckdb", feature = "postgres"))]
-fn stored_contract(
-    protocol: String,
-    name: String,
-    address: &str,
-    block_hash: &str,
-) -> Result<crate::decode::StoredContract, InvalidStoredValue> {
-    Ok(crate::decode::StoredContract {
-        protocol,
-        name,
-        address: parse_stored("contract.address", address)?,
-        block_hash: parse_stored("contract.block_hash", block_hash)?,
-    })
-}
-
-/// A stored `accepted_blocks` row, as a store's query returns it.
-#[cfg(any(feature = "duckdb", feature = "postgres"))]
-fn stored_block(
-    height: u64,
-    hash: &str,
-    parent_hash: &str,
-    timestamp: u64,
-) -> Result<AcceptedBlock, InvalidStoredValue> {
-    Ok(AcceptedBlock {
-        height,
-        hash: parse_stored("accepted_block.hash", hash)?,
-        parent_hash: parse_stored("accepted_block.parent_hash", parent_hash)?,
-        timestamp,
-    })
-}
-
-/// Parses one stored text column, naming the column when it does not parse.
-#[cfg(any(feature = "duckdb", feature = "postgres"))]
-fn parse_stored<T: std::str::FromStr>(
-    column: &'static str,
-    value: &str,
-) -> Result<T, InvalidStoredValue> {
-    value.parse().map_err(|_| InvalidStoredValue {
-        column,
-        value: value.to_owned(),
-    })
-}
-
-/// A value read back at startup that does not parse as its column's type.
-#[derive(Debug, Error)]
-#[error("stored {column} is invalid: {value:?}")]
-pub struct InvalidStoredValue {
-    /// The table and column, for example `contract.address`.
-    pub column: &'static str,
-    /// The stored text.
-    pub value: String,
-}
 
 /// Receives envelopes in per-chain order, as the pipeline publishes them.
 ///
@@ -314,17 +138,13 @@ pub enum SinkError {
     /// Writing the rendered envelope failed.
     #[error("write envelope: {0}")]
     Write(#[from] std::io::Error),
-    /// A store rejected the write, or could not be opened.
-    ///
-    /// Transparent, so the store's own variants — the setting it refused, the path it
-    /// could not open — survive to the caller instead of being flattened to a string.
-    #[cfg(feature = "duckdb")]
+    /// An envelope's row could not be built.
     #[error(transparent)]
-    Store(#[from] duckdb::StoreError),
-    /// `PostgreSQL` connection, schema, or transactional write failed.
-    #[cfg(feature = "postgres")]
+    Table(#[from] table::TableError),
+    /// A store could not be opened, read, or written.
+    #[cfg(any(feature = "duckdb", feature = "postgres"))]
     #[error(transparent)]
-    Postgres(#[from] postgres::StoreError),
+    Store(#[from] StoreError),
 }
 
 /// Fixtures the store tests share: the shipped catalog's event tables, and a real decoded
@@ -335,8 +155,8 @@ pub(crate) mod fixtures {
     use std::sync::Arc;
 
     use crate::decode::{Catalog, Decoder};
+    use crate::sink::table::Schema;
     use crate::wire::envelope::{ChainId, Decoded, Envelope, Event};
-    use crate::wire::row::Schema;
 
     fn catalog() -> Catalog {
         Catalog::load(

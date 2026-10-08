@@ -1,20 +1,11 @@
-//! `PostgreSQL` 18 storage using the shared typed rows and transactional binary `COPY`.
+//! `PostgreSQL` 18 storage: the shared [`SqlStore`] over a `tokio-postgres` client.
 //!
 //! Tables live in a schema named for the chain, so chains sharing a database keep their
-//! tables apart. Each flush loads all buffered datasets in one transaction. Binary `COPY` sends each
-//! value in `PostgreSQL`'s native field format, so the server does not parse text, into a
-//! temporary table that is then upserted on `(chain, dedupe_key)`. Only the last buffered
-//! copy of a repeated key is loaded, since `PostgreSQL` refuses to touch one conflict row
-//! twice in a statement. Unsigned integers use `NUMERIC(20,0)` (`PostgreSQL` has no
-//! unsigned bigint), documents use `JSONB`, and hex values remain `TEXT`. Columns the
-//! chain always provides are `NOT NULL`, and `(chain, dedupe_key)` is each table's primary
-//! key — the replica identity logical replication needs to publish a delete. A `reorg`
-//! deletes its orphaned blocks' rows in the same transaction, through an index on each
-//! table's `(chain, block hash)`. Decoded event tables store signed 64-bit arguments as
-//! `BIGINT` and wider integers as `NUMERIC(78,0)`, exact to 256 bits; an array of scalars
-//! is the element type's array, such as `NUMERIC(78,0)[]`. Columns of an
-//! existing table are not migrated: the block index is added to it at startup, but a
-//! table created before the primary key keeps its `UNIQUE` constraint instead.
+//! tables apart. A flush stages each table with binary `COPY`, which sends every value in
+//! `PostgreSQL`'s native field format so the server parses no text, then merges it on
+//! `(chain, dedupe_key)`, the primary key — the replica identity logical replication needs
+//! to publish a delete. Unsigned 64-bit integers are `NUMERIC(20,0)`, since `PostgreSQL`
+//! has no unsigned bigint, and wider integers `NUMERIC(78,0)`, exact to 256 bits.
 //! Connection strings accept the driver's URL or keyword syntax; TLS uses platform
 //! certificate validation and the connection's `sslmode`.
 
@@ -22,23 +13,18 @@ use std::error::Error;
 use std::sync::Arc;
 
 use alloy_primitives::U256;
-use bytes::{BufMut, BytesMut};
+use bytes::{Buf as _, BufMut, BytesMut};
 use futures_util::pin_mut;
 use postgres_native_tls::MakeTlsConnector;
 use serde::Deserialize;
-use thiserror::Error;
 use tokio_postgres::Client;
 use tokio_postgres::binary_copy::BinaryCopyInWriter;
-use tokio_postgres::types::{IsNull, Kind, ToSql, Type, to_sql_checked};
+use tokio_postgres::types::{FromSql, IsNull, Kind, ToSql, Type, to_sql_checked};
 
 use crate::config::Secret;
-use crate::decode::StoredContract;
-use crate::sink::{
-    Batch, EnvelopeSink, InvalidStoredValue, SinkError, parse_stored, quote_identifier,
-    stored_block, stored_contract,
-};
-use crate::wire::envelope::{AcceptedBlock, ChainId, Envelope};
-use crate::wire::row::{ColumnType, ColumnValue, Schema, TableDef};
+use crate::sink::sql::{self, Dialect, ident};
+use crate::sink::store::{Engine, EngineError, Operation, SqlStore, StoreError};
+use crate::sink::table::{ColumnType, Row, Schema, TableDef, Value};
 
 /// `PostgreSQL` connection and backlog batching settings for `[sink.postgres]`.
 #[derive(Debug, Deserialize)]
@@ -56,176 +42,206 @@ const fn default_batch_records() -> usize {
     500
 }
 
-fn sql_type(kind: ColumnType) -> String {
-    match kind {
-        ColumnType::Uint => "NUMERIC(20,0)",
-        ColumnType::Int => "BIGINT",
-        ColumnType::BigInt => "NUMERIC(78,0)",
-        ColumnType::Text => "TEXT",
-        ColumnType::Bool => "BOOLEAN",
-        ColumnType::Document => "JSONB",
-        ColumnType::List(element) => return format!("{}[]", sql_type(*element)),
-    }
-    .to_owned()
+/// A store in `PostgreSQL`.
+pub type PostgresSink = SqlStore<Postgres>;
+
+/// A connected client, and the task driving its connection.
+#[derive(Debug)]
+pub struct Postgres {
+    pub(crate) client: Client,
+    connection_task: Option<tokio::task::JoinHandle<()>>,
 }
 
+impl Drop for Postgres {
+    fn drop(&mut self) {
+        if let Some(task) = &self.connection_task {
+            task.abort();
+        }
+    }
+}
+
+impl PostgresSink {
+    /// Connects using platform TLS and creates the tables in `database_schema` before
+    /// ingest starts.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::Engine`] when TLS, the connection, or table creation fails.
+    pub async fn open(
+        settings: &PostgresSettings,
+        schema: Arc<Schema>,
+        database_schema: &str,
+    ) -> Result<Self, StoreError> {
+        let open = || StoreError::engine(Operation::Open, None);
+        let connector = MakeTlsConnector::new(
+            native_tls::TlsConnector::new().map_err(|error| open()(error.into()))?,
+        );
+        let (client, connection) =
+            tokio_postgres::connect(settings.connection_string.expose(), connector)
+                .await
+                .map_err(|error| open()(error.into()))?;
+        let task = tokio::spawn(async move {
+            if let Err(error) = connection.await {
+                tracing::error!(%error, "PostgreSQL connection stopped");
+            }
+        });
+        let engine = Postgres {
+            client,
+            connection_task: Some(task),
+        };
+        let store = SqlStore::new(engine, schema, database_schema).await?;
+        tracing::info!("PostgreSQL storage opened");
+        Ok(store)
+    }
+
+    /// Takes a connected client, whose connection future the caller is already driving,
+    /// and creates every table in `schema` in the database schema `database_schema`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::Engine`] when schema or table creation fails.
+    pub async fn connected(
+        client: Client,
+        schema: Arc<Schema>,
+        database_schema: &str,
+    ) -> Result<Self, StoreError> {
+        let engine = Postgres {
+            client,
+            connection_task: None,
+        };
+        SqlStore::new(engine, schema, database_schema).await
+    }
+}
+
+impl Dialect for Postgres {
+    const INDEXES: bool = true;
+    const DESCRIBE: &'static str = "SELECT attname::TEXT, format_type(atttypid, atttypmod) \
+         FROM pg_attribute WHERE attrelid = to_regclass(quote_ident($1)) AND attnum > 0 \
+         AND NOT attisdropped ORDER BY attnum";
+
+    fn type_name(kind: ColumnType) -> String {
+        match kind {
+            ColumnType::Uint => "NUMERIC(20,0)",
+            ColumnType::Int => "BIGINT",
+            ColumnType::BigInt => "NUMERIC(78,0)",
+            ColumnType::Text => "TEXT",
+            ColumnType::Bool => "BOOLEAN",
+            ColumnType::Timestamp => "TIMESTAMP",
+            ColumnType::Document => "JSONB",
+            ColumnType::List(element) => return format!("{}[]", Self::type_name(*element)),
+        }
+        .to_owned()
+    }
+
+    fn reported_type(kind: ColumnType) -> String {
+        match kind {
+            ColumnType::Uint => "numeric(20,0)",
+            ColumnType::Int => "bigint",
+            ColumnType::BigInt => "numeric(78,0)",
+            ColumnType::Text => "text",
+            ColumnType::Bool => "boolean",
+            ColumnType::Timestamp => "timestamp without time zone",
+            ColumnType::Document => "jsonb",
+            ColumnType::List(element) => return format!("{}[]", Self::reported_type(*element)),
+        }
+        .to_owned()
+    }
+
+    fn use_schema(schema: &str) -> String {
+        format!("SET search_path TO {}", ident(schema))
+    }
+
+    fn create_staging(table: &TableDef, staging: &str) -> String {
+        format!(
+            "CREATE TEMP TABLE {} (LIKE {} INCLUDING DEFAULTS) ON COMMIT DROP",
+            ident(staging),
+            ident(&table.name)
+        )
+    }
+
+    fn drop_staging(_: &str) -> Option<String> {
+        None
+    }
+}
+
+/// The wire type a column of `kind` is copied as.
 fn pg_type(kind: ColumnType) -> Type {
     match kind {
         ColumnType::Uint | ColumnType::BigInt => Type::NUMERIC,
         ColumnType::Int => Type::INT8,
         ColumnType::Text => Type::TEXT,
         ColumnType::Bool => Type::BOOL,
+        ColumnType::Timestamp => Type::TIMESTAMP,
         ColumnType::Document => Type::JSONB,
         // A list's element is a scalar (see `ColumnType::list`), so this is one dimension.
         ColumnType::List(element) => match pg_type(*element) {
             Type::INT8 => Type::INT8_ARRAY,
             Type::TEXT => Type::TEXT_ARRAY,
             Type::BOOL => Type::BOOL_ARRAY,
+            Type::TIMESTAMP => Type::TIMESTAMP_ARRAY,
             Type::JSONB => Type::JSONB_ARRAY,
             _ => Type::NUMERIC_ARRAY,
         },
     }
 }
 
-/// A table's name as SQL.
-fn quoted(table: &TableDef) -> String {
-    format!("\"{}\"", table.name)
-}
-
-/// Table DDL rendered from its columns. `(chain, dedupe_key)` is the primary key, so a
-/// replay can upsert and logical replication can publish a delete.
-fn create_table(table: &TableDef) -> String {
-    let columns = table
-        .columns
+/// Parameters as the driver takes them.
+fn params(values: &[Value]) -> Vec<&(dyn ToSql + Sync)> {
+    values
         .iter()
-        .map(|column| {
-            let nullability = if column.required { " NOT NULL" } else { "" };
-            format!("\"{}\" {}{nullability}", column.name, sql_type(column.kind))
-        })
-        .collect::<Vec<_>>()
-        .join(", ");
-    format!(
-        "CREATE TABLE IF NOT EXISTS {} ({columns}, PRIMARY KEY (\"chain\", \"dedupe_key\"))",
-        quoted(table)
-    )
+        .map(|value| value as &(dyn ToSql + Sync))
+        .collect()
 }
 
-/// `PostgreSQL`'s identifier limit, in bytes; a longer name is silently truncated.
-const MAX_IDENTIFIER: usize = 63;
-
-/// The name of a table's block index: `{table}_block_index`, or, when that would pass
-/// [`MAX_IDENTIFIER`], the table name cut short with a hash of the whole name, so two
-/// long tables never truncate to one index name.
-fn block_index_name(table: &str) -> String {
-    const SUFFIX: &str = "_block_index";
-    let name = format!("{table}{SUFFIX}");
-    if name.len() <= MAX_IDENTIFIER {
-        return name;
+impl Engine for Postgres {
+    async fn execute(&mut self, sql: &str, values: &[Value]) -> Result<(), EngineError> {
+        if values.is_empty() {
+            self.client.batch_execute(sql).await?;
+        } else {
+            self.client.execute(sql, &params(values)).await?;
+        }
+        Ok(())
     }
-    let hash = alloy_primitives::hex::encode(&alloy_primitives::keccak256(table)[..4]);
-    let keep = MAX_IDENTIFIER - SUFFIX.len() - hash.len() - 1;
-    format!("{}_{hash}{SUFFIX}", &table[..keep])
-}
 
-/// The index a `reorg`'s delete finds a block's rows by, for a table whose rows belong
-/// to a block. It lives in the table's schema.
-fn create_block_index(table: &TableDef) -> Option<String> {
-    table.block_hash_column.map(|column| {
-        format!(
-            "CREATE INDEX IF NOT EXISTS \"{}\" ON {} (\"chain\", \"{column}\")",
-            block_index_name(&table.name),
-            quoted(table)
-        )
-    })
-}
+    async fn query(&mut self, sql: &str, values: &[Value]) -> Result<Vec<Vec<Value>>, EngineError> {
+        let rows = self.client.query(sql, &params(values)).await?;
+        rows.iter()
+            .map(|row| {
+                (0..row.len())
+                    .map(|index| Ok(row.try_get(index)?))
+                    .collect()
+            })
+            .collect()
+    }
 
-/// Deletes chain `$1`'s rows of the blocks in `$2`, for a table whose rows belong to a
-/// block.
-fn delete_blocks_sql(table: &TableDef) -> Option<String> {
-    table.block_hash_column.map(|column| {
-        format!(
-            "DELETE FROM {} WHERE \"chain\" = $1 AND \"{column}\" = ANY($2)",
-            quoted(table)
-        )
-    })
-}
-
-fn quoted_columns(table: &TableDef) -> String {
-    table
-        .columns
-        .iter()
-        .map(|column| format!("\"{}\"", column.name))
-        .collect::<Vec<_>>()
-        .join(", ")
-}
-
-/// Merges the staging table into its table.
-///
-/// The staging table holds each key once (see `Batch::by_table`), so `ON CONFLICT` only
-/// updates a row an earlier flush already wrote.
-fn upsert_sql(table: &TableDef, staging: &str) -> String {
-    let names = quoted_columns(table);
-    let assignments = table
-        .columns
-        .iter()
-        .filter(|column| column.name != "chain" && column.name != "dedupe_key")
-        .map(|column| format!("\"{name}\" = EXCLUDED.\"{name}\"", name = column.name))
-        .collect::<Vec<_>>()
-        .join(", ");
-    format!(
-        "INSERT INTO {} ({names}) SELECT {names} FROM \"{staging}\" \
-         ON CONFLICT (\"chain\", \"dedupe_key\") DO UPDATE SET {assignments}",
-        quoted(table)
-    )
-}
-
-#[derive(Debug)]
-struct CopyPlan {
-    statement: String,
-    types: Vec<Type>,
-}
-
-fn copy_plan(table: &TableDef, staging: &str) -> CopyPlan {
-    CopyPlan {
-        statement: format!(
-            "COPY \"{staging}\" ({}) FROM STDIN WITH (FORMAT binary)",
-            quoted_columns(table)
-        ),
-        types: table
+    async fn load(
+        &mut self,
+        table: &TableDef,
+        staging: &str,
+        rows: &[&Row],
+    ) -> Result<(), EngineError> {
+        let statement = format!(
+            "COPY {} ({}) FROM STDIN WITH (FORMAT binary)",
+            ident(staging),
+            sql::column_list(table)
+        );
+        let types: Vec<Type> = table
             .columns
             .iter()
             .map(|column| pg_type(column.kind))
-            .collect(),
-    }
-}
-
-/// One table, with every statement a flush runs against it rendered once.
-#[derive(Debug)]
-struct Prepared {
-    def: TableDef,
-    /// Creates the session's temporary table a flush copies into, named by position so
-    /// a 63-byte table name cannot push it past `PostgreSQL`'s identifier limit.
-    create_staging: String,
-    copy: CopyPlan,
-    merge: String,
-    delete: Option<String>,
-}
-
-impl Prepared {
-    fn new(position: usize, def: TableDef) -> Self {
-        let staging = format!("staging_{position}");
-        Self {
-            create_staging: format!(
-                "CREATE TEMP TABLE \"{staging}\" (LIKE {} INCLUDING DEFAULTS) ON COMMIT DROP",
-                quoted(&def)
-            ),
-            copy: copy_plan(&def, &staging),
-            merge: upsert_sql(&def, &staging),
-            delete: delete_blocks_sql(&def),
-            def,
+            .collect();
+        let writer = BinaryCopyInWriter::new(self.client.copy_in(&statement).await?, &types);
+        pin_mut!(writer);
+        for row in rows {
+            writer.as_mut().write_raw(row.values()).await?;
         }
+        writer.as_mut().finish().await?;
+        Ok(())
     }
 }
+
+/// Seconds from the Unix epoch to `PostgreSQL`'s, 2000-01-01.
+const POSTGRES_EPOCH_SECONDS: i64 = 946_684_800;
 
 /// `NUMERIC` binary layout: a sign and base-10_000 digits, most significant first.
 ///
@@ -251,16 +267,47 @@ fn write_numeric(negative: bool, magnitude: U256, out: &mut BytesMut) -> Result<
     Ok(())
 }
 
+/// Reads an integral `NUMERIC`, the inverse of [`write_numeric`].
+fn read_numeric(mut raw: &[u8]) -> Result<Value, Box<dyn Error + Sync + Send>> {
+    if raw.len() < 8 {
+        return Err("short NUMERIC".into());
+    }
+    let count = raw.get_i16();
+    let weight = raw.get_i16();
+    let sign = raw.get_u16();
+    let _scale = raw.get_i16();
+    if sign == 0xC000 {
+        return Err("NUMERIC is NaN".into());
+    }
+    let base = U256::from(10_000_u16);
+    let mut magnitude = U256::ZERO;
+    for _ in 0..count {
+        if raw.len() < 2 {
+            return Err("short NUMERIC digits".into());
+        }
+        magnitude = magnitude * base + U256::from(u16::try_from(raw.get_i16())?);
+    }
+    // Trailing zero groups are omitted: the value is the digits times 10_000^(weight + 1
+    // - count).
+    for _ in 0..(i32::from(weight) + 1 - i32::from(count)).max(0) {
+        magnitude *= base;
+    }
+    Ok(Value::BigInt {
+        negative: sign == 0x4000,
+        magnitude,
+    })
+}
+
 /// One-dimensional array binary layout: dimensions, a null flag, the element type, the
 /// length and lower bound, then each element as a length and its own binary form. An empty
 /// array has no dimensions.
 fn write_array(
-    values: &[ColumnValue],
+    values: &[Value],
     element: &Type,
     out: &mut BytesMut,
 ) -> Result<(), Box<dyn Error + Sync + Send>> {
     out.put_i32(i32::from(!values.is_empty()));
-    out.put_i32(i32::from(values.contains(&ColumnValue::Null)));
+    out.put_i32(i32::from(values.contains(&Value::Null)));
     out.put_u32(element.oid());
     if !values.is_empty() {
         out.put_i32(i32::try_from(values.len())?);
@@ -278,17 +325,16 @@ fn write_array(
     Ok(())
 }
 
-impl ToSql for ColumnValue {
+impl ToSql for Value {
     fn to_sql(
         &self,
         ty: &Type,
         out: &mut BytesMut,
     ) -> Result<IsNull, Box<dyn Error + Sync + Send>> {
         match (self, ty) {
-            (Self::Null, _) => Ok(IsNull::Yes),
+            (Self::Null, _) => return Ok(IsNull::Yes),
             (Self::Uint(number), &Type::NUMERIC) => {
                 write_numeric(false, U256::from(*number), out)?;
-                Ok(IsNull::No)
             }
             (
                 Self::BigInt {
@@ -296,44 +342,40 @@ impl ToSql for ColumnValue {
                     magnitude,
                 },
                 &Type::NUMERIC,
-            ) => {
-                write_numeric(*negative, *magnitude, out)?;
-                Ok(IsNull::No)
-            }
-            (Self::Int(number), &Type::INT8) => {
-                out.put_i64(*number);
-                Ok(IsNull::No)
-            }
-            (Self::Text(text), &Type::TEXT) => {
-                out.extend_from_slice(text.as_bytes());
-                Ok(IsNull::No)
-            }
-            (Self::Bool(flag), &Type::BOOL) => {
-                out.put_u8(u8::from(*flag));
-                Ok(IsNull::No)
+            ) => write_numeric(*negative, *magnitude, out)?,
+            (Self::Int(number), &Type::INT8) => out.put_i64(*number),
+            (Self::Text(text), &Type::TEXT) => out.extend_from_slice(text.as_bytes()),
+            (Self::Bool(flag), &Type::BOOL) => out.put_u8(u8::from(*flag)),
+            (Self::Timestamp(seconds), &Type::TIMESTAMP) => {
+                let micros = (i64::try_from(*seconds)? - POSTGRES_EPOCH_SECONDS)
+                    .checked_mul(1_000_000)
+                    .ok_or("timestamp out of range")?;
+                out.put_i64(micros);
             }
             (Self::Document(json), &Type::JSONB) => {
                 out.put_u8(1);
                 out.extend_from_slice(json.as_bytes());
-                Ok(IsNull::No)
             }
             (Self::List(values), ty) => match ty.kind() {
-                Kind::Array(element) => {
-                    write_array(values, element, out)?;
-                    Ok(IsNull::No)
-                }
-                _ => Err(format!("cannot encode {self:?} as {ty}").into()),
+                Kind::Array(element) => write_array(values, element, out)?,
+                _ => return Err(format!("cannot encode {self:?} as {ty}").into()),
             },
-            _ => Err(format!("cannot encode {self:?} as {ty}").into()),
+            _ => return Err(format!("cannot encode {self:?} as {ty}").into()),
         }
+        Ok(IsNull::No)
     }
 
     fn accepts(ty: &Type) -> bool {
         match ty.kind() {
-            Kind::Array(element) => Self::accepts(element),
+            Kind::Array(element) => <Self as ToSql>::accepts(element),
             _ => matches!(
                 *ty,
-                Type::NUMERIC | Type::INT8 | Type::TEXT | Type::BOOL | Type::JSONB
+                Type::NUMERIC
+                    | Type::INT8
+                    | Type::TEXT
+                    | Type::BOOL
+                    | Type::TIMESTAMP
+                    | Type::JSONB
             ),
         }
     }
@@ -341,241 +383,33 @@ impl ToSql for ColumnValue {
     to_sql_checked!();
 }
 
-/// Upserts envelopes into `PostgreSQL`; buffered rows are cleared only after commit succeeds.
-///
-/// A failed flush rolls back the entire batch and leaves it buffered. A replay of
-/// `(chain, dedupe_key)` updates that row. A connection loss during commit can leave its
-/// outcome unknown, so retrying is not exactly-once delivery. No writes occur until
-/// [`EnvelopeSink::flush`].
-#[derive(Debug)]
-pub struct PostgresSink {
-    client: Client,
-    batch: Batch,
-    tables: Vec<Prepared>,
-    connection_task: Option<tokio::task::JoinHandle<()>>,
-}
-
-impl PostgresSink {
-    /// Connects using platform TLS and creates the tables in `database_schema` before
-    /// ingest starts.
-    ///
-    /// # Errors
-    ///
-    /// Returns a typed error for TLS setup, connection, or schema creation failures.
-    pub async fn open(
-        settings: &PostgresSettings,
-        schema: Arc<Schema>,
-        database_schema: &str,
-    ) -> Result<Self, StoreError> {
-        let connector = MakeTlsConnector::new(native_tls::TlsConnector::new()?);
-        let (client, connection) =
-            tokio_postgres::connect(settings.connection_string.expose(), connector).await?;
-        let task = tokio::spawn(async move {
-            if let Err(error) = connection.await {
-                tracing::error!(%error, "PostgreSQL connection stopped");
+/// What a startup read returns: the scalar columns the stores read back.
+impl<'a> FromSql<'a> for Value {
+    fn from_sql(ty: &Type, raw: &'a [u8]) -> Result<Self, Box<dyn Error + Sync + Send>> {
+        Ok(match *ty {
+            Type::NUMERIC => read_numeric(raw)?,
+            Type::INT8 => Self::Int(i64::from_sql(ty, raw)?),
+            Type::TEXT | Type::VARCHAR => Self::Text(String::from_sql(ty, raw)?),
+            Type::BOOL => Self::Bool(bool::from_sql(ty, raw)?),
+            Type::TIMESTAMP => {
+                let seconds =
+                    i64::from_sql(&Type::INT8, raw)?.div_euclid(1_000_000) + POSTGRES_EPOCH_SECONDS;
+                Self::Timestamp(u64::try_from(seconds)?)
             }
-        });
-        let mut sink = Self::new(client, schema, database_schema).await?;
-        sink.connection_task = Some(task);
-        tracing::info!("PostgreSQL storage opened");
-        Ok(sink)
-    }
-
-    /// Takes a connected client and creates every table in `schema`, with each one's
-    /// block index, in the database schema `database_schema`.
-    ///
-    /// A run names that schema for its chain — `base.logs`, `base.uniswap_v3_pool_swap` —
-    /// so chains sharing a database keep their tables apart. The schema is created if
-    /// missing and becomes the session's `search_path`, so every statement after names
-    /// tables unqualified. The caller must already be driving the client's connection
-    /// future. Existing tables are reused without schema migration or validation.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`StoreError::Database`] when schema or table creation fails.
-    pub async fn new(
-        mut client: Client,
-        schema: Arc<Schema>,
-        database_schema: &str,
-    ) -> Result<Self, StoreError> {
-        let quoted = quote_identifier(database_schema);
-        client
-            .batch_execute(&format!(
-                "CREATE SCHEMA IF NOT EXISTS {quoted}; SET search_path TO {quoted}"
-            ))
-            .await?;
-        let tables: Vec<Prepared> = schema
-            .tables()
-            .iter()
-            .enumerate()
-            .map(|(position, def)| Prepared::new(position, def.clone()))
-            .collect();
-        let ddl = tables
-            .iter()
-            .map(|table| create_table(&table.def))
-            .chain(
-                tables
-                    .iter()
-                    .filter_map(|table| create_block_index(&table.def)),
-            )
-            .collect::<Vec<_>>()
-            .join(";\n")
-            + ";";
-        let transaction = client.transaction().await?;
-        transaction.batch_execute(&ddl).await?;
-        transaction.commit().await?;
-        Ok(Self {
-            client,
-            batch: Batch::new(schema),
-            tables,
-            connection_task: None,
+            _ => return Err(format!("cannot read {ty} as a value").into()),
         })
     }
 
-    /// The contracts discovered on `chain` that this store holds. One created in a block a
-    /// `reorg` orphaned was deleted with that block, so every row here is canonical.
-    ///
-    /// Read once at startup, before the first write, so a restart decodes every contract
-    /// a previous run discovered.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`StoreError::Database`] when the query fails and [`StoreError::Restore`]
-    /// when a stored address does not parse.
-    pub async fn contracts(&self, chain: &ChainId) -> Result<Vec<StoredContract>, StoreError> {
-        let rows = self
-            .client
-            .query(
-                "SELECT protocol, name, address, block_hash FROM \"contracts\" WHERE chain = $1",
-                &[&chain.as_str()],
-            )
-            .await?;
-        let mut contracts = Vec::with_capacity(rows.len());
-        for row in rows {
-            contracts.push(stored_contract(
-                row.get(0),
-                row.get(1),
-                row.get(2),
-                row.get(3),
-            )?);
-        }
-        Ok(contracts)
+    fn from_sql_null(_: &Type) -> Result<Self, Box<dyn Error + Sync + Send>> {
+        Ok(Self::Null)
     }
 
-    /// The newest `limit` accepted blocks on `chain`, oldest first, after dropping every
-    /// older row. An orphaned block's row was deleted by its `reorg`, so these are
-    /// canonical.
-    ///
-    /// Read once at startup, before the first write: the result is the undo window a
-    /// restart resumes from. Rows below the oldest one returned can never be read again,
-    /// so they are deleted here, which is what keeps the ledger from growing without
-    /// bound across restarts. Contiguity is not checked; the pipeline does that.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`StoreError::Database`] when the query or the delete fails and
-    /// [`StoreError::Restore`] when a stored value does not parse.
-    pub async fn ledger(
-        &self,
-        chain: &ChainId,
-        limit: usize,
-    ) -> Result<Vec<AcceptedBlock>, StoreError> {
-        // `NUMERIC` has no `FromSql` without an extra crate, so heights cross as text.
-        let rows = self
-            .client
-            .query(
-                "SELECT height::TEXT, hash, parent_hash, \"timestamp\"::TEXT \
-                 FROM \"accepted_blocks\" WHERE chain = $1 ORDER BY height DESC LIMIT $2",
-                &[&chain.as_str(), &i64::try_from(limit).unwrap_or(i64::MAX)],
-            )
-            .await?;
-        let mut ledger = Vec::with_capacity(rows.len());
-        for row in rows.iter().rev() {
-            ledger.push(stored_block(
-                parse_stored("accepted_block.height", row.get(0))?,
-                row.get(1),
-                row.get(2),
-                parse_stored("accepted_block.timestamp", row.get(3))?,
-            )?);
-        }
-        if let Some(oldest) = ledger.first() {
-            self.client
-                .execute(
-                    "DELETE FROM \"accepted_blocks\" WHERE chain = $1 AND height < $2::TEXT::NUMERIC",
-                    &[&chain.as_str(), &oldest.height.to_string()],
-                )
-                .await?;
-        }
-        Ok(ledger)
+    fn accepts(ty: &Type) -> bool {
+        matches!(
+            *ty,
+            Type::NUMERIC | Type::INT8 | Type::TEXT | Type::VARCHAR | Type::BOOL | Type::TIMESTAMP
+        )
     }
-
-    async fn write_batch(&mut self) -> Result<(), StoreError> {
-        if self.batch.is_empty() {
-            return Ok(());
-        }
-        let transaction = self.client.transaction().await?;
-        // Deletes before upserts, so a block orphaned and then canonical again within
-        // this batch is deleted and rewritten rather than rewritten and deleted.
-        for delete in self.tables.iter().filter_map(|table| table.delete.as_ref()) {
-            for (chain, hashes) in &self.batch.orphaned {
-                let hashes: Vec<&str> = hashes.iter().map(String::as_str).collect();
-                transaction.execute(delete, &[chain, &hashes]).await?;
-            }
-        }
-        let mut grouped = self.batch.by_table();
-        for table in &self.tables {
-            let Some(rows) = grouped.remove(&table.def.id) else {
-                continue;
-            };
-            transaction.batch_execute(&table.create_staging).await?;
-            let writer = BinaryCopyInWriter::new(
-                transaction.copy_in(&table.copy.statement).await?,
-                &table.copy.types,
-            );
-            pin_mut!(writer);
-            for row in rows {
-                writer.as_mut().write_raw(row.values()).await?;
-            }
-            writer.as_mut().finish().await?;
-            transaction.batch_execute(&table.merge).await?;
-        }
-        transaction.commit().await?;
-        self.batch.clear();
-        Ok(())
-    }
-}
-
-impl Drop for PostgresSink {
-    fn drop(&mut self) {
-        if let Some(task) = &self.connection_task {
-            task.abort();
-        }
-    }
-}
-
-impl EnvelopeSink for PostgresSink {
-    async fn publish(&mut self, envelope: Envelope) -> Result<(), SinkError> {
-        self.batch.push(&envelope)
-    }
-
-    async fn flush(&mut self) -> Result<(), SinkError> {
-        self.write_batch().await?;
-        Ok(())
-    }
-}
-
-/// Why `PostgreSQL` storage could not be connected, initialized, or committed.
-#[derive(Debug, Error)]
-pub enum StoreError {
-    /// Platform TLS initialization failed.
-    #[error("initialize PostgreSQL TLS: {0}")]
-    Tls(#[from] native_tls::Error),
-    /// `PostgreSQL` connection, schema, COPY, or transaction failure.
-    #[error("PostgreSQL storage: {0}")]
-    Database(#[from] tokio_postgres::Error),
-    /// A value read back at startup did not parse.
-    #[error(transparent)]
-    Restore(#[from] InvalidStoredValue),
 }
 
 #[cfg(test)]
@@ -583,10 +417,17 @@ pub enum StoreError {
 mod tests {
     use alloy_primitives::B256;
 
-    use crate::wire::envelope::{ChainId, Event, Reorg};
-    use crate::wire::row::Table;
+    use crate::decode::StoredContract;
+    use crate::sink::table::Table;
+    use crate::sink::{EnvelopeSink as _, SinkError};
+    use crate::wire::envelope::{ChainId, Envelope, Event, Reorg};
 
     use super::*;
+
+    /// The dataset tables alone.
+    fn datasets() -> Arc<Schema> {
+        Arc::new(Schema::new().expect("the dataset tables"))
+    }
 
     fn numeric_words(negative: bool, magnitude: U256) -> Vec<i16> {
         let mut out = BytesMut::new();
@@ -623,7 +464,29 @@ mod tests {
     }
 
     #[test]
-    fn ddl_marks_required_columns_and_copy_uses_binary_field_order() {
+    fn numeric_binary_reads_back_what_it_wrote() {
+        for (negative, magnitude) in [
+            (false, U256::ZERO),
+            (false, U256::from(10_000_u64)),
+            (true, U256::from(12_345_u64)),
+            (false, U256::MAX),
+        ] {
+            let mut out = BytesMut::new();
+            write_numeric(negative, magnitude, &mut out).expect("a uint256 fits");
+            assert_eq!(
+                read_numeric(&out).expect("reads back"),
+                Value::BigInt {
+                    negative: negative && !magnitude.is_zero(),
+                    magnitude
+                }
+            );
+        }
+    }
+
+    /// Every table is keyed on its identity, and indexed and deleted by block exactly
+    /// when a reorg retracts its rows.
+    #[test]
+    fn every_table_is_keyed_and_indexed_by_block_when_reorgs_delete_from_it() {
         let schema = crate::sink::fixtures::schema();
         assert!(
             schema
@@ -632,54 +495,29 @@ mod tests {
                 .any(|table| table.name == "uniswap_v3_pool_swap"),
             "the shipped catalog's event tables are among them"
         );
-        for (position, table) in schema.tables().iter().cloned().enumerate() {
-            let label = table.name.clone();
-            let ddl = create_table(&table);
-            let prepared = Prepared::new(position, table.clone());
+        for table in schema.tables() {
+            let label = &table.name;
+            let ddl = sql::create_table::<Postgres>(table);
             assert!(
                 ddl.contains("PRIMARY KEY (\"chain\", \"dedupe_key\")"),
                 "{label} upserts on its identity and can publish a delete"
             );
             let retracted = table.id != Table::Reorg.into();
             assert_eq!(
-                create_block_index(&table).is_some(),
+                !sql::create_indexes::<Postgres>(table).is_empty(),
                 retracted,
                 "{label} is indexed by block exactly when a reorg deletes from it"
             );
-            assert_eq!(prepared.delete.is_some(), retracted);
-            assert!(
-                prepared
-                    .merge
-                    .contains("ON CONFLICT (\"chain\", \"dedupe_key\") DO UPDATE SET"),
-                "{label} merges on the identity"
-            );
-            assert!(
-                prepared
-                    .merge
-                    .contains(&format!("FROM \"staging_{position}\"")),
-                "{label} merges from its staging table"
-            );
-            assert!(
-                !prepared.merge.contains("\"chain\" = EXCLUDED"),
-                "the conflict columns stay the row's identity"
-            );
-            for column in table.columns.iter() {
+            assert_eq!(sql::delete_block(table).is_some(), retracted);
+            for column in &table.columns {
                 let definition = format!(
                     "\"{}\" {}{}",
                     column.name,
-                    sql_type(column.kind),
-                    if column.required { " NOT NULL" } else { "" }
+                    Postgres::type_name(column.kind),
+                    if column.nullable { "" } else { " NOT NULL" }
                 );
                 assert!(ddl.contains(&definition), "{definition} missing from {ddl}");
             }
-            assert_eq!(
-                prepared.copy.statement,
-                format!(
-                    "COPY \"staging_{position}\" ({}) FROM STDIN WITH (FORMAT binary)",
-                    quoted_columns(&table)
-                )
-            );
-            assert_eq!(prepared.copy.types.len(), table.columns.len());
         }
     }
 
@@ -699,15 +537,19 @@ mod tests {
         );
     }
 
+    fn db(sink: &PostgresSink) -> &Client {
+        &sink.engine.client
+    }
+
     /// A sink over the dataset tables only, for a test that decodes nothing.
     async fn dataset_sink(client: Client, database_schema: &str) -> PostgresSink {
-        PostgresSink::new(client, Arc::default(), database_schema)
+        PostgresSink::connected(client, datasets(), database_schema)
             .await
             .expect("sink")
     }
 
     async fn count(sink: &PostgresSink, table: Table) -> i64 {
-        sink.client
+        db(sink)
             .query_one(&format!("SELECT count(*) FROM \"{table}\""), &[])
             .await
             .expect("count rows")
@@ -787,7 +629,7 @@ mod tests {
             "the other chain's contract stays"
         );
 
-        sink.client
+        db(&sink)
             .batch_execute(&format!("DROP SCHEMA \"{schema}\" CASCADE"))
             .await
             .expect("drop test schema");
@@ -865,7 +707,7 @@ mod tests {
             [accepted(1)]
         );
 
-        sink.client
+        db(&sink)
             .batch_execute(&format!("DROP SCHEMA \"{schema}\" CASCADE"))
             .await
             .expect("drop test schema");
@@ -896,7 +738,7 @@ mod tests {
             .await
             .expect("test schema");
         let mut sink = dataset_sink(client, &schema).await;
-        sink.client
+        db(&sink)
             .batch_execute(&format!(
                 "CREATE PUBLICATION \"{schema}\" FOR TABLES IN SCHEMA \"{schema}\""
             ))
@@ -936,7 +778,7 @@ mod tests {
             )
         };
         let stored = async |sink: &PostgresSink| -> Vec<(String, String)> {
-            sink.client
+            db(sink)
                 .query(
                     "SELECT 'blocks', hash FROM blocks UNION ALL \
                      SELECT 'logs', block_hash FROM logs UNION ALL \
@@ -975,7 +817,7 @@ mod tests {
         assert_eq!(stored(&sink).await, only(0xa1));
         assert_eq!(count(&sink, Table::Reorg).await, 2);
 
-        sink.client
+        db(&sink)
             .batch_execute(&format!(
                 "DROP PUBLICATION \"{schema}\"; DROP SCHEMA \"{schema}\" CASCADE"
             ))
@@ -1003,7 +845,7 @@ mod tests {
             ))
             .await
             .expect("test schema");
-        let mut sink = PostgresSink::new(client, crate::sink::fixtures::schema(), &schema)
+        let mut sink = PostgresSink::connected(client, crate::sink::fixtures::schema(), &schema)
             .await
             .expect("sink");
         let created = crate::sink::fixtures::decoded_pool_created();
@@ -1015,8 +857,7 @@ mod tests {
         .expect("publish");
         sink.flush().await.expect("commit");
 
-        let row = sink
-            .client
+        let row = db(&sink)
             .query_one(
                 "SELECT extensions, pg_typeof(negative_bin_data_array)::TEXT, \
                  negative_bin_data_array[1]::TEXT, cardinality(negative_bin_data_array), \
@@ -1045,7 +886,7 @@ mod tests {
         assert_eq!(row.get::<_, String>(5), "3");
         assert_eq!(row.get::<_, String>(6), U256::MAX.to_string());
 
-        sink.client
+        db(&sink)
             .batch_execute(&format!("DROP SCHEMA \"{schema}\" CASCADE"))
             .await
             .expect("drop test schema");
@@ -1070,7 +911,7 @@ mod tests {
             ))
             .await
             .expect("test schema");
-        let mut sink = PostgresSink::new(client, crate::sink::fixtures::schema(), &schema)
+        let mut sink = PostgresSink::connected(client, crate::sink::fixtures::schema(), &schema)
             .await
             .expect("sink");
         let chain = ChainId::new("base");
@@ -1081,8 +922,7 @@ mod tests {
             .expect("publish");
         sink.flush().await.expect("commit");
 
-        let row = sink
-            .client
+        let row = db(&sink)
             .query_one(
                 "SELECT amount0::TEXT, amount1::TEXT, sqrt_price_x96::TEXT, liquidity::TEXT, \
                  tick, sender, (sqrt_price_x96 * 1000000)::TEXT FROM uniswap_v3_pool_swap",
@@ -1116,15 +956,14 @@ mod tests {
         .await
         .expect("publish");
         sink.flush().await.expect("commit the reorg");
-        let remaining: i64 = sink
-            .client
+        let remaining: i64 = db(&sink)
             .query_one("SELECT count(*) FROM uniswap_v3_pool_swap", &[])
             .await
             .expect("count")
             .get(0);
         assert_eq!(remaining, 0, "the reorg deleted the typed row");
 
-        sink.client
+        db(&sink)
             .batch_execute(&format!("DROP SCHEMA \"{schema}\" CASCADE"))
             .await
             .expect("drop test schema");
@@ -1174,8 +1013,7 @@ mod tests {
         }
         assert_eq!(count(&sink, Table::Reorg).await, 0);
         sink.flush().await.expect("commit");
-        let rows = sink
-            .client
+        let rows = db(&sink)
             .query("SELECT height::text, chain FROM reorgs", &[])
             .await
             .expect("rows");
@@ -1191,7 +1029,7 @@ mod tests {
         sink.publish(Envelope::new(chain, rejected))
             .await
             .expect("reorg");
-        sink.client
+        db(&sink)
             .batch_execute(
                 "ALTER TABLE reorgs ADD CONSTRAINT reject_height CHECK (height = 0) NOT VALID",
             )
@@ -1199,19 +1037,19 @@ mod tests {
             .expect("constraint");
         assert!(matches!(
             sink.flush().await,
-            Err(SinkError::Postgres(StoreError::Database(_)))
+            Err(SinkError::Store(StoreError::Engine { .. }))
         ));
-        assert_eq!(sink.batch.rows.len(), 1);
+        assert_eq!(sink.buffered(), 1);
         assert_eq!(count(&sink, Table::Reorg).await, 1);
-        sink.client
+        db(&sink)
             .batch_execute("ALTER TABLE reorgs DROP CONSTRAINT reject_height")
             .await
             .expect("remove constraint");
         sink.flush().await.expect("retry");
-        assert!(sink.batch.rows.is_empty());
+        assert!(sink.buffered() == 0);
         assert_eq!(count(&sink, Table::Reorg).await, 1);
         assert_eq!(
-            sink.client
+            db(&sink)
                 .query_one("SELECT height::text FROM reorgs", &[])
                 .await
                 .expect("updated row")
@@ -1220,8 +1058,7 @@ mod tests {
             "the retried replay updates the stored row"
         );
         let hashes: serde_json::Value = serde_json::from_str(
-            &sink
-                .client
+            &db(&sink)
                 .query_one("SELECT orphaned_hashes::text FROM reorgs", &[])
                 .await
                 .expect("JSONB")
@@ -1229,7 +1066,7 @@ mod tests {
         )
         .expect("JSON");
         assert_eq!(hashes, serde_json::json!([format!("{:#x}", B256::ZERO)]));
-        sink.client
+        db(&sink)
             .batch_execute(&format!("DROP SCHEMA \"{schema}\" CASCADE"))
             .await
             .expect("drop test schema");

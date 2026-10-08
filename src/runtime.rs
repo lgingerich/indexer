@@ -58,11 +58,11 @@ use crate::ingest::{pipeline::MAX_UNFINALIZED_BLOCKS, source::BlockMeta};
 use crate::sink;
 #[cfg(feature = "duckdb")]
 use crate::sink::DuckDbSink;
+use crate::sink::table::Schema;
 use crate::sink::{SinkError, StdoutJsonSink};
 #[cfg(any(feature = "duckdb", feature = "postgres"))]
 use crate::wire::envelope::AcceptedBlock;
 use crate::wire::envelope::ChainId;
-use crate::wire::row::Schema;
 
 /// Why the indexer stopped.
 ///
@@ -85,14 +85,10 @@ pub enum RuntimeError {
     /// The protocol manifests could not be loaded, so nothing would have decoded.
     #[error("protocol manifests could not be loaded: {0}")]
     Catalog(#[from] CatalogError),
-    /// The store could not be opened, so there was nowhere to write.
-    #[cfg(feature = "duckdb")]
+    /// The store could not be opened or read back, so there was nowhere to write.
+    #[cfg(any(feature = "duckdb", feature = "postgres"))]
     #[error("storage could not be opened: {0}")]
-    OpenStore(#[from] sink::duckdb::StoreError),
-    /// `PostgreSQL` could not be connected or initialized before ingest started.
-    #[cfg(feature = "postgres")]
-    #[error("PostgreSQL storage could not be opened: {0}")]
-    OpenPostgres(#[from] sink::postgres::StoreError),
+    OpenStore(#[from] sink::StoreError),
     /// Ingest stopped: a source failed, a sink refused an envelope, or the head
     /// subscription ended.
     #[error("ingest stopped: {0}")]
@@ -142,10 +138,11 @@ impl Pipeline {
             settings.ingest.start_block,
         )
         .map_err(PipelineError::from)?;
-        let mut catalog = settings.protocols_path().map_or_else(
-            || Ok(Catalog::default()),
-            |path| Catalog::load(path, &ChainId::new(&settings.ingest.chain)),
-        )?;
+        let mut catalog = settings
+            .protocols_path()
+            .map_or_else(Catalog::empty, |path| {
+                Catalog::load(path, &ChainId::new(&settings.ingest.chain))
+            })?;
         // The address filter is an explicit "only these contracts", fixed at startup, so
         // a discovered contract's logs would never be fetched. Respect it instead.
         if catalog.discovers() && !settings.ingest.log_addresses.is_empty() {
@@ -209,10 +206,10 @@ impl Pipeline {
             Sink::DuckDb(duckdb) => {
                 // Open the store before ingest starts, so a bad path fails at startup
                 // rather than after the first block.
-                let mut store = DuckDbSink::open(duckdb, schema, &settings.ingest.chain)?;
+                let mut store = DuckDbSink::open(duckdb, schema, &settings.ingest.chain).await?;
                 let chain = ChainId::new(&settings.ingest.chain);
-                let decoder = restore(decoder, &chain, store.contracts(&chain)?);
-                let ledger = ledger(&chain, store.ledger(&chain, LEDGER_WINDOW)?);
+                let decoder = restore(decoder, &chain, store.contracts(&chain).await?);
+                let ledger = ledger(&chain, store.ledger(&chain, LEDGER_WINDOW).await?);
 
                 let (blocks, receiver) = sink::channel::ChannelSink::new();
                 let batch_records = duckdb.batch_records;
@@ -318,10 +315,10 @@ mod tests {
     use crate::decode::{Catalog, Decoder, DecodingSink, StoredContract};
     use crate::ingest::pipeline::{Machine, PipelineError};
     use crate::ingest::source::{BlockMeta, BlockSource, FetchedBlock, HeadStream, SourceError};
-    use crate::sink::duckdb::StoreError;
+    use crate::sink::table::Schema;
     use crate::sink::{self, DuckDbSink, EnvelopeSink as _, SinkError};
+    use crate::sink::{Operation, StoreError};
     use crate::wire::envelope::{ChainId, Envelope, Event, Log, Reorg};
-    use crate::wire::row::Schema;
 
     use super::{LEDGER_WINDOW, Pipeline, RuntimeError, finish, ledger};
 
@@ -360,9 +357,10 @@ ws_url = "wss://example.invalid"
         let source = connection
             .execute("INSERT INTO blocks VALUES (1, 2)", [])
             .expect_err("two values cannot fit one column");
-        let storage = Ok(Err(SinkError::Store(StoreError::Append {
-            table: "blocks".to_owned(),
-            source,
+        let storage = Ok(Err(SinkError::Store(StoreError::Engine {
+            operation: Operation::Stage,
+            target: Some("blocks".to_owned()),
+            source: source.into(),
         })));
         let ingest = Err(PipelineError::Sink(SinkError::StorageClosed));
 
@@ -370,8 +368,10 @@ ws_url = "wss://example.invalid"
         assert!(
             matches!(
                 &error,
-                RuntimeError::Storage(SinkError::Store(StoreError::Append { table, .. }))
-                    if table == "blocks"
+                RuntimeError::Storage(SinkError::Store(StoreError::Engine {
+                    target: Some(table),
+                    ..
+                })) if table == "blocks"
             ),
             "the append error must be the one reported, not the closed send: {error:?}"
         );
@@ -492,7 +492,9 @@ ws_url = "wss://example.invalid"
 
         let connection = duckdb::Connection::open_in_memory().expect("open in-memory DuckDB");
         let reader = connection.try_clone().expect("a second handle");
-        let mut store = DuckDbSink::new(connection, schema(), "base").expect("create tables");
+        let mut store = DuckDbSink::connected(connection, schema(), "base")
+            .await
+            .expect("create tables");
         let (blocks, receiver) = sink::channel::ChannelSink::new();
         let storage = tokio::spawn(async move { receiver.drain(&mut store, 500).await });
 
@@ -536,8 +538,10 @@ ws_url = "wss://example.invalid"
 
         // A restart: a fresh decoder knows the pool once the store's rows are restored.
         let mut store =
-            DuckDbSink::new(reader.try_clone().expect("handle"), schema(), "base").expect("reopen");
-        let stored = store.contracts(&chain).expect("read back");
+            DuckDbSink::connected(reader.try_clone().expect("handle"), schema(), "base")
+                .await
+                .expect("reopen");
+        let stored = store.contracts(&chain).await.expect("read back");
         assert_eq!(
             stored,
             [StoredContract {
@@ -567,7 +571,7 @@ ws_url = "wss://example.invalid"
             .await
             .expect("publish");
         store.flush().await.expect("flush");
-        assert!(store.contracts(&chain).expect("read back").is_empty());
+        assert!(store.contracts(&chain).await.expect("read back").is_empty());
         assert_eq!(count(&reader, "contracts"), 0);
     }
 
@@ -655,12 +659,14 @@ ws_url = "wss://example.invalid"
     /// holds, index `chain` to its head through decode and the storage channel, then stop
     /// and let storage drain, as a crash after the last commit would leave it.
     async fn run_once(connection: &duckdb::Connection, chain: FakeChain, start: Option<u64>) {
-        let mut store = DuckDbSink::new(connection.try_clone().expect("handle"), schema(), "base")
-            .expect("open");
+        let mut store =
+            DuckDbSink::connected(connection.try_clone().expect("handle"), schema(), "base")
+                .await
+                .expect("open");
         let id = chain.chain.clone();
         let mut decoder = decoder();
-        decoder.restore(store.contracts(&id).expect("contracts"));
-        let restored = ledger(&id, store.ledger(&id, LEDGER_WINDOW).expect("ledger"));
+        decoder.restore(store.contracts(&id).await.expect("contracts"));
+        let restored = ledger(&id, store.ledger(&id, LEDGER_WINDOW).await.expect("ledger"));
         let (blocks, receiver) = sink::channel::ChannelSink::new();
         let storage = tokio::spawn(async move { receiver.drain(&mut store, 500).await });
         let machine = Machine::new(chain, DecodingSink::new(decoder, blocks), restored);
@@ -748,11 +754,13 @@ ws_url = "wss://example.invalid"
             7,
             "the orphaned blocks left the ledger"
         );
-        let store = DuckDbSink::new(connection.try_clone().expect("handle"), schema(), "base")
-            .expect("open");
+        let mut store =
+            DuckDbSink::connected(connection.try_clone().expect("handle"), schema(), "base")
+                .await
+                .expect("open");
         let chain = ChainId::new("base");
-        assert!(store.contracts(&chain).expect("contracts").is_empty());
-        let canonical = store.ledger(&chain, LEDGER_WINDOW).expect("ledger");
+        assert!(store.contracts(&chain).await.expect("contracts").is_empty());
+        let canonical = store.ledger(&chain, LEDGER_WINDOW).await.expect("ledger");
         assert_eq!(
             canonical
                 .iter()
@@ -774,10 +782,15 @@ ws_url = "wss://example.invalid"
     async fn a_start_height_with_a_stored_ledger_is_refused() {
         let connection = duckdb::Connection::open_in_memory().expect("open in-memory DuckDB");
         run_once(&connection, FakeChain::new(3, 0xa0), Some(1)).await;
-        let store = DuckDbSink::new(connection.try_clone().expect("handle"), schema(), "base")
-            .expect("open");
+        let mut store =
+            DuckDbSink::connected(connection.try_clone().expect("handle"), schema(), "base")
+                .await
+                .expect("open");
         let chain = ChainId::new("base");
-        let restored = ledger(&chain, store.ledger(&chain, LEDGER_WINDOW).expect("ledger"));
+        let restored = ledger(
+            &chain,
+            store.ledger(&chain, LEDGER_WINDOW).await.expect("ledger"),
+        );
         let machine = Machine::new(FakeChain::new(5, 0xa0), store, restored);
         assert!(matches!(
             machine.backfill(1).await.map(drop),

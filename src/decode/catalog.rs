@@ -49,7 +49,7 @@
 //! # Event tables
 //!
 //! Every event of every contract also gets a typed table — see
-//! [`Schema`](crate::wire::row::Schema) — named `{protocol}_{contract}_{event}`: the
+//! [`Schema`](crate::sink::table::Schema) — named `{protocol}_{contract}_{event}`: the
 //! manifest's `protocol`, the contract's name in `snake_case`, and the event's name in
 //! `snake_case`. The name does not depend on the directory, so pointing the setting at a
 //! subtree writes to the same tables. A contract's optional `table` key replaces its part
@@ -73,8 +73,8 @@ use alloy_primitives::Address;
 use serde::Deserialize;
 
 use super::abi::{Abi, AbiError, EventKey, InputSpec};
+use crate::sink::table::{Column, ColumnType, Schema, TableError, snake_case};
 use crate::wire::envelope::ChainId;
-use crate::wire::row::{Column, ColumnType, Schema, snake_case};
 
 /// The longest event table name: `PostgreSQL`'s identifier limit, past which it would
 /// silently truncate the name and two tables could collide.
@@ -143,7 +143,7 @@ pub(crate) struct Rule {
 
 /// The loaded catalog for one chain: every contract entry, and the seed addresses on that
 /// chain.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct Catalog {
     pub(crate) entries: Vec<Entry>,
     pub(crate) seeds: Vec<(Address, EntryId)>,
@@ -151,6 +151,22 @@ pub struct Catalog {
 }
 
 impl Catalog {
+    /// A catalog with no protocols: nothing decodes, and the schema is the dataset tables.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CatalogError::Table`] when a dataset table's declaration is inconsistent.
+    pub fn empty() -> Result<Self, CatalogError> {
+        Ok(Self {
+            entries: Vec::new(),
+            seeds: Vec::new(),
+            schema: Schema::new().map_err(|source| CatalogError::Table {
+                contract: "the dataset tables".to_owned(),
+                source,
+            })?,
+        })
+    }
+
     /// Loads every protocol under `dir`, keeping `chain`'s addresses.
     ///
     /// # Errors
@@ -173,7 +189,7 @@ impl Catalog {
         }
         // Sorted, so entry ids and error order do not depend on the filesystem's order.
         protocols.sort();
-        let mut catalog = Self::default();
+        let mut catalog = Self::empty()?;
         let mut names = HashMap::new();
         for protocol in protocols {
             let path = protocol.join(MANIFEST);
@@ -256,12 +272,9 @@ impl Catalog {
                 }
                 let params = event.inputs.iter().map(param).collect();
                 let key = (manifest.protocol.as_str(), name.as_str(), event.id);
-                if !self.schema.add_event(key, table.clone(), params) {
-                    return Err(CatalogError::DuplicateTable {
-                        table,
-                        contract: contract(),
-                    });
-                }
+                self.schema
+                    .add_event(key, table.clone(), params)
+                    .map_err(|source| event_table_error(source, table, contract()))?;
             }
             if let Some(addresses) = spec.addresses.get(chain.as_str()) {
                 self.seeds
@@ -362,6 +375,16 @@ fn find_manifests(dir: &Path, protocols: &mut Vec<PathBuf>) -> Result<(), Catalo
     Ok(())
 }
 
+/// A failure to add `table`, an event table of `contract`: a repeated name keeps its own
+/// variant, since two contracts naming one table is a manifest mistake to fix with a
+/// `table` key.
+fn event_table_error(source: TableError, table: String, contract: String) -> CatalogError {
+    match source {
+        TableError::DuplicateTable { .. } => CatalogError::DuplicateTable { table, contract },
+        source => CatalogError::Table { contract, source },
+    }
+}
+
 /// How one input is stored in its event's table: a column under its ABI name.
 ///
 /// A scalar is its own typed column and an array of scalars a list of that type. A tuple,
@@ -383,7 +406,7 @@ fn param(input: &InputSpec<'_>) -> Column {
             .map_or((ColumnType::Document, true), |list| (list, true)),
         ty => scalar(ty).unwrap_or((ColumnType::Document, true)),
     };
-    Column::named(input.name.to_owned(), kind, required)
+    Column::new(input.name.to_owned(), kind, !required)
 }
 
 /// A scalar ABI type's column type and whether every value fills it; `None` for an array
@@ -517,6 +540,14 @@ pub enum CatalogError {
         /// The contract that produced it again, as `protocol.name`.
         contract: String,
     },
+    /// A table generated for a contract's events is inconsistent.
+    #[error("{contract}: {source}")]
+    Table {
+        /// The contract whose events the table holds, as `protocol.name`.
+        contract: String,
+        /// What is wrong with the table.
+        source: TableError,
+    },
     /// A rule's parameter is absent from its event, or not an `address`.
     #[error("{contract} is created_by {event}.{param}, which is not an address argument")]
     Param {
@@ -535,8 +566,8 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     use super::{Catalog, CatalogError};
+    use crate::sink::table::{ColumnType, TableId};
     use crate::wire::envelope::ChainId;
-    use crate::wire::row::{ColumnType, TableId};
 
     fn repository() -> PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR")).join("protocols")
@@ -648,7 +679,7 @@ addresses = { base = ["0x33128a8fC17869897dcE68Ed026d694621f6FDfD"], ethereum = 
                 ("tick", ColumnType::Int),
                 ("block_number", ColumnType::Uint),
                 ("block_hash", ColumnType::Text),
-                ("block_timestamp", ColumnType::Uint),
+                ("block_timestamp", ColumnType::Timestamp),
                 ("chain", ColumnType::Text),
                 ("dedupe_key", ColumnType::Text),
             ]
