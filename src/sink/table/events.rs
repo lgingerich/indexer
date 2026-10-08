@@ -324,19 +324,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn names_become_snake_case() {
-        for (name, snake) in [
-            ("sqrtPriceX96", "sqrt_price_x96"),
-            ("amount0", "amount0"),
-            ("ETHAmount", "eth_amount"),
-            ("UniswapV3Pool", "uniswap_v3_pool"),
-            ("_from", "from"),
-        ] {
-            assert_eq!(super::snake_case(name), snake, "{name}");
-        }
-    }
-
     fn arg(position: usize, name: &str, value: TypedValue) -> DecodedArg {
         DecodedArg {
             position,

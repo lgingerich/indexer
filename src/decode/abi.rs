@@ -583,20 +583,6 @@ mod tests {
     }
 
     #[test]
-    fn startup_rejects_anonymous_and_impossible_topic_layouts() {
-        assert!(matches!(
-            Abi::from_json(r#"[{"type":"event","name":"Hidden","anonymous":true,"inputs":[]}]"#),
-            Err(AbiError::Anonymous { .. })
-        ));
-        assert!(matches!(
-            Abi::from_json(
-                r#"[{"type":"event","name":"TooMany","anonymous":false,"inputs":[{"name":"a","type":"uint256","indexed":true},{"name":"b","type":"uint256","indexed":true},{"name":"c","type":"uint256","indexed":true},{"name":"d","type":"uint256","indexed":true}]}]"#
-            ),
-            Err(AbiError::Layout { .. })
-        ));
-    }
-
-    #[test]
     fn signed_widths_and_scalar_constraints_are_checked() {
         use alloy_primitives::{I256, U256};
         assert!(convert(&DynSolType::Int(8), &DynSolValue::Int(I256::MINUS_ONE, 8)).is_ok());

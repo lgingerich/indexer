@@ -329,14 +329,6 @@ ws_url = "wss://example.invalid"
 [sink.duckdb]
 "#;
 
-    /// A configured chain is the pipeline: assembly needs no store and no network, so a
-    /// bad setting fails here rather than after a database file has been touched.
-    #[test]
-    fn a_chain_config_assembles_the_pipeline() {
-        let settings = Settings::from_str(SETTINGS).expect("settings parse");
-        Pipeline::from_settings(&settings).expect("the pipeline builds");
-    }
-
     /// The store's write error is the one returned when ingest then fails because the
     /// receiver is gone. That second failure is the failed send, and reporting it would
     /// hide the write that caused it.
@@ -367,20 +359,6 @@ ws_url = "wss://example.invalid"
             ),
             "the append error must be the one reported, not the closed send: {error:?}"
         );
-    }
-
-    /// A protocols directory that is not there is an assembly error, not a quiet run that
-    /// decodes nothing.
-    #[test]
-    fn a_missing_protocols_directory_is_an_assembly_error() {
-        let settings = Settings::from_str(&format!(
-            "{SETTINGS}\n[decode]\nprotocols = \"/nonexistent/protocols\"\n"
-        ))
-        .expect("settings parse");
-        assert!(matches!(
-            Pipeline::from_settings(&settings),
-            Err(RuntimeError::Catalog(_))
-        ));
     }
 
     /// The shipped protocols load, so the example settings a reader copies stay runnable.

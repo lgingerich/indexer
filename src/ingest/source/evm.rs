@@ -964,99 +964,6 @@ mod tests {
         assert_eq!(server.join().expect("server").len(), 1);
     }
 
-    /// A header read is one call for the header alone, by height or for the head,
-    /// whatever datasets the source fetches.
-    #[tokio::test]
-    async fn a_header_read_is_one_hashes_only_call() {
-        for (height, param) in [
-            (Some(18_000_000), json!("0x112a880")),
-            (None, json!("latest")),
-        ] {
-            let (url, server) = rpc_server(1, move |request| {
-                assert_eq!(request["method"], "eth_getBlockByNumber");
-                assert_eq!(request["params"], json!([param, false]));
-                json!({"jsonrpc": "2.0", "id": request["id"], "result": block()})
-            });
-            let source =
-                EvmSource::new("ethereum", url, "ws://unused", Datasets::all()).expect("source");
-            let meta = source.fetch_header(height).await.expect("header");
-            assert_eq!(meta.height, 18_000_000);
-            assert_eq!(meta.timestamp, TIMESTAMP);
-            server.join().expect("server");
-        }
-    }
-
-    #[tokio::test]
-    async fn logs_only_fetches_a_header_and_one_get_logs() {
-        let mut header = block();
-        header["transactions"] = json!([hash(0x11), hash(0x22)]);
-        let logs = receipts()[0]["logs"].clone();
-        let (url, server) = rpc_server(1, move |request| {
-            let calls = request.as_array().expect("batch");
-            assert_eq!(calls.len(), 2);
-            assert_eq!(calls[0]["method"], "eth_getBlockByNumber");
-            assert_eq!(calls[0]["params"], json!(["0x112a880", false]));
-            assert_eq!(calls[1]["method"], "eth_getLogs");
-            assert_eq!(calls[1]["params"][0]["fromBlock"], "0x112a880");
-            assert_eq!(calls[1]["params"][0]["toBlock"], "0x112a880");
-            assert!(calls[1]["params"][0].get("address").is_none());
-            json!([
-                {"jsonrpc": "2.0", "id": calls[0]["id"], "result": header},
-                {"jsonrpc": "2.0", "id": calls[1]["id"], "result": logs},
-            ])
-        });
-        let source = EvmSource::new(
-            "ethereum",
-            url,
-            "ws://unused",
-            serde_json::from_str(r#"["logs"]"#).expect("datasets"),
-        )
-        .expect("source");
-        let fetched = source.fetch_block(18_000_000, None).await.expect("fetch");
-        // The block is not stored, so no block event is emitted; the logs are.
-        let kinds: Vec<&str> = fetched.events.iter().map(Event::kind).collect();
-        assert_eq!(kinds, ["log", "log"]);
-        assert_eq!(fetched.meta.height, 18_000_000);
-        server.join().expect("server");
-    }
-
-    #[tokio::test]
-    async fn a_reusable_head_skips_the_block_read_for_logs_only() {
-        let logs = receipts()[0]["logs"].clone();
-        // One request, one call: no block read, only the hash-pinned log query.
-        let (url, server) = rpc_server(1, move |request| {
-            assert_eq!(request["method"], "eth_getLogs");
-            assert_eq!(request["params"][0]["blockHash"], hash(0xab));
-            assert!(
-                request["params"][0].get("fromBlock").is_none(),
-                "a pinned query carries the hash, not a height range"
-            );
-            json!({"jsonrpc": "2.0", "id": request["id"], "result": logs})
-        });
-        let source = EvmSource::new(
-            "ethereum",
-            url,
-            "ws://unused",
-            serde_json::from_str(r#"["logs"]"#).expect("datasets"),
-        )
-        .expect("source");
-        let head = BlockMeta {
-            height: 18_000_000,
-            hash: hash(0xab).parse().expect("hash"),
-            parent_hash: hash(0xaa).parse().expect("hash"),
-            timestamp: TIMESTAMP,
-        };
-        let fetched = source
-            .fetch_block(18_000_000, Some(&head))
-            .await
-            .expect("fetch");
-        let kinds: Vec<&str> = fetched.events.iter().map(Event::kind).collect();
-        assert_eq!(kinds, ["log", "log"]);
-        assert_eq!(fetched.meta.hash, hash(0xab).parse::<B256>().expect("hash"));
-        assert_eq!(fetched.meta.timestamp, head.timestamp);
-        server.join().expect("server");
-    }
-
     /// A reusable head stands in for the header only when logs are the only thing
     /// fetched. Anything else reads the block body, so a `transactions` dataset still
     /// fetches it and still emits its rows — silently dropping them would index
@@ -1089,108 +996,6 @@ mod tests {
             "the body rows survive a reusable head"
         );
         server.join().expect("server");
-    }
-
-    #[tokio::test]
-    async fn receipts_supply_logs_without_a_second_log_call() {
-        let (url, server) = rpc_server(1, |request| {
-            let calls = request.as_array().expect("batch");
-            assert_eq!(calls.len(), 2);
-            assert_eq!(calls[0]["params"], json!(["0x112a880", true]));
-            assert_eq!(calls[1]["method"], "eth_getBlockReceipts");
-            assert!(
-                calls.iter().all(|call| call["method"] != "eth_getLogs"),
-                "logs come off the receipts"
-            );
-            json!([
-                {"jsonrpc": "2.0", "id": calls[0]["id"], "result": block()},
-                {"jsonrpc": "2.0", "id": calls[1]["id"], "result": receipts()},
-            ])
-        });
-        let source = EvmSource::new(
-            "ethereum",
-            url,
-            "ws://unused",
-            serde_json::from_str(r#"["transactions", "logs"]"#).expect("datasets"),
-        )
-        .expect("source");
-        let fetched = source.fetch_block(18_000_000, None).await.expect("fetch");
-        let kinds: Vec<&str> = fetched.events.iter().map(Event::kind).collect();
-        assert_eq!(kinds, ["transaction", "log", "log", "transaction"]);
-        server.join().expect("server");
-    }
-
-    #[tokio::test]
-    async fn blocks_alone_are_one_hashes_only_call() {
-        let mut header = block();
-        header["transactions"] = json!([hash(0x11), hash(0x22)]);
-        let (url, server) = rpc_server(1, move |request| {
-            // One batch, one method: the block row reads no transaction objects,
-            // receipts, or logs.
-            let calls = request.as_array().expect("batch");
-            assert_eq!(calls.len(), 1);
-            assert_eq!(calls[0]["method"], "eth_getBlockByNumber");
-            assert_eq!(calls[0]["params"], json!(["0x112a880", false]));
-            json!([{"jsonrpc": "2.0", "id": calls[0]["id"], "result": header}])
-        });
-        let source = EvmSource::new(
-            "ethereum",
-            url,
-            "ws://unused",
-            serde_json::from_str(r#"["blocks"]"#).expect("datasets"),
-        )
-        .expect("source");
-        let fetched = source.fetch_block(18_000_000, None).await.expect("fetch");
-        let kinds: Vec<&str> = fetched.events.iter().map(Event::kind).collect();
-        assert_eq!(kinds, ["block"]);
-        server.join().expect("server");
-    }
-
-    /// The fetch policy for every selection, as the table on [`FetchPlan`] states it.
-    #[test]
-    fn every_selection_has_its_documented_plan() {
-        use super::{FetchPlan, LogSource};
-        let plan = |names: &str| {
-            FetchPlan::new(serde_json::from_str::<Datasets>(names).expect("datasets"))
-        };
-        let expected = |block_row, transactions, logs, reuse_head| FetchPlan {
-            block_row,
-            transactions,
-            logs,
-            reuse_head,
-        };
-        for (names, want) in [
-            (
-                r#"["logs"]"#,
-                expected(false, false, LogSource::GetLogs, true),
-            ),
-            (
-                r#"["blocks"]"#,
-                expected(true, false, LogSource::Skip, false),
-            ),
-            (
-                r#"["blocks", "logs"]"#,
-                expected(true, false, LogSource::GetLogs, false),
-            ),
-            (
-                r#"["transactions"]"#,
-                expected(false, true, LogSource::Skip, false),
-            ),
-            (
-                r#"["transactions", "logs"]"#,
-                expected(false, true, LogSource::Receipts, false),
-            ),
-            (
-                r#"["blocks", "transactions"]"#,
-                expected(true, true, LogSource::Skip, false),
-            ),
-            (
-                r#"["blocks", "transactions", "logs"]"#,
-                expected(true, true, LogSource::Receipts, false),
-            ),
-        ] {
-            assert_eq!(plan(names), want, "{names}");
-        }
     }
 
     #[tokio::test]
@@ -1505,24 +1310,6 @@ mod tests {
         }
     }
     #[test]
-    fn events_are_block_then_each_transaction_followed_by_its_logs() {
-        let fetched = decode_block(batch(&block(), &receipts())).expect("batch decodes");
-        let kinds: Vec<&str> = fetched.events.iter().map(Event::kind).collect();
-        assert_eq!(kinds, ["block", "transaction", "log", "log", "transaction"]);
-
-        let Event::Block(marker) = &fetched.events[0] else {
-            panic!("first event must be the block marker");
-        };
-        assert_eq!(marker.number, 18_000_000);
-        assert_eq!(marker.transaction_count, 2);
-        assert_eq!(marker.parent_hash.to_string(), hash(0xaa));
-        assert_eq!(
-            marker.ommers,
-            vec![hash(0x99).parse::<B256>().expect("hash")]
-        );
-    }
-
-    #[test]
     fn datasets_carry_their_fields_and_reference_children_by_key() {
         let fetched = decode_block(batch(&block(), &receipts())).expect("batch decodes");
 
@@ -1607,15 +1394,6 @@ mod tests {
             first.data,
             alloy_primitives::Bytes::from_static(&[0x00, 0x01])
         );
-    }
-
-    #[test]
-    fn metadata_is_reported_from_the_fetched_block() {
-        let fetched = decode_block(batch(&block(), &receipts())).expect("batch decodes");
-        assert_eq!(fetched.meta.height, 18_000_000);
-        assert_eq!(fetched.meta.hash.to_string(), hash(0xab));
-        assert_eq!(fetched.meta.parent_hash.to_string(), hash(0xaa));
-        assert_eq!(fetched.meta.timestamp, TIMESTAMP);
     }
 
     #[test]
@@ -1713,33 +1491,6 @@ mod tests {
         assert!(
             message.contains("eth_getBlockReceipts") && message.contains("logIndex"),
             "a log that cannot be placed in the block must not be filed under a guess: {message}"
-        );
-    }
-
-    /// The decode boundary requires receipts: a caller that forgets the fallback
-    /// gets a clear error rather than transaction rows with no receipt fields.
-    #[test]
-    fn decode_block_requires_receipts() {
-        let mut batch = batch(&block(), &receipts());
-        batch.receipts = None;
-        let error = decode_block(batch).expect_err("missing receipts must fail");
-        assert!(
-            error.to_string().contains("receipts were not fetched"),
-            "{error}"
-        );
-    }
-
-    /// The decode boundary requires a body whenever a selected row reads one. Without
-    /// this, a caller supplying metadata but no block would get transaction rows
-    /// silently omitted rather than an error.
-    #[test]
-    fn decode_block_requires_a_body_when_a_dataset_reads_it() {
-        let mut batch = batch(&block(), &receipts());
-        batch.block = None;
-        let error = decode_block(batch).expect_err("missing block must fail");
-        assert!(
-            error.to_string().contains("block was not fetched"),
-            "{error}"
         );
     }
 

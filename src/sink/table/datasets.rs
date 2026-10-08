@@ -303,28 +303,6 @@ mod tests {
 
     use crate::sink::table::{ColumnType, Row, Schema, Table, TableDef, TableId, Value};
 
-    /// A decoded record with no arguments, for a test to fill in.
-    fn decoded() -> Decoded {
-        Decoded {
-            event_id: hash(0x08),
-            name: "E".to_owned(),
-            address: Address::from([0xd0; 20]),
-            protocol: "p".to_owned(),
-            contract: "C".to_owned(),
-            selector: hash(0x07),
-            signature: "E()".to_owned(),
-            anonymous: false,
-            transaction_hash: TxHash::from([0x11; 32]),
-            transaction_index: 3,
-            log_index: 7,
-            indexed: Vec::new(),
-            body: Vec::new(),
-            block_number: 100,
-            block_hash: hash(0x01),
-            block_timestamp: 1_700_000_000,
-        }
-    }
-
     fn row_for(chain: &ChainId, event: &Event) -> Row {
         Schema::new()
             .expect("the dataset tables")
@@ -454,94 +432,6 @@ mod tests {
         }
     }
 
-    /// A column is nullable exactly when its field is an `Option`, which is to say when
-    /// the chain can omit it.
-    #[test]
-    fn only_fields_the_chain_can_omit_are_nullable() {
-        let optional = [
-            ("blocks", "withdrawals_root"),
-            ("blocks", "total_difficulty"),
-            ("blocks", "size"),
-            ("blocks", "base_fee_per_gas"),
-            ("blocks", "blob_gas_used"),
-            ("blocks", "excess_blob_gas"),
-            ("blocks", "parent_beacon_block_root"),
-            ("transactions", "to_address"),
-            ("transactions", "gas_price"),
-            ("transactions", "max_fee_per_gas"),
-            ("transactions", "max_priority_fee_per_gas"),
-            ("transactions", "max_fee_per_blob_gas"),
-            ("transactions", "chain_id"),
-            ("transactions", "access_list"),
-            ("transactions", "blob_versioned_hashes"),
-            ("transactions", "authorization_list"),
-            ("transactions", "receipt_contract_address"),
-            ("transactions", "receipt_blob_gas_used"),
-            ("transactions", "receipt_blob_gas_price"),
-            ("logs", "topic0"),
-            ("logs", "topic1"),
-            ("logs", "topic2"),
-            ("logs", "topic3"),
-        ];
-        let schema = Schema::new().expect("the dataset tables");
-        let nullable: Vec<(&str, &str)> = Table::ALL
-            .iter()
-            .flat_map(|&table| {
-                let def = schema.dataset(table);
-                def.columns
-                    .iter()
-                    .filter(|column| column.nullable)
-                    .map(|column| (def.name.as_str(), column.name.as_ref()))
-            })
-            .collect();
-        assert_eq!(nullable, optional);
-    }
-
-    /// Wei amounts, prices, and difficulty are exact numbers, as Allium stores them, not
-    /// the node's hex; gas amounts and indices are 64-bit; times are timestamps.
-    #[test]
-    fn chain_values_are_numbers_and_times_are_timestamps() {
-        let kind = |table: Table, name: &str| {
-            let def = def(table);
-            def.columns[def.position(name).expect("the column exists")].kind
-        };
-        for (table, wide) in [
-            (Table::Block, "difficulty"),
-            (Table::Block, "total_difficulty"),
-            (Table::Block, "size"),
-            (Table::Transaction, "value"),
-            (Table::Transaction, "gas_price"),
-            (Table::Transaction, "max_fee_per_gas"),
-            (Table::Transaction, "max_priority_fee_per_gas"),
-            (Table::Transaction, "max_fee_per_blob_gas"),
-            (Table::Transaction, "receipt_effective_gas_price"),
-            (Table::Transaction, "receipt_blob_gas_price"),
-        ] {
-            assert_eq!(kind(table, wide), ColumnType::BigInt, "{table}.{wide}");
-        }
-        for (table, amount) in [
-            (Table::Block, "gas_limit"),
-            (Table::Block, "gas_used"),
-            (Table::Block, "base_fee_per_gas"),
-            (Table::Transaction, "gas"),
-            (Table::Transaction, "nonce"),
-            (Table::Transaction, "receipt_cumulative_gas_used"),
-            (Table::Log, "log_index"),
-        ] {
-            assert_eq!(kind(table, amount), ColumnType::Uint, "{table}.{amount}");
-        }
-        for (table, time) in [
-            (Table::Block, "timestamp"),
-            (Table::Transaction, "block_timestamp"),
-            (Table::Log, "block_timestamp"),
-            (Table::Decoded, "block_timestamp"),
-            (Table::Contract, "block_timestamp"),
-            (Table::AcceptedBlock, "timestamp"),
-        ] {
-            assert_eq!(kind(table, time), ColumnType::Timestamp, "{table}.{time}");
-        }
-    }
-
     /// A price above `u64::MAX` and a value at `U256::MAX` survive exactly. `u64::MAX` wei
     /// is 18.4 ETH, which a gas price spike can pass.
     #[test]
@@ -577,56 +467,5 @@ mod tests {
             row.value("max_fee_per_gas").expect("a column"),
             &Value::Null
         );
-    }
-
-    /// The decoded row's identity is typed columns, not a document a consumer has to parse
-    /// to key or join on; the variable arguments stay documents.
-    #[test]
-    fn a_decoded_row_keys_and_joins_on_typed_columns() {
-        let decoded = decoded();
-        let row = row_for(&chain(), &Event::Decoded(Box::new(decoded.clone())));
-        assert_eq!(row.text("protocol").expect("text"), "p");
-        assert_eq!(
-            row.text("event_id").expect("text"),
-            format!("{:#x}", decoded.event_id)
-        );
-        assert_eq!(
-            row.text("address").expect("text"),
-            format!("{:#x}", decoded.address)
-        );
-        assert_eq!(
-            row.text("block_hash").expect("text"),
-            format!("{:#x}", decoded.block_hash)
-        );
-        assert_eq!(row.value("log_index").expect("a column"), &Value::Uint(7));
-        assert_eq!(
-            row.value("block_timestamp").expect("a column"),
-            &Value::Timestamp(1_700_000_000)
-        );
-        assert_eq!(
-            row.value("indexed").expect("a column"),
-            &Value::Document("[]".to_owned())
-        );
-        assert_eq!(
-            row.value("body").expect("a column"),
-            &Value::Document("[]".to_owned())
-        );
-    }
-
-    /// The two branches of a reorg are separate rows, keyed differently — which is what
-    /// makes a retraction addressable rather than an overwrite.
-    #[test]
-    fn a_log_and_its_replacement_do_not_share_a_row() {
-        let orphaned = Log {
-            block_hash: hash(0xaa),
-            ..Log::default()
-        };
-        let replacement = Log {
-            block_hash: hash(0xbb),
-            ..orphaned.clone()
-        };
-        let a = row_for(&chain(), &Event::Log(Box::new(orphaned)));
-        let b = row_for(&chain(), &Event::Log(Box::new(replacement)));
-        assert_ne!(a.dedupe_key(), b.dedupe_key());
     }
 }

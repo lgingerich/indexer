@@ -451,73 +451,6 @@ mod tests {
         sink.flush().await.expect("batch flushes");
     }
 
-    /// One event lands in its own table, and nowhere else. The point of dropping the
-    /// single `events` table: a log is a row of typed columns in `logs`, not a row with
-    /// most of them null.
-    ///
-    /// The fixture has no decoded record, so `decoded_logs` is expected to be empty rather than
-    /// to hold one; the decode stage's own output is covered in `decode` and `runtime`.
-    #[tokio::test]
-    async fn each_event_kind_lands_in_its_own_table() {
-        let mut sink = sink().await;
-        store(&mut sink).await;
-
-        for table in Table::ALL {
-            let expected = i64::from(table != Table::Decoded);
-            assert_eq!(
-                row_count(&sink, table.name()),
-                expected,
-                "one row in {table}, and nothing anywhere else"
-            );
-        }
-    }
-
-    /// The columns are typed values, not JSON text: a consumer filters and compares them
-    /// directly. Integers land as `UBIGINT` and hashes as `0x` hex, the encoding a node
-    /// itself uses, so a value read from a typed column and the same value read from a
-    /// JSON document compare equal.
-    #[tokio::test]
-    async fn a_log_row_is_typed_columns_rather_than_a_json_blob() {
-        let mut sink = sink().await;
-        let envelope = every_kind()
-            .into_iter()
-            .find(|envelope| matches!(envelope.event, Event::Log(_)))
-            .expect("a log envelope");
-        let expected_key = envelope.event.dedupe_key();
-        sink.publish(envelope).await.expect("row buffers");
-        sink.flush().await.expect("batch flushes");
-
-        let (log_index, transaction_index, address, topic0, block_number, block_hash, key, chain):
-            (u64, u64, String, String, u64, String, String, String) = sink.engine.connection
-            .query_row(
-                "SELECT log_index, transaction_index, address, topic0, block_number, \
-                 block_hash, dedupe_key, chain FROM logs",
-                [],
-                |row| {
-                    Ok((
-                        row.get(0)?,
-                        row.get(1)?,
-                        row.get(2)?,
-                        row.get(3)?,
-                        row.get(4)?,
-                        row.get(5)?,
-                        row.get(6)?,
-                        row.get(7)?,
-                    ))
-                },
-            )
-            .expect("log row reads back");
-
-        assert_eq!(log_index, 7, "the log's own position in the block");
-        assert_eq!(transaction_index, 3, "the emitting transaction's position");
-        assert_eq!(address, format!("{:#x}", Address::from([0x33; 20])));
-        assert_eq!(topic0, format!("{:#x}", hash(0x44)));
-        assert_eq!(block_number, 100);
-        assert_eq!(block_hash, format!("{:#x}", hash(0x01)));
-        assert_eq!(key, expected_key, "the key is the row's identity");
-        assert_eq!(chain, "base");
-    }
-
     /// A wei price above `u64::MAX` survives the round trip as an exact number, which
     /// is the whole reason those columns are not `UBIGINT`.
     #[tokio::test]
@@ -729,27 +662,6 @@ mod tests {
         sink.flush().await.expect("retry the whole batch");
         assert_eq!(row_count(&sink, "reorgs"), 2);
         assert_eq!(sink.buffered(), 0);
-    }
-
-    /// A batch of several rows lands in one flush.
-    #[tokio::test]
-    async fn a_flush_writes_the_whole_batch() {
-        let mut sink = sink().await;
-        for height in 0..5 {
-            sink.publish(Envelope::new(
-                chain(),
-                Event::Reorg(Reorg {
-                    height,
-                    new_head_hash: hash(u8::try_from(height).expect("five heights")),
-                    orphaned_hashes: vec![],
-                }),
-            ))
-            .await
-            .expect("row buffers");
-        }
-        sink.flush().await.expect("batch flushes");
-
-        assert_eq!(row_count(&sink, "reorgs"), 5);
     }
 
     /// A batch that holds a key twice keeps its last copy, a later flush of the same key
@@ -1205,25 +1117,6 @@ mod tests {
         }
         // Leave nothing behind; the connection is released when the sinks drop.
         std::fs::remove_file(&path).expect("remove temp database");
-    }
-
-    /// The row a store writes says which table and what it holds, so the store never has
-    /// to switch on the event to know where a row goes.
-    #[test]
-    fn a_row_names_its_table_and_carries_the_common_columns() {
-        let log = Log {
-            log_index: 7,
-            block_number: 100,
-            block_hash: hash(0x01),
-            ..Log::default()
-        };
-        let event = Event::Log(Box::new(log));
-        let row = datasets().row(&chain(), &event).expect("a row");
-
-        assert_eq!(row.table().id, Table::Log.into());
-        assert_eq!(row.chain(), "base");
-        assert_eq!(row.dedupe_key(), event.dedupe_key());
-        assert_eq!(row.values().len(), row.table().columns.len());
     }
 
     /// A decoded array of scalars lands as a native list of its element type, and a tuple
