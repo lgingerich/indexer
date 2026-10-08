@@ -172,7 +172,7 @@ pub(crate) fn select<'a>(table: &'a TableDef, columns: &'a [&'a str]) -> Select<
     Select {
         table,
         columns,
-        newest_first: None,
+        order: None,
         limit: false,
     }
 }
@@ -182,14 +182,21 @@ pub(crate) fn select<'a>(table: &'a TableDef, columns: &'a [&'a str]) -> Select<
 pub(crate) struct Select<'a> {
     table: &'a TableDef,
     columns: &'a [&'a str],
-    newest_first: Option<&'a str>,
+    /// The column to order by, and whether highest first.
+    order: Option<(&'a str, bool)>,
     limit: bool,
 }
 
 impl<'a> Select<'a> {
     /// Orders by `column`, highest first.
     pub(crate) const fn newest_first(mut self, column: &'a str) -> Self {
-        self.newest_first = Some(column);
+        self.order = Some((column, true));
+        self
+    }
+
+    /// Orders by `column`, lowest first.
+    pub(crate) const fn ordered_by(mut self, column: &'a str) -> Self {
+        self.order = Some((column, false));
         self
     }
 
@@ -206,7 +213,11 @@ impl<'a> Select<'a> {
     /// Returns [`TableError::UnknownColumn`] when it names a column the table does not
     /// have.
     pub(crate) fn render(&self) -> Result<String, TableError> {
-        for column in self.columns.iter().chain(&self.newest_first) {
+        for column in self
+            .columns
+            .iter()
+            .chain(self.order.as_ref().map(|(column, _)| column))
+        {
             self.table.require(column)?;
         }
         let mut sql = format!(
@@ -214,8 +225,9 @@ impl<'a> Select<'a> {
             list(self.columns.iter().copied()),
             ident(&self.table.name)
         );
-        if let Some(column) = self.newest_first {
-            let _ = write!(sql, " ORDER BY {} DESC", ident(column));
+        if let Some((column, descending)) = self.order {
+            let direction = if descending { "DESC" } else { "ASC" };
+            let _ = write!(sql, " ORDER BY {} {direction}", ident(column));
         }
         if self.limit {
             sql.push_str(" LIMIT $2");

@@ -369,6 +369,10 @@ impl<S: BlockSource, K: EnvelopeSink> Machine<S, K> {
         let mut heads = self.source.subscribe_heads().await?;
         loop {
             tokio::select! {
+                // A head and the reconcile timer can be ready together; checking the head
+                // first makes the choice the same every time instead of tokio's random
+                // pick. Either order is correct: a reconcile reads the head itself.
+                biased;
                 head = heads.next() => match head {
                     Some(head) => { self.process_head(head?).await?; }
                     None => return Err(PipelineError::SubscriptionClosed),

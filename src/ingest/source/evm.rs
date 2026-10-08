@@ -43,8 +43,9 @@ use alloy_network::any::{AnyRpcBlock, AnyRpcTransaction, AnyTransactionReceipt};
 use alloy_network::eip2718::Typed2718 as _;
 use alloy_network::{AnyNetwork, TransactionResponse};
 use alloy_primitives::{B256, Bloom};
-use alloy_provider::{Provider, ProviderBuilder, RootProvider, WsConnect};
-use alloy_rpc_client::ClientBuilder;
+use alloy_provider::{Provider, RootProvider, WsConnect};
+use alloy_pubsub::PubSubConnect;
+use alloy_rpc_client::{ClientBuilder, RpcClient};
 use alloy_rpc_types_eth::Filter;
 use alloy_rpc_types_eth::Log as RpcLog;
 use alloy_transport::{TransportError, TransportErrorKind};
@@ -141,59 +142,68 @@ impl FetchPlan {
     }
 }
 
-/// A source that talks to one EVM chain over HTTP JSON-RPC and WebSocket.
+/// A source that talks to one EVM chain: blocks over a JSON-RPC client, live heads
+/// over a subscription connection `C`.
+///
+/// A deployment reads over HTTP ([`http_client`]) and subscribes over WebSocket
+/// ([`ws_connect`]); a simulation passes in-memory ones instead.
 #[derive(Debug)]
-pub struct EvmSource {
+pub struct EvmSource<C = WsConnect> {
     chain: ChainId,
-    ws_url: String,
+    heads: C,
     provider: RootProvider<AnyNetwork>,
     plan: FetchPlan,
 }
 
-impl EvmSource {
-    /// Builds a source for `chain` that fetches `datasets`.
+impl<C> EvmSource<C> {
+    /// Builds a source for `chain` that fetches `datasets` over `http` and subscribes
+    /// to heads through `heads`, which is connected afresh for each subscription.
     ///
     /// A live notification's metadata stands in for the header only on the logs-only
     /// live path; every other dataset still reads the block body, and the header is
     /// what supplies linkage when no notification did.
-    ///
-    /// HTTP requests are paced and retried to fit the provider's rate limit, which is
-    /// learned from its refusals rather than configured.
-    ///
-    /// # Errors
-    ///
-    /// Returns a typed error if the HTTP endpoint or TLS client cannot be built.
-    pub fn new(
-        chain: impl Into<ChainId>,
-        http_url: impl Into<String>,
-        ws_url: impl Into<String>,
-        datasets: Datasets,
-    ) -> Result<Self, SourceError> {
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(10))
-            .build()?;
-        let url = http_url
-            .into()
-            .parse()
-            .map_err(|source| SourceError::Transport {
-                context: "HTTP endpoint",
-                source: TransportErrorKind::custom(source),
-            })?;
-        let provider = ProviderBuilder::new()
-            .disable_recommended_fillers()
-            .network::<AnyNetwork>()
-            .connect_client(
-                ClientBuilder::default()
-                    .layer(RetryLayer::default())
-                    .http_with_client(client, url),
-            );
-        Ok(Self {
+    pub fn new(chain: impl Into<ChainId>, http: RpcClient, heads: C, datasets: Datasets) -> Self {
+        Self {
             chain: chain.into(),
-            ws_url: ws_url.into(),
-            provider,
+            heads,
+            provider: RootProvider::new(http),
             plan: FetchPlan::new(datasets),
-        })
+        }
     }
+}
+
+/// The JSON-RPC client a deployment reads blocks over: HTTP to `url`.
+///
+/// Requests are paced and retried to fit the provider's rate limit, which is learned
+/// from its refusals rather than configured.
+///
+/// # Errors
+///
+/// Returns a typed error if the HTTP endpoint or TLS client cannot be built.
+pub fn http_client(url: &str) -> Result<RpcClient, SourceError> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()?;
+    let url = url.parse().map_err(|source| SourceError::Transport {
+        context: "HTTP endpoint",
+        source: TransportErrorKind::custom(source),
+    })?;
+    // Jitter only has to differ between processes, so the OS-keyed hasher seeds it.
+    let seed = std::hash::BuildHasher::hash_one(&std::hash::RandomState::new(), ());
+    Ok(ClientBuilder::default()
+        .layer(RetryLayer::new(seed))
+        .http_with_client(client, url))
+}
+
+/// The connection a deployment subscribes to heads over: WebSocket to `url`.
+///
+/// Alloy reconnects and reissues active subscriptions; retries are bounded per
+/// disconnect, rather than hiding an unavailable endpoint forever.
+#[must_use]
+pub fn ws_connect(url: &str) -> WsConnect {
+    WsConnect::new(url)
+        .with_max_retries(3)
+        .with_retry_interval(std::time::Duration::from_secs(1))
 }
 
 /// A block's header fields a `newHeads` notification carries: identity, parent
@@ -749,23 +759,17 @@ fn log_record(
     })
 }
 
-impl BlockSource for EvmSource {
+impl<C: PubSubConnect + Clone> BlockSource for EvmSource<C> {
     fn chain(&self) -> &ChainId {
         &self.chain
     }
 
     async fn subscribe_heads(&self) -> Result<HeadStream, SourceError> {
-        // Alloy reconnects and reissues active subscriptions; retries are bounded
-        // per disconnect, rather than hiding an unavailable endpoint forever.
-        let connect = WsConnect::new(self.ws_url.clone())
-            .with_max_retries(3)
-            .with_retry_interval(std::time::Duration::from_secs(1));
-        let provider = ProviderBuilder::new()
-            .disable_recommended_fillers()
-            .network::<AnyNetwork>()
-            .connect_ws(connect)
+        let client = ClientBuilder::default()
+            .pubsub(self.heads.clone())
             .await
             .map_err(|source| transport("websocket connect", source))?;
+        let provider = RootProvider::<AnyNetwork>::new(client);
         // Identity, parent hash, and timestamp, so a fetch for this height can reuse
         // them instead of reading the same header again over HTTP. Subscribe through
         // Alloy's client so the typed result stream retains malformed notifications
@@ -868,7 +872,7 @@ impl BlockSource for EvmSource {
     }
 }
 
-impl EvmSource {
+impl<C> EvmSource<C> {
     /// Fetches the block's receipts one transaction at a time, in index order.
     ///
     /// The fallback for nodes without `eth_getBlockReceipts`. The hashes are requested
@@ -918,7 +922,7 @@ impl EvmSource {
         height: u64,
     ) -> Result<(AnyRpcBlock, Option<Vec<AnyTransactionReceipt>>), SourceError> {
         let tag = alloy_rpc_types_eth::BlockNumberOrTag::Number(height);
-        // In 1.8.3 Provider::client() returns RpcClientInner; new_batch() is
+        // In alloy 2.5.0 Provider::client() returns RpcClientInner; new_batch() is
         // only on RpcClient. This is its identical BatchRequest constructor.
         let mut batch = alloy_rpc_client::BatchRequest::new(self.provider.client());
         let block = batch
@@ -996,7 +1000,7 @@ impl EvmSource {
 }
 
 /// Renders the source as its chain, for log fields.
-impl fmt::Display for EvmSource {
+impl<C> fmt::Display for EvmSource<C> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "evm[{}]", self.chain)
     }
@@ -1013,10 +1017,25 @@ mod tests {
     use alloy_primitives::{Address, B256};
     use serde_json::{Value, json};
 
-    use super::{EvmSource, RpcBatch, decode_block};
+    use super::{EvmSource, RpcBatch, decode_block, http_client, ws_connect};
     use crate::ingest::source::{BlockMeta, BlockSource, SourceError};
     use crate::sink::Datasets;
     use crate::wire::envelope::Event;
+
+    /// A source over real HTTP and WebSocket endpoints, as a deployment builds one.
+    fn from_urls(
+        chain: &str,
+        http_url: impl AsRef<str>,
+        ws_url: impl AsRef<str>,
+        datasets: Datasets,
+    ) -> Result<EvmSource, SourceError> {
+        Ok(EvmSource::new(
+            chain,
+            http_client(http_url.as_ref())?,
+            ws_connect(ws_url.as_ref()),
+            datasets,
+        ))
+    }
 
     /// Matches the `block()` fixture's `timestamp`, so metadata and body agree.
     const TIMESTAMP: u64 = 0x6530_a1b0;
@@ -1079,8 +1098,7 @@ mod tests {
     #[tokio::test]
     async fn primary_fetch_is_one_two_call_batch_with_reversed_responses() {
         let (url, server) = rpc_server(1, |request| primary_reply(request, &block(), &receipts()));
-        let source =
-            EvmSource::new("ethereum", url, "ws://unused", Datasets::all()).expect("source");
+        let source = from_urls("ethereum", url, "ws://unused", Datasets::all()).expect("source");
         let fetched = source.fetch_block(18_000_000, None).await.expect("fetch");
         assert_eq!(fetched.events.len(), 5);
         // The header is reported as metadata, and no finalized call is made.
@@ -1157,7 +1175,7 @@ mod tests {
     }
 
     fn logs_only(url: String) -> EvmSource {
-        EvmSource::new(
+        from_urls(
             "base",
             url,
             "ws://unused",
@@ -1180,7 +1198,7 @@ mod tests {
         ] {
             let logs = [log_at(100, 0), log_at(100, 1), log_at(102, 0)];
             let (url, server) = rpc_server(1, move |request| range_reply(request, &logs, None));
-            let source = EvmSource::new(
+            let source = from_urls(
                 "base",
                 url,
                 "ws://unused",
@@ -1290,8 +1308,7 @@ mod tests {
     #[tokio::test]
     async fn a_transaction_dataset_backfills_one_height_at_a_time() {
         let (url, server) = rpc_server(1, |request| primary_reply(request, &block(), &receipts()));
-        let source =
-            EvmSource::new("ethereum", url, "ws://unused", Datasets::all()).expect("source");
+        let source = from_urls("ethereum", url, "ws://unused", Datasets::all()).expect("source");
         let blocks = source
             .fetch_blocks(18_000_000, 18_000_009)
             .await
@@ -1309,7 +1326,7 @@ mod tests {
     async fn a_reusable_head_still_reads_the_body_for_a_transaction_dataset() {
         // One batch, two calls: the body is read even though a head was announced.
         let (url, server) = rpc_server(1, |request| primary_reply(request, &block(), &receipts()));
-        let source = EvmSource::new(
+        let source = from_urls(
             "ethereum",
             url,
             "ws://unused",
@@ -1382,8 +1399,7 @@ mod tests {
                     )
                 }
             });
-            let source =
-                EvmSource::new("base", url, "ws://unused", Datasets::all()).expect("source");
+            let source = from_urls("base", url, "ws://unused", Datasets::all()).expect("source");
             let fetched = source
                 .fetch_block(18_000_000, None)
                 .await
@@ -1427,7 +1443,7 @@ mod tests {
                 response
             });
             let source =
-                EvmSource::new("ethereum", url, "ws://unused", Datasets::all()).expect("source");
+                from_urls("ethereum", url, "ws://unused", Datasets::all()).expect("source");
             let error = source
                 .fetch_block(18_000_000, None)
                 .await
@@ -1492,8 +1508,7 @@ mod tests {
                 }
             }
         });
-        let source =
-            EvmSource::new("ethereum", "http://unused", url, Datasets::all()).expect("source");
+        let source = from_urls("ethereum", "http://unused", url, Datasets::all()).expect("source");
         let mut heads = source.subscribe_heads().await.expect("subscribe");
         drop(source);
         let consume = async {
@@ -1770,8 +1785,7 @@ mod tests {
         let (url, server) = rpc_server(1, move |request| {
             primary_reply(request, &block(), &receipts)
         });
-        let source =
-            EvmSource::new("ethereum", url, "ws://unused", Datasets::all()).expect("source");
+        let source = from_urls("ethereum", url, "ws://unused", Datasets::all()).expect("source");
         let error = source
             .fetch_block(18_000_000, None)
             .await
@@ -1796,8 +1810,7 @@ mod tests {
             .expect("a free port")
             .port();
         let url = format!("http://127.0.0.1:{port}/v2/secret-api-key");
-        let source =
-            EvmSource::new("ethereum", url, "ws://unused", Datasets::all()).expect("source");
+        let source = from_urls("ethereum", url, "ws://unused", Datasets::all()).expect("source");
         let error = source
             .fetch_block(1, None)
             .await
@@ -1861,7 +1874,7 @@ mod tests {
         receipts[0]["logs"] = json!([]);
 
         let (url, server) = rpc_server(1, move |request| primary_reply(request, &block, &receipts));
-        let source = EvmSource::new("base", url, "ws://unused", Datasets::all()).expect("source");
+        let source = from_urls("base", url, "ws://unused", Datasets::all()).expect("source");
         let fetched = source
             .fetch_block(18_000_000, None)
             .await

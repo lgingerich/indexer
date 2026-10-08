@@ -4,9 +4,10 @@
 //! whether that flush is a line of its own, part of a one-second catch-up summary, or
 //! quiet, and it logs a reorg on its own. Finality-only batches are not progress.
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use alloy_primitives::B256;
+use tokio::time::Instant;
 use tracing::info;
 
 use crate::wire::envelope::{ChainId, Envelope, Event};

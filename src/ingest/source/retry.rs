@@ -15,8 +15,12 @@
 //! One timeout is not transient: an `eth_getLogs` over more than one height. A range
 //! that ran out of time is too large for the provider, and resending it would only wait
 //! out the same timeout again, so it is returned at once for the source to retry smaller.
+//!
+//! A failure to reach the provider at all is a [`NetworkError`], whatever transport
+//! raised it: the layer converts the HTTP client's own errors into one, so the
+//! classification below never depends on which client sits underneath, and a simulated
+//! transport fails the same way a real one does.
 
-use std::hash::{BuildHasher as _, RandomState};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::{Context, Poll};
@@ -25,6 +29,7 @@ use std::time::Duration;
 use alloy_json_rpc::{RequestPacket, ResponsePacket, RpcError};
 use alloy_transport::{TransportError, TransportErrorKind, TransportFut};
 use serde::Deserialize;
+use thiserror::Error;
 use tower::{Layer, Service};
 use tracing::warn;
 
@@ -76,10 +81,105 @@ impl Pacing {
     }
 }
 
+/// The random spread added to each backoff, from a seed.
+///
+/// `SplitMix64`: one atomic word of state, so every request through one layer draws from
+/// one sequence without a lock, and a fixed seed replays the same delays. Jitter needs
+/// spread, not cryptographic quality.
+#[derive(Debug, Clone)]
+struct Jitter(Arc<AtomicU64>);
+
+impl Jitter {
+    fn new(seed: u64) -> Self {
+        Self(Arc::new(AtomicU64::new(seed)))
+    }
+
+    fn next(&self) -> u64 {
+        const GAMMA: u64 = 0x9e37_79b9_7f4a_7c15;
+        let mut z = self
+            .0
+            .fetch_add(GAMMA, Ordering::Relaxed)
+            .wrapping_add(GAMMA);
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        z ^ (z >> 31)
+    }
+
+    /// "Equal jitter": half of `delay_ms`, plus a random share of the other half, so
+    /// clients that failed together do not come back together.
+    fn delay(&self, delay_ms: u64) -> Duration {
+        let half = delay_ms / 2;
+        Duration::from_millis(half + self.next() % (half + 1))
+    }
+}
+
+/// A request that never got an answer: the connection failed, or no response arrived in
+/// time. Always transient, except as the [module docs](self) say for a ranged log query.
+///
+/// Its message carries no request URL, since a provider's URL usually holds its API key
+/// and these errors are logged.
+#[derive(Debug, Error)]
+#[error("{detail}")]
+pub(crate) struct NetworkError {
+    timeout: bool,
+    detail: String,
+}
+
+impl NetworkError {
+    /// The provider did not answer in time.
+    pub(crate) fn timeout(detail: impl Into<String>) -> Self {
+        Self {
+            timeout: true,
+            detail: detail.into(),
+        }
+    }
+
+    /// The connection failed: refused, reset, or closed mid-response.
+    pub(crate) fn connection(detail: impl Into<String>) -> Self {
+        Self {
+            timeout: false,
+            detail: detail.into(),
+        }
+    }
+
+    /// The HTTP client's error as a [`NetworkError`], or the error unchanged when it
+    /// came from anywhere else.
+    fn from_transport(error: TransportError) -> TransportError {
+        let RpcError::Transport(TransportErrorKind::Custom(error)) = error else {
+            return error;
+        };
+        let error = match error.downcast::<reqwest::Error>() {
+            Ok(error) => {
+                let error = error.without_url();
+                let detail = error.to_string();
+                Box::new(if error.is_timeout() {
+                    Self::timeout(detail)
+                } else {
+                    Self::connection(detail)
+                })
+            }
+            Err(error) => error,
+        };
+        RpcError::Transport(TransportErrorKind::Custom(error))
+    }
+}
+
 /// A tower layer that paces and retries requests. See the [module docs](self).
-#[derive(Debug, Clone, Default)]
-pub(super) struct RetryLayer {
+#[derive(Debug, Clone)]
+pub(crate) struct RetryLayer {
     pacing: Pacing,
+    jitter: Jitter,
+}
+
+impl RetryLayer {
+    /// A layer whose backoff jitter is drawn from `seed`. A deployment seeds it from the
+    /// OS; a simulation passes its own, so a run replays.
+    pub(crate) fn new(seed: u64) -> Self {
+        Self {
+            pacing: Pacing::default(),
+            jitter: Jitter::new(seed),
+        }
+    }
 }
 
 impl<S> Layer<S> for RetryLayer {
@@ -89,15 +189,17 @@ impl<S> Layer<S> for RetryLayer {
         RetryService {
             inner,
             pacing: self.pacing.clone(),
+            jitter: self.jitter.clone(),
         }
     }
 }
 
 /// The service [`RetryLayer`] wraps a transport in.
 #[derive(Debug, Clone)]
-pub(super) struct RetryService<S> {
+pub(crate) struct RetryService<S> {
     inner: S,
     pacing: Pacing,
+    jitter: Jitter,
 }
 
 impl<S> Service<RequestPacket> for RetryService<S>
@@ -125,14 +227,18 @@ where
         let clone = self.inner.clone();
         let mut inner = std::mem::replace(&mut self.inner, clone);
         let pacing = self.pacing.clone();
+        let jitter = self.jitter.clone();
         Box::pin(async move {
             let mut retries = 0;
             loop {
                 let delay = pacing.current();
                 if delay > 0 {
-                    tokio::time::sleep(jitter(delay)).await;
+                    tokio::time::sleep(jitter.delay(delay)).await;
                 }
-                let result = inner.call(request.clone()).await;
+                let result = inner
+                    .call(request.clone())
+                    .await
+                    .map_err(NetworkError::from_transport);
                 if timed_out(&result) && spans_heights(&request) {
                     return result;
                 }
@@ -176,23 +282,21 @@ fn transient(result: &Result<ResponsePacket, TransportError>) -> Option<String> 
         Err(RpcError::Transport(TransportErrorKind::MissingBatchResponse(_))) => {
             Some("batch response missing a call".to_owned())
         }
-        // The HTTP transport's connect, send, and body-read failures. The error's
-        // message carries the URL, and with it the API key, so it is not logged.
         Err(RpcError::Transport(TransportErrorKind::Custom(error)))
-            if error.is::<reqwest::Error>() =>
+            if error.is::<NetworkError>() =>
         {
-            Some("network error".to_owned())
+            Some(format!("network error: {error}"))
         }
         _ => None,
     }
 }
 
-/// Whether `result` is the HTTP client's request timeout.
+/// Whether `result` is a request that ran out of time.
 fn timed_out(result: &Result<ResponsePacket, TransportError>) -> bool {
     matches!(
         result,
         Err(RpcError::Transport(TransportErrorKind::Custom(error)))
-            if error.downcast_ref::<reqwest::Error>().is_some_and(reqwest::Error::is_timeout)
+            if error.downcast_ref::<NetworkError>().is_some_and(|error| error.timeout)
     )
 }
 
@@ -212,16 +316,6 @@ fn spans_heights(request: &RequestPacket) -> bool {
                 .and_then(|params| serde_json::from_str::<(Range,)>(params.get()).ok())
                 .is_some_and(|(range,)| range.from_block != range.to_block)
     })
-}
-
-/// "Equal jitter": half of `delay_ms`, plus a random share of the other half, so clients
-/// that failed together do not come back together.
-fn jitter(delay_ms: u64) -> Duration {
-    let half = delay_ms / 2;
-    // Each `RandomState` is keyed afresh, so hashing nothing with one yields a random
-    // `u64` without an RNG dependency. Jitter needs spread, not cryptographic quality.
-    let random = RandomState::new().hash_one(());
-    Duration::from_millis(half + random % (half + 1))
 }
 
 #[cfg(test)]
@@ -273,7 +367,7 @@ mod tests {
     /// the slowdown it caused wears off as requests succeed.
     #[tokio::test(start_paused = true)]
     async fn a_refusal_is_retried_and_the_slowdown_recovers() {
-        let layer = RetryLayer::default();
+        let layer = RetryLayer::new(0);
         let (result, calls) = send(&layer, |n| match n {
             0 => Err(TransportErrorKind::http_error(429, String::new())),
             1 => Ok(response(
@@ -299,7 +393,7 @@ mod tests {
     /// handed back after one call.
     #[tokio::test(start_paused = true)]
     async fn a_permanent_error_is_returned_at_once() {
-        let (result, calls) = send(&RetryLayer::default(), |_| {
+        let (result, calls) = send(&RetryLayer::new(0), |_| {
             Ok(response(
                 r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32601,"message":"not found"}}"#,
             ))
@@ -312,7 +406,7 @@ mod tests {
     /// Retrying ends, and the provider's own last error is what the caller sees.
     #[tokio::test(start_paused = true)]
     async fn retries_stop_and_return_the_last_error() {
-        let (result, calls) = send(&RetryLayer::default(), |_| {
+        let (result, calls) = send(&RetryLayer::new(0), |_| {
             Err(TransportErrorKind::http_error(503, String::new()))
         })
         .await;
@@ -360,7 +454,7 @@ mod tests {
                 timeouts.push(timeout().await);
             }
             let timeouts = Mutex::new(timeouts);
-            let layer = RetryLayer::default();
+            let layer = RetryLayer::new(0);
             let (result, calls) = send_call(&layer, "eth_getLogs", json!([filter]), move |_| {
                 Err(timeouts
                     .lock()

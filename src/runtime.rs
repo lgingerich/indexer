@@ -52,6 +52,8 @@ use crate::config::{Settings, SettingsError, Sink};
 use crate::decode::{Catalog, CatalogError, Decoder, DecodingSink};
 use crate::ingest::Ingest;
 use crate::ingest::pipeline::PipelineError;
+use crate::ingest::source::evm::{http_client, ws_connect};
+use crate::ingest::source::{BlockSource, EvmSource, SourceError};
 #[cfg(any(feature = "duckdb", feature = "postgres"))]
 use crate::ingest::{pipeline::MAX_UNFINALIZED_BLOCKS, source::BlockMeta};
 #[cfg(any(feature = "duckdb", feature = "postgres"))]
@@ -60,6 +62,8 @@ use crate::sink;
 use crate::sink::DuckDbSink;
 use crate::sink::table::Schema;
 use crate::sink::{SinkError, StdoutJsonSink};
+#[cfg(any(feature = "duckdb", feature = "postgres"))]
+use crate::sink::{SqlStore, store::Engine};
 #[cfg(any(feature = "duckdb", feature = "postgres"))]
 use crate::wire::envelope::AcceptedBlock;
 use crate::wire::envelope::ChainId;
@@ -85,6 +89,9 @@ pub enum RuntimeError {
     /// The protocol manifests could not be loaded, so nothing would have decoded.
     #[error("protocol manifests could not be loaded: {0}")]
     Catalog(#[from] CatalogError),
+    /// The chain source could not be built from its endpoints.
+    #[error("chain source could not be built: {0}")]
+    Source(#[from] SourceError),
     /// The store could not be opened or read back, so there was nowhere to write.
     #[cfg(any(feature = "duckdb", feature = "postgres"))]
     #[error("storage could not be opened: {0}")]
@@ -111,9 +118,12 @@ pub enum RuntimeError {
 }
 
 /// The pipeline the settings describe: the parts, built and ready.
+///
+/// Generic over its source so a simulation runs the same assembly over an in-memory
+/// chain; a deployment's is the [`EvmSource`] [`Pipeline::from_settings`] builds.
 #[derive(Debug)]
-pub(crate) struct Pipeline {
-    ingest: Ingest,
+pub(crate) struct Pipeline<B = EvmSource> {
+    ingest: Ingest<B>,
     decoder: Decoder,
     /// Every table a store creates: the dataset tables and each decoded event's.
     schema: Arc<Schema>,
@@ -122,30 +132,38 @@ pub(crate) struct Pipeline {
 impl Pipeline {
     /// Assembles the pipeline the settings describe.
     ///
-    /// Opens nothing: the store is connected in [`Pipeline::run`], so building fails on
-    /// unreadable manifests without touching a database file.
+    /// Opens nothing: the store is connected in [`Pipeline::run`], and the source's
+    /// WebSocket at its first subscription, so building fails on unreadable manifests
+    /// without touching a database file or the network.
     ///
     /// # Errors
     ///
-    /// Returns [`RuntimeError::Catalog`] when the manifests cannot be loaded.
+    /// Returns [`RuntimeError::Catalog`] when the manifests cannot be loaded, and
+    /// [`RuntimeError::Source`] when the HTTP client cannot be built.
     pub(crate) fn from_settings(settings: &Settings) -> Result<Self, RuntimeError> {
-        let ingest = Ingest::new(
-            &settings.ingest.chain,
-            settings.ingest.http_url.clone(),
-            settings.ingest.ws_url.clone(),
-            &settings.ingest.datasets,
-            settings.ingest.start_block,
+        let source = EvmSource::new(
+            settings.ingest.chain.as_str(),
+            http_client(settings.ingest.http_url.expose())?,
+            ws_connect(settings.ingest.ws_url.expose()),
+            settings.ingest.datasets,
         );
         let catalog = settings
             .protocols_path()
             .map_or_else(Catalog::empty, |path| {
                 Catalog::load(path, &ChainId::new(&settings.ingest.chain))
             })?;
-        Ok(Self {
-            ingest,
+        Ok(Self::new(source, settings.ingest.start_block, catalog))
+    }
+}
+
+impl<B: BlockSource> Pipeline<B> {
+    /// Assembles a pipeline reading `source` and decoding what `catalog` declares.
+    pub(crate) fn new(source: B, start_block: Option<u64>, catalog: Catalog) -> Self {
+        Self {
+            ingest: Ingest::new(source, start_block),
             schema: Arc::new(catalog.schema().clone()),
             decoder: Decoder::new(catalog),
-        })
+        }
     }
 
     /// Runs until ingest or storage stops.
@@ -156,12 +174,7 @@ impl Pipeline {
     /// [`RuntimeError::Ingest`] or [`RuntimeError::Storage`] when a part fails. Each
     /// carries that part's own error, because "storage stopped" says nothing about why.
     pub(crate) async fn run(self, settings: &Settings) -> Result<(), RuntimeError> {
-        let Self {
-            ingest,
-            decoder,
-            schema,
-        } = self;
-        if !settings.ingest.datasets.logs && decoder.contracts() > 0 {
+        if !settings.ingest.datasets.logs && self.decoder.contracts() > 0 {
             warn!("`logs` dataset is not selected; registered contracts will not decode");
         }
 
@@ -171,6 +184,11 @@ impl Pipeline {
             Sink::Stdout(_) => {
                 // No store, so no tables and nothing to restore: a run starts fresh from the
                 // manifests' seeds.
+                let Self {
+                    ingest,
+                    decoder,
+                    schema,
+                } = self;
                 drop(schema);
                 ingest
                     .run(
@@ -182,43 +200,57 @@ impl Pipeline {
             }
             #[cfg(feature = "postgres")]
             Sink::Postgres(postgres) => {
-                let mut store =
-                    sink::PostgresSink::open(postgres, schema, &settings.ingest.chain).await?;
-                let chain = ChainId::new(&settings.ingest.chain);
-                let decoder = restore(decoder, &chain, store.contracts(&chain).await?);
-                let ledger = ledger(&chain, store.ledger(&chain, LEDGER_WINDOW).await?);
-                let (blocks, receiver) = sink::channel::ChannelSink::new();
-                let batch_records = postgres.batch_records;
-                let storage =
-                    tokio::spawn(async move { receiver.drain(&mut store, batch_records).await });
-                let ingest = ingest.run(DecodingSink::new(decoder, blocks), ledger).await;
-                finish(storage.await, ingest)
+                let store = sink::PostgresSink::open(
+                    postgres,
+                    Arc::clone(&self.schema),
+                    &settings.ingest.chain,
+                )
+                .await?;
+                Box::pin(self.run_with_store(store, postgres.batch_records)).await
             }
             #[cfg(feature = "duckdb")]
             Sink::DuckDb(duckdb) => {
                 // Open the store before ingest starts, so a bad path fails at startup
                 // rather than after the first block.
-                let mut store = DuckDbSink::open(duckdb, schema, &settings.ingest.chain).await?;
-                let chain = ChainId::new(&settings.ingest.chain);
-                let decoder = restore(decoder, &chain, store.contracts(&chain).await?);
-                let ledger = ledger(&chain, store.ledger(&chain, LEDGER_WINDOW).await?);
-
-                let (blocks, receiver) = sink::channel::ChannelSink::new();
-                let batch_records = duckdb.batch_records;
-                // `ponytail:` the store's writes block, so this holds one runtime worker
-                // for the length of each flush. Fine on the multi-threaded runtime the
-                // binary uses; a dedicated blocking thread is the upgrade if the store
-                // gets slow enough to starve other tasks.
-                let storage =
-                    tokio::spawn(async move { receiver.drain(&mut store, batch_records).await });
-
-                let ingest = ingest.run(DecodingSink::new(decoder, blocks), ledger).await;
-
-                // Ingest's half of the channel is gone by now, so storage drains what is
-                // queued and ends. The join order is [`finish`].
-                finish(storage.await, ingest)
+                let store =
+                    DuckDbSink::open(duckdb, Arc::clone(&self.schema), &settings.ingest.chain)
+                        .await?;
+                Box::pin(self.run_with_store(store, duckdb.batch_records)).await
             }
         }
+    }
+
+    /// Runs against an open `store`: restores what it holds, then ingests into it,
+    /// committing at most `batch_records` records per flush.
+    ///
+    /// # Errors
+    ///
+    /// As [`Pipeline::run`], less opening the store.
+    #[cfg(any(feature = "duckdb", feature = "postgres"))]
+    pub(crate) async fn run_with_store<E: Engine + 'static>(
+        self,
+        mut store: SqlStore<E>,
+        batch_records: usize,
+    ) -> Result<(), RuntimeError> {
+        let Self {
+            ingest, decoder, ..
+        } = self;
+        let chain = ingest.chain().clone();
+        let decoder = restore(decoder, &chain, store.contracts(&chain).await?);
+        let ledger = ledger(&chain, store.ledger(&chain, LEDGER_WINDOW).await?);
+
+        let (blocks, receiver) = sink::channel::ChannelSink::new();
+        // `ponytail:` the store's writes block, so this holds one runtime worker for the
+        // length of each flush. Fine on the multi-threaded runtime the binary uses; a
+        // dedicated blocking thread is the upgrade if the store gets slow enough to
+        // starve other tasks.
+        let storage = tokio::spawn(async move { receiver.drain(&mut store, batch_records).await });
+
+        let ingest = ingest.run(DecodingSink::new(decoder, blocks), ledger).await;
+
+        // Ingest's half of the channel is gone by now, so storage drains what is
+        // queued and ends. The join order is [`finish`].
+        finish(storage.await, ingest)
     }
 }
 
@@ -609,28 +641,25 @@ ws_url = "wss://example.invalid"
 
     /// One process lifetime against the store behind `connection`: restore what the store
     /// holds, index `chain` to its head through decode and the storage channel, then stop
-    /// and let storage drain, as a crash after the last commit would leave it.
+    /// when the head subscription ends and let storage drain, as a crash after the last
+    /// commit would leave it.
     async fn run_once(connection: &duckdb::Connection, chain: FakeChain, start: Option<u64>) {
-        let mut store =
+        let store =
             DuckDbSink::connected(connection.try_clone().expect("handle"), schema(), "base")
                 .await
                 .expect("open");
-        let id = chain.chain.clone();
-        let mut decoder = decoder();
-        decoder.restore(store.contracts(&id).await.expect("contracts"));
-        let restored = ledger(&id, store.ledger(&id, LEDGER_WINDOW).await.expect("ledger"));
-        let (blocks, receiver) = sink::channel::ChannelSink::new();
-        let storage = tokio::spawn(async move { receiver.drain(&mut store, 500).await });
-        let machine = Machine::new(chain, DecodingSink::new(decoder, blocks), restored);
-        let ingest = match start {
-            Some(from) => machine.backfill(from).await.map(drop),
-            None => machine.run().await,
-        };
+        let catalog =
+            Catalog::load(protocols(), &ChainId::new("base")).expect("shipped protocols load");
+        let result = Pipeline::new(chain, start, catalog)
+            .run_with_store(store, 500)
+            .await;
         assert!(
-            matches!(ingest, Ok(()) | Err(PipelineError::SubscriptionClosed)),
-            "{ingest:?}"
+            matches!(
+                result,
+                Err(RuntimeError::Ingest(PipelineError::SubscriptionClosed))
+            ),
+            "{result:?}"
         );
-        storage.await.expect("no panic").expect("storage drains");
     }
 
     fn heights(reader: &duckdb::Connection) -> Vec<(u64, String)> {

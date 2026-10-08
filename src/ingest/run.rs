@@ -1,48 +1,39 @@
 //! Running the ingest stage: one source into one sink.
 //!
-//! A caller names a chain and its endpoints and gets a future that runs until the
-//! source ends. Nothing here reads the environment — that is [`crate::config`]'s job,
-//! which has already required both endpoints before this is constructed.
+//! A caller hands over a built source and gets a future that runs until the source
+//! ends. Building the source — endpoints, clients, subscriptions — is the caller's job,
+//! so a deployment and a simulation run the same stage over different sources.
 
 use tracing::info;
 
-use crate::config::Secret;
 use crate::ingest::pipeline::{Machine, PipelineError};
-use crate::ingest::source::{BlockMeta, EvmSource};
-use crate::sink::{Datasets, EnvelopeSink};
+use crate::ingest::source::{BlockMeta, BlockSource};
+use crate::sink::EnvelopeSink;
+use crate::wire::envelope::ChainId;
 
-/// Builds and runs the ingest stage.
+/// The ingest stage: a source and where a fresh run starts.
 #[derive(Debug)]
-pub struct Ingest {
-    chain: String,
-    http_url: Secret,
-    ws_url: Secret,
-    datasets: Datasets,
+pub struct Ingest<B> {
+    source: B,
     start_block: Option<u64>,
 }
 
-impl Ingest {
-    /// Builds an ingest stage for `chain` and its two endpoints.
+impl<B: BlockSource> Ingest<B> {
+    /// An ingest stage reading `source`.
     ///
-    /// Both endpoints are required [`Secret`]s, since a provider's URL usually carries
-    /// its API key. A settings file that omits one never reaches here: serde rejects it
-    /// first. `start_block` selects the first height of a fresh run: `None` starts at
-    /// the observed head, `Some` indexes from that height.
+    /// `start_block` selects the first height of a fresh run: `None` starts at the
+    /// observed head, `Some` indexes from that height.
     #[must_use]
-    pub fn new(
-        chain: impl Into<String>,
-        http_url: Secret,
-        ws_url: Secret,
-        datasets: &Datasets,
-        start_block: Option<u64>,
-    ) -> Self {
+    pub const fn new(source: B, start_block: Option<u64>) -> Self {
         Self {
-            chain: chain.into(),
-            http_url,
-            ws_url,
-            datasets: *datasets,
+            source,
             start_block,
         }
+    }
+
+    /// The chain the source reads.
+    pub fn chain(&self) -> &ChainId {
+        self.source.chain()
     }
 
     /// Indexes through the sampled head, then follows live heads.
@@ -64,19 +55,12 @@ impl Ingest {
         ledger: Vec<BlockMeta>,
     ) -> Result<(), PipelineError> {
         info!(
-            chain = %self.chain,
-            datasets = %self.datasets,
+            chain = %self.source.chain(),
             start_block = ?self.start_block,
             restored = ledger.len(),
             "ingest started"
         );
-        let source = EvmSource::new(
-            self.chain,
-            self.http_url.expose(),
-            self.ws_url.expose(),
-            self.datasets,
-        )?;
-        let machine = Machine::new(source, sink, ledger);
+        let machine = Machine::new(self.source, sink, ledger);
         match self.start_block {
             Some(from) => machine.backfill(from).await?.run().await,
             None => machine.run().await,

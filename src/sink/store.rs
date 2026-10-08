@@ -189,7 +189,10 @@ impl Reads {
         let contracts = schema.dataset(Table::Contract);
         let ledger = schema.dataset(Table::AcceptedBlock);
         Ok(Self {
+            // Ordered, so a restore reads the rows the same way every time; an engine
+            // returns an unordered scan in whatever order its threads finish.
             contracts: sql::select(contracts, &["protocol", "name", "address", "block_hash"])
+                .ordered_by("dedupe_key")
                 .render()?,
             ledger: sql::select(ledger, &["height", "hash", "parent_hash", "timestamp"])
                 .newest_first("height")

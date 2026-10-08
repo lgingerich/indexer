@@ -23,23 +23,25 @@ duckdb = ["dep:duckdb"]
 postgres = ["dep:bytes", "dep:native-tls", "dep:postgres-native-tls", "dep:tokio-postgres"]
 
 [dependencies]
-alloy-consensus = "1.8.3"
+alloy-consensus = "2.5.0"
 # Typed RPC errors preserve the node's error payload and method-not-found code.
-alloy-json-rpc = "1.8.3"
-alloy-provider = { version = "=1.8.3", default-features = false, features = ["reqwest", "reqwest-native-tls", "ws"] }
-alloy-transport = "=1.8.3"
-alloy-rpc-client = { version = "=1.8.3", default-features = false, features = ["reqwest"] }
+alloy-json-rpc = "2.5.0"
+# The subscription connector a source takes, so heads can come from any `PubSubConnect`.
+alloy-pubsub = "=2.5.0"
+alloy-provider = { version = "=2.5.0", default-features = false, features = ["reqwest", "reqwest-native-tls", "ws"] }
+alloy-transport = "=2.5.0"
+alloy-rpc-client = { version = "=2.5.0", default-features = false, features = ["reqwest"] }
 # `any` types (`AnyRpcBlock`/`AnyRpcTransaction`) are alloy's catch-all for networks
 # whose transaction types fall outside Ethereum's 0-4: an OP-stack deposit (`0x7e`)
 # or Arbitrum retry (`0x6a`) otherwise fails the whole block. See `ingest::source`.
-alloy-network = "1.8.3"
+alloy-network = "2.5.0"
 alloy-primitives = { version = "1.7.3", default-features = false, features = ["serde", "std"] }
-alloy-rpc-types-eth = { version = "1.8.3", default-features = false, features = ["serde", "std"] }
+alloy-rpc-types-eth = { version = "2.5.0", default-features = false, features = ["serde", "std"] }
 # alloy's own serde helpers. `quantity` renders integers as the Ethereum JSON-RPC
 # "quantity" format (`0x` hex), which is the canonical wire form for these fields
 # and, unlike serde's native integer encoding, survives `#[serde(flatten)]` for
 # `u128` (see `wire::envelope::Envelope`).
-alloy-serde = { version = "1.8.3", default-features = false, features = ["std"] }
+alloy-serde = { version = "2.5.0", default-features = false, features = ["std"] }
 # The dynamic decoder. Static `sol!` decoding cannot cover an open-ended set of
 # contracts, so the registry path is runtime-typed; see `decode::ContractRegistry`.
 alloy-dyn-abi = { version = "1.7.3", default-features = false }
@@ -47,7 +49,7 @@ alloy-dyn-abi = { version = "1.7.3", default-features = false }
 alloy-json-abi = { version = "1.7.3", default-features = false }
 # Bundled DuckDB compiles the C++ engine once via duckdb-sys; it is an embedded,
 # single-writer store, used only by the local DuckDB sink (`duckdb` feature).
-duckdb = { version = "1.10505.0", default-features = false, features = ["bundled"], optional = true }
+duckdb = { version = "1.10506.0", default-features = false, features = ["bundled"], optional = true }
 bytes = { version = "1.12.1", optional = true }
 futures-util = { version = "0.3.34", features = ["sink"] }
 native-tls = { version = "0.2.18", optional = true }
@@ -62,18 +64,18 @@ serde_json = { version = "1.0.151", features = ["raw_value"] }
 thiserror = "2.0.21"
 # The settings file. One format, with `serde` doing the parsing so an unknown key is
 # an error rather than a silently ignored typo.
-toml = { version = "1.1.6", features = ["parse"] }
-tokio = { version = "1.53.1", features = ["io-std", "io-util", "macros", "rt-multi-thread", "signal", "sync", "time"] }
-# Alloy 1.8.3 uses tungstenite 0.28 and enables rustls. Unifying native-tls
+toml = { version = "1.1.7", features = ["parse"] }
+tokio = { version = "1.53.2", features = ["io-std", "io-util", "macros", "rt-multi-thread", "signal", "sync", "time"] }
+# Alloy 2.5.0 uses tungstenite 0.29 and enables rustls. Unifying native-tls
 # makes tungstenite prefer platform TLS while retaining Alloy's required features.
 # The retry layer around the RPC transport is a tower `Layer`, as alloy's own are.
 tower = { version = "0.5.3", default-features = false, features = ["util"] }
-tokio-tungstenite = { version = "0.28", default-features = false, features = ["connect", "native-tls"] }
+tokio-tungstenite = { version = "0.29", default-features = false, features = ["connect", "native-tls"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", default-features = false, features = ["env-filter", "fmt", "json"] }
 
 [dev-dependencies]
-tokio = { version = "1.53.1", features = ["test-util"] }
+tokio = { version = "1.53.2", features = ["test-util"] }
 
 [[bench]]
 name = "hot_path"
