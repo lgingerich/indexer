@@ -417,11 +417,13 @@ handled yet:
 - **Long names need a manual `table` key.** A name past 63 bytes is a startup error, so
   a contract with long event names needs a `table` key chosen by hand; there is no
   automatic shortening.
-- **Documents keep the wire encoding.** Array and tuple arguments, and every argument in
-  `decoded_logs`, are JSON in the published form, where integers are `0x` hex strings.
-  PostgreSQL cannot cast a 256-bit hex string to `NUMERIC` without a helper function, so
-  arithmetic on a value inside a document is awkward. Scalar arguments have typed columns
-  and are not affected.
+- **`decoded_logs` keeps the wire encoding.** Its arguments are JSON in the published
+  form, where integers are `0x` hex strings. PostgreSQL cannot cast a 256-bit hex string
+  to `NUMERIC` without a helper function, so query the event tables for arithmetic.
+- **A tuple's integers are decimal strings.** In an event table a tuple is a JSON
+  document, as Allium renders decoded `params`, so read a value with a cast:
+  `(extension_orders->>'beforeSwap')::NUMERIC`. Packed words, such as Metric's bin data,
+  are stored as the exact integer the ABI declares; unpacking them is left downstream.
 - **A `string` argument may be `NULL`.** A string whose bytes are not valid UTF-8, or that
   holds a NUL, which PostgreSQL rejects in text, is `NULL` in its event table. The raw log
   keeps the exact bytes.
@@ -647,12 +649,16 @@ uniswap_v3_pool_swap
 | `bool` | `BOOLEAN` | `BOOLEAN` |
 | `address`, `bytesN`, `bytes`, `function` | `TEXT`, `0x` hex | `VARCHAR`, `0x` hex |
 | `string` | `TEXT`; `NULL` when not valid UTF-8 or holding a NUL | same |
-| arrays, tuples | `JSONB`, as in `decoded_logs` | `JSON`, as in `decoded_logs` |
+| an array of scalars | that scalar's array, e.g. `NUMERIC(78,0)[]` | that scalar's list, e.g. `BIGNUM[]` |
+| a tuple, or an array of tuples or arrays | `JSONB` | `JSON` |
 | an indexed `string`, `bytes`, array, or tuple | its topic hash, as text | same |
 
 Wide integers are exact, so `sum(amount0)` needs no cast. In DuckDB, `BIGNUM` sums and
 adds exactly, but multiplying it by another type turns the result into a `DOUBLE`; cast
-first when that matters. Argument names become `snake_case` (`sqrtPriceX96` is
+first when that matters. A tuple's document is an object keyed by its ABI component names
+(`arg{n}` when unnamed), with every integer a decimal string and addresses and bytes as
+`0x` hex, as Allium's decoded `params` are; an array of tuples is a list of them. Argument
+names become `snake_case` (`sqrtPriceX96` is
 `sqrt_price_x96`); an unnamed argument is `arg{n}`, and one that repeats an earlier column
 gets `_{n}` appended. A row's key is the decoded record's `dedupe_key`, and a reorg
 deletes it with the rest of its block.

@@ -363,6 +363,9 @@ fn find_manifests(dir: &Path, protocols: &mut Vec<PathBuf>) -> Result<(), Catalo
 }
 
 /// How one input is stored in its event's table: a column under its ABI name.
+///
+/// A scalar is its own typed column and an array of scalars a list of that type. A tuple,
+/// or an array of tuples or arrays, is one document, so a tuple's components stay together.
 fn param(input: &InputSpec<'_>) -> Column {
     let (kind, required) = match input.ty {
         // An indexed string, bytes, array, or tuple is only its topic hash.
@@ -375,6 +378,18 @@ fn param(input: &InputSpec<'_>) -> Column {
         {
             (ColumnType::Text, true)
         }
+        DynSolType::Array(element) | DynSolType::FixedArray(element, _) => scalar(element)
+            .and_then(|(element, _)| ColumnType::list(element))
+            .map_or((ColumnType::Document, true), |list| (list, true)),
+        ty => scalar(ty).unwrap_or((ColumnType::Document, true)),
+    };
+    Column::named(input.name.to_owned(), kind, required)
+}
+
+/// A scalar ABI type's column type and whether every value fills it; `None` for an array
+/// or a tuple.
+const fn scalar(ty: &DynSolType) -> Option<(ColumnType, bool)> {
+    Some(match ty {
         DynSolType::Bool => (ColumnType::Bool, true),
         DynSolType::Uint(bits) if *bits <= 64 => (ColumnType::Uint, true),
         DynSolType::Int(bits) if *bits <= 64 => (ColumnType::Int, true),
@@ -385,9 +400,8 @@ fn param(input: &InputSpec<'_>) -> Column {
         | DynSolType::Bytes => (ColumnType::Text, true),
         // Null when the bytes are not text.
         DynSolType::String => (ColumnType::Text, false),
-        _ => (ColumnType::Document, true),
-    };
-    Column::named(input.name.to_owned(), kind, required)
+        _ => return None,
+    })
 }
 
 /// Why the catalog could not be loaded.
@@ -639,6 +653,38 @@ addresses = { base = ["0x33128a8fC17869897dcE68Ed026d694621f6FDfD"], ethereum = 
                 ("dedupe_key", ColumnType::Text),
             ]
         );
+    }
+
+    /// An array of scalars is a list of its element's column type; a tuple, and an array
+    /// of tuples, is one document.
+    #[test]
+    fn arrays_are_lists_and_tuples_are_documents() {
+        let catalog = Catalog::load(repository(), &ChainId::new("base")).expect("loads");
+        let kind = |table: &str, column: &str| {
+            catalog
+                .schema()
+                .tables()
+                .iter()
+                .find(|def| def.name == table)
+                .unwrap_or_else(|| panic!("a {table} table"))
+                .columns
+                .iter()
+                .find(|def| def.name == column)
+                .unwrap_or_else(|| panic!("a {column} column"))
+                .kind
+        };
+        let list = |element| ColumnType::list(element).expect("a scalar element");
+        let created = "metric_v1_factory_pool_created";
+        assert_eq!(kind(created, "extensions"), list(ColumnType::Text));
+        assert_eq!(kind(created, "extension_orders"), ColumnType::Document);
+        assert_eq!(
+            kind(created, "non_negative_bin_data_array"),
+            list(ColumnType::BigInt)
+        );
+        let added = "metric_v1_metric_omm_pool_liquidity_added";
+        assert_eq!(kind(added, "bin_idxs"), list(ColumnType::BigInt));
+        assert_eq!(kind(added, "bin_balance_deltas"), ColumnType::Document);
+        assert_eq!(ColumnType::list(list(ColumnType::Bool)), None);
     }
 
     /// A name past the limit, two contracts sharing a `table`, and two events by one name

@@ -37,9 +37,10 @@
 //!   of a raw JSON document. That is what makes a typed table a rewrite rather than a
 //!   second dialect.
 //! - [`Bool`](ColumnType::Bool) — receipt status, a log's `removed` flag.
-//! - [`Document`](ColumnType::Document) — a value that does not flatten into scalars. Two
-//!   uses today: a decoded record's arguments, which vary per event, and the hash lists a
-//!   block carries, whose length is known only at read time.
+//! - [`List`](ColumnType::List) — a decoded array of scalars, such as a `uint256[]`, with
+//!   each element in its own type.
+//! - [`Document`](ColumnType::Document) — a value that does not flatten into scalars: a
+//!   decoded record's arguments, a decoded tuple, and the hash lists a block carries.
 //!
 //! Absence is not a type. A field the chain does not have is a [`ColumnValue::Null`] in a
 //! column that otherwise holds its real type, because `NULL` and "no such field" are
@@ -54,7 +55,7 @@ use alloy_primitives::{B256, Bytes, U256};
 
 use crate::wire::datasets::evm::{Block, Log, Receipt, Transaction};
 use crate::wire::envelope::{AcceptedBlock, ChainId, Contract, Decoded, DecodedArg, Event, Reorg};
-use crate::wire::typed::TypedValue;
+use crate::wire::typed::{AbiType, TypedValue};
 
 /// One table a store persists.
 ///
@@ -74,7 +75,7 @@ pub enum Table {
     Receipt,
     /// Logs, one row per log.
     Log,
-    /// Decoded event records, whose arguments ride as documents.
+    /// Decoded event records, whose arguments ride as documents in their raw ABI form.
     Decoded,
     /// Contracts discovered from a factory's creation event.
     Contract,
@@ -273,8 +274,31 @@ pub enum ColumnType {
     Text,
     /// A boolean.
     Bool,
+    /// A list of one scalar type: a decoded `uint256[]`, `address[]`, or `int24[3]`.
+    ///
+    /// The element is a scalar column type, never a list or a document; build one with
+    /// [`list`](Self::list), which enforces that. A store keeps it as its native array
+    /// (`NUMERIC(78,0)[]` in `PostgreSQL`, `BIGNUM[]` in `DuckDB`), so each element is as
+    /// usable as the same value in a scalar column.
+    List(&'static Self),
     /// A structured value that does not flatten into scalars.
     Document,
+}
+
+impl ColumnType {
+    /// A list of `element`, or `None` when `element` is not a scalar: a list of lists or of
+    /// documents is a document instead.
+    #[must_use]
+    pub const fn list(element: Self) -> Option<Self> {
+        Some(Self::List(match element {
+            Self::Uint => &Self::Uint,
+            Self::Int => &Self::Int,
+            Self::BigInt => &Self::BigInt,
+            Self::Text => &Self::Text,
+            Self::Bool => &Self::Bool,
+            Self::List(_) | Self::Document => return None,
+        }))
+    }
 }
 
 /// The two columns every table carries, and the reason a store can key and partition
@@ -307,6 +331,9 @@ pub enum ColumnValue {
     Text(String),
     /// A boolean.
     Bool(bool),
+    /// A list of scalars, each in its column's element type; an element that is not
+    /// storable is [`Null`](Self::Null).
+    List(Vec<Self>),
     /// A structured value that does not flatten.
     ///
     /// A distinct variant rather than `Text` so a store can type the column as a document
@@ -609,12 +636,31 @@ pub fn snake_case(name: &str) -> String {
 
 /// One decoded argument's cell, in the column type its table declares.
 ///
+/// A scalar is the cell [`scalar`] renders, and an array of scalars is a list of them. A
+/// tuple, or an array holding tuples or arrays, is a document in Allium's decoded `params`
+/// form (see [`Params`]) rather than the raw ABI form the `decoded_logs` table keeps.
+fn cell(kind: ColumnType, argument: &DecodedArg) -> ColumnValue {
+    match (kind, &argument.value) {
+        (
+            ColumnType::List(element),
+            TypedValue::Array { value } | TypedValue::FixedArray { value, .. },
+        ) => ColumnValue::List(value.iter().map(|value| scalar(*element, value)).collect()),
+        (ColumnType::Document, value) => ColumnValue::document(&Params {
+            value,
+            abi_type: &argument.abi_type,
+        }),
+        (kind, value) => scalar(kind, value),
+    }
+}
+
+/// One decoded scalar, in the column type its table declares.
+///
 /// The decoder has already checked each value against its declared width, so a `uint64`
 /// fits [`ColumnValue::Uint`] and an `int64` fits [`ColumnValue::Int`]. A `string` that is
 /// not text, or holds a NUL `PostgreSQL` would reject, is null; the raw log keeps its
-/// bytes. Arrays and tuples are documents in the same form the `decoded_logs` table uses.
-fn cell(kind: ColumnType, argument: &DecodedArg) -> ColumnValue {
-    match (kind, &argument.value) {
+/// bytes.
+fn scalar(kind: ColumnType, value: &TypedValue) -> ColumnValue {
+    match (kind, value) {
         (ColumnType::Uint, TypedValue::Uint { value, .. }) => {
             ColumnValue::Uint(value.saturating_to())
         }
@@ -638,8 +684,72 @@ fn cell(kind: ColumnType, argument: &DecodedArg) -> ColumnValue {
             .as_ref()
             .filter(|text| !text.contains('\0'))
             .map_or(ColumnValue::Null, |text| ColumnValue::Text(text.clone())),
-        (ColumnType::Document, value) => ColumnValue::document(value),
         _ => ColumnValue::Null,
+    }
+}
+
+/// A composite decoded argument as Allium renders decoded `params`: a tuple is an object
+/// keyed by its components' ABI names, an array is a list, every integer is a decimal
+/// string, and an address or bytes is `0x` hex. A string that is not text is `null`.
+///
+/// Decimal strings rather than JSON numbers, as Allium has them, so a consumer that parses
+/// JSON numbers as doubles cannot round a `uint256`. An unnamed component is keyed
+/// `arg{n}`, as an unnamed argument's column is.
+struct Params<'a> {
+    value: &'a TypedValue,
+    /// The value's declared type. An array's elements share it, since a tuple array's
+    /// type carries its element tuple's components.
+    abi_type: &'a AbiType,
+}
+
+impl serde::Serialize for Params<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::{SerializeMap as _, SerializeSeq as _};
+
+        match self.value {
+            TypedValue::Bool { value } => serializer.serialize_bool(*value),
+            TypedValue::Uint { value, .. } => serializer.collect_str(value),
+            TypedValue::Int { value, .. } => serializer.collect_str(value),
+            TypedValue::Address { value } => serializer.collect_str(&format_args!("{value:#x}")),
+            TypedValue::IndexedHash { value } => {
+                serializer.collect_str(&format_args!("{value:#x}"))
+            }
+            TypedValue::Function { value } => serializer.collect_str(&format_args!("{value:#x}")),
+            TypedValue::FixedBytes { value, .. } | TypedValue::Bytes { value } => {
+                serializer.collect_str(&format_args!("{value:#x}"))
+            }
+            TypedValue::String { text, .. } => match text {
+                Some(text) => serializer.serialize_str(text),
+                None => serializer.serialize_none(),
+            },
+            TypedValue::Array { value } | TypedValue::FixedArray { value, .. } => {
+                let mut list = serializer.serialize_seq(Some(value.len()))?;
+                for element in value {
+                    list.serialize_element(&Params {
+                        value: element,
+                        abi_type: self.abi_type,
+                    })?;
+                }
+                list.end()
+            }
+            TypedValue::Tuple { value } => {
+                let mut object = serializer.serialize_map(Some(value.len()))?;
+                for (position, (component, declared)) in
+                    value.iter().zip(&self.abi_type.components).enumerate()
+                {
+                    if declared.name.is_empty() {
+                        object.serialize_key(&format_args!("arg{position}"))?;
+                    } else {
+                        object.serialize_key(&declared.name)?;
+                    }
+                    object.serialize_value(&Params {
+                        value: component,
+                        abi_type: &declared.abi_type,
+                    })?;
+                }
+                object.end()
+            }
+        }
     }
 }
 
@@ -1424,6 +1534,7 @@ mod tests {
                     }
                     ColumnType::Text => matches!(value, ColumnValue::Text(_) | ColumnValue::Null),
                     ColumnType::Bool => matches!(value, ColumnValue::Bool(_) | ColumnValue::Null),
+                    ColumnType::List(_) => matches!(value, ColumnValue::List(_)),
                     ColumnType::Document => {
                         matches!(value, ColumnValue::Document(_) | ColumnValue::Null)
                     }
@@ -1647,6 +1758,74 @@ mod tests {
         }
     }
 
+    /// Argument 5, `ids`: an `int24[2]` holding `[-1, 7]`.
+    fn ids() -> DecodedArg {
+        arg(
+            5,
+            "ids",
+            TypedValue::FixedArray {
+                value: vec![
+                    TypedValue::Int {
+                        value: I256::MINUS_ONE,
+                        bits: 24,
+                    },
+                    TypedValue::Int {
+                        value: I256::try_from(7).expect("fits"),
+                        bits: 24,
+                    },
+                ],
+                size: 2,
+            },
+        )
+    }
+
+    /// Argument 6, `legs`: a `(int256 delta, address, (bool flag, bytes data, string
+    /// text) inner)[]` holding one tuple, whose string is not text.
+    fn legs() -> DecodedArg {
+        let param: alloy_json_abi::EventParam = serde_json::from_str(
+            r#"{"name":"legs","type":"tuple[]","indexed":false,"components":[
+                {"name":"delta","type":"int256"},
+                {"name":"","type":"address"},
+                {"name":"inner","type":"tuple","components":[
+                    {"name":"flag","type":"bool"},
+                    {"name":"data","type":"bytes"},
+                    {"name":"text","type":"string"}
+                ]}
+            ]}"#,
+        )
+        .expect("the ABI parses");
+        DecodedArg {
+            position: 6,
+            name: param.name.clone(),
+            abi_type: AbiType::from(&param),
+            value: TypedValue::Array {
+                value: vec![TypedValue::Tuple {
+                    value: vec![
+                        TypedValue::Int {
+                            value: I256::MINUS_ONE,
+                            bits: 256,
+                        },
+                        TypedValue::Address {
+                            value: Address::repeat_byte(1),
+                        },
+                        TypedValue::Tuple {
+                            value: vec![
+                                TypedValue::Bool { value: true },
+                                TypedValue::Bytes {
+                                    value: Bytes::from_static(&[0xff]),
+                                },
+                                TypedValue::String {
+                                    value: Bytes::from_static(&[0xff]),
+                                    text: None,
+                                },
+                            ],
+                        },
+                    ],
+                }],
+            },
+        }
+    }
+
     /// A schema with one event table, `p_c_e`, for event `0x09…` of contract `p.C`.
     fn event_schema() -> Schema {
         let column = |name: &str, kind| super::Column::named(name.to_owned(), kind, true);
@@ -1660,7 +1839,8 @@ mod tests {
                 column("", ColumnType::Uint),
                 column("blockHash", ColumnType::Text),
                 super::Column::named("note".to_owned(), ColumnType::Text, false),
-                column("ids", ColumnType::Document),
+                column("ids", ColumnType::list(ColumnType::Int).expect("a scalar")),
+                column("legs", ColumnType::Document),
             ],
         ));
         schema
@@ -1675,14 +1855,23 @@ mod tests {
         let table = schema.tables().last().expect("the event table");
         let names: Vec<&str> = table.columns.iter().map(|c| c.name.as_ref()).collect();
         assert_eq!(
-            names[4..10],
-            ["amount", "tick", "arg2", "block_hash_3", "note", "ids"]
+            names[4..11],
+            [
+                "amount",
+                "tick",
+                "arg2",
+                "block_hash_3",
+                "note",
+                "ids",
+                "legs"
+            ]
         );
         assert!(!schema.add_event(("p", "C", hash(0x0a)), "p_c_e".to_owned(), Vec::new()));
     }
 
     /// A decoded record fills its event's table: wide integers exact with their sign, a
-    /// string that is not storable text as null, an array as a document.
+    /// string that is not storable text as null, an array of scalars as a typed list, and
+    /// an array of tuples as one document in Allium's `params` form.
     #[test]
     fn a_decoded_record_fills_its_event_table() {
         let schema = event_schema();
@@ -1729,13 +1918,8 @@ mod tests {
                         text: Some("a\0b".to_owned()),
                     },
                 ),
-                arg(
-                    5,
-                    "ids",
-                    TypedValue::Array {
-                        value: vec![TypedValue::Bool { value: true }],
-                    },
-                ),
+                ids(),
+                legs(),
             ],
             ..decoded()
         };
@@ -1759,7 +1943,18 @@ mod tests {
             &ColumnValue::Null,
             "PostgreSQL rejects a NUL"
         );
-        assert!(matches!(row.value("ids"), ColumnValue::Document(_)));
+        assert_eq!(
+            row.value("ids"),
+            &ColumnValue::List(vec![ColumnValue::Int(-1), ColumnValue::Int(7)])
+        );
+        assert_eq!(
+            row.value("legs"),
+            &ColumnValue::Document(
+                r#"[{"delta":"-1","arg1":"0x0101010101010101010101010101010101010101","inner":{"flag":true,"data":"0xff","text":null}}]"#
+                    .to_owned()
+            ),
+            "keys in ABI order, unnamed by position, integers as decimal strings"
+        );
         assert_eq!(row.text("block_hash"), format!("{:#x}", decoded.block_hash));
 
         let other = Decoded {

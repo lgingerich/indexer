@@ -11,7 +11,8 @@
 //! key — the replica identity logical replication needs to publish a delete. A `reorg`
 //! deletes its orphaned blocks' rows in the same transaction, through an index on each
 //! table's `(chain, block hash)`. Decoded event tables store signed 64-bit arguments as
-//! `BIGINT` and wider integers as `NUMERIC(78,0)`, exact to 256 bits. Columns of an
+//! `BIGINT` and wider integers as `NUMERIC(78,0)`, exact to 256 bits; an array of scalars
+//! is the element type's array, such as `NUMERIC(78,0)[]`. Columns of an
 //! existing table are not migrated: the block index is added to it at startup, but a
 //! table created before the primary key keeps its `UNIQUE` constraint instead.
 //! Connection strings accept the driver's URL or keyword syntax; TLS uses platform
@@ -28,7 +29,7 @@ use serde::Deserialize;
 use thiserror::Error;
 use tokio_postgres::Client;
 use tokio_postgres::binary_copy::BinaryCopyInWriter;
-use tokio_postgres::types::{IsNull, ToSql, Type, to_sql_checked};
+use tokio_postgres::types::{IsNull, Kind, ToSql, Type, to_sql_checked};
 
 use crate::config::Secret;
 use crate::decode::StoredContract;
@@ -55,7 +56,7 @@ const fn default_batch_records() -> usize {
     500
 }
 
-fn sql_type(kind: ColumnType) -> &'static str {
+fn sql_type(kind: ColumnType) -> String {
     match kind {
         ColumnType::Uint => "NUMERIC(20,0)",
         ColumnType::Int => "BIGINT",
@@ -63,7 +64,9 @@ fn sql_type(kind: ColumnType) -> &'static str {
         ColumnType::Text => "TEXT",
         ColumnType::Bool => "BOOLEAN",
         ColumnType::Document => "JSONB",
+        ColumnType::List(element) => return format!("{}[]", sql_type(*element)),
     }
+    .to_owned()
 }
 
 fn pg_type(kind: ColumnType) -> Type {
@@ -73,6 +76,14 @@ fn pg_type(kind: ColumnType) -> Type {
         ColumnType::Text => Type::TEXT,
         ColumnType::Bool => Type::BOOL,
         ColumnType::Document => Type::JSONB,
+        // A list's element is a scalar (see `ColumnType::list`), so this is one dimension.
+        ColumnType::List(element) => match pg_type(*element) {
+            Type::INT8 => Type::INT8_ARRAY,
+            Type::TEXT => Type::TEXT_ARRAY,
+            Type::BOOL => Type::BOOL_ARRAY,
+            Type::JSONB => Type::JSONB_ARRAY,
+            _ => Type::NUMERIC_ARRAY,
+        },
     }
 }
 
@@ -240,6 +251,33 @@ fn write_numeric(negative: bool, magnitude: U256, out: &mut BytesMut) -> Result<
     Ok(())
 }
 
+/// One-dimensional array binary layout: dimensions, a null flag, the element type, the
+/// length and lower bound, then each element as a length and its own binary form. An empty
+/// array has no dimensions.
+fn write_array(
+    values: &[ColumnValue],
+    element: &Type,
+    out: &mut BytesMut,
+) -> Result<(), Box<dyn Error + Sync + Send>> {
+    out.put_i32(i32::from(!values.is_empty()));
+    out.put_i32(i32::from(values.contains(&ColumnValue::Null)));
+    out.put_u32(element.oid());
+    if !values.is_empty() {
+        out.put_i32(i32::try_from(values.len())?);
+        out.put_i32(1);
+    }
+    for value in values {
+        let start = out.len();
+        out.put_i32(0);
+        let length = match value.to_sql(element, out)? {
+            IsNull::Yes => -1,
+            IsNull::No => i32::try_from(out.len() - start - 4)?,
+        };
+        out[start..start + 4].copy_from_slice(&length.to_be_bytes());
+    }
+    Ok(())
+}
+
 impl ToSql for ColumnValue {
     fn to_sql(
         &self,
@@ -279,15 +317,25 @@ impl ToSql for ColumnValue {
                 out.extend_from_slice(json.as_bytes());
                 Ok(IsNull::No)
             }
+            (Self::List(values), ty) => match ty.kind() {
+                Kind::Array(element) => {
+                    write_array(values, element, out)?;
+                    Ok(IsNull::No)
+                }
+                _ => Err(format!("cannot encode {self:?} as {ty}").into()),
+            },
             _ => Err(format!("cannot encode {self:?} as {ty}").into()),
         }
     }
 
     fn accepts(ty: &Type) -> bool {
-        matches!(
-            *ty,
-            Type::NUMERIC | Type::INT8 | Type::TEXT | Type::BOOL | Type::JSONB
-        )
+        match ty.kind() {
+            Kind::Array(element) => Self::accepts(element),
+            _ => matches!(
+                *ty,
+                Type::NUMERIC | Type::INT8 | Type::TEXT | Type::BOOL | Type::JSONB
+            ),
+        }
     }
 
     to_sql_checked!();
@@ -931,6 +979,74 @@ mod tests {
             .batch_execute(&format!(
                 "DROP PUBLICATION \"{schema}\"; DROP SCHEMA \"{schema}\" CASCADE"
             ))
+            .await
+            .expect("drop test schema");
+        drop(sink);
+        task.abort();
+    }
+
+    /// A decoded array of scalars lands as a native array of its element type, and a
+    /// tuple as one `JSONB` object keyed by its ABI names with every integer a decimal
+    /// string, as Allium's decoded `params` are.
+    #[tokio::test]
+    #[ignore = "requires INDEXER_TEST_POSTGRES_URL pointing to PostgreSQL 18"]
+    async fn an_array_is_a_typed_array_and_a_tuple_one_object() {
+        let url = std::env::var("INDEXER_TEST_POSTGRES_URL").expect("test database URL");
+        let (client, connection) = tokio_postgres::connect(&url, tokio_postgres::NoTls)
+            .await
+            .expect("connect");
+        let task = tokio::spawn(connection);
+        let schema = format!("array_test_{}", std::process::id());
+        client
+            .batch_execute(&format!(
+                "CREATE SCHEMA \"{schema}\"; SET search_path TO \"{schema}\""
+            ))
+            .await
+            .expect("test schema");
+        let mut sink = PostgresSink::new(client, crate::sink::fixtures::schema(), &schema)
+            .await
+            .expect("sink");
+        let created = crate::sink::fixtures::decoded_pool_created();
+        sink.publish(Envelope::new(
+            ChainId::new("base"),
+            Event::Decoded(Box::new(created)),
+        ))
+        .await
+        .expect("publish");
+        sink.flush().await.expect("commit");
+
+        let row = sink
+            .client
+            .query_one(
+                "SELECT extensions, pg_typeof(negative_bin_data_array)::TEXT, \
+                 negative_bin_data_array[1]::TEXT, cardinality(negative_bin_data_array), \
+                 (extension_orders->>'afterSwap')::NUMERIC::TEXT, \
+                 extension_orders->>'beforeSwap', price_provider_timelock::TEXT \
+                 FROM metric_v1_factory_pool_created",
+                &[],
+            )
+            .await
+            .expect("the pool reads back");
+        assert_eq!(
+            row.get::<_, Vec<String>>(0),
+            [
+                "0xb1a246b1131ff328067c4aaf4f772ff351475244",
+                "0xe4038fa09f0bb9963068afaf97be0c045155090d",
+                "0xebc53e61078976118e384f110c262a263decb84b",
+            ]
+        );
+        assert_eq!(row.get::<_, String>(1), "numeric[]");
+        assert_eq!(
+            row.get::<_, String>(2),
+            "2510840694154681225832395181564014445733957084757624461722000"
+        );
+        assert_eq!(row.get::<_, i32>(3), 4);
+        assert_eq!(row.get::<_, String>(4), "10");
+        assert_eq!(row.get::<_, String>(5), "3");
+        assert_eq!(row.get::<_, String>(6), U256::MAX.to_string());
+
+        sink.client
+            .batch_execute(&format!("DROP SCHEMA \"{schema}\" CASCADE"))
             .await
             .expect("drop test schema");
         drop(sink);

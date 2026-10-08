@@ -35,6 +35,9 @@
 //!   hex is what a node sends, so a value read from a typed column compares equal to the
 //!   same value read out of the raw RPC response — which is what makes the typed tables a
 //!   rewrite rather than a second dialect.
+//! - A [`List`](crate::wire::row::ColumnValue::List) is the element type's native list,
+//!   such as `BIGNUM[]`. The appender cannot append a list, so one arrives as list text,
+//!   which the engine casts into the column exactly, as it does a `BIGNUM`.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -117,7 +120,7 @@ impl Default for DuckDbSettings {
 /// The only place a `DuckDB` type name appears. A `ClickHouse` sink would have its own
 /// mapping and read the same headers, which is the whole point of the split: the row
 /// says what the data *is*, and this says what `DuckDB` calls it.
-fn sql_type(kind: ColumnType) -> &'static str {
+fn sql_type(kind: ColumnType) -> String {
     match kind {
         // `UBIGINT`, not `BIGINT`: block numbers and gas *amounts* are unsigned, and a
         // signed 64-bit column cannot hold the top half of the range.
@@ -132,7 +135,9 @@ fn sql_type(kind: ColumnType) -> &'static str {
         ColumnType::Text => "VARCHAR",
         ColumnType::Bool => "BOOLEAN",
         ColumnType::Document => "JSON",
+        ColumnType::List(element) => return format!("{}[]", sql_type(*element)),
     }
+    .to_owned()
 }
 
 /// A table's name as SQL.
@@ -252,8 +257,53 @@ impl ToSql for ColumnValue {
                 ToSqlOutput::Borrowed(ValueRef::Text(text.as_bytes()))
             }
             Self::Bool(flag) => ToSqlOutput::Borrowed(ValueRef::Boolean(*flag)),
+            Self::List(values) => {
+                let mut text = String::new();
+                list_literal(values, &mut text);
+                ToSqlOutput::Owned(Value::Text(text))
+            }
         })
     }
+}
+
+/// A list as the text `DuckDB` casts to a list column: `[1, -2, "0xab", NULL]`.
+///
+/// Every text element is double-quoted with `\` and `"` escaped, so a comma, a bracket,
+/// or the word `NULL` inside one stays part of the element.
+fn list_literal(values: &[ColumnValue], out: &mut String) {
+    out.push('[');
+    for (index, value) in values.iter().enumerate() {
+        if index > 0 {
+            out.push_str(", ");
+        }
+        match value {
+            ColumnValue::Null => out.push_str("NULL"),
+            ColumnValue::Uint(number) => out.push_str(&number.to_string()),
+            ColumnValue::Int(number) => out.push_str(&number.to_string()),
+            ColumnValue::BigInt {
+                negative,
+                magnitude,
+            } => {
+                if *negative {
+                    out.push('-');
+                }
+                out.push_str(&magnitude.to_string());
+            }
+            ColumnValue::Bool(flag) => out.push_str(if *flag { "true" } else { "false" }),
+            ColumnValue::Text(text) | ColumnValue::Document(text) => {
+                out.push('"');
+                for c in text.chars() {
+                    if matches!(c, '"' | '\\') {
+                        out.push('\\');
+                    }
+                    out.push(c);
+                }
+                out.push('"');
+            }
+            ColumnValue::List(inner) => list_literal(inner, out),
+        }
+    }
+    out.push(']');
 }
 
 /// Upserts envelopes into a local `DuckDB` database, one atomic batch per [`flush`].
@@ -658,8 +708,8 @@ impl DuckDbSink {
 // means the fixture or setup is wrong.
 #[expect(clippy::expect_used)]
 mod tests {
-    use alloy_primitives::{Address, B256, TxHash};
-    use duckdb::Connection;
+    use alloy_primitives::{Address, B256, TxHash, U256};
+    use duckdb::{Connection, appender_params_from_iter};
 
     use crate::sink::EnvelopeSink as _;
     use crate::wire::envelope::{
@@ -667,7 +717,7 @@ mod tests {
     };
     use std::sync::Arc;
 
-    use crate::wire::row::{Schema, Table, row_for};
+    use crate::wire::row::{ColumnValue, Schema, Table, row_for};
 
     use super::DuckDbSink;
 
@@ -720,7 +770,7 @@ mod tests {
                     hash: TxHash::from([0x11; 32]),
                     transaction_index: 3,
                     from: Address::from([0x22; 20]),
-                    value: alloy_primitives::U256::from(1_000),
+                    value: U256::from(1_000),
                     // A wei price above `u64::MAX`, which is ~18.4 ETH — so this also
                     // checks the 128-bit columns are not truncated to 64.
                     gas_price: Some(u128::from(u64::MAX) + 1),
@@ -1514,6 +1564,131 @@ mod tests {
         assert_eq!(row.chain(), "base");
         assert_eq!(row.dedupe_key(), event.dedupe_key());
         assert_eq!(row.values().len(), row.columns().len());
+    }
+
+    /// A decoded array of scalars lands as a native list of its element type, and a tuple
+    /// as one JSON object keyed by its ABI names with every integer a decimal string, as
+    /// Allium's decoded `params` are.
+    #[tokio::test]
+    async fn an_array_is_a_typed_list_and_a_tuple_one_object() {
+        let mut sink = DuckDbSink::new(
+            Connection::open_in_memory().expect("open DuckDB"),
+            crate::sink::fixtures::schema(),
+            "base",
+        )
+        .expect("create dataset and event tables");
+        let created = crate::sink::fixtures::decoded_pool_created();
+        sink.publish(Envelope::new(chain(), Event::Decoded(Box::new(created))))
+            .await
+            .expect("row buffers");
+        sink.flush().await.expect("batch commits");
+
+        let (extensions, words, word, orders, after_swap, timelock): (
+            String,
+            String,
+            String,
+            String,
+            String,
+            String,
+        ) = sink
+            .connection
+            .query_row(
+                "SELECT extensions::VARCHAR, typeof(negative_bin_data_array), \
+                 negative_bin_data_array[1]::VARCHAR, extension_orders::VARCHAR, \
+                 (extension_orders->>'afterSwap')::BIGNUM::VARCHAR, \
+                 price_provider_timelock::VARCHAR FROM metric_v1_factory_pool_created",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
+            )
+            .expect("the pool reads back");
+        assert_eq!(
+            extensions,
+            "[0xb1a246b1131ff328067c4aaf4f772ff351475244, \
+             0xe4038fa09f0bb9963068afaf97be0c045155090d, \
+             0xebc53e61078976118e384f110c262a263decb84b]"
+        );
+        assert_eq!(words, "BIGNUM[]");
+        assert_eq!(
+            word, "2510840694154681225832395181564014445733957084757624461722000",
+            "a packed word is its exact integer"
+        );
+        assert_eq!(
+            orders,
+            r#"{"beforeAddLiquidity":"0","afterAddLiquidity":"0","beforeRemoveLiquidity":"0","afterRemoveLiquidity":"0","beforeSwap":"3","afterSwap":"10"}"#
+        );
+        assert_eq!(after_swap, "10");
+        assert_eq!(timelock, U256::MAX.to_string());
+    }
+
+    /// A list's text casts into its column exactly: signed 256-bit elements keep every
+    /// digit, and a text element keeps a quote, a comma, a bracket, a backslash, or the
+    /// word `NULL` as its own characters.
+    #[test]
+    fn a_list_casts_into_its_column_exactly() {
+        let connection = Connection::open_in_memory().expect("open DuckDB");
+        connection
+            .execute_batch("CREATE TABLE lists (numbers BIGNUM[], texts VARCHAR[], empty BIGNUM[])")
+            .expect("create table");
+        let texts = [r#"a,"b]"#, r"back\slash", "NULL", ""];
+        let values = [
+            ColumnValue::List(vec![
+                ColumnValue::BigInt {
+                    negative: true,
+                    magnitude: U256::MAX,
+                },
+                ColumnValue::BigInt {
+                    negative: false,
+                    magnitude: U256::ZERO,
+                },
+            ]),
+            ColumnValue::List(
+                texts
+                    .iter()
+                    .map(|text| ColumnValue::Text((*text).to_owned()))
+                    .chain([ColumnValue::Null])
+                    .collect(),
+            ),
+            ColumnValue::List(Vec::new()),
+        ];
+        {
+            let mut appender = connection.appender("lists").expect("appender");
+            appender
+                .append_row(appender_params_from_iter(&values))
+                .expect("append");
+        }
+        let (numbers, read, nulls, empty): (String, Vec<String>, i64, i64) = connection
+            .query_row(
+                "SELECT numbers::VARCHAR, list_filter(texts, x -> x IS NOT NULL)::VARCHAR[], \
+                 len(list_filter(texts, x -> x IS NULL)), len(empty) FROM lists",
+                [],
+                |row| {
+                    let read = match row.get::<_, duckdb::types::Value>(1)? {
+                        duckdb::types::Value::List(items) => items
+                            .into_iter()
+                            .map(|item| match item {
+                                duckdb::types::Value::Text(text) => text,
+                                other => panic!("a text element, not {other:?}"),
+                            })
+                            .collect(),
+                        other => panic!("a list, not {other:?}"),
+                    };
+                    Ok((row.get(0)?, read, row.get(2)?, row.get(3)?))
+                },
+            )
+            .expect("the lists read back");
+        assert_eq!(numbers, format!("[-{}, 0]", U256::MAX));
+        assert_eq!(read, texts);
+        assert_eq!(nulls, 1);
+        assert_eq!(empty, 0);
     }
 
     fn row_count(sink: &DuckDbSink, table: &str) -> i64 {

@@ -368,4 +368,65 @@ pub(crate) mod fixtures {
             .expect("a seeded pool's swap")
             .decoded
     }
+
+    /// A Metric `PoolCreated` carrying a real Base pool's arguments, decoded against the
+    /// shipped catalog: an `address[]`, a tuple of `uint256`s, and `uint256[]`s of packed
+    /// words beside scalars up to `type(uint256).max`.
+    pub(crate) fn decoded_pool_created() -> Decoded {
+        use alloy_dyn_abi::DynSolValue;
+        use alloy_json_abi::JsonAbi;
+        use alloy_primitives::{Address, B256, U256, address};
+
+        let abi: JsonAbi = serde_json::from_str(include_str!(
+            "../../protocols/metric/v1/MetricOmmPoolFactory.json"
+        ))
+        .expect("the factory ABI parses");
+        let event = abi.event("PoolCreated").expect("the event")[0].clone();
+        let topic = |address: Address| Some(address.into_word());
+        let uint = |value: u64| DynSolValue::Uint(U256::from(value), 256);
+        let packed =
+            U256::from_str_radix("190000000000190000000000190000000000190000000000190", 16)
+                .expect("a packed word");
+        let words = DynSolValue::Array(vec![DynSolValue::Uint(packed, 256); 4]);
+        let log = crate::wire::envelope::Log {
+            address: address!("0x2a53833cc95548cf52c7b159110e22d3a9018f32"),
+            topic0: Some(event.selector()),
+            topic1: topic(address!("0xb030150465b706f81eecc453ba5e9bae7b06e50d")),
+            topic2: topic(address!("0x0b3e328455c4059eeb9e3f84b5543f74e24e7e1b")),
+            topic3: topic(address!("0x833589fcd6edb6e08f4c7c32d4f71b54bda02913")),
+            data: DynSolValue::Tuple(vec![
+                uint(92),
+                DynSolValue::Address(address!("0x2a53833cc95548cf52c7b159110e22d3a9018f32")),
+                DynSolValue::Address(address!("0x80f0a7d148729ccedb6cd07fbaaefc5a16f33d4f")),
+                DynSolValue::Address(address!("0xb1a246b1131ff328067c4aaf4f772ff351475244")),
+                DynSolValue::Array(vec![
+                    DynSolValue::Address(address!("0xb1a246b1131ff328067c4aaf4f772ff351475244")),
+                    DynSolValue::Address(address!("0xe4038fa09f0bb9963068afaf97be0c045155090d")),
+                    DynSolValue::Address(address!("0xebc53e61078976118e384f110c262a263decb84b")),
+                ]),
+                DynSolValue::Tuple(vec![uint(0), uint(0), uint(0), uint(0), uint(3), uint(10)]),
+                DynSolValue::Uint(U256::MAX, 256),
+                uint(1_244_090_569_793_480_965),
+                uint(1_000_000_000_000_000_000),
+                uint(1_000_000_000_000_000_000),
+                DynSolValue::Uint(U256::from(150_000), 24),
+                DynSolValue::Uint(U256::ZERO, 24),
+                DynSolValue::Uint(U256::from(200_000), 24),
+                DynSolValue::Uint(U256::ZERO, 24),
+                DynSolValue::Address(address!("0x53f0ace6156daf7f6b50b395f6dd66c9d2f50c8c")),
+                DynSolValue::Int(alloy_primitives::I256::ZERO, 24),
+                words.clone(),
+                words,
+            ])
+            .abi_encode_params()
+            .into(),
+            block_hash: B256::with_last_byte(0x0b),
+            ..crate::wire::envelope::Log::default()
+        };
+        Decoder::new(catalog())
+            .decode(&log)
+            .expect("decodes")
+            .expect("the seeded factory's event")
+            .decoded
+    }
 }
