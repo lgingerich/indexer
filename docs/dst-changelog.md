@@ -8,4 +8,4 @@ Replay a seed on the commit it was found on (later changes reshuffle seeds) with
 
 | ID | Found | Seeds | Bug | Impact | Fix |
 | --- | --- | --- | --- | --- | --- |
-| DST-001 | 2026-10-08, `bf9a787` | 17, 68, 172, 202 | A fork replacing the first indexed block stopped the pipeline with `UndoWindowExceeded`, again on every restart. | Liveness: stuck until an operator edits the store | |
+| DST-001 | 2026-10-08, `bf9a787` | 17, 68, 172, 202 | A fork replacing the first indexed block stopped the pipeline with `UndoWindowExceeded`, again on every restart. | Liveness: stuck until an operator edits the store | [#1](https://github.com/lgingerich/indexer/pull/1) |
