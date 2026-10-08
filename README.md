@@ -309,12 +309,13 @@ that matters most: `decode` must not depend on `ingest`.
   [Resume from the store](#resume-from-the-store).
 - **NDJSON to stdout.** See `src/sink/stdout.rs`; the `[sink.stdout]` backend prints the
   stream instead of storing it, and opens no store.
-- **A local `DuckDB` store**, behind the `duckdb` feature (on by default). Embedded and
+- **A local `DuckDB` store**, behind the `duckdb` feature. Embedded and
   single-writer, so it is the archive; anything downstream reads from it rather than from
   the live stream.
 
-`duckdb` is on by default because the pipeline needs a store to run. No broker is involved
-anywhere, so `cargo run` alone runs the pipeline.
+The default build has only `stdout`, since it needs no engine and no store: a bare
+`cargo run` compiles fast and prints the stream. Add `--features duckdb` for the store, or
+`--features postgres` for a remote one. No broker is involved anywhere.
 
 ## Not built yet
 
@@ -450,7 +451,7 @@ lives in a directory of protocol manifests, named by `[decode] protocols` and de
 to nothing — `protocols/` is a working example; see [Protocol manifests](#protocol-manifests).
 
 ```bash
-RUST_LOG=info cargo run --release -- indexer.toml
+RUST_LOG=info cargo run --release --features duckdb -- indexer.toml
 ```
 
 ```toml
@@ -698,8 +699,8 @@ wire rather than re-derived downstream.
 
 ### PostgreSQL 18 sink
 
-Build with `cargo run --release --no-default-features --features postgres -- indexer.toml`
-(or add `--features postgres` to the default build to retain DuckDB support). Replace
+Build with `cargo run --release --features postgres -- indexer.toml`
+(or name both features to keep DuckDB support as well). Replace
 `[sink.duckdb]` with exactly one PostgreSQL sink table:
 
 ```toml

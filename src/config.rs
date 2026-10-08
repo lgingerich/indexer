@@ -555,9 +555,10 @@ datasets = ["logs", "logs"]
         assert_eq!(settings.ingest.chain, "base");
         assert!(!settings.ingest.http_url.expose().is_empty());
         assert!(!settings.ingest.ws_url.expose().is_empty());
-        let Sink::Stdout(_) = &settings.sink else {
-            panic!("the table names the backend: {settings:?}");
-        };
+        assert!(
+            matches!(&settings.sink, Sink::Stdout(_)),
+            "the table names the backend: {settings:?}"
+        );
         // The file omits `datasets`, so the stages are built with all four.
         assert_eq!(settings.ingest.datasets, crate::sink::Datasets::all());
         // The file leaves `[decode]` commented out, so the catalog stays empty.

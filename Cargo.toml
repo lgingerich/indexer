@@ -14,9 +14,10 @@ name = "indexer"
 path = "src/main.rs"
 
 [features]
-default = ["duckdb"]
-# Local `DuckDB` store (`sink::duckdb`), enabled by default.
-# Disable it for a PostgreSQL-only or stdout-only build without the C++ engine.
+default = []
+# Local `DuckDB` store (`sink::duckdb`). Off by default: the `stdout` sink needs no
+# feature and no engine, so a bare `cargo run` prints and compiles fast. Add `duckdb`
+# for the embedded store, which pays for the bundled C++ engine at build time.
 duckdb = ["dep:duckdb"]
 # Remote PostgreSQL store, using asynchronous COPY and platform TLS.
 postgres = ["dep:bytes", "dep:native-tls", "dep:postgres-native-tls", "dep:tokio-postgres"]
