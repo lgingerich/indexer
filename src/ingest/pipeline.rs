@@ -30,6 +30,11 @@
 //! what the store committed, so coverage from the restored tip forward is contiguous. A
 //! fork deeper than the restored window stops with
 //! [`PipelineError::UndoWindowExceeded`]: recovering from it is an operator's decision.
+//!
+//! The first block a run ever indexed is the exception. Nothing below it was stored, so
+//! a fork that replaces it has nothing older to retract: while the window still holds
+//! that block, the walk stops there, retracts everything above it, and adopts the new
+//! branch from the start height, as the first block itself was adopted.
 
 use crate::ingest::source::{BlockMeta, BlockSource, FetchedBlock, SourceError};
 use crate::sink::{EnvelopeSink, SinkError};
@@ -158,6 +163,9 @@ struct UndoRing {
     floor: Option<BlockMeta>,
     /// Published tail, oldest first, at most [`MAX_UNFINALIZED_BLOCKS`] identities.
     entries: VecDeque<BlockMeta>,
+    /// Whether a restored ledger lost older blocks that did not link to the rest, so
+    /// stored rows may sit below the oldest entry.
+    truncated: bool,
 }
 
 impl UndoRing {
@@ -190,13 +198,24 @@ impl UndoRing {
             .copied()
     }
 
+    /// Whether the window still holds the first block this run's history ever indexed:
+    /// nothing has slid into the floor, and no older part of a restored ledger was
+    /// dropped. Then nothing is stored below the oldest entry.
+    ///
+    /// A restart reads back up to a window plus one of the stored ledger, and the store
+    /// prunes only below what it read, so a restored ledger without a floor was never
+    /// pruned.
+    fn holds_whole_history(&self) -> bool {
+        self.floor.is_none() && !self.truncated
+    }
+
     /// Whether `height` is still inside the retained window, so a backward walk may
     /// still find an ancestor there.
     fn retains(&self, height: u64) -> bool {
         self.oldest().is_some_and(|oldest| height >= oldest.height)
     }
 
-    /// Collects hashes above a previously verified ancestor, newest first.
+    /// Collects hashes above the ancestor at height `ancestor`, newest first.
     /// Does not remove them: the sink must accept their retraction before rewind.
     ///
     /// ponytail: `take_while` stops at the first entry at or below the ancestor, so it
@@ -204,19 +223,20 @@ impl UndoRing {
     /// and the driver only ever accepts the next height, but nothing here enforces it —
     /// unordered input yields a partial orphan list. Upgrade path: a `debug_assert!` in
     /// `push`, or a sort, if a future caller ever pushes out of order.
-    fn orphaned(&self, ancestor: BlockMeta) -> Vec<B256> {
+    fn orphaned(&self, ancestor: u64) -> Vec<B256> {
         self.entries
             .iter()
             .rev()
-            .take_while(|meta| meta.height > ancestor.height)
+            .take_while(|meta| meta.height > ancestor)
             .map(|meta| meta.hash)
             .collect()
     }
 
-    /// Removes the suffix above a verified ancestor after retraction is accepted.
-    /// Order-independent, unlike [`Self::orphaned`]: every entry above the height goes.
-    fn rewind(&mut self, ancestor: BlockMeta) {
-        self.entries.retain(|meta| meta.height <= ancestor.height);
+    /// Removes the suffix above the ancestor at height `ancestor` after retraction is
+    /// accepted. Order-independent, unlike [`Self::orphaned`]: every entry above the
+    /// height goes.
+    fn rewind(&mut self, ancestor: u64) {
+        self.entries.retain(|meta| meta.height <= ancestor);
     }
 
     /// Appends an accepted identity, sliding the window: the oldest tail entry
@@ -280,8 +300,13 @@ impl<S, K> Machine<S, K> {
     /// plus one floor are remembered.
     #[must_use]
     pub fn new(source: S, sink: K, ledger: Vec<BlockMeta>) -> Self {
-        let mut ring = UndoRing::default();
-        for meta in linked_suffix(ledger) {
+        let stored = ledger.len();
+        let linked = linked_suffix(ledger);
+        let mut ring = UndoRing {
+            truncated: linked.len() < stored,
+            ..UndoRing::default()
+        };
+        for meta in linked {
             ring.push(meta);
         }
         Self {
@@ -657,8 +682,9 @@ impl<S: BlockSource, K: EnvelopeSink> Machine<S, K> {
 
     /// Resolves a candidate branch in one bounded walk-and-replay operation.
     ///
-    /// Validates backward edges, finds a retained ancestor, and rechecks the target
-    /// before output. Retracts only a nonempty old suffix, then publishes replacements
+    /// Validates backward edges, finds a retained ancestor — or reaches the first block
+    /// ever indexed, below which nothing needs one — and rechecks the target before
+    /// output. Retracts only a nonempty old suffix, then publishes replacements
     /// ascending and returns to `Syncing`. Discovery failures leave history untouched;
     /// delivery can be partial on error, so public callers consume the instance.
     async fn handle_reorg(&mut self, head: FetchedBlock, height: u64) -> Result<(), PipelineError> {
@@ -678,7 +704,18 @@ impl<S: BlockSource, K: EnvelopeSink> Machine<S, K> {
             if let Some(parent) = self.accepted(parent_height)
                 && parent.hash == meta.parent_hash
             {
-                break parent;
+                break parent.height;
+            }
+            // The branch replaces the first block ever indexed. Nothing was stored below
+            // it, so there is no older ancestor to find or retract: adopt the branch from
+            // here, as that first block was adopted.
+            if self.ring.holds_whole_history()
+                && self
+                    .ring
+                    .oldest()
+                    .is_some_and(|oldest| oldest.height == meta.height)
+            {
+                break parent_height;
             }
             // The common ancestor is below the retained window: stop before any partial
             // retraction rather than guess.
@@ -713,7 +750,7 @@ impl<S: BlockSource, K: EnvelopeSink> Machine<S, K> {
         let orphaned = self.ring.orphaned(ancestor);
         if !orphaned.is_empty() {
             self.deliver(vec![Event::Reorg(Reorg {
-                height: Self::next(ancestor.height)?,
+                height: Self::next(ancestor)?,
                 new_head_hash: target.hash,
                 orphaned_hashes: orphaned,
             })])
@@ -1086,23 +1123,29 @@ mod tests {
         assert_eq!(markers[0].orphaned_hashes, [hash(head)]);
     }
 
+    /// A fresh run's first block has nothing stored below it, so a fork that replaces
+    /// it is retracted and the new branch adopted from the start height, whatever the
+    /// branch's parent. Found by the simulation: see `docs/dst-changelog.md`.
     #[tokio::test]
-    async fn a_fork_below_the_window_stops_without_retraction() {
+    async fn a_fork_replacing_the_first_indexed_block_adopts_the_new_branch() {
         let mut machine = Machine::new(Source::linear(3), Sink::default(), Vec::new());
         settle(&mut machine, Some(3)).await;
-        // The window keeps only the tip; a replacement at 3 whose parent is below it.
+        // The window holds only the first block; its replacement descends from height 1.
         machine.source.data.blocks.insert(3, (hash(103), hash(1)));
-        assert!(matches!(
-            machine.process_head(machine.source.head_meta()).await,
-            Err(PipelineError::UndoWindowExceeded { .. })
-        ));
-        assert!(
-            !machine
-                .sink
-                .events
-                .iter()
-                .any(|event| matches!(event, Event::Reorg(_)))
+        machine
+            .process_head(machine.source.head_meta())
+            .await
+            .expect("the fork is resolved");
+        let markers = reorgs(&machine);
+        assert_eq!(markers.len(), 1);
+        assert_eq!(markers[0].height, 3);
+        assert_eq!(markers[0].orphaned_hashes, [hash(3)]);
+        assert_eq!(
+            heights(&machine),
+            [3, 3],
+            "the first block, then its replacement"
         );
+        assert_eq!(machine.tip().expect("tip").hash, hash(103));
     }
 
     /// A source returning several heights per call still has every buried height accepted
@@ -1581,11 +1624,31 @@ mod tests {
         assert_eq!(machine.tip().expect("tip").hash, hash(107));
     }
 
+    /// A store whose ledger starts at the run's first block resumes through a fork that
+    /// replaced it while down — here its parent too — by adopting the new branch.
     #[tokio::test]
-    async fn a_fork_while_down_deeper_than_the_restored_window_stops() {
+    async fn a_fork_while_down_replacing_the_first_stored_block_is_adopted() {
         let mut source = Source::linear(7);
         fork(&mut source, 3, 7);
         let mut machine = Machine::new(source, Sink::default(), ledger(4..=5));
+        machine.start(None).await.expect("start");
+        let markers = reorgs(&machine);
+        assert_eq!(markers.len(), 1);
+        assert_eq!(markers[0].height, 4);
+        assert_eq!(markers[0].orphaned_hashes, [hash(5), hash(4)]);
+        assert_eq!(heights(&machine), [4, 5, 6, 7]);
+        assert_eq!(machine.tip().expect("tip").hash, hash(107));
+    }
+
+    /// A restored ledger that lost an older, unlinked part may have rows below its oldest
+    /// block, so a fork below that block stops rather than adopt over them.
+    #[tokio::test]
+    async fn a_fork_while_down_below_a_truncated_ledger_stops() {
+        let mut source = Source::linear(7);
+        fork(&mut source, 3, 7);
+        let mut stored = ledger(0..=1);
+        stored.extend(ledger(4..=5));
+        let mut machine = Machine::new(source, Sink::default(), stored);
         assert!(matches!(
             machine.start(None).await,
             Err(PipelineError::UndoWindowExceeded { .. })
@@ -1650,6 +1713,30 @@ mod tests {
         assert_eq!(machine.ring.entries.len(), MAX_UNFINALIZED_BLOCKS);
         assert_eq!(machine.ring.floor.expect("floor").height, 0);
         assert_eq!(machine.tip().expect("tip").height, window);
+    }
+
+    #[test]
+    fn the_whole_history_is_held_until_the_window_slides() {
+        let mut ring = UndoRing::default();
+        for height in 0..(MAX_UNFINALIZED_BLOCKS as u64) {
+            ring.push(BlockMeta {
+                height,
+                hash: hash(height),
+                parent_hash: hash(height.saturating_sub(1)),
+                timestamp: height,
+            });
+        }
+        assert!(ring.holds_whole_history());
+        ring.push(BlockMeta {
+            height: MAX_UNFINALIZED_BLOCKS as u64,
+            hash: hash(MAX_UNFINALIZED_BLOCKS as u64),
+            parent_hash: hash(MAX_UNFINALIZED_BLOCKS as u64 - 1),
+            timestamp: 0,
+        });
+        assert!(
+            !ring.holds_whole_history(),
+            "the first block slid into the floor"
+        );
     }
 
     #[test]
