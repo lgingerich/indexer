@@ -9,12 +9,12 @@
 chain = "base"
 # Public endpoints, so written as values. An endpoint carrying an API key names the
 # environment variable that holds it instead: http_url = { env = "INDEXER_HTTP_URL" }.
-http_url = "https://8453.rpc.thirdweb.com"
-ws_url = "wss://base-rpc.publicnode.com"
+http_url = { env = "INDEXER_HTTP_URL" }
+ws_url = { env = "INDEXER_WS_URL" }
 # Datasets to fetch and store. Omitted means all three. Transactions include their
 # receipts, and logs selected with them come from those receipts. Logs without
-# transactions use one eth_getLogs per height, reusing the live notification's
-# metadata so no block read is issued; every other dataset still reads the block body.
+# transactions use eth_getLogs: live, for one height, reusing the notification's
+# metadata so no block read is issued; in backfill, over a range of up to ten heights.
 # datasets = ["blocks", "transactions", "logs"]
 datasets = ["logs"]
 start_block = 52266840

@@ -23,8 +23,8 @@ ws_url = "wss://base-rpc.publicnode.com"
 
 # Which datasets to fetch and store: any combination of these three, but not empty.
 # Omitted means all three. Transactions include their receipts, and logs selected
-# with them come from those receipts. Logs without transactions use one eth_getLogs
-# per height; every other dataset reads the block body.
+# with them come from those receipts. Logs without transactions use eth_getLogs,
+# over a range of up to ten heights in backfill; transactions read the block body.
 # datasets = ["blocks", "transactions", "logs"]
 
 # First height to index on an empty store. Omitted starts at the observed head,

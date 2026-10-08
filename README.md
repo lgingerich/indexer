@@ -254,7 +254,9 @@ that matters most: `decode` must not depend on `ingest`.
   timestamp, so a logs-only fetch reuses them and pins `eth_getLogs` to the announced
   hash instead of re-reading the header; a block or transaction dataset still fetches
   the body it needs. The whole choice is one table, `FetchPlan`, in
-  `src/ingest/source/evm.rs`.
+  `src/ingest/source/evm.rs`. Without transactions, buried backfill fetches up to ten
+  heights in one batch — a header per height and one ranged `eth_getLogs` — and retries
+  a range the provider fails on, or that times out, in halves.
 - **One event per dataset.** A `block` event, then for each transaction a
   `transaction` event and its `log` events. A transaction carries its receipt's fields
   with Allium's `receipt_` prefix, as `ethereum.raw.transactions` does, since there is
@@ -331,7 +333,7 @@ writes every row. These are the gaps that leaves.
 stored-log replay
 streaming aggregation
 Avro for a serialized envelope
-ranged log backfill
+cross-block transaction batching
 signature-only decoding
 event table and schema limitations
 ```
@@ -364,13 +366,13 @@ one typed table per dataset. The only serialization is stdout, which writes
 newline-delimited JSON. Avro is the planned encoding for that serialized envelope —
 stdout and anything downstream of it — so those hops share one schema.
 
-### Ranged log backfill
+### Cross-block transaction batching
 
-Logs without transactions come from one `eth_getLogs` per height, and backfill walks one
-height at a time — even a live notification reuses its header but fetches logs for
-that one height. A wider `eth_getLogs` range covering many historical blocks, and
-cross-block batching of the per-height block/receipt calls, are not built.
-A `logs` subscription is not the log source: it has no end-of-block marker.
+Buried backfill ranges `blocks` and `logs`, but a selection with transactions still fetches
+one height at a time: its block and receipt calls are per block, and batching them across
+heights is not built. The reorgable tail and live heads are fetched a height at a time
+whatever is selected. A `logs` subscription is not the log source: it has no end-of-block
+marker.
 
 ### OpenTelemetry metrics
 

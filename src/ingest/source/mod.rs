@@ -8,7 +8,8 @@
 //!   meet a sub-100ms budget.
 //! - [`BlockSource::fetch_block`] is the *pull* path. It fetches one block, limited
 //!   to the datasets the source was built with, which is what backfill and reorg
-//!   reconciliation need.
+//!   reconciliation need. [`BlockSource::fetch_blocks`] is its buried-backfill form,
+//!   which may fetch several consecutive heights at once.
 //! - [`BlockSource::fetch_header`] reads one header, at a height or the head, for when
 //!   only a block's identity is needed: sampling the head, and checking a restored tip.
 //!
@@ -157,6 +158,26 @@ pub trait BlockSource: Send + Sync {
         height: u64,
         head: Option<&BlockMeta>,
     ) -> impl Future<Output = Result<FetchedBlock, SourceError>> + Send;
+
+    /// Fetches consecutive blocks from `from`, at most through `to`, in height order,
+    /// with the datasets this source was built for.
+    ///
+    /// The buried-backfill path, where no fork can reach, so no notification is reused.
+    /// The source chooses how many heights to return, but must return at least one, and
+    /// none above `to`; a source that cannot fetch several heights at once returns one.
+    /// All or nothing: an error means no block of the call was returned.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed transport error or a violated projection invariant.
+    fn fetch_blocks(
+        &self,
+        from: u64,
+        to: u64,
+    ) -> impl Future<Output = Result<Vec<FetchedBlock>, SourceError>> + Send {
+        let _ = to;
+        async move { Ok(vec![self.fetch_block(from, None).await?]) }
+    }
 
     /// One block's header as [`BlockMeta`], fetched on demand: the block at `height`, or
     /// the chain's head as it is right now when `height` is `None`.

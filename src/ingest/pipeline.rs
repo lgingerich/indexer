@@ -101,6 +101,16 @@ pub enum PipelineError {
         /// The restored tip's height.
         tip: u64,
     },
+    /// A range fetch returned no blocks, or blocks past the end of the range.
+    #[error("source returned {returned} blocks for heights {from}..={to}")]
+    InvalidRange {
+        /// First requested height.
+        from: u64,
+        /// Last height the fetch could return.
+        to: u64,
+        /// How many blocks it returned.
+        returned: usize,
+    },
     /// A height-only source changed views during reconciliation.
     #[error("source changed canonical views during reconciliation")]
     UnstableSource,
@@ -440,7 +450,8 @@ impl<S: BlockSource, K: EnvelopeSink> Machine<S, K> {
         // `next > end` check below takes the live path instead.
         let end = head.height.saturating_sub(MAX_UNFINALIZED_BLOCKS as u64);
         if next > end {
-            self.accept(next).await?;
+            let fetched = self.source.fetch_block(next, None).await?;
+            self.accept(next, fetched).await?;
             self.settle_tail(head).await?;
         } else {
             self.state = State::Backfilling { next, end, head };
@@ -483,7 +494,7 @@ impl<S: BlockSource, K: EnvelopeSink> Machine<S, K> {
         Ok(())
     }
 
-    /// Fetches one height, delivers its events, and records its identity.
+    /// Delivers a block fetched for `height` and records its identity.
     ///
     /// The link to the accepted tip is checked first and the identity is recorded after
     /// delivery succeeds, so a failure leaves the accepted history untouched. The first
@@ -491,8 +502,7 @@ impl<S: BlockSource, K: EnvelopeSink> Machine<S, K> {
     /// resumed run links its first block to the restored tip. A link
     /// failure here is a source fault: this is the buried path, where no fork is
     /// reachable.
-    async fn accept(&mut self, height: u64) -> Result<(), PipelineError> {
-        let fetched = self.source.fetch_block(height, None).await?;
+    async fn accept(&mut self, height: u64, fetched: FetchedBlock) -> Result<(), PipelineError> {
         let meta = Self::marker(&fetched, height)?;
         if let Some(tip) = self.ring.tip() {
             Self::validate_link(tip, meta)?;
@@ -529,25 +539,45 @@ impl<S: BlockSource, K: EnvelopeSink> Machine<S, K> {
         Ok(())
     }
 
-    /// Fetches and publishes one buried height. No reorg handling: no fork this deep is
-    /// reachable, and invalid linkage is a source fault rather than a fork to replay.
-    /// At the buried bound, the remaining reorgable tail is filled through [`Self::settle_tail`]
-    /// before the run goes live.
+    /// Fetches and publishes the buried heights the source returns from `next`, as many
+    /// as it chooses, in order. No reorg handling: no fork this deep is reachable, and
+    /// invalid linkage is a source fault rather than a fork to replay. The cursor moves
+    /// past each block as it is accepted, so a failure partway through leaves it at the
+    /// first block not taken. At the buried bound, the remaining reorgable tail is filled
+    /// through [`Self::settle_tail`] before the run goes live.
+    ///
+    /// # Errors
+    /// Returns [`PipelineError::InvalidRange`] when the source returns no blocks or blocks
+    /// past `end`, before any of them is published.
     async fn backfill_step(
         &mut self,
         next: u64,
         end: u64,
         head: BlockMeta,
     ) -> Result<(), PipelineError> {
-        self.accept(next).await?;
-        if next >= end {
+        let blocks = self.source.fetch_blocks(next, end).await?;
+        let last = u64::try_from(blocks.len())
+            .ok()
+            .and_then(|count| count.checked_sub(1))
+            .and_then(|extra| next.checked_add(extra))
+            .filter(|last| *last <= end)
+            .ok_or(PipelineError::InvalidRange {
+                from: next,
+                to: end,
+                returned: blocks.len(),
+            })?;
+        for (height, fetched) in (next..=last).zip(blocks) {
+            self.accept(height, fetched).await?;
+            if height < end {
+                self.state = State::Backfilling {
+                    next: Self::next(height)?,
+                    end,
+                    head,
+                };
+            }
+        }
+        if last >= end {
             self.settle_tail(head).await?;
-        } else {
-            self.state = State::Backfilling {
-                next: Self::next(next)?,
-                end,
-                head,
-            };
         }
         Ok(())
     }
@@ -740,6 +770,8 @@ mod tests {
         fail_once: AtomicBool,
         head_calls: AtomicUsize,
         block_calls: AtomicUsize,
+        /// How many heights one `fetch_blocks` returns; zero answers with none.
+        range: u64,
     }
 
     impl Source {
@@ -755,6 +787,7 @@ mod tests {
                     fail_once: AtomicBool::new(false),
                     head_calls: AtomicUsize::new(0),
                     block_calls: AtomicUsize::new(0),
+                    range: 1,
                 },
             }
         }
@@ -796,6 +829,16 @@ mod tests {
                 parent_hash: parent,
                 timestamp: height,
             })
+        }
+        async fn fetch_blocks(&self, from: u64, to: u64) -> Result<Vec<FetchedBlock>, SourceError> {
+            let mut blocks = Vec::new();
+            if self.data.range == 0 {
+                return Ok(blocks);
+            }
+            for height in from..=to.min(from + self.data.range - 1) {
+                blocks.push(self.fetch_block(height, None).await?);
+            }
+            Ok(blocks)
         }
         async fn fetch_block(
             &self,
@@ -1056,6 +1099,46 @@ mod tests {
                 .iter()
                 .any(|event| matches!(event, Event::Reorg(_)))
         );
+    }
+
+    /// A source returning several heights per call still has every buried height accepted
+    /// once, in order, with the last range cut at the buried bound and the tail filled
+    /// after it.
+    #[tokio::test]
+    async fn ranged_backfill_accepts_every_buried_height_once_in_order() {
+        // The buried bound is 17: ranges of seven are 0..=6, 7..=13, then 14..=17.
+        let head = MAX_UNFINALIZED_BLOCKS as u64 + 17;
+        let mut source = Source::linear(head);
+        source.data.range = 7;
+        let mut machine = Machine::new(source, Sink::default(), Vec::new());
+        machine.start(Some(0)).await.expect("start");
+        catch_up(&mut machine).await;
+        assert!(matches!(machine.state(), State::Syncing));
+        assert_eq!(heights(&machine), (0..=head).collect::<Vec<_>>());
+        assert_eq!(
+            machine.source.data.block_calls.load(Ordering::Relaxed),
+            usize::try_from(head + 1).expect("count"),
+            "each height is fetched exactly once"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_range_answered_with_no_blocks_is_rejected_before_output() {
+        let head = MAX_UNFINALIZED_BLOCKS as u64 + 5;
+        let mut source = Source::linear(head);
+        source.data.range = 0;
+        let mut machine = Machine::new(source, Sink::default(), Vec::new());
+        machine.start(Some(0)).await.expect("start");
+        assert!(matches!(
+            machine.step().await,
+            Err(PipelineError::InvalidRange {
+                from: 0,
+                to: 5,
+                returned: 0
+            })
+        ));
+        assert!(machine.sink.events.is_empty());
+        assert!(machine.tip().is_none());
     }
 
     #[tokio::test]

@@ -11,6 +11,10 @@
 //! in a `200`, as recognized by alloy's [`ErrorPayload::is_retry_err`]), an overloaded
 //! or restarting backend, a timeout, or a dropped connection. Every call this source
 //! makes is a read, so a retry cannot apply anything twice.
+//!
+//! One timeout is not transient: an `eth_getLogs` over more than one height. A range
+//! that ran out of time is too large for the provider, and resending it would only wait
+//! out the same timeout again, so it is returned at once for the source to retry smaller.
 
 use std::hash::{BuildHasher as _, RandomState};
 use std::sync::Arc;
@@ -20,6 +24,7 @@ use std::time::Duration;
 
 use alloy_json_rpc::{RequestPacket, ResponsePacket, RpcError};
 use alloy_transport::{TransportError, TransportErrorKind, TransportFut};
+use serde::Deserialize;
 use tower::{Layer, Service};
 use tracing::warn;
 
@@ -128,6 +133,9 @@ where
                     tokio::time::sleep(jitter(delay)).await;
                 }
                 let result = inner.call(request.clone()).await;
+                if timed_out(&result) && spans_heights(&request) {
+                    return result;
+                }
                 let Some(cause) = transient(&result) else {
                     pacing.speed_up();
                     return result;
@@ -179,6 +187,33 @@ fn transient(result: &Result<ResponsePacket, TransportError>) -> Option<String> 
     }
 }
 
+/// Whether `result` is the HTTP client's request timeout.
+fn timed_out(result: &Result<ResponsePacket, TransportError>) -> bool {
+    matches!(
+        result,
+        Err(RpcError::Transport(TransportErrorKind::Custom(error)))
+            if error.downcast_ref::<reqwest::Error>().is_some_and(reqwest::Error::is_timeout)
+    )
+}
+
+/// Whether `request` carries an `eth_getLogs` over more than one height. A query pinned
+/// to a block hash, or bounded by one height, does not.
+fn spans_heights(request: &RequestPacket) -> bool {
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Range {
+        from_block: Option<String>,
+        to_block: Option<String>,
+    }
+    request.requests().iter().any(|call| {
+        call.method() == "eth_getLogs"
+            && call
+                .params()
+                .and_then(|params| serde_json::from_str::<(Range,)>(params.get()).ok())
+                .is_some_and(|(range,)| range.from_block != range.to_block)
+    })
+}
+
 /// "Equal jitter": half of `delay_ms`, plus a random share of the other half, so clients
 /// that failed together do not come back together.
 fn jitter(delay_ms: u64) -> Duration {
@@ -192,11 +227,12 @@ fn jitter(delay_ms: u64) -> Duration {
 #[cfg(test)]
 #[expect(clippy::expect_used)]
 mod tests {
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::{Arc, Mutex};
 
     use alloy_json_rpc::{Id, Request, RequestPacket, ResponsePacket};
     use alloy_transport::{TransportError, TransportErrorKind, TransportFut};
+    use serde_json::{Value, json};
     use tower::{Layer as _, ServiceExt as _};
 
     use super::{MAX_RETRIES, RetryLayer};
@@ -205,10 +241,20 @@ mod tests {
         serde_json::from_str(body).expect("response")
     }
 
-    /// Sends one request through `layer` over a transport that answers its `n`th call
-    /// with `reply(n)`, and reports the result and how many calls were made.
+    /// Sends one `eth_blockNumber` through `layer` over a transport that answers its
+    /// `n`th call with `reply(n)`, and reports the result and how many calls were made.
     async fn send(
         layer: &RetryLayer,
+        reply: impl Fn(u32) -> Result<ResponsePacket, TransportError> + Send + Sync + 'static,
+    ) -> (Result<ResponsePacket, TransportError>, u32) {
+        send_call(layer, "eth_blockNumber", Value::Null, reply).await
+    }
+
+    /// [`send`] for any one call.
+    async fn send_call(
+        layer: &RetryLayer,
+        method: &'static str,
+        params: Value,
         reply: impl Fn(u32) -> Result<ResponsePacket, TransportError> + Send + Sync + 'static,
     ) -> (Result<ResponsePacket, TransportError>, u32) {
         let calls = Arc::new(AtomicU32::new(0));
@@ -217,7 +263,7 @@ mod tests {
             let (n, reply) = (counter.fetch_add(1, Ordering::SeqCst), Arc::clone(&reply));
             Box::pin(async move { reply(n) })
         });
-        let request = Request::new("eth_blockNumber", Id::Number(1), ());
+        let request = Request::new(method, Id::Number(1), params);
         let request = RequestPacket::Single(request.serialize().expect("request"));
         let result = layer.layer(transport).oneshot(request).await;
         (result, calls.load(Ordering::SeqCst))
@@ -273,5 +319,58 @@ mod tests {
         let error = result.expect_err("gives up");
         assert!(error.to_string().contains("503"), "{error}");
         assert_eq!(calls, MAX_RETRIES + 1);
+    }
+
+    /// A real HTTP client timeout: a request to a listener that never answers.
+    async fn timeout() -> TransportError {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let url = format!("http://{}", listener.local_addr().expect("address"));
+        let error = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_millis(1))
+            .build()
+            .expect("client")
+            .get(url)
+            .send()
+            .await
+            .expect_err("times out");
+        assert!(error.is_timeout(), "{error}");
+        TransportErrorKind::custom(error)
+    }
+
+    /// A log query over several heights that times out goes back at once, so the source
+    /// can retry a smaller range; one height's, or a hash-pinned one's, is retried like
+    /// any network failure.
+    #[tokio::test(start_paused = true)]
+    async fn only_a_ranged_log_query_timeout_is_returned_at_once() {
+        for (filter, expected) in [
+            (json!({"fromBlock": "0x64", "toBlock": "0x6d"}), 1),
+            (
+                json!({"fromBlock": "0x64", "toBlock": "0x64"}),
+                MAX_RETRIES + 1,
+            ),
+            (
+                json!({"blockHash": format!("0x{}", "ab".repeat(32))}),
+                MAX_RETRIES + 1,
+            ),
+        ] {
+            let mut timeouts = Vec::new();
+            for _ in 0..=MAX_RETRIES {
+                timeouts.push(timeout().await);
+            }
+            let timeouts = Mutex::new(timeouts);
+            let layer = RetryLayer::default();
+            let (result, calls) = send_call(&layer, "eth_getLogs", json!([filter]), move |_| {
+                Err(timeouts
+                    .lock()
+                    .expect("lock")
+                    .pop()
+                    .expect("a timeout per call"))
+            })
+            .await;
+            result.expect_err("times out");
+            assert_eq!(calls, expected, "{filter}");
+        }
     }
 }

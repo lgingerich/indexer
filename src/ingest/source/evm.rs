@@ -20,10 +20,13 @@
 //!   returns are not, and each omission is named at the projection that makes it.
 //!   Some nodes lack `eth_getBlockReceipts` (some L2s, pre-Cancun Ethereum); it is
 //!   answered with `-32601` or null, and the source then fetches each receipt with
-//!   `eth_getTransactionReceipt` in batches of `RECEIPT_BATCH_LIMIT`.
+//!   `eth_getTransactionReceipt` in batches of `BATCH_LIMIT`.
 //! - The calls are sent as one batch, so a block costs one round trip. They
 //!   still execute separately on the node, so a reorg between them can pair a
 //!   block with another fork's receipts or logs; every `blockHash` is checked.
+//! - Without transactions, buried backfill widens that batch to a range of up to
+//!   `BATCH_LIMIT` heights — their headers and one `eth_getLogs` over the range — and
+//!   retries a range the provider fails on in halves.
 //! - The batch is parsed into alloy's RPC types, then projected field by field into
 //!   the [`crate::wire::datasets`] records; nothing is kept as opaque JSON.
 //! - Parsing uses alloy's *catch-all* (`any`) types, so a chain's non-Ethereum
@@ -39,7 +42,7 @@ use alloy_json_rpc::RpcError;
 use alloy_network::any::{AnyRpcBlock, AnyRpcTransaction, AnyTransactionReceipt};
 use alloy_network::eip2718::Typed2718 as _;
 use alloy_network::{AnyNetwork, TransactionResponse};
-use alloy_primitives::B256;
+use alloy_primitives::{B256, Bloom};
 use alloy_provider::{Provider, ProviderBuilder, RootProvider, WsConnect};
 use alloy_rpc_client::ClientBuilder;
 use alloy_rpc_types_eth::Filter;
@@ -47,6 +50,7 @@ use alloy_rpc_types_eth::Log as RpcLog;
 use alloy_transport::{TransportError, TransportErrorKind};
 use futures_util::StreamExt;
 use serde::Deserialize;
+use tracing::warn;
 
 use super::retry::RetryLayer;
 use super::{BlockMeta, BlockSource, FetchedBlock, HeadStream, METHOD_NOT_FOUND, SourceError};
@@ -54,12 +58,16 @@ use crate::sink::Datasets;
 use crate::wire::datasets::evm::{Block, Log, Transaction};
 use crate::wire::envelope::{ChainId, Event};
 
-/// How many `eth_getTransactionReceipt` calls to put in one JSON-RPC batch.
+/// The most calls one JSON-RPC batch carries.
 ///
-/// Public nodes cap a batch — Base and Optimism reject anything above ten calls
-/// with `-32014` — so the per-transaction receipt fallback requests hashes in
-/// chunks this size. Ten is the smallest observed cap, so it is safe everywhere.
-const RECEIPT_BATCH_LIMIT: usize = 10;
+/// Providers limit requests per second and count each call in a batch against that
+/// limit. Over it, the batch comes back with its first calls answered and the rest
+/// refused, so a batch larger than the limit fails the same way however often it is
+/// retried. `mainnet.base.org` and a Chainstack plan both refused every call past the
+/// 25th in one batch; ten leaves room for pacing and the requests around it. The
+/// per-transaction receipt fallback requests hashes in chunks this size, and a ranged
+/// backfill fetches at most this many heights at once: their headers, with one log query.
+const BATCH_LIMIT: usize = 10;
 
 /// The method labels these calls are reported under, shared by the fetch path and
 /// the projection so an error names the same boundary wherever it is raised.
@@ -83,16 +91,20 @@ enum LogSource {
 /// This is the whole fetch policy; the fetch path and the projection read it rather
 /// than the selection, so the table below is the one place the choice is made:
 ///
-/// | Selected | Block read | Receipts | Logs from |
-/// | --- | --- | --- | --- |
-/// | `logs` | none when a live head matches, else hashes only | — | `eth_getLogs` |
-/// | `blocks` | hashes only | — | — |
-/// | `blocks`, `logs` | hashes only | — | `eth_getLogs` |
-/// | `transactions`, with any others | full | `eth_getBlockReceipts` | receipts |
+/// | Selected | Block read | Receipts | Logs from | Buried backfill |
+/// | --- | --- | --- | --- | --- |
+/// | `logs` | none when a live head matches, else hashes only | — | `eth_getLogs` | ranged |
+/// | `blocks` | hashes only | — | — | ranged |
+/// | `blocks`, `logs` | hashes only | — | `eth_getLogs` | ranged |
+/// | `transactions`, with any others | full | `eth_getBlockReceipts` | receipts | per height |
 ///
 /// Receipts are fetched only for transactions, because each transaction row is joined
 /// to its receipt. A node without `eth_getBlockReceipts` is answered per transaction,
 /// which is a fallback inside the receipts step rather than another plan.
+///
+/// A plan is ranged when every selected dataset can be served for a range of heights at
+/// once: headers as one batch, logs as one `eth_getLogs` over the range. Receipts are per
+/// block, so `transactions` is never ranged.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct FetchPlan {
     /// Project the block row. Its header is read whenever the plan reads a block.
@@ -120,6 +132,12 @@ impl FetchPlan {
             logs,
             reuse_head: datasets.logs && !datasets.blocks && !datasets.transactions,
         }
+    }
+
+    /// Whether buried backfill fetches heights a range at a time: whenever transactions,
+    /// whose receipts are per block, are not selected.
+    const fn ranged(self) -> bool {
+        !self.transactions
     }
 }
 
@@ -318,6 +336,11 @@ pub fn decode_block(batch: RpcBatch) -> Result<FetchedBlock, SourceError> {
 /// index order, with `eth_getLogs` rows appended after.
 /// A selected dataset whose body is absent is an error; a logs-only fetch that reused
 /// a notification has no body and appends only its hash-pinned logs.
+///
+/// `eth_getLogs` answering nothing for a header whose `logsBloom` is set is an error
+/// too: the block has logs, and a backend that has not indexed it can answer an empty
+/// list rather than fail. A notification carries no bloom, so a reused head is not
+/// checked.
 fn project(
     meta: BlockMeta,
     block: Option<&AnyRpcBlock>,
@@ -353,6 +376,15 @@ fn project(
         append_body(&mut events, block, receipts, plan, meta)?;
     }
     if let Some(logs) = logs {
+        if logs.is_empty()
+            && let Some(block) = block
+            && block.0.inner.header.inner.logs_bloom != Bloom::ZERO
+        {
+            return Err(malformed(
+                LOGS,
+                "no logs returned for a block whose logsBloom is set",
+            ));
+        }
         for log in logs {
             events.push(Event::Log(Box::new(get_logs_record(
                 log,
@@ -479,6 +511,69 @@ fn get_logs_record(
         block_timestamp,
         LOGS,
     )
+}
+
+/// Splits one range's headers and `eth_getLogs` rows into a block per height, in order.
+///
+/// `headers` are the range's headers in height order, starting at `from`. Each height is
+/// projected exactly as a single block would be, so the same checks apply: each log's
+/// block hash against its header, and an empty answer against the header's bloom. The
+/// range adds its own: every log belongs to a requested height, in ascending
+/// `(blockNumber, logIndex)` order. Logs out of order are rejected rather than sorted,
+/// since a node that misorders them is not one to trust with the rest of the answer.
+fn split_range(
+    from: u64,
+    headers: &[AnyRpcBlock],
+    logs: Option<&[RpcLog]>,
+    plan: FetchPlan,
+) -> Result<Vec<FetchedBlock>, SourceError> {
+    let mut rest = logs;
+    let mut blocks = Vec::with_capacity(headers.len());
+    for (height, header) in (from..).zip(headers) {
+        let meta = BlockMeta::from(header);
+        if meta.height != height {
+            return Err(malformed(
+                BLOCK,
+                format!("requested block {height}, received {}", meta.height),
+            ));
+        }
+        // In order, this height's logs are the next run carrying its number.
+        let own = match rest {
+            Some(logs) => {
+                let count = logs
+                    .iter()
+                    .take_while(|log| log.block_number == Some(height))
+                    .count();
+                let (own, after) = logs.split_at(count);
+                if own
+                    .windows(2)
+                    .any(|pair| pair[0].log_index >= pair[1].log_index)
+                {
+                    return Err(malformed(
+                        LOGS,
+                        format!("logs of block {height} are not in ascending logIndex order"),
+                    ));
+                }
+                rest = Some(after);
+                Some(own)
+            }
+            None => None,
+        };
+        blocks.push(FetchedBlock {
+            meta,
+            events: project(meta, Some(header), None, own, plan)?,
+        });
+    }
+    if let Some(log) = rest.and_then(<[RpcLog]>::first) {
+        return Err(malformed(
+            LOGS,
+            format!(
+                "log at block {:?} is outside the range or out of order",
+                log.block_number
+            ),
+        ));
+    }
+    Ok(blocks)
 }
 
 /// Flattens a block header and its transaction hashes into the `blocks` dataset.
@@ -697,39 +792,59 @@ impl BlockSource for EvmSource {
         // the plan reads nothing else from the block body it stands in for the block
         // read entirely. A head for a different height is no use, so it is ignored
         // rather than mistrusted.
-        let reuse = head.filter(|meta| meta.height == height && self.plan.reuse_head);
-        let (meta, block, mut receipts, logs) = if let Some(meta) = reuse {
+        if let Some(meta) = head.filter(|meta| meta.height == height && self.plan.reuse_head) {
             let logs = self.fetch_logs(meta.hash).await?;
-            (*meta, None, None, Some(logs))
-        } else {
-            let RpcBatch {
-                meta,
-                block,
-                receipts,
-                logs,
-            } = self.fetch_batch(height).await?;
-            let block = block.ok_or_else(|| malformed(BLOCK, "block was not fetched"))?;
-            (meta, Some(block), receipts, logs)
-        };
+            return Ok(FetchedBlock {
+                meta: *meta,
+                events: project(*meta, None, None, Some(&logs), self.plan)?,
+            });
+        }
+        if self.plan.ranged() {
+            return self
+                .fetch_range(height, height)
+                .await?
+                .pop()
+                .ok_or_else(|| malformed(BLOCK, "block was not fetched"));
+        }
+        let (block, receipts) = self.fetch_batch(height).await?;
         // Nodes that do not serve `eth_getBlockReceipts` (some L2s, and pre-Cancun
         // Ethereum) answer it with `METHOD_NOT_FOUND` or null. Fetch the receipts
         // by transaction hash instead, so the block still becomes events.
-        if self.plan.transactions && receipts.is_none() {
-            let block = block
-                .as_ref()
-                .ok_or_else(|| malformed(RECEIPTS, "block was not fetched"))?;
-            receipts = Some(self.fetch_receipts(block).await?);
-        }
+        let receipts = match receipts {
+            Some(receipts) => receipts,
+            None => self.fetch_receipts(&block).await?,
+        };
+        let meta = BlockMeta::from(&block);
         Ok(FetchedBlock {
             meta,
-            events: project(
-                meta,
-                block.as_ref(),
-                receipts.as_deref(),
-                logs.as_deref(),
-                self.plan,
-            )?,
+            events: project(meta, Some(&block), Some(&receipts), None, self.plan)?,
         })
+    }
+
+    /// Fetches up to `BATCH_LIMIT` heights as one range when the plan is ranged, and
+    /// one height otherwise.
+    ///
+    /// Logs per block vary widely, so a range a provider cannot serve is not the end: a
+    /// transport failure — a refusal of the range's size, a timeout, or an error that
+    /// outlasted the retry layer — is retried for the first half of the range, rounded
+    /// up, down to one height, and only a single height's failure is returned. Each
+    /// call starts again at the full size, since the next stretch of the chain may be
+    /// quieter. A range that comes back but fails its checks is returned as is: a
+    /// smaller range would not fix data the node got wrong.
+    async fn fetch_blocks(&self, from: u64, to: u64) -> Result<Vec<FetchedBlock>, SourceError> {
+        if !self.plan.ranged() {
+            return Ok(vec![self.fetch_block(from, None).await?]);
+        }
+        let mut last = to.min(from.saturating_add(BATCH_LIMIT as u64 - 1));
+        loop {
+            match self.fetch_range(from, last).await {
+                Err(error @ SourceError::Transport { .. }) if last > from => {
+                    warn!(from, to = last, %error, "range fetch failed; retrying its first half");
+                    last = from + (last - from) / 2;
+                }
+                result => return result,
+            }
+        }
     }
 
     async fn fetch_header(&self, height: Option<u64>) -> Result<BlockMeta, SourceError> {
@@ -756,9 +871,8 @@ impl BlockSource for EvmSource {
 impl EvmSource {
     /// Fetches the block's receipts one transaction at a time, in index order.
     ///
-    /// The fallback for nodes without `eth_getBlockReceipts`. Many public nodes cap
-    /// a JSON-RPC batch at [`RECEIPT_BATCH_LIMIT`] calls — Base and Optimism answer
-    /// `-32014` above it — so the hashes are requested in chunks of that size.
+    /// The fallback for nodes without `eth_getBlockReceipts`. The hashes are requested
+    /// in chunks of [`BATCH_LIMIT`], so no batch outruns a provider's per-second limit.
     async fn fetch_receipts(
         &self,
         block: &AnyRpcBlock,
@@ -767,7 +881,7 @@ impl EvmSource {
         let hashes: Vec<B256> = block.0.inner.transactions.hashes().collect();
 
         let mut receipts = Vec::with_capacity(hashes.len());
-        for chunk in hashes.chunks(RECEIPT_BATCH_LIMIT) {
+        for chunk in hashes.chunks(BATCH_LIMIT) {
             let mut batch = alloy_rpc_client::BatchRequest::new(self.provider.client());
             let mut calls = Vec::with_capacity(chunk.len());
             for hash in chunk {
@@ -793,42 +907,26 @@ impl EvmSource {
         Ok(receipts)
     }
 
-    /// Fetches the dataset calls this source needs for one height, in one batch.
+    /// Fetches one height's full block and its receipts in one batch: the per-height
+    /// fetch of a plan with transactions.
     ///
-    /// The block is always read: its header supplies the metadata the projection is
-    /// anchored to, and the receipt fallback reads transaction hashes from it. When
-    /// a live notification already supplied the metadata and only logs are selected,
-    /// [`Self::fetch_logs`] is used instead and this block read is skipped.
-    async fn fetch_batch(&self, height: u64) -> Result<RpcBatch, SourceError> {
+    /// The receipts are `None` when the node does not serve `eth_getBlockReceipts`. Some
+    /// nodes answer the method with a [`METHOD_NOT_FOUND`] error and others with a `null`
+    /// result, so both are treated the same way.
+    async fn fetch_batch(
+        &self,
+        height: u64,
+    ) -> Result<(AnyRpcBlock, Option<Vec<AnyTransactionReceipt>>), SourceError> {
         let tag = alloy_rpc_types_eth::BlockNumberOrTag::Number(height);
-        let filter = Filter::new().select(height);
         // In 1.8.3 Provider::client() returns RpcClientInner; new_batch() is
         // only on RpcClient. This is its identical BatchRequest constructor.
         let mut batch = alloy_rpc_client::BatchRequest::new(self.provider.client());
-        // Full objects only when transactions are stored; hashes fill the block row.
-        // Order matches the all-dataset batch the tests lock: block, then receipts,
-        // then logs.
         let block = batch
-            .add_call::<_, Option<AnyRpcBlock>>(BLOCK, &(tag, self.plan.transactions))
+            .add_call::<_, Option<AnyRpcBlock>>(BLOCK, &(tag, true))
             .map_err(|source| transport(BLOCK, source))?;
-        let receipts = if self.plan.transactions {
-            Some(
-                batch
-                    .add_call::<_, Option<Vec<AnyTransactionReceipt>>>(RECEIPTS, &(tag,))
-                    .map_err(|source| transport(RECEIPTS, source))?,
-            )
-        } else {
-            None
-        };
-        let logs = if self.plan.logs == LogSource::GetLogs {
-            Some(
-                batch
-                    .add_call::<_, Vec<RpcLog>>(LOGS, &(filter,))
-                    .map_err(|source| transport(LOGS, source))?,
-            )
-        } else {
-            None
-        };
+        let receipts = batch
+            .add_call::<_, Option<Vec<AnyTransactionReceipt>>>(RECEIPTS, &(tag,))
+            .map_err(|source| transport(RECEIPTS, source))?;
         batch
             .send()
             .await
@@ -837,25 +935,12 @@ impl EvmSource {
             .await
             .map_err(|source| transport(BLOCK, source))?
             .ok_or_else(|| malformed(BLOCK, "result was null"))?;
-        let receipts = match receipts {
-            Some(receipts) => match receipts.await {
-                Ok(receipts) => receipts,
-                Err(RpcError::ErrorResp(error)) if error.code == METHOD_NOT_FOUND => None,
-                Err(source) => return Err(transport(RECEIPTS, source)),
-            },
-            None => None,
+        let receipts = match receipts.await {
+            Ok(receipts) => receipts,
+            Err(RpcError::ErrorResp(error)) if error.code == METHOD_NOT_FOUND => None,
+            Err(source) => return Err(transport(RECEIPTS, source)),
         };
-        let logs = match logs {
-            Some(logs) => Some(logs.await.map_err(|source| transport(LOGS, source))?),
-            None => None,
-        };
-        let meta = BlockMeta::from(&block);
-        Ok(RpcBatch {
-            meta,
-            block: Some(block),
-            receipts,
-            logs,
-        })
+        Ok((block, receipts))
     }
 
     /// Fetches one height's logs, pinned to `hash` so a reorg cannot silently answer
@@ -867,6 +952,46 @@ impl EvmSource {
             .request(LOGS, (filter,))
             .await
             .map_err(|source| transport(LOGS, source))
+    }
+
+    /// Fetches the heights `from ..= to` in one batch: each height's hashes-only header
+    /// and, when logs are selected, one `eth_getLogs` over the range. One height is a
+    /// range of one, so this is also the per-height fetch of a plan without
+    /// transactions.
+    async fn fetch_range(&self, from: u64, to: u64) -> Result<Vec<FetchedBlock>, SourceError> {
+        let mut batch = alloy_rpc_client::BatchRequest::new(self.provider.client());
+        let headers = (from..=to)
+            .map(|height| {
+                let tag = alloy_rpc_types_eth::BlockNumberOrTag::Number(height);
+                batch.add_call::<_, Option<AnyRpcBlock>>(BLOCK, &(tag, false))
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|source| transport(BLOCK, source))?;
+        let logs = (self.plan.logs == LogSource::GetLogs)
+            .then(|| {
+                let filter = Filter::new().from_block(from).to_block(to);
+                batch.add_call::<_, Vec<RpcLog>>(LOGS, &(filter,))
+            })
+            .transpose()
+            .map_err(|source| transport(LOGS, source))?;
+        batch
+            .send()
+            .await
+            .map_err(|source| transport("rpc batch", source))?;
+        let mut blocks = Vec::with_capacity(headers.len());
+        for header in headers {
+            blocks.push(
+                header
+                    .await
+                    .map_err(|source| transport(BLOCK, source))?
+                    .ok_or_else(|| malformed(BLOCK, "result was null"))?,
+            );
+        }
+        let logs = match logs {
+            Some(logs) => Some(logs.await.map_err(|source| transport(LOGS, source))?),
+            None => None,
+        };
+        split_range(from, &blocks, logs.as_deref(), self.plan)
     }
 }
 
@@ -962,6 +1087,218 @@ mod tests {
         assert_eq!(fetched.meta.height, 18_000_000);
         assert_eq!(fetched.meta.timestamp, TIMESTAMP);
         assert_eq!(server.join().expect("server").len(), 1);
+    }
+
+    /// Reads a hex quantity out of a request.
+    fn quantity(value: &Value) -> u64 {
+        let digits = value.as_str().expect("quantity").trim_start_matches("0x");
+        u64::from_str_radix(digits, 16).expect("quantity")
+    }
+
+    /// A hashes-only header at `height`, on a chain whose block at height `h` hashes to
+    /// `hash(h)`, with an empty bloom. Heights stay below 256 so each has its own hash.
+    fn header_at(height: u8) -> Value {
+        let mut header = block();
+        header["number"] = json!(format!("0x{height:x}"));
+        header["hash"] = json!(hash(height));
+        header["parentHash"] = json!(hash(height - 1));
+        header["transactions"] = json!([]);
+        header
+    }
+
+    /// Log `index` of the block at `height`, as `eth_getLogs` returns it.
+    fn log_at(height: u8, index: u8) -> Value {
+        let mut log = receipts()[0]["logs"][0].clone();
+        log["blockNumber"] = json!(format!("0x{height:x}"));
+        log["blockHash"] = json!(hash(height));
+        log["logIndex"] = json!(format!("0x{index:x}"));
+        log
+    }
+
+    /// The `eth_getLogs` call in a range's batch.
+    fn log_query(request: &Value) -> &Value {
+        let calls = request.as_array().expect("a range is one batch");
+        calls
+            .iter()
+            .find(|call| call["method"] == "eth_getLogs")
+            .expect("a log query")
+    }
+
+    /// How many heights a range's log query spans.
+    fn span(request: &Value) -> u64 {
+        let filter = &log_query(request)["params"][0];
+        quantity(&filter["toBlock"]) - quantity(&filter["fromBlock"]) + 1
+    }
+
+    /// Answers a range's batch: each requested header, its bloom set at `bloom_at`, and
+    /// `logs` as given, so a test controls exactly what the node got wrong.
+    fn range_reply(request: &Value, logs: &[Value], bloom_at: Option<u8>) -> Value {
+        let calls = request.as_array().expect("a range is one batch");
+        Value::Array(
+            calls
+                .iter()
+                .map(|call| {
+                    let result = if call["method"] == "eth_getLogs" {
+                        json!(logs)
+                    } else {
+                        assert_eq!(call["method"], "eth_getBlockByNumber");
+                        assert_eq!(call["params"][1], false, "a range reads hashes only");
+                        let height = u8::try_from(quantity(&call["params"][0])).expect("height");
+                        let mut header = header_at(height);
+                        if bloom_at == Some(height) {
+                            header["logsBloom"] = json!(format!("0x80{}", "00".repeat(255)));
+                        }
+                        header
+                    };
+                    json!({"jsonrpc": "2.0", "id": call["id"], "result": result})
+                })
+                .collect(),
+        )
+    }
+
+    fn logs_only(url: String) -> EvmSource {
+        EvmSource::new(
+            "base",
+            url,
+            "ws://unused",
+            serde_json::from_str(r#"["logs"]"#).expect("datasets"),
+        )
+        .expect("source")
+    }
+
+    /// A range is one batch — a header per height and one `eth_getLogs` — split back into
+    /// a block per height, an empty height included, with each block's events in the
+    /// order a single height's fetch emits them.
+    #[tokio::test]
+    async fn a_range_is_one_batch_split_per_height() {
+        for (selection, expected) in [
+            (r#"["logs"]"#, [&["log", "log"][..], &[], &["log"]]),
+            (
+                r#"["blocks", "logs"]"#,
+                [&["block", "log", "log"][..], &["block"], &["block", "log"]],
+            ),
+        ] {
+            let logs = [log_at(100, 0), log_at(100, 1), log_at(102, 0)];
+            let (url, server) = rpc_server(1, move |request| range_reply(request, &logs, None));
+            let source = EvmSource::new(
+                "base",
+                url,
+                "ws://unused",
+                serde_json::from_str(selection).expect("datasets"),
+            )
+            .expect("source");
+            let blocks = source.fetch_blocks(100, 102).await.expect("range");
+            let observed = server.join().expect("server");
+            assert_eq!(observed[0].as_array().expect("batch").len(), 4);
+            assert_eq!(span(&observed[0]), 3);
+            assert_eq!(blocks.len(), 3);
+            for ((height, block), kinds) in (100_u8..).zip(&blocks).zip(expected) {
+                assert_eq!(block.meta.height, u64::from(height));
+                assert_eq!(block.meta.hash, hash(height).parse::<B256>().expect("hash"));
+                let got: Vec<&str> = block.events.iter().map(Event::kind).collect();
+                assert_eq!(got, kinds, "{selection} at {height}");
+            }
+        }
+    }
+
+    /// Without transactions, one height is a range of one: the tail and live paths send
+    /// the same single batch.
+    #[tokio::test]
+    async fn one_height_without_transactions_is_a_range_of_one() {
+        let logs = [log_at(100, 0)];
+        let (url, server) = rpc_server(1, move |request| range_reply(request, &logs, None));
+        let fetched = logs_only(url).fetch_block(100, None).await.expect("fetch");
+        let observed = server.join().expect("server");
+        assert_eq!(observed[0].as_array().expect("batch").len(), 2);
+        assert_eq!(span(&observed[0]), 1);
+        assert_eq!(fetched.meta.height, 100);
+        assert_eq!(fetched.events.len(), 1);
+    }
+
+    /// A range the provider refuses is retried for its first half, rounded up, down to
+    /// one height, and only a single height's failure is returned. The first attempt is
+    /// capped at the batch limit, however far the caller allows.
+    #[tokio::test]
+    async fn a_refused_range_is_retried_in_halves_down_to_one_height() {
+        for (largest, spans, served) in [
+            (2, vec![10, 5, 3, 2], Some(2)),
+            (0, vec![10, 5, 3, 2, 1], None),
+        ] {
+            let (url, server) = rpc_server(spans.len(), move |request| {
+                let mut reply = range_reply(request, &[], None);
+                if span(request) > largest {
+                    let id = &log_query(request)["id"];
+                    for response in reply.as_array_mut().expect("batch") {
+                        if response["id"] == *id {
+                            *response = json!({"jsonrpc": "2.0", "id": id, "error":
+                                {"code": -32602, "message": "query exceeds the maximum range"}});
+                        }
+                    }
+                }
+                reply
+            });
+            let result = logs_only(url).fetch_blocks(100, 200).await;
+            let observed = server.join().expect("server");
+            assert_eq!(observed.iter().map(span).collect::<Vec<_>>(), spans);
+            match served {
+                Some(count) => assert_eq!(result.expect("a smaller range").len(), count),
+                None => assert!(matches!(
+                    result,
+                    Err(SourceError::Transport {
+                        context: "eth_getLogs",
+                        ..
+                    })
+                )),
+            }
+        }
+    }
+
+    /// A range that comes back but breaks a range check fails as it is: a smaller range
+    /// would not fix data the node got wrong.
+    #[tokio::test]
+    async fn a_range_that_fails_its_checks_is_not_retried_smaller() {
+        let mut wrong_hash = log_at(101, 0);
+        wrong_hash["blockHash"] = json!(hash(0xee));
+        for (case, logs, bloom_at) in [
+            ("a log from another block", vec![wrong_hash], None),
+            (
+                "logs out of order",
+                vec![log_at(101, 1), log_at(101, 0)],
+                None,
+            ),
+            (
+                "a duplicate log",
+                vec![log_at(101, 0), log_at(101, 0)],
+                None,
+            ),
+            ("a log below the range", vec![log_at(99, 0)], None),
+            ("a log above the range", vec![log_at(103, 0)], None),
+            ("no logs for a header whose bloom is set", vec![], Some(101)),
+        ] {
+            let (url, server) = rpc_server(1, move |request| range_reply(request, &logs, bloom_at));
+            let error = logs_only(url).fetch_blocks(100, 102).await.expect_err(case);
+            assert!(
+                matches!(error, SourceError::Malformed { .. }),
+                "{case}: {error}"
+            );
+            assert_eq!(server.join().expect("server").len(), 1, "{case}");
+        }
+    }
+
+    /// Transactions come with their receipts, which are per block, so a transaction
+    /// dataset backfills a height at a time.
+    #[tokio::test]
+    async fn a_transaction_dataset_backfills_one_height_at_a_time() {
+        let (url, server) = rpc_server(1, |request| primary_reply(request, &block(), &receipts()));
+        let source =
+            EvmSource::new("ethereum", url, "ws://unused", Datasets::all()).expect("source");
+        let blocks = source
+            .fetch_blocks(18_000_000, 18_000_009)
+            .await
+            .expect("fetch");
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].meta.height, 18_000_000);
+        server.join().expect("server");
     }
 
     /// A reusable head stands in for the header only when logs are the only thing
