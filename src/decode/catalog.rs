@@ -334,19 +334,6 @@ impl Catalog {
             .position(|entry| entry.protocol == protocol && entry.name == name)
     }
 
-    /// Whether any contract is discovered from a creation event.
-    #[must_use]
-    pub fn discovers(&self) -> bool {
-        self.entries.iter().any(|entry| !entry.rules.is_empty())
-    }
-
-    /// Drops every discovery rule, leaving seeds and stored contracts to decode as listed.
-    pub fn disable_discovery(&mut self) {
-        for entry in &mut self.entries {
-            entry.rules.clear();
-        }
-    }
-
     /// `protocol.name`, for messages.
     pub(crate) fn label(&self, entry: EntryId) -> String {
         format!(
@@ -773,7 +760,7 @@ addresses = { base = ["0x33128a8fC17869897dcE68Ed026d694621f6FDfD"], ethereum = 
     #[test]
     fn the_shipped_protocols_load() {
         let catalog = Catalog::load(repository(), &ChainId::new("base")).expect("loads");
-        assert!(catalog.discovers());
+        assert!(catalog.entries.iter().any(|entry| !entry.rules.is_empty()));
         let pool = catalog.entry("uniswap_v3", "UniswapV3Pool").expect("pool");
         assert!(catalog.seeds.iter().any(|&(_, entry)| entry == pool));
         assert!(catalog.entry("uniswap_v4", "PoolManager").is_some());
@@ -784,7 +771,7 @@ addresses = { base = ["0x33128a8fC17869897dcE68Ed026d694621f6FDfD"], ethereum = 
     /// position from the parent's ABI.
     #[test]
     fn contracts_are_named_by_their_abi_file_and_rules_resolve_against_the_parent() {
-        let mut catalog = single(&format!(
+        let catalog = single(&format!(
             "{FACTORY}{POOL}created_by = [{{ contract = \"UniswapV3Factory\", event = \"PoolCreated\", param = \"pool\" }}]\n"
         ))
         .expect("loads");
@@ -802,9 +789,6 @@ addresses = { base = ["0x33128a8fC17869897dcE68Ed026d694621f6FDfD"], ethereum = 
             [(4, pool)]
         );
         assert_eq!(catalog.seeds.len(), 1, "only the loaded chain's addresses");
-
-        catalog.disable_discovery();
-        assert!(!catalog.discovers());
     }
 
     #[test]

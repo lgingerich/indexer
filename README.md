@@ -248,11 +248,11 @@ that matters most: `decode` must not depend on `ingest`.
 - **EVM ingestion.** Live heads over WebSocket (`eth_subscribe`/`newHeads`), and
   each block fetched over JSON-RPC in one batched request. `[ingest] datasets`
   chooses which of block, transaction, receipt, and log are fetched and stored;
-  omitted, all four are. Logs without receipts use one `eth_getLogs` per height,
-  and `[ingest] log_addresses` limits that call to those contracts. A live `newHeads`
-  notification carries the head's identity, parent hash, and timestamp, so a logs-only
-  fetch reuses them and pins `eth_getLogs` to the announced hash instead of re-reading
-  the header; a block, transaction, or `receipts` dataset still fetches the body it needs.
+  omitted, all four are. Logs without receipts use one `eth_getLogs` per height. A
+  live `newHeads` notification carries the head's identity, parent hash, and
+  timestamp, so a logs-only fetch reuses them and pins `eth_getLogs` to the announced
+  hash instead of re-reading the header; a block, transaction, or `receipts` dataset
+  still fetches the body it needs.
   See `src/ingest/source/evm.rs`.
 - **One event per dataset.** A `block` event, then for each transaction a
   `transaction` event, its `receipt` event, and its `log` events. Each dataset is a
@@ -363,9 +363,7 @@ stdout and anything downstream of it — so those hops share one schema.
 
 ### Ranged log backfill
 
-`[ingest] log_addresses` limits each `eth_getLogs` to those contracts. That call
-runs when logs are selected and receipts are not; with receipts, logs come from
-the receipts and an address list is refused at startup. Backfill still walks one
+Logs without receipts come from one `eth_getLogs` per height, and backfill walks one
 height at a time — even a live notification reuses its header but fetches logs for
 that one height. A wider `eth_getLogs` range covering many historical blocks, and
 cross-block batching of the per-height block/receipt calls, are not built.
@@ -493,7 +491,6 @@ the field:
 | Key | Default | Meaning |
 | --- | --- | --- |
 | `ingest.datasets` | blocks, transactions, receipts, logs | Which datasets are fetched and stored. A dataset that needs the block body still reads it; a logs-only live fetch reuses the notification header |
-| `ingest.log_addresses` | none | Contracts passed to `eth_getLogs`. Empty fetches every log. Valid only when `logs` is selected and `receipts` is not |
 | `ingest.start_block` | the sampled head | First height to index on an empty store. Absent starts live at the observed head; a value backfills that inclusive height forward before following live heads. A value above the sampled head is a startup error, and so is a value when the store already holds blocks: a run resumes from the store |
 | `sink.duckdb.batch_records` | `500` | Most records one store commit may cover; a backlog of blocks is folded into one commit up to this, and a block is never split |
 | `sink.duckdb.path` | `indexer.duckdb` | Path to the store. Tables live in a schema named for the chain: `base.logs` |
@@ -609,9 +606,6 @@ blocks missed while the process was down are replayed and a pool created then is
 discovered; a reorg while it was down retracts a pool whose creating block it orphaned.
 A pool created before the first run is never seen — list those as seeds. With
 `[sink.stdout]` there is no store, so each start begins from the seeds.
-
-`ingest.log_addresses` turns discovery off, with a warning at startup. That filter is an
-explicit list fixed at startup, so a discovered contract's logs would never be fetched.
 
 **Upgrades.** List every version's ABI in `abi`. Events merge by selector and topic
 count, so a log decodes as whichever version emitted it; the same selector with a

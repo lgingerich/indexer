@@ -12,14 +12,13 @@
 //!   `blocks` dataset is selected.
 //! - The selected datasets decide the calls. Logs without receipts use `eth_getLogs`
 //!   for that one height, pinned to the announced hash when the notification
-//!   supplied it, optionally limited to a list of contract addresses; a validated
-//!   notification header then stands in for the header read. Transactions require
-//!   full transaction objects, and receipts come from `eth_getBlockReceipts` with
-//!   selected logs taken from those receipts. Every field the selected datasets
-//!   declare is carried across; a few the node also returns are not, and each
-//!   omission is named at the projection that makes it. Some nodes lack
-//!   `eth_getBlockReceipts` (some L2s, pre-Cancun Ethereum); it is answered with
-//!   `-32601` or null, and the source then fetches each receipt with
+//!   supplied it; a validated notification header then stands in for the header
+//!   read. Transactions require full transaction objects, and receipts come from
+//!   `eth_getBlockReceipts` with selected logs taken from those receipts. Every
+//!   field the selected datasets declare is carried across; a few the node also
+//!   returns are not, and each omission is named at the projection that makes it.
+//!   Some nodes lack `eth_getBlockReceipts` (some L2s, pre-Cancun Ethereum); it is
+//!   answered with `-32601` or null, and the source then fetches each receipt with
 //!   `eth_getTransactionReceipt` in batches of `RECEIPT_BATCH_LIMIT`.
 //! - The calls are sent as one batch, so a block costs one round trip. They
 //!   still execute separately on the node, so a reorg between them can pair a
@@ -39,7 +38,7 @@ use alloy_json_rpc::RpcError;
 use alloy_network::any::{AnyRpcBlock, AnyRpcTransaction, AnyTransactionReceipt};
 use alloy_network::eip2718::Typed2718 as _;
 use alloy_network::{AnyNetwork, TransactionResponse};
-use alloy_primitives::{Address, B256};
+use alloy_primitives::B256;
 use alloy_provider::{Provider, ProviderBuilder, RootProvider, WsConnect};
 use alloy_rpc_client::ClientBuilder;
 use alloy_rpc_types_eth::Filter;
@@ -74,8 +73,6 @@ pub struct EvmSource {
     ws_url: String,
     provider: RootProvider<AnyNetwork>,
     datasets: Datasets,
-    /// Contracts `eth_getLogs` is limited to. Empty means every log at the height.
-    log_addresses: Vec<Address>,
 }
 
 impl EvmSource {
@@ -83,28 +80,20 @@ impl EvmSource {
     ///
     /// A live notification's metadata stands in for the header only on the logs-only
     /// live path; every other dataset still reads the block body, and the header is
-    /// what supplies linkage when no notification did. `log_addresses` limits
-    /// `eth_getLogs` to those contracts. An empty list fetches every log. A non-empty
-    /// list is rejected unless logs are selected and receipts are not, because that is
-    /// the only batch that sends `eth_getLogs`.
+    /// what supplies linkage when no notification did.
     ///
     /// HTTP requests are paced and retried to fit the provider's rate limit, which is
     /// learned from its refusals rather than configured.
     ///
     /// # Errors
     ///
-    /// Returns [`SourceError::LogAddresses`] when addresses are set but `eth_getLogs`
-    /// would not run, and a typed error if the HTTP endpoint or TLS client cannot be built.
+    /// Returns a typed error if the HTTP endpoint or TLS client cannot be built.
     pub fn new(
         chain: impl Into<ChainId>,
         http_url: impl Into<String>,
         ws_url: impl Into<String>,
         datasets: Datasets,
-        log_addresses: &[Address],
     ) -> Result<Self, SourceError> {
-        if !log_addresses.is_empty() && (!datasets.logs || datasets.receipts) {
-            return Err(SourceError::LogAddresses);
-        }
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(10))
             .build()?;
@@ -128,7 +117,6 @@ impl EvmSource {
             ws_url: ws_url.into(),
             provider,
             datasets,
-            log_addresses: log_addresses.to_vec(),
         })
     }
 }
@@ -309,7 +297,7 @@ fn project(
     }
     if let Some(logs) = logs {
         for log in logs {
-            events.push(Event::Log(Box::new(filtered_log(
+            events.push(Event::Log(Box::new(get_logs_record(
                 log,
                 meta.height,
                 meta.hash,
@@ -415,7 +403,10 @@ fn append_body(
 }
 
 /// One `eth_getLogs` row, checked against the header it was requested for.
-fn filtered_log(
+///
+/// The `eth_getLogs` counterpart of the receipt path's [`log_record`] call: that call
+/// runs separately from the block read, so the row's block identity is checked here.
+fn get_logs_record(
     log: &RpcLog,
     block_number: u64,
     block_hash: B256,
@@ -790,10 +781,7 @@ impl EvmSource {
     /// [`Self::fetch_logs`] is used instead and this block read is skipped.
     async fn fetch_batch(&self, height: u64) -> Result<RpcBatch, SourceError> {
         let tag = alloy_rpc_types_eth::BlockNumberOrTag::Number(height);
-        let mut filter = Filter::new().select(height);
-        if !self.log_addresses.is_empty() {
-            filter = filter.address(self.log_addresses.clone());
-        }
+        let filter = Filter::new().select(height);
         // In 1.8.3 Provider::client() returns RpcClientInner; new_batch() is
         // only on RpcClient. This is its identical BatchRequest constructor.
         let mut batch = alloy_rpc_client::BatchRequest::new(self.provider.client());
@@ -854,10 +842,7 @@ impl EvmSource {
     /// Fetches one height's logs, pinned to `hash` so a reorg cannot silently answer
     /// with the replacement branch: the query returns that block's logs or nothing.
     async fn fetch_logs(&self, hash: B256) -> Result<Vec<RpcLog>, SourceError> {
-        let mut filter = Filter::new().at_block_hash(hash);
-        if !self.log_addresses.is_empty() {
-            filter = filter.address(self.log_addresses.clone());
-        }
+        let filter = Filter::new().at_block_hash(hash);
         self.provider
             .client()
             .request(LOGS, (filter,))
@@ -951,7 +936,7 @@ mod tests {
     async fn primary_fetch_is_one_two_call_batch_with_reversed_responses() {
         let (url, server) = rpc_server(1, |request| primary_reply(request, &block(), &receipts()));
         let source =
-            EvmSource::new("ethereum", url, "ws://unused", Datasets::all(), &[]).expect("source");
+            EvmSource::new("ethereum", url, "ws://unused", Datasets::all()).expect("source");
         let fetched = source.fetch_block(18_000_000, None).await.expect("fetch");
         assert_eq!(fetched.events.len(), 7);
         // The header is reported as metadata, and no finalized call is made.
@@ -973,8 +958,8 @@ mod tests {
                 assert_eq!(request["params"], json!([param, false]));
                 json!({"jsonrpc": "2.0", "id": request["id"], "result": block()})
             });
-            let source = EvmSource::new("ethereum", url, "ws://unused", Datasets::all(), &[])
-                .expect("source");
+            let source =
+                EvmSource::new("ethereum", url, "ws://unused", Datasets::all()).expect("source");
             let meta = source.fetch_header(height).await.expect("header");
             assert_eq!(meta.height, 18_000_000);
             assert_eq!(meta.timestamp, TIMESTAMP);
@@ -1006,7 +991,6 @@ mod tests {
             url,
             "ws://unused",
             serde_json::from_str(r#"["logs"]"#).expect("datasets"),
-            &[],
         )
         .expect("source");
         let fetched = source.fetch_block(18_000_000, None).await.expect("fetch");
@@ -1035,7 +1019,6 @@ mod tests {
             url,
             "ws://unused",
             serde_json::from_str(r#"["logs"]"#).expect("datasets"),
-            &[],
         )
         .expect("source");
         let head = BlockMeta {
@@ -1077,7 +1060,6 @@ mod tests {
             url,
             "ws://unused",
             serde_json::from_str(r#"["transactions", "logs"]"#).expect("datasets"),
-            &[],
         )
         .expect("source");
         let head = BlockMeta {
@@ -1097,69 +1079,6 @@ mod tests {
             "the body rows survive a reusable head"
         );
         server.join().expect("server");
-    }
-
-    #[tokio::test]
-    async fn log_addresses_are_sent_on_get_logs() {
-        let want: Address = address(0xde).parse().expect("address");
-        let other: Address = address(0xbe).parse().expect("address");
-        let mut header = block();
-        header["transactions"] = json!([hash(0x11), hash(0x22)]);
-        let logs = receipts()[0]["logs"].clone();
-        let (url, server) = rpc_server(1, move |request| {
-            let calls = request.as_array().expect("batch");
-            assert_eq!(calls[1]["method"], "eth_getLogs");
-            let filter = &calls[1]["params"][0];
-            assert_eq!(filter["fromBlock"], "0x112a880");
-            assert_eq!(filter["toBlock"], "0x112a880");
-            let mut sent: Vec<Address> = filter["address"]
-                .as_array()
-                .expect("address list")
-                .iter()
-                .map(|value| value.as_str().expect("address").parse().expect("address"))
-                .collect();
-            sent.sort_unstable();
-            let mut expected = [want, other];
-            expected.sort_unstable();
-            assert_eq!(sent, expected);
-            json!([
-                {"jsonrpc": "2.0", "id": calls[0]["id"], "result": header},
-                {"jsonrpc": "2.0", "id": calls[1]["id"], "result": logs},
-            ])
-        });
-        let source = EvmSource::new(
-            "ethereum",
-            url,
-            "ws://unused",
-            serde_json::from_str(r#"["logs"]"#).expect("datasets"),
-            &[want, other],
-        )
-        .expect("source");
-        let fetched = source.fetch_block(18_000_000, None).await.expect("fetch");
-        let kinds: Vec<&str> = fetched.events.iter().map(Event::kind).collect();
-        assert_eq!(kinds, ["log", "log"]);
-        server.join().expect("server");
-    }
-
-    #[test]
-    fn log_addresses_require_get_logs() {
-        let addresses = [Address::ZERO];
-        let with_receipts = EvmSource::new(
-            "ethereum",
-            "http://unused",
-            "ws://unused",
-            Datasets::all(),
-            &addresses,
-        );
-        assert!(matches!(with_receipts, Err(SourceError::LogAddresses)));
-        let without_logs = EvmSource::new(
-            "ethereum",
-            "http://unused",
-            "ws://unused",
-            serde_json::from_str(r#"["blocks"]"#).expect("datasets"),
-            &addresses,
-        );
-        assert!(matches!(without_logs, Err(SourceError::LogAddresses)));
     }
 
     #[tokio::test]
@@ -1183,7 +1102,6 @@ mod tests {
             url,
             "ws://unused",
             serde_json::from_str(r#"["receipts", "logs"]"#).expect("datasets"),
-            &[],
         )
         .expect("source");
         let fetched = source.fetch_block(18_000_000, None).await.expect("fetch");
@@ -1208,7 +1126,6 @@ mod tests {
             url,
             "ws://unused",
             serde_json::from_str(r#"["blocks", "transactions"]"#).expect("datasets"),
-            &[],
         )
         .expect("source");
         let fetched = source.fetch_block(18_000_000, None).await.expect("fetch");
@@ -1265,7 +1182,7 @@ mod tests {
                 }
             });
             let source =
-                EvmSource::new("base", url, "ws://unused", Datasets::all(), &[]).expect("source");
+                EvmSource::new("base", url, "ws://unused", Datasets::all()).expect("source");
             let fetched = source
                 .fetch_block(18_000_000, None)
                 .await
@@ -1308,8 +1225,8 @@ mod tests {
                 }
                 response
             });
-            let source = EvmSource::new("ethereum", url, "ws://unused", Datasets::all(), &[])
-                .expect("source");
+            let source =
+                EvmSource::new("ethereum", url, "ws://unused", Datasets::all()).expect("source");
             let error = source
                 .fetch_block(18_000_000, None)
                 .await
@@ -1375,7 +1292,7 @@ mod tests {
             }
         });
         let source =
-            EvmSource::new("ethereum", "http://unused", url, Datasets::all(), &[]).expect("source");
+            EvmSource::new("ethereum", "http://unused", url, Datasets::all()).expect("source");
         let mut heads = source.subscribe_heads().await.expect("subscribe");
         drop(source);
         let consume = async {
@@ -1684,7 +1601,7 @@ mod tests {
             primary_reply(request, &block(), &receipts)
         });
         let source =
-            EvmSource::new("ethereum", url, "ws://unused", Datasets::all(), &[]).expect("source");
+            EvmSource::new("ethereum", url, "ws://unused", Datasets::all()).expect("source");
         let error = source
             .fetch_block(18_000_000, None)
             .await
@@ -1710,7 +1627,7 @@ mod tests {
             .port();
         let url = format!("http://127.0.0.1:{port}/v2/secret-api-key");
         let source =
-            EvmSource::new("ethereum", url, "ws://unused", Datasets::all(), &[]).expect("source");
+            EvmSource::new("ethereum", url, "ws://unused", Datasets::all()).expect("source");
         let error = source
             .fetch_block(1, None)
             .await
@@ -1801,8 +1718,7 @@ mod tests {
         receipts[0]["logs"] = json!([]);
 
         let (url, server) = rpc_server(1, move |request| primary_reply(request, &block, &receipts));
-        let source =
-            EvmSource::new("base", url, "ws://unused", Datasets::all(), &[]).expect("source");
+        let source = EvmSource::new("base", url, "ws://unused", Datasets::all()).expect("source");
         let fetched = source
             .fetch_block(18_000_000, None)
             .await

@@ -9,15 +9,14 @@
 chain = "base"
 # Public endpoints, so written as values. An endpoint carrying an API key names the
 # environment variable that holds it instead: http_url = { env = "INDEXER_HTTP_URL" }.
-http_url = "https://base-rpc.publicnode.com"
+http_url = "https://8453.rpc.thirdweb.com"
 ws_url = "wss://base-rpc.publicnode.com"
 # Datasets to fetch and store. Omitted means all four. Logs without receipts use
 # one eth_getLogs per height, reusing the live notification's metadata so no block
-# read is issued; every other dataset still reads the block body. log_addresses limits
-# that call to those contracts. Empty fetches every log, and
-# a non-empty list requires the `logs` dataset without receipts.
+# read is issued; every other dataset still reads the block body.
 # datasets = ["blocks", "transactions", "receipts", "logs"]
-# log_addresses = ["0x1111111111111111111111111111111111111111"]
+datasets = ["logs"]
+start_block = 52266840
 
 # A remote PostgreSQL 18 database, written with transactional binary COPY and
 # upserted on (chain, dedupe_key). Requires the `postgres` feature. The connection

@@ -4,12 +4,11 @@
 //! source ends. Nothing here reads the environment — that is [`crate::config`]'s job,
 //! which has already required both endpoints before this is constructed.
 
-use alloy_primitives::Address;
 use tracing::info;
 
 use crate::config::Secret;
 use crate::ingest::pipeline::{Machine, PipelineError};
-use crate::ingest::source::{BlockMeta, EvmSource, SourceError};
+use crate::ingest::source::{BlockMeta, EvmSource};
 use crate::sink::{Datasets, EnvelopeSink};
 
 /// Builds and runs the ingest stage.
@@ -19,7 +18,6 @@ pub struct Ingest {
     http_url: Secret,
     ws_url: Secret,
     datasets: Datasets,
-    log_addresses: Vec<Address>,
     start_block: Option<u64>,
 }
 
@@ -28,33 +26,23 @@ impl Ingest {
     ///
     /// Both endpoints are required [`Secret`]s, since a provider's URL usually carries
     /// its API key. A settings file that omits one never reaches here: serde rejects it
-    /// first. `log_addresses` limits `eth_getLogs`;
-    /// an empty slice fetches every log. `start_block` selects the first height of a
-    /// fresh run: `None` starts at the observed head, `Some` indexes from that height.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`SourceError::LogAddresses`] when addresses are set but logs are not
-    /// fetched with `eth_getLogs`.
+    /// first. `start_block` selects the first height of a fresh run: `None` starts at
+    /// the observed head, `Some` indexes from that height.
+    #[must_use]
     pub fn new(
         chain: impl Into<String>,
         http_url: Secret,
         ws_url: Secret,
         datasets: &Datasets,
-        log_addresses: &[Address],
         start_block: Option<u64>,
-    ) -> Result<Self, SourceError> {
-        if !log_addresses.is_empty() && (!datasets.logs || datasets.receipts) {
-            return Err(SourceError::LogAddresses);
-        }
-        Ok(Self {
+    ) -> Self {
+        Self {
             chain: chain.into(),
             http_url,
             ws_url,
             datasets: *datasets,
-            log_addresses: log_addresses.to_vec(),
             start_block,
-        })
+        }
     }
 
     /// Indexes through the sampled head, then follows live heads.
@@ -78,7 +66,6 @@ impl Ingest {
         info!(
             chain = %self.chain,
             datasets = %self.datasets,
-            log_addresses = self.log_addresses.len(),
             start_block = ?self.start_block,
             restored = ledger.len(),
             "ingest started"
@@ -88,7 +75,6 @@ impl Ingest {
             self.http_url.expose(),
             self.ws_url.expose(),
             self.datasets,
-            &self.log_addresses,
         )?;
         let machine = Machine::new(source, sink, ledger);
         match self.start_block {

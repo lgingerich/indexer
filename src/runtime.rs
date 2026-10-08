@@ -134,21 +134,13 @@ impl Pipeline {
             settings.ingest.http_url.clone(),
             settings.ingest.ws_url.clone(),
             &settings.ingest.datasets,
-            &settings.ingest.log_addresses,
             settings.ingest.start_block,
-        )
-        .map_err(PipelineError::from)?;
-        let mut catalog = settings
+        );
+        let catalog = settings
             .protocols_path()
             .map_or_else(Catalog::empty, |path| {
                 Catalog::load(path, &ChainId::new(&settings.ingest.chain))
             })?;
-        // The address filter is an explicit "only these contracts", fixed at startup, so
-        // a discovered contract's logs would never be fetched. Respect it instead.
-        if catalog.discovers() && !settings.ingest.log_addresses.is_empty() {
-            warn!("ingest.log_addresses is set; created_by discovery is disabled");
-            catalog.disable_discovery();
-        }
         Ok(Self {
             ingest,
             schema: Arc::new(catalog.schema().clone()),
@@ -391,30 +383,12 @@ ws_url = "wss://example.invalid"
         ));
     }
 
-    /// The shipped protocols load, so the example settings a reader copies stay runnable,
-    /// with or without a log address filter, which turns discovery off.
+    /// The shipped protocols load, so the example settings a reader copies stay runnable.
     #[test]
-    fn the_shipped_protocols_assemble_with_and_without_an_address_filter() {
+    fn the_shipped_protocols_assemble() {
         let decode = format!("\n[decode]\nprotocols = {:?}\n", protocols());
         let settings = Settings::from_str(&format!("{SETTINGS}{decode}")).expect("settings parse");
         Pipeline::from_settings(&settings).expect("the pipeline builds");
-
-        let filtered = SETTINGS.replace(
-            "ws_url = \"wss://example.invalid\"",
-            "ws_url = \"wss://example.invalid\"\ndatasets = [\"logs\"]\n\
-             log_addresses = [\"0x1111111111111111111111111111111111111111\"]",
-        );
-        let settings = Settings::from_str(&format!("{filtered}{decode}")).expect("settings parse");
-        let mut pipeline = Pipeline::from_settings(&settings).expect("the pipeline builds");
-        let Event::Log(created) = pool_created(Address::from([0xd0; 20]), B256::ZERO).event else {
-            panic!("log");
-        };
-        let decoding = pipeline
-            .decoder
-            .decode(&created)
-            .expect("decode")
-            .expect("the factory still decodes");
-        assert!(decoding.discovered.is_empty(), "discovery is off");
     }
 
     /// The shipped protocols' schema, which a store opens with to hold what [`decoder`]

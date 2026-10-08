@@ -26,11 +26,6 @@ ws_url = "wss://base-rpc.publicnode.com"
 # every other dataset reads the block body.
 # datasets = ["blocks", "transactions", "receipts", "logs"]
 
-# Contracts `eth_getLogs` is limited to. Sent only when logs are selected and
-# receipts are not (receipts already carry every log, so any other combination is
-# rejected). Omitted or empty fetches every log.
-# log_addresses = ["0x1111111111111111111111111111111111111111"]
-
 # First height to index on an empty store. Omitted starts at the observed head,
 # skipping earlier history; a value indexes that height onward before following live
 # heads. A value above the current head is a startup error rather than a silent clamp.
