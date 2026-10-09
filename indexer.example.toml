@@ -70,6 +70,10 @@ ws_url = "wss://base-rpc.publicnode.com"
 # set the lake's file size.
 # commit_interval_secs = 30
 # max_buffer_bytes = 268435456
+# The store compacts the partitions the tip has left behind and, once a day, deletes
+# files no commit has referenced for this long. Turn it off only if another job does it.
+# maintenance = true
+# vacuum_retention_hours = 168
 
 # S3 options, passed straight through. Every value may be `{ env = "NAME" }`;
 # credentials may also come from the standard `AWS_*` environment variables. Leave

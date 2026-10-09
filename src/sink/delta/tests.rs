@@ -17,7 +17,7 @@ use deltalake::datafusion::prelude::ident;
 use deltalake::kernel::{DataType, StructField};
 use deltalake::{DeltaTable, ensure_table_uri};
 
-use super::{DeltaSettings, DeltaSink, in_texts, texts, texts_of};
+use super::{DeltaSettings, DeltaSink, in_texts, maintenance, texts, texts_of};
 use crate::sink::table::{Schema, Table, TableId};
 use crate::sink::{EnvelopeSink, Store as _, StoreError, fixtures};
 use crate::wire::envelope::{Block, BlockMeta, ChainId, Envelope, Event, Log, Reorg, Transaction};
@@ -39,12 +39,14 @@ impl Dir {
     }
 
     /// Settings for a lake in this directory. The sink commits on every flush; how
-    /// often that is, the drain decides.
+    /// often that is, the drain decides. A test runs maintenance itself.
     fn settings(&self) -> DeltaSettings {
         DeltaSettings {
             uri: self.0.display().to_string(),
             commit_interval_secs: 30,
             max_buffer_bytes: usize::MAX,
+            maintenance: false,
+            vacuum_retention_hours: 168,
             storage: std::collections::BTreeMap::new(),
         }
     }
@@ -601,4 +603,112 @@ async fn opening_over_a_different_table_is_drift() {
         matches!(&error, StoreError::Drift { table, .. } if *table == name),
         "{error}"
     );
+}
+
+/// The files `table` holds in each partition, by partition.
+fn files_by_partition(sink: &DeltaSink, table: Table) -> std::collections::BTreeMap<String, usize> {
+    let lake = sink.lake(table);
+    let mut files = std::collections::BTreeMap::new();
+    for file in lake
+        .table
+        .snapshot()
+        .expect("a snapshot")
+        .snapshot()
+        .try_log_data()
+        .expect("the file list")
+        .iter()
+    {
+        let partition = file
+            .partition_values_map()
+            .remove(super::PARTITION)
+            .flatten()
+            .expect("a partition");
+        *files.entry(partition).or_default() += 1;
+    }
+    files
+}
+
+/// A partition the tip has left behind by more than the reorg window is compacted into
+/// one file, with every row kept; the partitions a reorg can still reach are not
+/// touched. Vacuum then deletes the files compaction replaced.
+#[tokio::test]
+async fn maintenance_compacts_finished_partitions_and_vacuums_what_they_replaced() {
+    let dir = Dir::new();
+    let mut sink = open(&dir).await;
+    for height in [1, 2, 3, 100_001, 100_002] {
+        publish(&mut sink, block(height, 0)).await;
+    }
+    let before = files_by_partition(&sink, Table::Block);
+    assert_eq!(before, [("0".to_owned(), 3), ("1".to_owned(), 2)].into());
+
+    let position = sink.positions[&TableId::Dataset(Table::Block)];
+    let mut table = sink.lakes[position].table.clone();
+    let writer = sink.writer.clone();
+    // Partition 0 ends at 99_999: one height short of the window past it, nothing moves.
+    let short = 100_000 + crate::ingest::pipeline::MAX_UNFINALIZED_BLOCKS as u64 - 1;
+    assert_eq!(
+        maintenance::compact("blocks", &mut table, short, &writer)
+            .await
+            .expect("compacts"),
+        0
+    );
+    let compacted = maintenance::compact("blocks", &mut table, short + 1, &writer)
+        .await
+        .expect("compacts");
+    assert_eq!(compacted, 1);
+    sink.lakes[position].table = table.clone();
+    assert_eq!(
+        files_by_partition(&sink, Table::Block),
+        [("0".to_owned(), 1), ("1".to_owned(), 2)].into()
+    );
+    let held = [(1, 0), (2, 0), (3, 0), (100_001, 0), (100_002, 0)];
+    assert_eq!(stored(&sink, Table::Block, "hash").await, expected(&held));
+
+    let on_disk = |partition: &str| {
+        std::fs::read_dir(dir.table(&format!("blocks/{}={partition}", super::PARTITION)))
+            .expect("the partition directory")
+            .filter(|entry| {
+                entry
+                    .as_ref()
+                    .is_ok_and(|entry| entry.path().extension().is_some_and(|ext| ext == "parquet"))
+            })
+            .count()
+    };
+    assert_eq!(on_disk("0"), 4, "the replaced files stay until a vacuum");
+    let vacuumed = maintenance::vacuum("blocks", &mut table, std::time::Duration::ZERO)
+        .await
+        .expect("vacuums");
+    assert_eq!(vacuumed, 3);
+    assert_eq!(on_disk("0"), 1);
+    assert_eq!(on_disk("1"), 2);
+}
+
+/// Compaction is a second writer: the tip writer, holding a snapshot from before it,
+/// still appends and deletes in the newest partition, and nothing is lost on either side.
+#[tokio::test]
+async fn the_writer_commits_past_a_compaction_it_did_not_see() {
+    let dir = Dir::new();
+    let mut sink = open(&dir).await;
+    for height in [1, 2, 104_096, 104_097] {
+        publish(&mut sink, block(height, 0)).await;
+    }
+    let position = sink.positions[&TableId::Dataset(Table::Block)];
+    let mut behind = sink.lakes[position].table.clone();
+    let writer = sink.writer.clone();
+    maintenance::compact("blocks", &mut behind, 104_097, &writer)
+        .await
+        .expect("compacts");
+
+    let mut replacement = vec![reorg(104_097..=104_097, 1)];
+    replacement.extend(block(104_097, 1));
+    replacement.extend(block(104_098, 0));
+    publish(&mut sink, replacement).await;
+    drop(sink);
+
+    let sink = open(&dir).await;
+    assert_eq!(
+        blocks(&sink).await,
+        expected(&[(1, 0), (2, 0), (104_096, 0), (104_097, 1), (104_098, 0)])
+    );
+    assert_eq!(files_by_partition(&sink, Table::Block)["0"], 1);
 }

@@ -39,7 +39,7 @@ pub(super) const PARTITION: &str = "block_range";
 /// How many block heights one partition covers: about 2.3 days of Base, two weeks of
 /// Ethereum. A constant, not a setting, because rows stay in the partition they were
 /// written to: a table whose width changed could no longer bound a delete by it.
-const PARTITION_BLOCKS: u64 = 100_000;
+pub(super) const PARTITION_BLOCKS: u64 = 100_000;
 
 /// Digits of a `Uint` column: `u64::MAX` has 20.
 pub(super) const UINT_PRECISION: u8 = 20;

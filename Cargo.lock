@@ -4625,6 +4625,7 @@ dependencies = [
  "alloy-serde",
  "alloy-transport",
  "bytes",
+ "chrono",
  "deltalake",
  "duckdb",
  "futures-util",

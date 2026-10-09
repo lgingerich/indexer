@@ -23,7 +23,7 @@ duckdb = ["store", "dep:duckdb"]
 postgres = ["store", "dep:bytes", "dep:native-tls", "dep:postgres-native-tls", "dep:tokio-postgres"]
 # Delta Lake tables on object storage (`sink::delta`): the cheap raw-data lake. Off by
 # default because delta-rs brings DataFusion and Arrow, which are heavy to build.
-delta = ["store", "dep:deltalake"]
+delta = ["store", "dep:chrono", "dep:deltalake"]
 # Internal: what every store feature shares (the storage channel, its progress log, the
 # store's error). Enabled by each store above, not meant to be named on its own.
 store = []
@@ -57,6 +57,8 @@ alloy-json-abi = { version = "1.7.3", default-features = false }
 # single-writer store, used only by the local DuckDB sink (`duckdb` feature).
 duckdb = { version = "1.10506.0", default-features = false, features = ["bundled"], optional = true }
 bytes = { version = "1.12.1", optional = true }
+# The duration delta-rs takes for a vacuum's retention (`delta` feature).
+chrono = { version = "0.4.45", default-features = false, optional = true }
 # Delta Lake on object storage. `datafusion` is what gives delta-rs its write, delete,
 # and optimize operations; `s3-native-tls` asks for platform TLS to S3 and S3-compatible
 # stores. Not all of it is: the AWS SDK's credential chain and `object_store`'s client

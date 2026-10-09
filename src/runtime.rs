@@ -785,4 +785,110 @@ ws_url = "wss://example.invalid"
             Err(PipelineError::StartWithHistory { start: 1, tip: 3 })
         ));
     }
+
+    /// A lake directory for one test, removed when the guard drops.
+    #[cfg(feature = "delta")]
+    struct LakeDir(std::path::PathBuf);
+
+    #[cfg(feature = "delta")]
+    impl Drop for LakeDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// One process lifetime against the lake `settings` names, as [`run_once`] is against
+    /// a database: restore, index to the head, stop. The interval is far longer than the
+    /// run, so every row reaches the lake through the drain's flush when the channel
+    /// closes.
+    #[cfg(feature = "delta")]
+    async fn run_lake(settings: &sink::DeltaSettings, chain: FakeChain, start: Option<u64>) {
+        let store = sink::DeltaSink::open(settings, schema(), "base")
+            .await
+            .expect("the lake opens");
+        let catalog =
+            Catalog::load(protocols(), &ChainId::new("base")).expect("shipped protocols load");
+        let result = Box::pin(
+            Pipeline::new(chain, start, catalog).run_with_store(store, settings.batching()),
+        )
+        .await;
+        assert!(
+            matches!(
+                result,
+                Err(RuntimeError::Ingest(PipelineError::SubscriptionClosed))
+            ),
+            "{result:?}"
+        );
+    }
+
+    /// What a fresh open of the lake restores.
+    #[cfg(feature = "delta")]
+    async fn restored(settings: &sink::DeltaSettings) -> sink::Restored {
+        sink::DeltaSink::open(settings, schema(), "base")
+            .await
+            .expect("the lake opens")
+            .restore()
+            .await
+            .expect("the lake restores")
+    }
+
+    /// The restart test of [`a_restart_resumes_from_the_store_and_reconciles_a_fork_while_down`]
+    /// against the lake: three process lifetimes, the second discovering a pool created
+    /// while down and the third reconciling a fork that replaced the pool's block. Each
+    /// commits only when storage drains at the end, so a lost final flush would show as
+    /// an empty restore.
+    #[cfg(feature = "delta")]
+    #[tokio::test]
+    async fn a_lake_restart_resumes_from_its_ledger_and_reconciles_a_fork_while_down() {
+        let dir = LakeDir(
+            std::env::temp_dir().join(format!("indexer-runtime-lake-{}", std::process::id())),
+        );
+        let settings = sink::DeltaSettings {
+            uri: dir.0.display().to_string(),
+            commit_interval_secs: 3600,
+            max_buffer_bytes: usize::MAX,
+            maintenance: false,
+            vacuum_retention_hours: 168,
+            storage: std::collections::BTreeMap::new(),
+        };
+        let heights = |restored: &sink::Restored| -> Vec<u64> {
+            restored.ledger.iter().map(|block| block.height).collect()
+        };
+        let pool = Address::from([0xd0; 20]);
+
+        run_lake(&settings, FakeChain::new(4, 0xa0), Some(1)).await;
+        assert_eq!(heights(&restored(&settings).await), [1, 2, 3, 4]);
+
+        let mut grown = FakeChain::new(6, 0xa0);
+        grown.log(5, pool_created(pool, B256::ZERO));
+        run_lake(&settings, grown, None).await;
+        let after = restored(&settings).await;
+        assert_eq!(
+            heights(&after),
+            [1, 2, 3, 4, 5, 6],
+            "resumed after 4 with no gap"
+        );
+        assert_eq!(after.contracts.len(), 1, "created while down, discovered");
+
+        let mut forked = FakeChain::new(6, 0xa0);
+        forked.log(5, pool_created(pool, B256::ZERO));
+        forked.branch(5, 7, 0xb0);
+        forked.log(7, swap(pool));
+        run_lake(&settings, forked, None).await;
+
+        let after = restored(&settings).await;
+        assert!(
+            after.contracts.is_empty(),
+            "the creation went with its block"
+        );
+        assert_eq!(heights(&after), [1, 2, 3, 4, 5, 6, 7]);
+        assert!(
+            after
+                .ledger
+                .windows(2)
+                .all(|pair| pair[1].parent_hash == pair[0].hash),
+            "the restored ledger is one linked chain"
+        );
+        assert_eq!(after.ledger[6].hash, block_hash(0xb0, 7));
+    }
 }

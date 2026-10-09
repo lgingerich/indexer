@@ -14,9 +14,9 @@
 //! storage drain gathers them into one flush, and so one commit, until the oldest has
 //! waited [`commit_interval_secs`](DeltaSettings::commit_interval_secs) or
 //! [`max_buffer_bytes`](DeltaSettings::max_buffer_bytes) are buffered, so a commit
-//! holds many blocks. Each commit writes one
-//! file per table and partition it touches, so the buffer sets the file size; nothing
-//! compacts them afterwards.
+//! holds many blocks. Each commit writes one file per table and partition it touches,
+//! which at the tip are small; once the tip has left a partition behind, `maintenance`
+//! compacts it, and vacuums the files compaction and reorgs replaced.
 //!
 //! A `reorg` drops the orphaned blocks still in the buffer, which most are, since a reorg
 //! is a few blocks deep and a commit holds tens of seconds of them. Orphaned blocks
@@ -50,18 +50,26 @@
 //! # One writer
 //!
 //! A chain's tables are written by one process, and hold that chain alone: rows are not
-//! keyed by chain here, so a store is handed only the chain it was opened for. Unlike `PostgreSQL`'s advisory lock or
-//! `DuckDB`'s file lock, nothing here enforces that: a deployment runs one indexer per
-//! chain. A second writer on the same `uri` would append duplicate rows, and its open
+//! keyed by chain here, so a store is handed only the chain it was opened for. Within
+//! the process, `maintenance` writes beside the store, to files the store no longer
+//! touches. Unlike `PostgreSQL`'s advisory lock or `DuckDB`'s file lock, nothing here
+//! enforces one process: a deployment runs one indexer per chain. A second writer on the same `uri` would append duplicate rows, and its open
 //! would repair away the first's uncommitted ones. If that ever needs enforcing, the
 //! design is a lease object at `<uri>/<chain>/_writer`: created with a conditional put,
 //! renewed on a timer by conditional overwrite, checked before every commit, and taken
 //! over once expired — at the cost of a restart after a crash waiting out the lease.
+//!
+//! # Open items
+//!
+//! Gaps decided against for now, with their options, are in
+//! `docs/delta-lake-open-items.md`.
 
 mod arrow;
+mod maintenance;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use alloy_primitives::B256;
@@ -71,10 +79,11 @@ use deltalake::datafusion::dataframe::DataFrame;
 use deltalake::datafusion::error::DataFusionError;
 use deltalake::datafusion::prelude::{Expr, SessionContext, cast, ident, lit};
 use deltalake::datafusion::scalar::ScalarValue;
+use deltalake::logstore::{ObjectStoreRef, store_for};
 use deltalake::parquet::basic::{Compression, ZstdLevel};
 use deltalake::parquet::file::properties::WriterProperties;
 use deltalake::protocol::SaveMode;
-use deltalake::{DeltaTable, ensure_table_uri};
+use deltalake::{DeltaTable, DeltaTableBuilder, DeltaTableError, ensure_table_uri};
 use serde::Deserialize;
 use tokio::time::Instant;
 use tracing::{info, warn};
@@ -89,6 +98,7 @@ use crate::sink::{EnvelopeSink, Restored, SinkError, Store};
 use crate::wire::envelope::{BlockMeta, ChainId, Envelope, StoredContract};
 
 use self::arrow::{PARTITION, UINT_PRECISION};
+use self::maintenance::Maintenance;
 
 /// The `contracts` columns a restore reads back.
 const CONTRACT_COLUMNS: [&str; 4] = ["protocol", "name", "address", "block_hash"];
@@ -107,6 +117,8 @@ const REORG_COLUMNS: [&str; 3] = ["height", "dedupe_key", "orphaned_hashes"];
 /// uri = "s3://indexer-lake"          # or a local directory
 /// commit_interval_secs = 30
 /// max_buffer_bytes = 268435456
+/// maintenance = true
+/// vacuum_retention_hours = 168
 ///
 /// [sink.delta.storage]               # passed to the object store
 /// endpoint = "https://s3.example.com"  # omit for AWS S3
@@ -136,6 +148,20 @@ pub struct DeltaSettings {
     /// from them while they are still held, so it briefly needs as much again.
     #[serde(default = "default_max_buffer_bytes")]
     pub max_buffer_bytes: usize,
+    /// Whether the store compacts and vacuums its own tables in the background. Defaults
+    /// to true; turn it off only when another job does both.
+    ///
+    /// Compaction rewrites each partition the tip has left behind into a few large
+    /// files, once. Vacuum deletes files no commit has referenced for
+    /// [`vacuum_retention_hours`](Self::vacuum_retention_hours), once a day.
+    #[serde(default = "default_maintenance")]
+    pub maintenance: bool,
+    /// How long a file no commit references is kept before vacuum deletes it, in hours:
+    /// longer than any reader of an older version needs. Defaults to 168, a week. At
+    /// least an hour is always kept, so a commit still writing its files is never
+    /// vacuumed under it.
+    #[serde(default = "default_vacuum_retention_hours")]
+    pub vacuum_retention_hours: u64,
     /// S3 options, passed straight through, such as `endpoint`, `region`, and
     /// `access_key_id`; the `aws_`-prefixed spellings work too. Every value is a
     /// [`Secret`], so keys can be named by environment variable and none is logged.
@@ -163,6 +189,14 @@ const fn default_commit_interval_secs() -> u64 {
 
 const fn default_max_buffer_bytes() -> usize {
     256 * 1024 * 1024
+}
+
+const fn default_maintenance() -> bool {
+    true
+}
+
+const fn default_vacuum_retention_hours() -> u64 {
+    168
 }
 
 /// One table: its definition, the Arrow schema its batches are built against, and the
@@ -232,6 +266,11 @@ pub struct DeltaSink {
     /// The committed blocks a reorg could still orphan, by hash, with their heights.
     committed: HashMap<String, u64>,
     writer: WriterProperties,
+    /// The highest committed height, as maintenance reads it; zero before the first.
+    published_tip: Arc<AtomicU64>,
+    /// The background compaction and vacuum, when the settings ask for it. Held, never
+    /// read: dropping the store stops the task.
+    maintenance: Option<Maintenance>,
 }
 
 impl DeltaSink {
@@ -257,16 +296,11 @@ impl DeltaSink {
         ] {
             require(schema.dataset(table), columns)?;
         }
-        deltalake::aws::register_handlers(None);
-        let storage: HashMap<String, String> = settings
-            .storage
-            .iter()
-            .map(|(key, value)| (key.clone(), value.expose().to_owned()))
-            .collect();
         let root = settings.uri.trim_end_matches('/');
+        let storage = Storage::new(root, &settings.storage)?;
         let mut lakes = Vec::with_capacity(schema.tables().len());
         for def in schema.tables() {
-            lakes.push(open_table(&format!("{root}/{chain}/{}", def.name), &storage, def).await?);
+            lakes.push(open_table(&storage, &format!("{root}/{chain}/{}", def.name), def).await?);
         }
         let positions = lakes
             .iter()
@@ -283,6 +317,8 @@ impl DeltaSink {
             writer: WriterProperties::builder()
                 .set_compression(Compression::ZSTD(ZstdLevel::default()))
                 .build(),
+            published_tip: Arc::new(AtomicU64::new(0)),
+            maintenance: None,
         };
         let ledger = sink.read_ledger().await?;
         sink.repair(&ledger).await?;
@@ -290,6 +326,23 @@ impl DeltaSink {
             .iter()
             .map(|block| (hex(&block.hash), block.height))
             .collect();
+        sink.publish_tip();
+        if settings.maintenance {
+            // Started after the repair, so it never compacts what the repair deletes.
+            let tables = sink
+                .lakes
+                .iter()
+                .filter(|lake| arrow::partitioned(&lake.def).is_some())
+                .map(|lake| (lake.def.name.clone(), lake.table.clone()))
+                .collect();
+            let retention = Duration::from_hours(settings.vacuum_retention_hours.max(1));
+            sink.maintenance = Some(maintenance::spawn(
+                tables,
+                Arc::clone(&sink.published_tip),
+                retention,
+                sink.writer.clone(),
+            ));
+        }
         info!(%chain, uri = root, tables = sink.lakes.len(), tip = ?sink.tip(), "delta lake opened");
         Ok(sink)
     }
@@ -624,6 +677,14 @@ impl DeltaSink {
             let floor = tip.saturating_sub(LEDGER_WINDOW as u64);
             self.committed.retain(|_, height| *height >= floor);
         }
+        self.publish_tip();
+    }
+
+    /// Shares the committed tip with maintenance, which compacts only what it has left
+    /// behind.
+    fn publish_tip(&self) {
+        self.published_tip
+            .store(self.tip().unwrap_or_default(), Ordering::Release);
     }
 
     fn position(&self, table: Table) -> usize {
@@ -662,13 +723,47 @@ impl EnvelopeSink for DeltaSink {
     }
 }
 
+/// The object store every table of the lake is opened through: one client, so one
+/// credential chain and one connection pool, rather than one of each per table.
+struct Storage {
+    /// The store, rooted at the bucket (or the filesystem root), as delta-rs scopes a
+    /// shared store to each table's path itself.
+    root: ObjectStoreRef,
+    /// The settings' storage options, which each table's log store reads too.
+    options: HashMap<String, String>,
+}
+
+impl Storage {
+    fn new(uri: &str, options: &BTreeMap<String, Secret>) -> Result<Self, StoreError> {
+        deltalake::aws::register_handlers(None);
+        let options: HashMap<String, String> = options
+            .iter()
+            .map(|(key, value)| (key.clone(), value.expose().to_owned()))
+            .collect();
+        let open = || StoreError::engine(Operation::Open, Some(uri));
+        let mut root = ensure_table_uri(uri).map_err(open())?;
+        root.set_path("/");
+        let root = store_for(&root, options.clone()).map_err(open())?;
+        Ok(Self { root, options })
+    }
+
+    /// The table at `uri`, loaded, or not yet created there.
+    async fn table(&self, uri: &str) -> Result<DeltaTable, DeltaTableError> {
+        let url = ensure_table_uri(uri)?;
+        let mut table = DeltaTableBuilder::from_url(url.clone())?
+            .with_storage_backend(Arc::clone(&self.root), url)
+            .with_storage_options(self.options.clone())
+            .build()?;
+        match table.load().await {
+            Ok(()) | Err(DeltaTableError::NotATable(_)) => Ok(table),
+            Err(error) => Err(error),
+        }
+    }
+}
+
 /// Opens the table of `def` at `uri`, creating it when it does not exist, and checks an
 /// existing one against its definition.
-async fn open_table(
-    uri: &str,
-    storage: &HashMap<String, String>,
-    def: &Arc<TableDef>,
-) -> Result<Lake, StoreError> {
+async fn open_table(storage: &Storage, uri: &str, def: &Arc<TableDef>) -> Result<Lake, StoreError> {
     let name = def.name.as_str();
     if def.position(PARTITION).is_some() {
         return Err(StoreError::Reserved {
@@ -678,8 +773,8 @@ async fn open_table(
     }
     let expected =
         arrow::delta_schema(def).map_err(StoreError::engine(Operation::Create, Some(name)))?;
-    let url = ensure_table_uri(uri).map_err(StoreError::engine(Operation::Open, Some(name)))?;
-    let mut table = DeltaTable::try_from_url_with_storage_options(url, storage.clone())
+    let mut table = storage
+        .table(uri)
         .await
         .map_err(StoreError::engine(Operation::Open, Some(name)))?;
     if table.version().is_none() {
