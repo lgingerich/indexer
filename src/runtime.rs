@@ -50,13 +50,15 @@ use tracing::{info, warn};
 
 use crate::config::{Settings, SettingsError, Sink};
 use crate::decode::{Catalog, CatalogError, Decoder, DecodingSink};
-#[cfg(any(feature = "duckdb", feature = "postgres"))]
+#[cfg(any(feature = "duckdb", feature = "postgres", feature = "delta"))]
 use crate::ingest::pipeline::MAX_UNFINALIZED_BLOCKS;
 use crate::ingest::pipeline::{Machine, PipelineError};
 use crate::ingest::source::evm::{http_client, ws_connect};
 use crate::ingest::source::{BlockSource, EvmSource, SourceError};
-#[cfg(any(feature = "duckdb", feature = "postgres"))]
+#[cfg(any(feature = "duckdb", feature = "postgres", feature = "delta"))]
 use crate::sink;
+#[cfg(feature = "delta")]
+use crate::sink::DeltaSink;
 #[cfg(feature = "duckdb")]
 use crate::sink::DuckDbSink;
 use crate::sink::table::Schema;
@@ -64,7 +66,7 @@ use crate::sink::{SinkError, StdoutJsonSink};
 #[cfg(any(feature = "duckdb", feature = "postgres"))]
 use crate::sink::{SqlStore, store::Engine};
 use crate::wire::envelope::ChainId;
-#[cfg(any(feature = "duckdb", feature = "postgres"))]
+#[cfg(any(feature = "duckdb", feature = "postgres", feature = "delta"))]
 use crate::wire::envelope::{BlockMeta, StoredContract};
 
 /// Why the indexer stopped.
@@ -92,7 +94,7 @@ pub enum RuntimeError {
     #[error("chain source could not be built: {0}")]
     Source(#[from] SourceError),
     /// The store could not be opened or read back, so there was nowhere to write.
-    #[cfg(any(feature = "duckdb", feature = "postgres"))]
+    #[cfg(any(feature = "duckdb", feature = "postgres", feature = "delta"))]
     #[error("storage could not be opened: {0}")]
     OpenStore(#[from] sink::StoreError),
     /// Ingest stopped: a source failed, a sink refused an envelope, or the head
@@ -218,6 +220,15 @@ impl<B: BlockSource> Pipeline<B> {
                         .await?;
                 Box::pin(self.run_with_store(store, duckdb.batch_records)).await
             }
+            #[cfg(feature = "delta")]
+            Sink::Delta(delta) => {
+                let store =
+                    DeltaSink::open(delta, Arc::clone(&self.schema), &settings.ingest.chain)
+                        .await?;
+                // The lake commits on its own interval, not per flush, so the drain may
+                // fold any backlog into one pass; the bound only caps a pass's memory.
+                Box::pin(self.run_with_store(store, LAKE_BATCH_RECORDS)).await
+            }
         }
     }
 
@@ -227,10 +238,10 @@ impl<B: BlockSource> Pipeline<B> {
     /// # Errors
     ///
     /// As [`Pipeline::run`], less opening the store.
-    #[cfg(any(feature = "duckdb", feature = "postgres"))]
-    pub(crate) async fn run_with_store<E: Engine + 'static>(
+    #[cfg(any(feature = "duckdb", feature = "postgres", feature = "delta"))]
+    pub(crate) async fn run_with_store<S: Store>(
         self,
-        mut store: SqlStore<E>,
+        mut store: S,
         batch_records: usize,
     ) -> Result<(), RuntimeError> {
         let Self {
@@ -248,7 +259,11 @@ impl<B: BlockSource> Pipeline<B> {
         // length of each flush. Fine on the multi-threaded runtime the binary uses; a
         // dedicated blocking thread is the upgrade if the store gets slow enough to
         // starve other tasks.
-        let storage = tokio::spawn(async move { receiver.drain(&mut store, batch_records).await });
+        let storage = tokio::spawn(async move {
+            let stored = receiver.drain(&mut store, batch_records).await?;
+            store.close().await?;
+            Ok(stored)
+        });
 
         let ingest = Machine::new(source, DecodingSink::new(decoder, blocks), ledger)
             .run(start_block)
@@ -260,8 +275,72 @@ impl<B: BlockSource> Pipeline<B> {
     }
 }
 
-/// Adds the contracts a previous run discovered, as the store read them back.
+/// What [`Pipeline::run_with_store`] needs of a store beyond accepting envelopes: what a
+/// previous run left in it, and a last chance to make buffered rows durable.
+#[cfg(any(feature = "duckdb", feature = "postgres", feature = "delta"))]
+pub(crate) trait Store: sink::EnvelopeSink + Send + 'static {
+    /// The contracts a previous run discovered on `chain`.
+    fn contracts(
+        &mut self,
+        chain: &ChainId,
+    ) -> impl Future<Output = Result<Vec<StoredContract>, RuntimeError>> + Send;
+
+    /// The newest `limit` accepted blocks on `chain`, oldest first.
+    fn ledger(
+        &mut self,
+        chain: &ChainId,
+        limit: usize,
+    ) -> impl Future<Output = Result<Vec<BlockMeta>, RuntimeError>> + Send;
+
+    /// Makes whatever is still buffered durable, once storage has drained. A store that
+    /// commits every flush has nothing left.
+    fn close(&mut self) -> impl Future<Output = Result<(), SinkError>> + Send {
+        async { Ok(()) }
+    }
+}
+
 #[cfg(any(feature = "duckdb", feature = "postgres"))]
+impl<E: Engine + 'static> Store for SqlStore<E> {
+    async fn contracts(&mut self, chain: &ChainId) -> Result<Vec<StoredContract>, RuntimeError> {
+        Ok(Self::contracts(self, chain).await?)
+    }
+
+    async fn ledger(
+        &mut self,
+        chain: &ChainId,
+        limit: usize,
+    ) -> Result<Vec<BlockMeta>, RuntimeError> {
+        Ok(Self::ledger(self, chain, limit).await?)
+    }
+}
+
+/// A Delta Lake table is one chain's, so the chain is already chosen at open.
+#[cfg(feature = "delta")]
+impl Store for DeltaSink {
+    async fn contracts(&mut self, _chain: &ChainId) -> Result<Vec<StoredContract>, RuntimeError> {
+        Ok(Self::contracts(self).await?)
+    }
+
+    async fn ledger(
+        &mut self,
+        _chain: &ChainId,
+        limit: usize,
+    ) -> Result<Vec<BlockMeta>, RuntimeError> {
+        Ok(Self::ledger(self, limit))
+    }
+
+    async fn close(&mut self) -> Result<(), SinkError> {
+        Ok(Self::close(self).await?)
+    }
+}
+
+/// The most envelopes one drain pass hands the lake before flushing. A flush only
+/// commits once the lake's own interval or size is reached.
+#[cfg(feature = "delta")]
+const LAKE_BATCH_RECORDS: usize = 10_000;
+
+/// Adds the contracts a previous run discovered, as the store read them back.
+#[cfg(any(feature = "duckdb", feature = "postgres", feature = "delta"))]
 fn restore(mut decoder: Decoder, chain: &ChainId, stored: Vec<StoredContract>) -> Decoder {
     let restored = decoder.restore(stored);
     info!(%chain, restored, contracts = decoder.contracts(), "discovered contracts restored");
@@ -269,11 +348,11 @@ fn restore(mut decoder: Decoder, chain: &ChainId, stored: Vec<StoredContract>) -
 }
 
 /// How many accepted blocks a restart reads back: the undo window plus its floor.
-#[cfg(any(feature = "duckdb", feature = "postgres"))]
+#[cfg(any(feature = "duckdb", feature = "postgres", feature = "delta"))]
 const LEDGER_WINDOW: usize = MAX_UNFINALIZED_BLOCKS + 1;
 
 /// The accepted blocks a previous run committed, as ingest takes them.
-#[cfg(any(feature = "duckdb", feature = "postgres"))]
+#[cfg(any(feature = "duckdb", feature = "postgres", feature = "delta"))]
 fn ledger(chain: &ChainId, stored: Vec<BlockMeta>) -> Vec<BlockMeta> {
     if let (Some(oldest), Some(tip)) = (stored.first(), stored.last()) {
         info!(%chain, from = oldest.height, tip = tip.height, hash = %tip.hash,
@@ -291,7 +370,7 @@ fn ledger(chain: &ChainId, stored: Vec<BlockMeta>) -> Vec<BlockMeta> {
 /// which is neither a store failure nor an ingest failure. Ingest's error on this path
 /// is the failed send that followed — [`crate::sink::SinkError::StorageClosed`] — so it
 /// is returned only when the store itself finished.
-#[cfg(any(feature = "duckdb", feature = "postgres"))]
+#[cfg(any(feature = "duckdb", feature = "postgres", feature = "delta"))]
 fn finish(
     storage: Result<Result<u64, SinkError>, tokio::task::JoinError>,
     ingest: Result<(), PipelineError>,

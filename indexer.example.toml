@@ -60,6 +60,26 @@ ws_url = "wss://base-rpc.publicnode.com"
 # connection_string = { env = "INDEXER_POSTGRES_URL" }
 # batch_records = 500
 
+# Delta Lake tables on object storage, one per table under `<uri>/<chain>/`: the cheap
+# raw-data lake. Requires the `delta` feature. Written at the tip; a reorg deletes the
+# orphaned rows. `uri` is an `s3://` URL (any S3-compatible store) or a local directory.
+# Run one indexer per chain and `uri`: unlike the databases, nothing locks out a second.
+# [sink.delta]
+# uri = "s3://indexer-lake"
+# Rows are committed this often, or sooner once this many bytes are buffered; the two
+# set the lake's file size.
+# commit_interval_secs = 30
+# max_buffer_bytes = 268435456
+
+# S3 options, passed straight through. Every value may be `{ env = "NAME" }`;
+# credentials may also come from the standard `AWS_*` environment variables. Leave
+# `endpoint` out for AWS S3; set it for any other S3-compatible store.
+# [sink.delta.storage]
+# endpoint = "https://s3.example.com"
+# region = "us-east-1"
+# access_key_id = { env = "S3_ACCESS_KEY_ID" }
+# secret_access_key = { env = "S3_SECRET_ACCESS_KEY" }
+
 # What the decode stage decodes: a directory of protocol manifests (see `protocols/`),
 # so the catalog grows without churning this file. Absent means nothing is decoded,
 # which is a legitimate way to run.

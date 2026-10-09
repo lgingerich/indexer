@@ -19,37 +19,48 @@
 //!   statements, and [`store`] is the write path both stores share. Both upsert on
 //!   `(chain, dedupe_key)`.
 //! - [`stdout`] — newline-delimited JSON, for watching the stream.
+//! - `delta` — Delta Lake tables on object storage: the cheap raw-data lake. Not a SQL
+//!   store: it appends, and holds replays out with its ledger instead of upserting.
+//! - `store_error` — the `StoreError` all three stores return.
 //!
 //! Stores take a connection or open one from their own settings, so client settings
 //! live beside the backend that knows how to apply them.
 
 /// The bounded channel from decode to storage: the one hop that crosses tasks.
 ///
-/// Enabled with either store feature: its consumer is the store's writer in
+/// Enabled with any store feature: its consumer is the store's writer in
 /// [`runtime`](crate::runtime). A stdout-only build has no storage task or channel.
-#[cfg(any(feature = "duckdb", feature = "postgres"))]
+#[cfg(any(feature = "duckdb", feature = "postgres", feature = "delta"))]
 pub(crate) mod channel;
+#[cfg(feature = "delta")]
+pub mod delta;
 #[cfg(feature = "duckdb")]
 pub mod duckdb;
 #[cfg(feature = "postgres")]
 pub mod postgres;
-#[cfg(any(feature = "duckdb", feature = "postgres"))]
+#[cfg(any(feature = "duckdb", feature = "postgres", feature = "delta"))]
 mod progress;
 #[cfg(any(feature = "duckdb", feature = "postgres"))]
 pub mod sql;
 pub mod stdout;
 #[cfg(any(feature = "duckdb", feature = "postgres"))]
 pub mod store;
+#[cfg(any(feature = "duckdb", feature = "postgres", feature = "delta"))]
+pub mod store_error;
 pub mod table;
 
 #[cfg(feature = "postgres")]
 pub use postgres::{PostgresSettings, PostgresSink};
 
+#[cfg(feature = "delta")]
+pub use delta::{DeltaSettings, DeltaSink};
 #[cfg(feature = "duckdb")]
 pub use duckdb::{DuckDbSettings, DuckDbSink};
 pub use stdout::{StdoutJsonSink, StdoutSettings};
 #[cfg(any(feature = "duckdb", feature = "postgres"))]
-pub use store::{InvalidStoredValue, Operation, SqlStore, StoreError};
+pub use store::SqlStore;
+#[cfg(any(feature = "duckdb", feature = "postgres", feature = "delta"))]
+pub use store_error::{InvalidStoredValue, Operation, StoreError};
 
 use thiserror::Error;
 
@@ -140,7 +151,7 @@ pub enum SinkError {
     #[error(transparent)]
     Table(#[from] table::TableError),
     /// A store could not be opened, read, or written.
-    #[cfg(any(feature = "duckdb", feature = "postgres"))]
+    #[cfg(any(feature = "duckdb", feature = "postgres", feature = "delta"))]
     #[error(transparent)]
     Store(#[from] StoreError),
 }

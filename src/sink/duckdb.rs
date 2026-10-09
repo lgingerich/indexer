@@ -22,7 +22,8 @@ use tracing::info;
 
 use crate::secret::Secret;
 use crate::sink::sql::{Dialect, ident};
-use crate::sink::store::{Engine, EngineError, Operation, SqlStore, StoreError};
+use crate::sink::store::{Engine, SqlStore};
+use crate::sink::store_error::{EngineError, Operation, StoreError};
 use crate::sink::table::{ColumnType, Row, Schema, TableDef, Value};
 
 /// The `DuckDB` database file written when the settings name no path.
@@ -111,13 +112,13 @@ impl DuckDbSink {
     ) -> Result<Self, StoreError> {
         let mut config = duckdb::Config::default();
         for (key, value) in &settings.settings {
-            config = config.with(key, value.expose()).map_err(|error| {
-                StoreError::engine(Operation::Configure, Some(key))(error.into())
-            })?;
+            config = config
+                .with(key, value.expose())
+                .map_err(StoreError::engine(Operation::Configure, Some(key)))?;
         }
         let path = settings.path.display().to_string();
         let connection = Connection::open_with_flags(&settings.path, config)
-            .map_err(|error| StoreError::engine(Operation::Open, Some(&path))(error.into()))?;
+            .map_err(StoreError::engine(Operation::Open, Some(&path)))?;
         info!(store = %path, "storage opened");
         Self::connected(connection, schema, database_schema).await
     }

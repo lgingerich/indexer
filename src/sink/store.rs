@@ -15,18 +15,13 @@
 //! retry, which deletes nothing it already deleted and upserts onto itself.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::fmt;
 use std::sync::Arc;
 
-use thiserror::Error;
-
 use crate::sink::sql::{self, Dialect};
+use crate::sink::store_error::{EngineError, InvalidStoredValue, Operation, StoreError};
 use crate::sink::table::{Row, Schema, Table, TableDef, TableError, TableId, Value};
 use crate::sink::{EnvelopeSink, SinkError};
 use crate::wire::envelope::{BlockMeta, ChainId, Envelope, Event, StoredContract};
-
-/// An engine's own error, carried as its cause.
-pub type EngineError = Box<dyn std::error::Error + Send + Sync>;
 
 /// What runs a [`SqlStore`]'s statements.
 pub trait Engine: Send {
@@ -55,106 +50,6 @@ pub trait Engine: Send {
         staging: &str,
         rows: &[&Row],
     ) -> impl Future<Output = Result<(), EngineError>> + Send;
-}
-
-/// What a store was doing when its engine failed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Operation {
-    /// Applying a setting.
-    Configure,
-    /// Opening or connecting to the database.
-    Open,
-    /// Creating the database schema, tables, or indexes.
-    Create,
-    /// Starting a flush's transaction.
-    Begin,
-    /// Deleting an orphaned block's rows.
-    Delete,
-    /// Creating, loading, or dropping a staging table.
-    Stage,
-    /// Merging staged rows into their table.
-    Merge,
-    /// Committing a flush.
-    Commit,
-    /// Reading stored contracts or accepted blocks at startup.
-    Read,
-}
-
-impl fmt::Display for Operation {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            Self::Configure => "apply setting",
-            Self::Open => "open store",
-            Self::Create => "create",
-            Self::Begin => "begin transaction",
-            Self::Delete => "delete orphaned rows of",
-            Self::Stage => "stage",
-            Self::Merge => "upsert",
-            Self::Commit => "commit transaction",
-            Self::Read => "read",
-        })
-    }
-}
-
-/// Why a store could not be opened, read, or written.
-#[derive(Debug, Error)]
-pub enum StoreError {
-    /// The engine failed during `operation`, on `target` — a table, a setting, or a path —
-    /// when there is one.
-    #[error("{operation}{}: {source}", target.as_ref().map(|target| format!(" {target}")).unwrap_or_default())]
-    Engine {
-        /// What the store was doing.
-        operation: Operation,
-        /// What it was doing it to.
-        target: Option<String>,
-        /// The engine's own error.
-        source: EngineError,
-    },
-    /// A value read back at startup did not parse.
-    #[error(transparent)]
-    Restore(#[from] InvalidStoredValue),
-    /// A table's declaration is inconsistent.
-    #[error(transparent)]
-    Table(#[from] TableError),
-    /// Another process already writes this database schema.
-    #[error("another indexer is already writing database schema {schema}")]
-    Locked {
-        /// The database schema.
-        schema: String,
-    },
-    /// An existing table does not match its definition. Tables are not migrated, so the
-    /// store needs a fresh database schema or the table dropped.
-    #[error("table {table} does not match its definition: {difference}")]
-    Drift {
-        /// The table.
-        table: String,
-        /// The first difference found, such as a column with another type.
-        difference: String,
-    },
-}
-
-impl StoreError {
-    /// Wraps an engine error from `operation` on `target`.
-    pub(crate) fn engine(
-        operation: Operation,
-        target: Option<&str>,
-    ) -> impl FnOnce(EngineError) -> Self {
-        move |source| Self::Engine {
-            operation,
-            target: target.map(str::to_owned),
-            source,
-        }
-    }
-}
-
-/// A value read back at startup that does not parse as its column's type.
-#[derive(Debug, Error)]
-#[error("stored {column} is invalid: {value}")]
-pub struct InvalidStoredValue {
-    /// The table and column, for example `contracts.address`.
-    pub column: &'static str,
-    /// The stored value.
-    pub value: String,
 }
 
 /// One table, with every statement a flush runs against it rendered once.

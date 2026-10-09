@@ -23,7 +23,8 @@ use tokio_postgres::types::{FromSql, IsNull, Kind, ToSql, Type, to_sql_checked};
 
 use crate::secret::Secret;
 use crate::sink::sql::{self, Dialect, ident};
-use crate::sink::store::{Engine, EngineError, Operation, SqlStore, StoreError};
+use crate::sink::store::{Engine, SqlStore};
+use crate::sink::store_error::{EngineError, Operation, StoreError};
 use crate::sink::table::{ColumnType, Row, Schema, TableDef, Value};
 
 /// `PostgreSQL` connection and backlog batching settings for `[sink.postgres]`.
@@ -73,14 +74,13 @@ impl PostgresSink {
         schema: Arc<Schema>,
         database_schema: &str,
     ) -> Result<Self, StoreError> {
-        let open = || StoreError::engine(Operation::Open, None);
         let connector = MakeTlsConnector::new(
-            native_tls::TlsConnector::new().map_err(|error| open()(error.into()))?,
+            native_tls::TlsConnector::new().map_err(StoreError::engine(Operation::Open, None))?,
         );
         let (client, connection) =
             tokio_postgres::connect(settings.connection_string.expose(), connector)
                 .await
-                .map_err(|error| open()(error.into()))?;
+                .map_err(StoreError::engine(Operation::Open, None))?;
         let task = tokio::spawn(async move {
             if let Err(error) = connection.await {
                 tracing::error!(%error, "PostgreSQL connection stopped");
@@ -94,7 +94,7 @@ impl PostgresSink {
             )
             .await
             .and_then(|row| row.try_get(0))
-            .map_err(|error| open()(error.into()))?;
+            .map_err(StoreError::engine(Operation::Open, None))?;
         if !locked {
             task.abort();
             return Err(StoreError::Locked {
