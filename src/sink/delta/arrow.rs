@@ -42,7 +42,7 @@ pub(super) const PARTITION: &str = "block_range";
 const PARTITION_BLOCKS: u64 = 100_000;
 
 /// Digits of a `Uint` column: `u64::MAX` has 20.
-const UINT_PRECISION: u8 = 20;
+pub(super) const UINT_PRECISION: u8 = 20;
 
 /// The Delta type a column of `kind` is stored as.
 fn delta_type(kind: ColumnType) -> Result<DataType, ArrowError> {
@@ -71,7 +71,7 @@ pub(super) fn delta_schema(def: &TableDef) -> Result<StructType, ArrowError> {
             ))
         })
         .collect::<Result<Vec<_>, ArrowError>>()?;
-    if partitioned(def) {
+    if partitioned(def).is_some() {
         fields.push(StructField::new(PARTITION, DataType::LONG, false));
     }
     StructType::try_new(fields).map_err(schema_error)
@@ -87,9 +87,10 @@ pub(super) fn arrow_schema(def: &TableDef) -> Result<Arc<ArrowSchema>, ArrowErro
     Ok(Arc::new(schema))
 }
 
-/// Whether `def`'s rows belong to a block, and so carry a [`PARTITION`].
-pub(super) fn partitioned(def: &TableDef) -> bool {
-    def.block_number.is_some()
+/// The block height column `def`'s [`PARTITION`] is derived from, when its rows belong
+/// to a block.
+pub(super) fn partitioned(def: &TableDef) -> Option<&str> {
+    def.block_number.as_deref()
 }
 
 /// `rows` of one table as a batch of `schema`, each row in the partition its block height
@@ -107,15 +108,20 @@ pub(super) fn record_batch(
     let mut columns: Vec<ArrayRef> = Vec::with_capacity(schema.fields().len());
     for (position, column) in def.columns.iter().enumerate() {
         let values: Vec<&Value> = rows.iter().map(|row| &row.values()[position]).collect();
-        columns.push(array(column.kind, schema.field(position), &values)?);
+        columns.push(array(
+            &def.name,
+            column.kind,
+            schema.field(position),
+            &values,
+        )?);
     }
-    if partitioned(def) {
+    if let Some(height) = partitioned(def) {
         let ranges = rows
             .iter()
             .map(|row| {
-                row.block_number().map(partition_of).ok_or_else(|| {
-                    invalid(&def.name, def.block_number.as_deref().unwrap_or_default())
-                })
+                row.block_number()
+                    .map(partition_of)
+                    .ok_or_else(|| invalid(&def.name, height))
             })
             .collect::<Result<Int64Array, _>>()?;
         columns.push(Arc::new(ranges));
@@ -130,77 +136,62 @@ pub(super) fn partition_of(height: u64) -> i64 {
 }
 
 /// One column's array: `values` as `kind`, typed as `field` says.
-fn array(kind: ColumnType, field: &Field, values: &[&Value]) -> Result<ArrayRef, ArrowError> {
-    let wrong = || invalid("column", field.name());
+fn array(
+    table: &str,
+    kind: ColumnType,
+    field: &Field,
+    values: &[&Value],
+) -> Result<ArrayRef, ArrowError> {
+    let wrong = || invalid(table, field.name());
     Ok(match kind {
         ColumnType::Uint => Arc::new(
-            values
-                .iter()
-                .map(|value| match value {
-                    Value::Null => Ok(None),
-                    Value::Uint(number) => Ok(Some(i128::from(*number))),
-                    _ => Err(wrong()),
-                })
-                .collect::<Result<Decimal128Array, _>>()?
-                .with_precision_and_scale(UINT_PRECISION, 0)?,
+            column::<Decimal128Array, _>(values, wrong, |value| match value {
+                Value::Uint(number) => Some(i128::from(*number)),
+                _ => None,
+            })?
+            .with_precision_and_scale(UINT_PRECISION, 0)?,
         ),
-        ColumnType::Int => Arc::new(
-            values
-                .iter()
-                .map(|value| match value {
-                    Value::Null => Ok(None),
-                    Value::Int(number) => Ok(Some(*number)),
-                    _ => Err(wrong()),
-                })
-                .collect::<Result<Int64Array, _>>()?,
-        ),
-        ColumnType::BigInt => Arc::new(
-            values
-                .iter()
-                .map(|value| match value {
-                    Value::Null => Ok(None),
-                    Value::BigInt {
-                        negative,
-                        magnitude,
-                    } => Ok(Some(decimal_text(*negative, *magnitude))),
-                    _ => Err(wrong()),
-                })
-                .collect::<Result<StringArray, _>>()?,
-        ),
-        ColumnType::Text | ColumnType::Document => Arc::new(
-            values
-                .iter()
-                .map(|value| match value {
-                    Value::Null => Ok(None),
-                    Value::Text(text) | Value::Document(text) => Ok(Some(text.as_str())),
-                    _ => Err(wrong()),
-                })
-                .collect::<Result<StringArray, _>>()?,
-        ),
-        ColumnType::Bool => Arc::new(
-            values
-                .iter()
-                .map(|value| match value {
-                    Value::Null => Ok(None),
-                    Value::Bool(flag) => Ok(Some(*flag)),
-                    _ => Err(wrong()),
-                })
-                .collect::<Result<BooleanArray, _>>()?,
-        ),
+        ColumnType::Int => Arc::new(column::<Int64Array, _>(
+            values,
+            wrong,
+            |value| match value {
+                Value::Int(number) => Some(*number),
+                _ => None,
+            },
+        )?),
+        ColumnType::BigInt => Arc::new(column::<StringArray, _>(
+            values,
+            wrong,
+            |value| match value {
+                Value::BigInt {
+                    negative,
+                    magnitude,
+                } => Some(decimal_text(*negative, *magnitude)),
+                _ => None,
+            },
+        )?),
+        ColumnType::Text | ColumnType::Document => Arc::new(column::<StringArray, _>(
+            values,
+            wrong,
+            |value| match value {
+                Value::Text(text) | Value::Document(text) => Some(text.as_str()),
+                _ => None,
+            },
+        )?),
+        ColumnType::Bool => Arc::new(column::<BooleanArray, _>(
+            values,
+            wrong,
+            |value| match value {
+                Value::Bool(flag) => Some(*flag),
+                _ => None,
+            },
+        )?),
         ColumnType::Timestamp => Arc::new(
-            values
-                .iter()
-                .map(|value| match value {
-                    Value::Null => Ok(None),
-                    Value::Timestamp(seconds) => i64::try_from(*seconds)
-                        .ok()
-                        .and_then(|seconds| seconds.checked_mul(1_000_000))
-                        .map(Some)
-                        .ok_or_else(wrong),
-                    _ => Err(wrong()),
-                })
-                .collect::<Result<TimestampMicrosecondArray, _>>()?
-                .with_data_type(field.data_type().clone()),
+            column::<TimestampMicrosecondArray, _>(values, wrong, |value| match value {
+                Value::Timestamp(seconds) => i64::try_from(*seconds).ok()?.checked_mul(1_000_000),
+                _ => None,
+            })?
+            .with_data_type(field.data_type().clone()),
         ),
         ColumnType::List(element) => {
             let ArrowType::List(element_field) = field.data_type() else {
@@ -226,11 +217,30 @@ fn array(kind: ColumnType, field: &Field, values: &[&Value]) -> Result<ArrayRef,
             Arc::new(ListArray::try_new(
                 Arc::clone(element_field),
                 OffsetBuffer::from_lengths(lengths),
-                array(*element, element_field, &elements)?,
+                array(table, *element, element_field, &elements)?,
                 Some(NullBuffer::from(present)),
             )?)
         }
     })
+}
+
+/// A column of scalars: `Null` as null, and every other value as `item` reads it, which
+/// is `None` for a value of another type.
+fn column<'a, A, T>(
+    values: &[&'a Value],
+    wrong: impl Fn() -> ArrowError,
+    item: impl Fn(&'a Value) -> Option<T>,
+) -> Result<A, ArrowError>
+where
+    A: FromIterator<Option<T>>,
+{
+    values
+        .iter()
+        .map(|value| match value {
+            Value::Null => Ok(None),
+            value => item(value).map(Some).ok_or_else(&wrong),
+        })
+        .collect()
 }
 
 /// An integer as signed decimal text: what a `BigInt` column holds.

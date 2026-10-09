@@ -21,16 +21,21 @@
 //! - [`stdout`] — newline-delimited JSON, for watching the stream.
 //! - `delta` — Delta Lake tables on object storage: the cheap raw-data lake. Not a SQL
 //!   store: it appends, and holds replays out with its ledger instead of upserting.
+//! - `batch` — the rows a store buffers between commits, with a `reorg`'s orphans
+//!   dropped and the last copy of each row kept, the same for all three stores.
 //! - `store_error` — the `StoreError` all three stores return.
 //!
 //! Stores take a connection or open one from their own settings, so client settings
 //! live beside the backend that knows how to apply them.
 
+/// The rows a store buffers between commits, which every store fills the same way.
+#[cfg(feature = "store")]
+mod batch;
 /// The bounded channel from decode to storage: the one hop that crosses tasks.
 ///
 /// Enabled with any store feature: its consumer is the store's writer in
 /// [`runtime`](crate::runtime). A stdout-only build has no storage task or channel.
-#[cfg(any(feature = "duckdb", feature = "postgres", feature = "delta"))]
+#[cfg(feature = "store")]
 pub(crate) mod channel;
 #[cfg(feature = "delta")]
 pub mod delta;
@@ -38,14 +43,14 @@ pub mod delta;
 pub mod duckdb;
 #[cfg(feature = "postgres")]
 pub mod postgres;
-#[cfg(any(feature = "duckdb", feature = "postgres", feature = "delta"))]
+#[cfg(feature = "store")]
 mod progress;
 #[cfg(any(feature = "duckdb", feature = "postgres"))]
 pub mod sql;
 pub mod stdout;
 #[cfg(any(feature = "duckdb", feature = "postgres"))]
 pub mod store;
-#[cfg(any(feature = "duckdb", feature = "postgres", feature = "delta"))]
+#[cfg(feature = "store")]
 pub mod store_error;
 pub mod table;
 
@@ -59,7 +64,7 @@ pub use duckdb::{DuckDbSettings, DuckDbSink};
 pub use stdout::{StdoutJsonSink, StdoutSettings};
 #[cfg(any(feature = "duckdb", feature = "postgres"))]
 pub use store::SqlStore;
-#[cfg(any(feature = "duckdb", feature = "postgres", feature = "delta"))]
+#[cfg(feature = "store")]
 pub use store_error::{InvalidStoredValue, Operation, StoreError};
 
 use thiserror::Error;
@@ -151,14 +156,14 @@ pub enum SinkError {
     #[error(transparent)]
     Table(#[from] table::TableError),
     /// A store could not be opened, read, or written.
-    #[cfg(any(feature = "duckdb", feature = "postgres", feature = "delta"))]
+    #[cfg(feature = "store")]
     #[error(transparent)]
     Store(#[from] StoreError),
 }
 
 /// Fixtures the store tests share: the shipped catalog's event tables, and a real decoded
 /// record to write into them.
-#[cfg(all(test, any(feature = "duckdb", feature = "postgres")))]
+#[cfg(all(test, feature = "store"))]
 #[expect(clippy::expect_used)]
 pub(crate) mod fixtures {
     use std::sync::Arc;

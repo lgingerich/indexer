@@ -14,14 +14,14 @@
 //! stored. On failure the transaction rolls back and the whole batch stays buffered for a
 //! retry, which deletes nothing it already deleted and upserts onto itself.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
+use crate::sink::batch::Batch;
 use crate::sink::sql::{self, Dialect};
 use crate::sink::store_error::{EngineError, InvalidStoredValue, Operation, StoreError};
-use crate::sink::table::{Row, Schema, Table, TableDef, TableError, TableId, Value};
+use crate::sink::table::{Row, Schema, Table, TableDef, TableError, Value};
 use crate::sink::{EnvelopeSink, SinkError};
-use crate::wire::envelope::{BlockMeta, ChainId, Envelope, Event, StoredContract};
+use crate::wire::envelope::{BlockMeta, ChainId, Envelope, StoredContract};
 
 /// What runs a [`SqlStore`]'s statements.
 pub trait Engine: Send {
@@ -397,10 +397,7 @@ fn column(row: &[Value], index: usize) -> &Value {
 
 /// A stored value that is not what its column holds.
 fn invalid(column: &'static str, value: &Value) -> InvalidStoredValue {
-    InvalidStoredValue {
-        column,
-        value: format!("{value:?}"),
-    }
+    InvalidStoredValue::new(column, format!("{value:?}"))
 }
 
 fn text<'a>(column: &'static str, value: &'a Value) -> Result<&'a str, InvalidStoredValue> {
@@ -435,116 +432,5 @@ fn timestamp(column: &'static str, value: &Value) -> Result<u64, InvalidStoredVa
     match value {
         Value::Timestamp(seconds) => Ok(*seconds),
         other => Err(invalid(column, other)),
-    }
-}
-
-/// What a store has been handed since its last commit: the rows to write, and the
-/// blocks a buffered `reorg` retracted.
-///
-/// A decoded record is two rows: its generic `decoded_logs` row, and its event's typed
-/// row, from the run's [`Schema`].
-///
-/// A store holds only the canonical chain. A `reorg` orphans blocks that are either
-/// already committed or still in this buffer — blocks are published in order and the
-/// storage channel is FIFO, so an orphaned block can never arrive after its `reorg`.
-/// [`push`](Self::push) drops the buffered ones at once, and the store deletes the
-/// committed ones in the same transaction that writes [`rows`](Self::rows), before
-/// writing them.
-#[derive(Debug)]
-struct Batch {
-    /// Rows to upsert, in publish order.
-    rows: Vec<Row>,
-    /// Orphaned block hashes to delete from the store, as `0x` hex, by chain, with the
-    /// lowest buffered `reorg` height, which none of them is below.
-    orphaned: BTreeMap<String, (u64, BTreeSet<String>)>,
-    /// Every table the run writes, which renders each decoded record's typed row.
-    schema: Arc<Schema>,
-}
-
-impl Batch {
-    fn new(schema: Arc<Schema>) -> Self {
-        Self {
-            rows: Vec::new(),
-            orphaned: BTreeMap::new(),
-            schema,
-        }
-    }
-
-    /// Buffers one envelope's rows. A `reorg` first drops every buffered row of the
-    /// blocks it orphans and records them for deletion; its own row is kept as the
-    /// record of the retraction.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`SinkError::UnknownEvent`] for a decoded record no event table holds,
-    /// which means it was decoded against a different catalog than the store opened with,
-    /// and [`SinkError::Table`] when a row cannot be built.
-    fn push(&mut self, envelope: &Envelope) -> Result<(), SinkError> {
-        if let Event::Reorg(reorg) = &envelope.event
-            && !reorg.orphaned_hashes.is_empty()
-        {
-            let chain = envelope.chain.as_str();
-            let hashes: BTreeSet<String> = reorg
-                .orphaned_hashes
-                .iter()
-                .map(|hash| format!("{hash:#x}"))
-                .collect();
-            self.rows.retain(|row| {
-                row.chain() != chain || !row.block_hash().is_some_and(|h| hashes.contains(h))
-            });
-            let (height, orphaned) = self
-                .orphaned
-                .entry(chain.to_owned())
-                .or_insert((reorg.height, BTreeSet::new()));
-            *height = (*height).min(reorg.height);
-            orphaned.extend(hashes);
-        }
-        if let Event::Decoded(decoded) = &envelope.event {
-            let row = self
-                .schema
-                .event_row(&envelope.chain, decoded)?
-                .ok_or_else(|| SinkError::UnknownEvent {
-                    protocol: decoded.protocol.clone(),
-                    contract: decoded.contract.clone(),
-                    event: decoded.name.clone(),
-                })?;
-            self.rows.push(row);
-        }
-        self.rows
-            .push(self.schema.row(&envelope.chain, &envelope.event)?);
-        Ok(())
-    }
-
-    /// The rows each table should load: the last buffered copy of each
-    /// `(chain, dedupe_key)`, in publish order.
-    ///
-    /// A merge must not see a key twice — both engines refuse to update one conflict row
-    /// twice in a statement — and "last" means last published, which only the buffer
-    /// knows; the staging table's physical order does not promise it.
-    fn by_table(&self) -> HashMap<TableId, Vec<&Row>> {
-        let mut seen = HashSet::new();
-        let mut tables: HashMap<TableId, Vec<&Row>> = HashMap::new();
-        for row in self.rows.iter().rev() {
-            let id = row.table().id;
-            if seen.insert((id, row.chain(), row.dedupe_key())) {
-                tables.entry(id).or_default().push(row);
-            }
-        }
-        for rows in tables.values_mut() {
-            rows.reverse();
-        }
-        tables
-    }
-
-    /// Whether there is nothing to commit. A `reorg` always buffers its own row, so a
-    /// batch with deletions is never empty.
-    fn is_empty(&self) -> bool {
-        self.rows.is_empty()
-    }
-
-    /// Forgets everything, once a commit has made it durable.
-    fn clear(&mut self) {
-        self.rows.clear();
-        self.orphaned.clear();
     }
 }

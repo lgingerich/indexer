@@ -126,3 +126,13 @@ pub struct InvalidStoredValue {
     /// The stored value.
     pub value: String,
 }
+
+impl InvalidStoredValue {
+    /// The value `value`, read back from `column`, which does not parse.
+    pub(crate) fn new(column: &'static str, value: impl Into<String>) -> Self {
+        Self {
+            column,
+            value: value.into(),
+        }
+    }
+}

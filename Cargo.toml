@@ -18,12 +18,15 @@ default = []
 # Local `DuckDB` store (`sink::duckdb`). Off by default: the `stdout` sink needs no
 # feature and no engine, so a bare `cargo run` prints and compiles fast. Add `duckdb`
 # for the embedded store, which pays for the bundled C++ engine at build time.
-duckdb = ["dep:duckdb"]
+duckdb = ["store", "dep:duckdb"]
 # Remote PostgreSQL store, using asynchronous COPY and platform TLS.
-postgres = ["dep:bytes", "dep:native-tls", "dep:postgres-native-tls", "dep:tokio-postgres"]
+postgres = ["store", "dep:bytes", "dep:native-tls", "dep:postgres-native-tls", "dep:tokio-postgres"]
 # Delta Lake tables on object storage (`sink::delta`): the cheap raw-data lake. Off by
 # default because delta-rs brings DataFusion and Arrow, which are heavy to build.
-delta = ["dep:deltalake"]
+delta = ["store", "dep:deltalake"]
+# Internal: what every store feature shares (the storage channel, its progress log, the
+# store's error). Enabled by each store above, not meant to be named on its own.
+store = []
 
 [dependencies]
 alloy-consensus = "2.5.0"
@@ -55,8 +58,9 @@ alloy-json-abi = { version = "1.7.3", default-features = false }
 duckdb = { version = "1.10506.0", default-features = false, features = ["bundled"], optional = true }
 bytes = { version = "1.12.1", optional = true }
 # Delta Lake on object storage. `datafusion` is what gives delta-rs its write, delete,
-# and optimize operations; `s3-native-tls` reaches S3 and S3-compatible stores over
-# platform TLS, like every other client here.
+# and optimize operations; `s3-native-tls` asks for platform TLS to S3 and S3-compatible
+# stores. Not all of it is: the AWS SDK's credential chain and `object_store`'s client
+# still bring rustls.
 deltalake = { version = "1.1.1", default-features = false, features = ["datafusion", "s3-native-tls"], optional = true }
 futures-util = { version = "0.3.34", features = ["sink"] }
 native-tls = { version = "0.2.18", optional = true }

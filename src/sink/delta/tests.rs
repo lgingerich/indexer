@@ -12,10 +12,14 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use alloy_primitives::{B256, U256};
+use deltalake::arrow::util::display::{ArrayFormatter, FormatOptions};
+use deltalake::datafusion::prelude::ident;
+use deltalake::kernel::{DataType, StructField};
+use deltalake::{DeltaTable, ensure_table_uri};
 
 use super::{DeltaSettings, DeltaSink, in_texts, texts, texts_of};
-use crate::sink::EnvelopeSink;
 use crate::sink::table::{Schema, Table, TableId};
+use crate::sink::{EnvelopeSink, StoreError, fixtures};
 use crate::wire::envelope::{Block, BlockMeta, ChainId, Envelope, Event, Log, Reorg, Transaction};
 
 const CHAIN: &str = "base";
@@ -42,6 +46,11 @@ impl Dir {
             max_buffer_bytes: usize::MAX,
             storage: std::collections::BTreeMap::new(),
         }
+    }
+
+    /// Where the lake keeps `table` of the test chain.
+    fn table(&self, table: &str) -> String {
+        format!("{}/{CHAIN}/{table}", self.0.display())
     }
 }
 
@@ -375,4 +384,210 @@ async fn opening_with_no_ledger_keeps_no_block_rows() {
     let mut sink = open(&dir, 0).await;
     assert!(stored(&sink, Table::Block, "hash").await.is_empty());
     assert!(sink.ledger(usize::MAX).is_empty());
+}
+
+/// A buffer past its byte limit commits at the next flush, long before its interval; one
+/// under it waits for the interval, or for the close.
+#[tokio::test]
+async fn a_full_buffer_commits_before_its_interval() {
+    let dir = Dir::new();
+    let mut sink = open(&dir, 3600).await;
+    publish(&mut sink, block(1, 0)).await;
+    assert!(
+        blocks(&sink).await.is_empty(),
+        "under the limit, nothing commits"
+    );
+
+    sink.max_buffer_bytes = 1;
+    publish(&mut sink, block(2, 0)).await;
+    assert_eq!(blocks(&sink).await, expected(&[(1, 0), (2, 0)]));
+}
+
+/// A reorg that orphans committed blocks and buffered ones at once deletes the first and
+/// drops the second, and only the replacements are stored.
+#[tokio::test]
+async fn a_reorg_across_committed_and_buffered_blocks_keeps_only_its_replacements() {
+    let dir = Dir::new();
+    let mut sink = open(&dir, 3600).await;
+    for height in 1..=3 {
+        publish(&mut sink, block(height, 0)).await;
+    }
+    sink.close().await.expect("commits");
+    for height in 4..=5 {
+        publish(&mut sink, block(height, 0)).await;
+    }
+    let mut replacements = vec![reorg(3..=5, 1)];
+    for height in 3..=5 {
+        replacements.extend(block(height, 1));
+    }
+    publish(&mut sink, replacements).await;
+    sink.close().await.expect("commits");
+
+    let canonical = [(1, 0), (2, 0), (3, 1), (4, 1), (5, 1)];
+    assert_eq!(blocks(&sink).await, expected(&canonical));
+    drop(sink);
+    let sink = open(&dir, 0).await;
+    assert_eq!(blocks(&sink).await, expected(&canonical));
+}
+
+/// A committed block orphaned and canonical again within one buffer ends up stored, and
+/// a later reorg can still orphan it.
+#[tokio::test]
+async fn a_block_orphaned_and_canonical_again_in_one_buffer_is_stored() {
+    let dir = Dir::new();
+    let mut sink = open(&dir, 3600).await;
+    for height in 1..=3 {
+        publish(&mut sink, block(height, 0)).await;
+    }
+    sink.close().await.expect("commits");
+    let mut flips = vec![reorg(3..=3, 1)];
+    flips.extend(block(3, 1));
+    flips.push(Envelope::new(
+        ChainId::new(CHAIN),
+        Event::Reorg(Reorg {
+            height: 3,
+            new_head_hash: hash(3, 0),
+            orphaned_hashes: vec![hash(3, 1)],
+        }),
+    ));
+    flips.extend(block(3, 0));
+    publish(&mut sink, flips).await;
+    sink.close().await.expect("commits");
+
+    assert_eq!(blocks(&sink).await, expected(&[(1, 0), (2, 0), (3, 0)]));
+    assert!(sink.committed.contains_key(&hex(hash(3, 0))));
+}
+
+/// A commit that stopped part-way through deleting a retraction's orphans — out of the
+/// ledger and one table, not yet the others — is finished by the next open.
+#[tokio::test]
+async fn opening_finishes_a_retraction_stopped_between_tables() {
+    let dir = Dir::new();
+    let mut sink = open(&dir, 0).await;
+    for height in 1..=3 {
+        publish(&mut sink, block(height, 0)).await;
+    }
+    append_only(&mut sink, &reorg(3..=3, 1)).await;
+    for (table, column) in [(Table::AcceptedBlock, "hash"), (Table::Block, "hash")] {
+        let position = sink.positions[&TableId::Dataset(table)];
+        sink.delete(position, in_texts(column, &[hex(hash(3, 0))]))
+            .await
+            .expect("deleted");
+    }
+    drop(sink);
+
+    let sink = open(&dir, 0).await;
+    assert_eq!(retractions(&sink).await, expected(&[(3, 1)]));
+    assert_eq!(blocks(&sink).await, expected(&[(1, 0), (2, 0)]));
+}
+
+/// The ledger is read from its newest two partitions: the window across a partition
+/// boundary comes back whole, and a block partitions below it is not read.
+#[tokio::test]
+async fn the_ledger_is_read_from_its_newest_partitions() {
+    let dir = Dir::new();
+    let mut sink = open(&dir, 0).await;
+    for height in [1, 199_999, 200_000, 200_001] {
+        publish(&mut sink, block(height, 0)).await;
+    }
+    drop(sink);
+
+    let mut sink = open(&dir, 0).await;
+    assert_eq!(
+        sink.ledger(usize::MAX)
+            .iter()
+            .map(|block| block.height)
+            .collect::<Vec<_>>(),
+        [199_999, 200_000, 200_001]
+    );
+}
+
+/// A decoded record is stored twice — its generic row and its event's typed row — with
+/// an array as a typed list, a `uint256` element as exact decimal text, and a tuple as
+/// one JSON object.
+#[tokio::test]
+async fn a_decoded_record_fills_its_event_table_with_typed_lists() {
+    let dir = Dir::new();
+    let schema = fixtures::schema();
+    let mut sink = DeltaSink::open(&dir.settings(0), Arc::clone(&schema), CHAIN)
+        .await
+        .expect("the lake opens with the event tables");
+    let created = fixtures::decoded_pool_created();
+    let swap = fixtures::decoded_swap();
+    let event = schema
+        .event_row(&ChainId::new(CHAIN), &created)
+        .expect("a row")
+        .expect("an event table");
+    let name = event.table().name.clone();
+    publish(
+        &mut sink,
+        [created, swap]
+            .into_iter()
+            .map(|decoded| Envelope::new(ChainId::new(CHAIN), Event::Decoded(Box::new(decoded))))
+            .collect(),
+    )
+    .await;
+
+    assert_eq!(stored(&sink, Table::Decoded, "dedupe_key").await.len(), 2);
+    let lake = &sink.lakes[sink.positions[&event.table().id]];
+    assert_eq!(lake.name(), name);
+    let columns = [
+        "extensions",
+        "negative_bin_data_array",
+        "extension_orders",
+        "price_provider_timelock",
+    ];
+    let batches = lake
+        .read(|frame| frame.select(columns.map(ident)))
+        .await
+        .expect("the event table reads");
+    let values: Vec<String> = (0..columns.len())
+        .map(|index| {
+            ArrayFormatter::try_new(batches[0].column(index).as_ref(), &FormatOptions::default())
+                .expect("formats")
+                .value(0)
+                .to_string()
+        })
+        .collect();
+    assert_eq!(
+        values[0],
+        "[0xb1a246b1131ff328067c4aaf4f772ff351475244, \
+         0xe4038fa09f0bb9963068afaf97be0c045155090d, \
+         0xebc53e61078976118e384f110c262a263decb84b]"
+    );
+    assert!(
+        values[1].starts_with("[2510840694154681225832395181564014445733957084757624461722000,"),
+        "a packed word is its exact integer: {}",
+        values[1]
+    );
+    assert_eq!(
+        values[2],
+        r#"{"beforeAddLiquidity":"0","afterAddLiquidity":"0","beforeRemoveLiquidity":"0","afterRemoveLiquidity":"0","beforeSwap":"3","afterSwap":"10"}"#
+    );
+    assert_eq!(values[3], U256::MAX.to_string());
+}
+
+/// A table already at the lake's location that does not match its definition stops the
+/// open, rather than the first write.
+#[tokio::test]
+async fn opening_over_a_different_table_is_drift() {
+    let dir = Dir::new();
+    let schema = Schema::new().expect("the dataset tables");
+    let name = schema.dataset(Table::Block).name.clone();
+    let url = ensure_table_uri(dir.table(&name)).expect("a table url");
+    DeltaTable::try_from_url(url)
+        .await
+        .expect("a location")
+        .create()
+        .with_columns([StructField::new("hash", DataType::STRING, false)])
+        .await
+        .expect("a stranger's table");
+
+    let error = DeltaSink::open(&dir.settings(0), Arc::new(schema), CHAIN)
+        .await
+        .expect_err("drift stops the open");
+    assert!(
+        matches!(&error, StoreError::Drift { table, .. } if *table == name),
+        "{error}"
+    );
 }

@@ -50,12 +50,12 @@ use tracing::{info, warn};
 
 use crate::config::{Settings, SettingsError, Sink};
 use crate::decode::{Catalog, CatalogError, Decoder, DecodingSink};
-#[cfg(any(feature = "duckdb", feature = "postgres", feature = "delta"))]
-use crate::ingest::pipeline::MAX_UNFINALIZED_BLOCKS;
+#[cfg(feature = "store")]
+use crate::ingest::pipeline::LEDGER_WINDOW;
 use crate::ingest::pipeline::{Machine, PipelineError};
 use crate::ingest::source::evm::{http_client, ws_connect};
 use crate::ingest::source::{BlockSource, EvmSource, SourceError};
-#[cfg(any(feature = "duckdb", feature = "postgres", feature = "delta"))]
+#[cfg(feature = "store")]
 use crate::sink;
 #[cfg(feature = "delta")]
 use crate::sink::DeltaSink;
@@ -66,7 +66,7 @@ use crate::sink::{SinkError, StdoutJsonSink};
 #[cfg(any(feature = "duckdb", feature = "postgres"))]
 use crate::sink::{SqlStore, store::Engine};
 use crate::wire::envelope::ChainId;
-#[cfg(any(feature = "duckdb", feature = "postgres", feature = "delta"))]
+#[cfg(feature = "store")]
 use crate::wire::envelope::{BlockMeta, StoredContract};
 
 /// Why the indexer stopped.
@@ -94,7 +94,7 @@ pub enum RuntimeError {
     #[error("chain source could not be built: {0}")]
     Source(#[from] SourceError),
     /// The store could not be opened or read back, so there was nowhere to write.
-    #[cfg(any(feature = "duckdb", feature = "postgres", feature = "delta"))]
+    #[cfg(feature = "store")]
     #[error("storage could not be opened: {0}")]
     OpenStore(#[from] sink::StoreError),
     /// Ingest stopped: a source failed, a sink refused an envelope, or the head
@@ -238,7 +238,7 @@ impl<B: BlockSource> Pipeline<B> {
     /// # Errors
     ///
     /// As [`Pipeline::run`], less opening the store.
-    #[cfg(any(feature = "duckdb", feature = "postgres", feature = "delta"))]
+    #[cfg(feature = "store")]
     pub(crate) async fn run_with_store<S: Store>(
         self,
         mut store: S,
@@ -277,7 +277,7 @@ impl<B: BlockSource> Pipeline<B> {
 
 /// What [`Pipeline::run_with_store`] needs of a store beyond accepting envelopes: what a
 /// previous run left in it, and a last chance to make buffered rows durable.
-#[cfg(any(feature = "duckdb", feature = "postgres", feature = "delta"))]
+#[cfg(feature = "store")]
 pub(crate) trait Store: sink::EnvelopeSink + Send + 'static {
     /// The contracts a previous run discovered on `chain`.
     fn contracts(
@@ -340,19 +340,15 @@ impl Store for DeltaSink {
 const LAKE_BATCH_RECORDS: usize = 10_000;
 
 /// Adds the contracts a previous run discovered, as the store read them back.
-#[cfg(any(feature = "duckdb", feature = "postgres", feature = "delta"))]
+#[cfg(feature = "store")]
 fn restore(mut decoder: Decoder, chain: &ChainId, stored: Vec<StoredContract>) -> Decoder {
     let restored = decoder.restore(stored);
     info!(%chain, restored, contracts = decoder.contracts(), "discovered contracts restored");
     decoder
 }
 
-/// How many accepted blocks a restart reads back: the undo window plus its floor.
-#[cfg(any(feature = "duckdb", feature = "postgres", feature = "delta"))]
-const LEDGER_WINDOW: usize = MAX_UNFINALIZED_BLOCKS + 1;
-
 /// The accepted blocks a previous run committed, as ingest takes them.
-#[cfg(any(feature = "duckdb", feature = "postgres", feature = "delta"))]
+#[cfg(feature = "store")]
 fn ledger(chain: &ChainId, stored: Vec<BlockMeta>) -> Vec<BlockMeta> {
     if let (Some(oldest), Some(tip)) = (stored.first(), stored.last()) {
         info!(%chain, from = oldest.height, tip = tip.height, hash = %tip.hash,
@@ -370,7 +366,7 @@ fn ledger(chain: &ChainId, stored: Vec<BlockMeta>) -> Vec<BlockMeta> {
 /// which is neither a store failure nor an ingest failure. Ingest's error on this path
 /// is the failed send that followed — [`crate::sink::SinkError::StorageClosed`] — so it
 /// is returned only when the store itself finished.
-#[cfg(any(feature = "duckdb", feature = "postgres", feature = "delta"))]
+#[cfg(feature = "store")]
 fn finish(
     storage: Result<Result<u64, SinkError>, tokio::task::JoinError>,
     ingest: Result<(), PipelineError>,

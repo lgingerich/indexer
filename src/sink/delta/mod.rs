@@ -13,7 +13,8 @@
 //! Blocks are written as they are accepted, not held back until they are final. Rows are
 //! buffered and committed every [`commit_interval_secs`](DeltaSettings::commit_interval_secs),
 //! or sooner once [`max_buffer_bytes`](DeltaSettings::max_buffer_bytes) are buffered, so
-//! a commit holds many blocks and the buffer, not a later compaction, sets the file size.
+//! a commit holds many blocks. Each commit writes one file per table and partition it
+//! touches, so the buffer sets the file size; nothing compacts them afterwards.
 //!
 //! A `reorg` drops the orphaned blocks still in the buffer, which most are, since a reorg
 //! is a few blocks deep and a commit holds tens of seconds of them. Orphaned blocks
@@ -29,7 +30,8 @@
 //!
 //! A commit deletes orphaned blocks from `accepted_blocks` *before* their rows, and
 //! appends new blocks to it *after* theirs, so the ledger only ever names blocks whose
-//! rows are all present. Opening the store repairs what a stopped commit left behind:
+//! rows are all present. Opening the store reads the ledger's newest blocks from its
+//! newest two partitions, and repairs what a stopped commit left behind:
 //! rows of blocks the ledger does not name, at or above its oldest height, are deleted
 //! before ingest resumes. A reader that must never see such rows reads up to the
 //! ledger's tip, or joins on it.
@@ -45,7 +47,8 @@
 //!
 //! # One writer
 //!
-//! A chain's tables are written by one process. Unlike `PostgreSQL`'s advisory lock or
+//! A chain's tables are written by one process, and hold that chain alone: rows are not
+//! keyed by chain here, so a store is handed only the chain it was opened for. Unlike `PostgreSQL`'s advisory lock or
 //! `DuckDB`'s file lock, nothing here enforces that: a deployment runs one indexer per
 //! chain. A second writer on the same `uri` would append duplicate rows, and its open
 //! would repair away the first's uncommitted ones. If that ever needs enforcing, the
@@ -55,7 +58,7 @@
 
 mod arrow;
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -74,18 +77,24 @@ use serde::Deserialize;
 use tokio::time::Instant;
 use tracing::{info, warn};
 
+use crate::ingest::pipeline::LEDGER_WINDOW;
 use crate::secret::Secret;
-
-use crate::ingest::pipeline::MAX_UNFINALIZED_BLOCKS;
-use crate::sink::store_error::{InvalidStoredValue, Operation, StoreError};
-use crate::sink::table::{Row, Schema, Table, TableDef, TableId, Value};
+use crate::sink::batch::Batch;
+use crate::sink::store_error::{EngineError, InvalidStoredValue, Operation, StoreError};
+use crate::sink::table::{Row, Schema, Table, TableDef, TableError, TableId};
 use crate::sink::{EnvelopeSink, SinkError};
-use crate::wire::envelope::{BlockMeta, ChainId, Envelope, Event, StoredContract};
+use crate::wire::envelope::{BlockMeta, ChainId, Envelope, StoredContract};
 
-use self::arrow::PARTITION;
+use self::arrow::{PARTITION, UINT_PRECISION};
 
-/// How many accepted blocks opening the store reads back: the undo window and its floor.
-const LEDGER_WINDOW: usize = MAX_UNFINALIZED_BLOCKS + 1;
+/// The `contracts` columns a restore reads back.
+const CONTRACT_COLUMNS: [&str; 4] = ["protocol", "name", "address", "block_hash"];
+
+/// The `accepted_blocks` columns opening the store reads back.
+const LEDGER_COLUMNS: [&str; 4] = ["height", "hash", "parent_hash", "timestamp"];
+
+/// The `reorgs` columns opening the store reads back.
+const REORG_COLUMNS: [&str; 3] = ["height", "dedupe_key", "orphaned_hashes"];
 
 /// The Delta Lake store's settings: where the tables live, how often to commit, and the
 /// object store's own options, passed through.
@@ -118,6 +127,9 @@ pub struct DeltaSettings {
     pub commit_interval_secs: u64,
     /// How many bytes of rows, roughly, may be buffered before a commit is made early.
     /// Defaults to 256 MiB. Reached while catching up, where it sets the file size.
+    ///
+    /// Counts the rows as they sit in memory. A commit builds each table's Arrow batch
+    /// from them while they are still held, so it briefly needs as much again.
     #[serde(default = "default_max_buffer_bytes")]
     pub max_buffer_bytes: usize,
     /// S3 options, passed straight through, such as `endpoint`, `region`, and
@@ -163,85 +175,30 @@ impl Lake {
         &self,
         plan: impl FnOnce(DataFrame) -> Result<DataFrame, DataFusionError>,
     ) -> Result<Vec<RecordBatch>, StoreError> {
-        let name = Some(self.name());
-        let ctx = SessionContext::new();
-        self.table
-            .update_datafusion_session(&ctx.state())
-            .map_err(StoreError::engine(Operation::Read, name))?;
-        let provider = self
-            .table
-            .table_provider()
-            .await
-            .map_err(StoreError::engine(Operation::Read, name))?;
-        let frame = ctx
-            .read_table(provider)
-            .map_err(StoreError::engine(Operation::Read, name))?;
-        plan(frame)
-            .map_err(StoreError::engine(Operation::Read, name))?
-            .collect()
-            .await
-            .map_err(StoreError::engine(Operation::Read, name))
-    }
-}
-
-/// What has been published since the last commit.
-#[derive(Debug, Default)]
-struct Buffer {
-    /// Rows to append, in publish order.
-    rows: Vec<Row>,
-    /// Committed blocks a buffered `reorg` orphaned, by hash, to delete at the next
-    /// commit.
-    orphaned: BTreeSet<String>,
-    /// Roughly how many bytes `rows` hold.
-    bytes: usize,
-}
-
-impl Buffer {
-    fn is_empty(&self) -> bool {
-        self.rows.is_empty() && self.orphaned.is_empty()
+        let read = async {
+            let ctx = SessionContext::new();
+            self.table.update_datafusion_session(&ctx.state())?;
+            let frame = ctx.read_table(self.table.table_provider().await?)?;
+            Ok::<_, EngineError>(plan(frame)?.collect().await?)
+        };
+        read.await
+            .map_err(StoreError::engine(Operation::Read, Some(self.name())))
     }
 
-    fn push(&mut self, row: Row) {
-        self.bytes += row.values().iter().map(size).sum::<usize>();
-        self.rows.push(row);
-    }
-
-    /// Drops every buffered row of the blocks `hashes` names.
-    fn drop_blocks(&mut self, hashes: &BTreeSet<String>) {
-        self.rows
-            .retain(|row| !row.block_hash().is_some_and(|hash| hashes.contains(hash)));
-        self.bytes = self
-            .rows
-            .iter()
-            .flat_map(|row| row.values().iter().map(size))
-            .sum();
-    }
-
-    /// The rows each table should append: the last buffered copy of each `dedupe_key`,
-    /// in publish order.
-    fn by_table(&self) -> HashMap<TableId, Vec<&Row>> {
-        let mut seen = HashSet::new();
-        let mut tables: HashMap<TableId, Vec<&Row>> = HashMap::new();
-        for row in self.rows.iter().rev() {
-            let id = row.table().id;
-            if seen.insert((id, row.dedupe_key())) {
-                tables.entry(id).or_default().push(row);
-            }
+    /// The newest partition any of the table's files is in, from its file list rather
+    /// than its rows. `None` for a table with no files.
+    fn newest_partition(&self) -> Result<Option<i64>, StoreError> {
+        let read = || StoreError::engine(Operation::Read, Some(self.name()));
+        let snapshot = self.table.snapshot().map_err(read())?;
+        let files = snapshot.snapshot().try_log_data().map_err(read())?;
+        let mut newest = None;
+        for file in files.iter() {
+            let values = file.partition_values_map();
+            let value = values.get(PARTITION).cloned().flatten().unwrap_or_default();
+            let partition: i64 = parse("accepted_blocks.block_range", &value)?;
+            newest = newest.max(Some(partition));
         }
-        for rows in tables.values_mut() {
-            rows.reverse();
-        }
-        tables
-    }
-}
-
-/// Roughly how many bytes a value takes in the buffer.
-fn size(value: &Value) -> usize {
-    match value {
-        Value::Text(text) | Value::Document(text) => text.len(),
-        Value::BigInt { .. } => 32,
-        Value::List(items) => items.iter().map(size).sum(),
-        Value::Null | Value::Uint(_) | Value::Int(_) | Value::Bool(_) | Value::Timestamp(_) => 8,
+        Ok(newest)
     }
 }
 
@@ -254,11 +211,9 @@ pub struct DeltaSink {
     lakes: Vec<Lake>,
     /// Each table's position in `lakes`.
     positions: HashMap<TableId, usize>,
-    buffer: Buffer,
+    batch: Batch,
     /// The committed blocks a reorg could still orphan, by hash, with their heights.
     committed: HashMap<String, u64>,
-    /// The highest committed height.
-    tip: Option<u64>,
     /// The ledger as opening the store read it, oldest first, until ingest takes it.
     restored: Vec<BlockMeta>,
     last_commit: Instant,
@@ -275,13 +230,21 @@ impl DeltaSink {
     ///
     /// Returns [`StoreError::Engine`] when a table cannot be opened, created, read, or
     /// repaired, [`StoreError::Reserved`] when a table declares the partition column,
-    /// [`StoreError::Drift`] when an existing table does not match its definition, and
+    /// [`StoreError::Drift`] when an existing table does not match its definition,
+    /// [`StoreError::Table`] when a startup read names a column its table lacks, and
     /// [`StoreError::Restore`] when the ledger holds a value that does not parse.
     pub async fn open(
         settings: &DeltaSettings,
         schema: Arc<Schema>,
         chain: &str,
     ) -> Result<Self, StoreError> {
+        for (table, columns) in [
+            (Table::Contract, &CONTRACT_COLUMNS[..]),
+            (Table::AcceptedBlock, &LEDGER_COLUMNS[..]),
+            (Table::Reorg, &REORG_COLUMNS[..]),
+        ] {
+            require(schema.dataset(table), columns)?;
+        }
         deltalake::aws::register_handlers(None);
         let storage: HashMap<String, String> = settings
             .storage
@@ -300,12 +263,11 @@ impl DeltaSink {
             .collect();
         let mut sink = Self {
             chain: ChainId::new(chain),
-            schema,
             lakes,
             positions,
-            buffer: Buffer::default(),
+            batch: Batch::new(Arc::clone(&schema)),
+            schema,
             committed: HashMap::new(),
-            tip: None,
             restored: Vec::new(),
             last_commit: Instant::now(),
             commit_interval: Duration::from_secs(settings.commit_interval_secs),
@@ -316,12 +278,11 @@ impl DeltaSink {
         };
         let ledger = sink.read_ledger().await?;
         sink.repair(&ledger).await?;
-        sink.tip = ledger.last().map(|block| block.height);
         sink.committed = ledger
             .iter()
-            .map(|block| (format!("{:#x}", block.hash), block.height))
+            .map(|block| (hex(&block.hash), block.height))
             .collect();
-        info!(%chain, uri = root, tables = sink.lakes.len(), tip = ?sink.tip, "delta lake opened");
+        info!(%chain, uri = root, tables = sink.lakes.len(), tip = ?sink.tip(), "delta lake opened");
         sink.restored = ledger;
         Ok(sink)
     }
@@ -341,7 +302,7 @@ impl DeltaSink {
                 // Ordered, so a restore reads the rows the same way every time.
                 frame
                     .sort(vec![ident("dedupe_key").sort(true, false)])?
-                    .select(texts_of(&["protocol", "name", "address", "block_hash"]))
+                    .select(texts_of(&CONTRACT_COLUMNS))
             })
             .await?;
         let mut contracts = Vec::new();
@@ -385,22 +346,36 @@ impl DeltaSink {
         &self.lakes[self.positions[&TableId::Dataset(table)]]
     }
 
+    /// The highest committed height.
+    fn tip(&self) -> Option<u64> {
+        self.committed.values().max().copied()
+    }
+
     /// The newest [`LEDGER_WINDOW`] accepted blocks, oldest first.
+    ///
+    /// Read from the ledger's newest two partitions alone, which hold far more blocks
+    /// than the window, so a restart does not scan every file the ledger ever wrote.
     async fn read_ledger(&self) -> Result<Vec<BlockMeta>, StoreError> {
-        let batches = self
-            .lake(Table::AcceptedBlock)
+        let lake = self.lake(Table::AcceptedBlock);
+        let newest = lake.newest_partition()?;
+        let [height, hash, parent_hash, timestamp] = LEDGER_COLUMNS;
+        let batches = lake
             .read(|frame| {
+                let frame = match newest {
+                    Some(newest) => frame.filter(ident(PARTITION).gt_eq(lit(newest - 1)))?,
+                    None => frame,
+                };
                 let seconds = cast(
-                    cast(ident("timestamp"), ArrowType::Int64) / lit(1_000_000_i64),
+                    cast(ident(timestamp), ArrowType::Int64) / lit(1_000_000_i64),
                     ArrowType::UInt64,
                 );
                 frame
-                    .sort(vec![ident("height").sort(false, false)])?
+                    .sort(vec![ident(height).sort(false, false)])?
                     .limit(0, Some(LEDGER_WINDOW))?
                     .select(vec![
-                        cast(ident("height"), ArrowType::UInt64),
-                        cast(ident("hash"), ArrowType::Utf8),
-                        cast(ident("parent_hash"), ArrowType::Utf8),
+                        cast(ident(height), ArrowType::UInt64),
+                        cast(ident(hash), ArrowType::Utf8),
+                        cast(ident(parent_hash), ArrowType::Utf8),
                         seconds,
                     ])
             })
@@ -428,10 +403,7 @@ impl DeltaSink {
     /// what a commit that stopped part-way appended before its ledger entry. With no
     /// ledger at all, every block row is such a row.
     async fn repair(&mut self, ledger: &[BlockMeta]) -> Result<(), StoreError> {
-        let named: HashSet<String> = ledger
-            .iter()
-            .map(|block| format!("{:#x}", block.hash))
-            .collect();
+        let named: HashSet<String> = ledger.iter().map(|block| hex(&block.hash)).collect();
         let floor = ledger.first().map(|block| block.height);
         let ledger_id = TableId::Dataset(Table::AcceptedBlock);
         for position in 0..self.lakes.len() {
@@ -442,11 +414,10 @@ impl DeltaSink {
             if lake.def.id == ledger_id {
                 continue;
             }
-            let bound = floor.map(|floor| at_or_above(number, floor));
             let batches = lake
                 .read(|frame| {
-                    let frame = match bound.clone() {
-                        Some(bound) => frame.filter(bound)?,
+                    let frame = match floor {
+                        Some(floor) => frame.filter(at_or_above(number, floor))?,
                         None => frame,
                     };
                     frame.select(texts_of(&[hash]))?.distinct()
@@ -471,12 +442,8 @@ impl DeltaSink {
                 blocks = stray.len(),
                 "deleting rows a stopped commit left behind"
             );
-            let predicate = in_texts(hash, &stray);
-            let predicate = match bound {
-                Some(bound) => bound.and(predicate),
-                None => predicate,
-            };
-            self.delete(position, predicate).await?;
+            self.delete(position, of_blocks((hash, number), &stray, floor))
+                .await?;
         }
         self.repair_reorgs(ledger).await
     }
@@ -495,13 +462,14 @@ impl DeltaSink {
         };
         let named: HashSet<B256> = ledger.iter().map(|block| block.hash).collect();
         let position = self.positions[&TableId::Dataset(Table::Reorg)];
+        let [height, dedupe_key, orphaned_hashes] = REORG_COLUMNS;
         // A retraction's height is its lowest orphan's, so an unfinished one is at or
         // above the ledger's oldest block.
         let batches = self.lakes[position]
             .read(|frame| {
                 frame
-                    .filter(ident("height").gt_eq(height(floor)))?
-                    .select(texts_of(&["dedupe_key", "orphaned_hashes"]))
+                    .filter(ident(height).gt_eq(uint(floor)))?
+                    .select(texts_of(&[dedupe_key, orphaned_hashes]))
             })
             .await?;
         let mut unfinished = Vec::new();
@@ -509,8 +477,10 @@ impl DeltaSink {
             let keys = texts(batch, 0, "reorgs.dedupe_key")?;
             let orphans = texts(batch, 1, "reorgs.orphaned_hashes")?;
             for row in 0..batch.num_rows() {
-                let orphans: Vec<B256> = serde_json::from_str(orphans.value(row))
-                    .map_err(|_| invalid("reorgs.orphaned_hashes", orphans.value(row)))?;
+                let orphans: Vec<B256> =
+                    serde_json::from_str(orphans.value(row)).map_err(|_| {
+                        InvalidStoredValue::new("reorgs.orphaned_hashes", orphans.value(row))
+                    })?;
                 if orphans.iter().any(|hash| named.contains(hash)) {
                     unfinished.push(keys.value(row).to_owned());
                 }
@@ -523,7 +493,7 @@ impl DeltaSink {
             rows = unfinished.len(),
             "deleting retractions a stopped commit left unfinished"
         );
-        self.delete(position, in_texts("dedupe_key", &unfinished))
+        self.delete(position, in_texts(dedupe_key, &unfinished))
             .await
     }
 
@@ -552,7 +522,7 @@ impl DeltaSink {
             .write(vec![batch])
             .with_save_mode(SaveMode::Append)
             .with_writer_properties(self.writer.clone());
-        if arrow::partitioned(&lake.def) {
+        if arrow::partitioned(&lake.def).is_some() {
             write = write.with_partition_columns([PARTITION]);
         }
         let table = write
@@ -562,137 +532,139 @@ impl DeltaSink {
         Ok(())
     }
 
-    /// Writes the buffer: retractions into `reorgs`; orphaned blocks out of the ledger,
-    /// then out of every table; rows into every table; then the new blocks into the
-    /// ledger.
+    /// Appends `rows` to the table at `position`, when there are any.
+    async fn append_some(&mut self, position: usize, rows: &[&Row]) -> Result<(), StoreError> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        self.append(position, rows).await
+    }
+
+    /// Writes the batch in the ledger's order, one step per rule in the module docs:
     ///
-    /// A failure part-way leaves the lake as the next open repairs it, so the buffer is
+    /// 1. retractions into `reorgs`, while the ledger still names their orphans;
+    /// 2. the orphans out of the ledger, then out of every other table;
+    /// 3. every table's rows;
+    /// 4. the new blocks into the ledger, once their rows are all present.
+    ///
+    /// A failure part-way leaves the lake as the next open repairs it, so the batch is
     /// not retried here: the error stops storage, and a restart resumes from the ledger.
     async fn commit(&mut self) -> Result<(), StoreError> {
-        if self.buffer.is_empty() {
+        if self.batch.is_empty() {
             return Ok(());
         }
         let started = Instant::now();
-        let buffer = std::mem::take(&mut self.buffer);
-        let ledger = self.positions[&TableId::Dataset(Table::AcceptedBlock)];
-        let mut grouped = buffer.by_table();
-        let ledger_rows = grouped
+        // Taken out so the commit can borrow its rows while it writes, and put back
+        // cleared, keeping its allocation for the next one.
+        let mut batch = std::mem::replace(&mut self.batch, Batch::new(Arc::clone(&self.schema)));
+        let mut tables = batch.by_table();
+        let reorgs = tables
+            .remove(&TableId::Dataset(Table::Reorg))
+            .unwrap_or_default();
+        let accepted = tables
             .remove(&TableId::Dataset(Table::AcceptedBlock))
             .unwrap_or_default();
-        let mut appended = 0;
+        let orphans = self.committed_orphans(&batch);
 
-        // A retraction is recorded while the ledger still names what it orphans, so a
-        // stop before the ledger delete leaves a record the next open deletes, and never
-        // a retraction with no record.
-        if let Some(rows) = grouped.remove(&TableId::Dataset(Table::Reorg)) {
-            appended += rows.len();
-            let position = self.positions[&TableId::Dataset(Table::Reorg)];
-            self.append(position, &rows).await?;
+        self.append_some(self.position(Table::Reorg), &reorgs)
+            .await?;
+        if let Some((floor, hashes)) = &orphans {
+            self.retract(*floor, hashes).await?;
         }
-        if !buffer.orphaned.is_empty() {
-            let orphaned: Vec<String> = buffer.orphaned.iter().cloned().collect();
-            let floor = orphaned
-                .iter()
-                .filter_map(|hash| self.committed.get(hash))
-                .min()
-                .copied();
-            let others = (0..self.lakes.len()).filter(|&position| position != ledger);
-            for position in std::iter::once(ledger).chain(others) {
-                let Some((hash, number)) = self.lakes[position].block_columns() else {
-                    continue;
-                };
-                let predicate = in_texts(hash, &orphaned);
-                let predicate = match floor {
-                    Some(floor) => at_or_above(number, floor).and(predicate),
-                    None => predicate,
-                };
-                self.delete(position, predicate).await?;
-            }
-            for hash in &orphaned {
-                self.committed.remove(hash);
-            }
-        }
-
+        let mut rows = reorgs.len() + accepted.len();
         for position in 0..self.lakes.len() {
-            if let Some(rows) = grouped.remove(&self.lakes[position].def.id) {
-                appended += rows.len();
-                self.append(position, &rows).await?;
+            if let Some(table) = tables.remove(&self.lakes[position].def.id) {
+                rows += table.len();
+                self.append(position, &table).await?;
             }
         }
-        if !ledger_rows.is_empty() {
-            self.append(ledger, &ledger_rows).await?;
-        }
+        self.append_some(self.position(Table::AcceptedBlock), &accepted)
+            .await?;
 
-        let accepted: Vec<(String, u64)> = ledger_rows
-            .iter()
-            .filter_map(|row| Some((row.block_hash()?.to_owned(), row.block_number()?)))
-            .collect();
-        let first = accepted.iter().map(|(_, height)| *height).min();
-        if let Some(last) = accepted.iter().map(|(_, height)| *height).max() {
-            let tip = self.tip.map_or(last, |tip| tip.max(last));
-            self.tip = Some(tip);
-            let floor = tip.saturating_sub(LEDGER_WINDOW as u64);
-            self.committed.extend(accepted);
-            self.committed.retain(|_, height| *height >= floor);
-        }
+        let first = accepted.iter().filter_map(|row| row.block_number()).min();
+        let orphaned = orphans.map(|(_, hashes)| hashes).unwrap_or_default();
+        self.advance(&orphaned, &accepted);
         self.last_commit = Instant::now();
         info!(
             chain = %self.chain,
-            rows = appended + ledger_rows.len(),
-            orphaned = buffer.orphaned.len(),
+            rows,
+            orphaned = orphaned.len(),
             from = ?first,
-            to = ?self.tip,
+            to = ?self.tip(),
             elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
             "lake commit"
         );
+        batch.clear();
+        self.batch = batch;
         Ok(())
     }
 
-    /// Whether the buffer is due: old enough, or large enough.
+    /// The committed blocks `batch` orphans, with the lowest height any of them is at.
+    /// The others never left the buffer, which dropped them already.
+    fn committed_orphans(&self, batch: &Batch) -> Option<(u64, Vec<String>)> {
+        let floor = batch.orphaned.values().map(|(height, _)| *height).min()?;
+        let hashes: Vec<String> = batch
+            .orphaned
+            .values()
+            .flat_map(|(_, hashes)| hashes)
+            .filter(|hash| self.committed.contains_key(*hash))
+            .cloned()
+            .collect();
+        (!hashes.is_empty()).then_some((floor, hashes))
+    }
+
+    /// Deletes the orphaned blocks `hashes`, none below `floor`: out of the ledger first,
+    /// so it never names a block whose rows are going, then out of every other table.
+    async fn retract(&mut self, floor: u64, hashes: &[String]) -> Result<(), StoreError> {
+        let ledger = self.position(Table::AcceptedBlock);
+        let others = (0..self.lakes.len()).filter(|&position| position != ledger);
+        for position in std::iter::once(ledger).chain(others) {
+            if let Some(columns) = self.lakes[position].block_columns() {
+                let predicate = of_blocks(columns, hashes, Some(floor));
+                self.delete(position, predicate).await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Moves the window of blocks a reorg could still orphan past a commit: its orphans
+    /// out, the blocks it accepted in, and anything below the window dropped.
+    fn advance(&mut self, orphaned: &[String], accepted: &[&Row]) {
+        for hash in orphaned {
+            self.committed.remove(hash);
+        }
+        self.committed.extend(
+            accepted
+                .iter()
+                .filter_map(|row| Some((row.block_hash()?.to_owned(), row.block_number()?))),
+        );
+        if let Some(tip) = self.tip() {
+            let floor = tip.saturating_sub(LEDGER_WINDOW as u64);
+            self.committed.retain(|_, height| *height >= floor);
+        }
+    }
+
+    fn position(&self, table: Table) -> usize {
+        self.positions[&TableId::Dataset(table)]
+    }
+
+    /// Whether the batch is due: old enough, or large enough.
     fn due(&self) -> bool {
-        !self.buffer.is_empty()
-            && (self.buffer.bytes >= self.max_buffer_bytes
+        !self.batch.is_empty()
+            && (self.batch.bytes() >= self.max_buffer_bytes
                 || self.last_commit.elapsed() >= self.commit_interval)
     }
 }
 
 impl EnvelopeSink for DeltaSink {
     /// Buffers one envelope's rows. A `reorg` first drops every buffered row of the
-    /// blocks it orphans, and marks the committed ones for deletion; its own row is kept
-    /// as the record of the retraction.
+    /// blocks it orphans; the committed ones are deleted at the next commit, and its own
+    /// row is kept as the record of the retraction.
     async fn publish(&mut self, envelope: Envelope) -> Result<(), SinkError> {
-        if let Event::Reorg(reorg) = &envelope.event
-            && !reorg.orphaned_hashes.is_empty()
-        {
-            let hashes: BTreeSet<String> = reorg
-                .orphaned_hashes
-                .iter()
-                .map(|hash| format!("{hash:#x}"))
-                .collect();
-            self.buffer.drop_blocks(&hashes);
-            self.buffer.orphaned.extend(
-                hashes
-                    .into_iter()
-                    .filter(|hash| self.committed.contains_key(hash)),
-            );
-        }
-        if let Event::Decoded(decoded) = &envelope.event {
-            let row = self
-                .schema
-                .event_row(&envelope.chain, decoded)?
-                .ok_or_else(|| SinkError::UnknownEvent {
-                    protocol: decoded.protocol.clone(),
-                    contract: decoded.contract.clone(),
-                    event: decoded.name.clone(),
-                })?;
-            self.buffer.push(row);
-        }
-        let row = self.schema.row(&envelope.chain, &envelope.event)?;
-        self.buffer.push(row);
-        Ok(())
+        self.batch.push(&envelope)
     }
 
-    /// Commits when the buffer is due. Accepting a block is not making it durable: a
+    /// Commits when the batch is due. Accepting a block is not making it durable: a
     /// block buffered when the process stops is fetched again from the ledger's tip.
     async fn flush(&mut self) -> Result<(), SinkError> {
         if self.due() {
@@ -723,7 +695,7 @@ async fn open_table(
         .await
         .map_err(StoreError::engine(Operation::Open, Some(name)))?;
     if table.version().is_none() {
-        let partitions = arrow::partitioned(def).then(|| PARTITION.to_owned());
+        let partitions = arrow::partitioned(def).map(|_| PARTITION.to_owned());
         table = table
             .create()
             .with_table_name(name)
@@ -788,17 +760,44 @@ fn check(
     }
 }
 
+/// Fails when `def` lacks any of `columns`, which a startup read names.
+fn require(def: &TableDef, columns: &[&str]) -> Result<(), TableError> {
+    for column in columns {
+        def.require(column)?;
+    }
+    Ok(())
+}
+
 /// `column >= height`, with the partition column bounding it too, so a scan or delete
 /// skips every older partition without opening a file.
 fn at_or_above(column: &str, height: u64) -> Expr {
     ident(PARTITION)
         .gt_eq(lit(arrow::partition_of(height)))
-        .and(ident(column).gt_eq(self::height(height)))
+        .and(ident(column).gt_eq(uint(height)))
 }
 
-/// A block height as the lake stores it.
-fn height(height: u64) -> Expr {
-    lit(ScalarValue::Decimal128(Some(i128::from(height)), 20, 0))
+/// The rows of the blocks `hashes`, by a table's `(hash, height)` columns, none of them
+/// below `floor` when there is one.
+fn of_blocks((hash, height): (&str, &str), hashes: &[String], floor: Option<u64>) -> Expr {
+    let blocks = in_texts(hash, hashes);
+    match floor {
+        Some(floor) => at_or_above(height, floor).and(blocks),
+        None => blocks,
+    }
+}
+
+/// A `Uint` value, such as a block height, as the lake stores it.
+fn uint(value: u64) -> Expr {
+    lit(ScalarValue::Decimal128(
+        Some(i128::from(value)),
+        UINT_PRECISION,
+        0,
+    ))
+}
+
+/// A hash as the lake stores it: lowercase `0x` hex.
+fn hex(hash: &B256) -> String {
+    format!("{hash:#x}")
 }
 
 /// `column IN (values)`.
@@ -817,16 +816,10 @@ fn texts_of(columns: &[&str]) -> Vec<Expr> {
         .collect()
 }
 
-/// A value read back that is not what its column holds.
-fn invalid(column: &'static str, value: &str) -> InvalidStoredValue {
-    InvalidStoredValue {
-        column,
-        value: value.to_owned(),
-    }
-}
-
 fn parse<T: std::str::FromStr>(column: &'static str, value: &str) -> Result<T, InvalidStoredValue> {
-    value.parse().map_err(|_| invalid(column, value))
+    value
+        .parse()
+        .map_err(|_| InvalidStoredValue::new(column, value))
 }
 
 /// Column `index` of a batch read back, which the read cast to text.
@@ -838,7 +831,7 @@ fn texts<'a>(
     batch
         .column(index)
         .as_string_opt::<i32>()
-        .ok_or_else(|| invalid(column, "not text"))
+        .ok_or_else(|| InvalidStoredValue::new(column, "not text"))
 }
 
 /// Column `index` of a batch read back, which the read cast to unsigned integers.
@@ -850,7 +843,7 @@ fn uints<'a>(
     batch
         .column(index)
         .as_primitive_opt::<UInt64Type>()
-        .ok_or_else(|| invalid(column, "not an unsigned integer"))
+        .ok_or_else(|| InvalidStoredValue::new(column, "not an unsigned integer"))
 }
 
 #[cfg(test)]

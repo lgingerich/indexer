@@ -53,6 +53,10 @@ use tracing::{info, warn};
 /// they describe, so the value is a bounded-memory choice, not a tuning knob.
 pub const MAX_UNFINALIZED_BLOCKS: usize = 4096;
 
+/// How many accepted blocks a store hands back to a restart: the undo window and the
+/// block below it, which the oldest unfinalized block's parent hash is checked against.
+pub const LEDGER_WINDOW: usize = MAX_UNFINALIZED_BLOCKS + 1;
+
 /// Why ingestion cannot continue safely.
 ///
 /// The identity-bearing variants box their [`BlockMeta`] fields: an unboxed pair is 160
