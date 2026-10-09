@@ -11,8 +11,9 @@
 //! ```
 //!
 //! An argument's column is its name in `snake_case`; an unnamed argument is `arg{n}`, and
-//! a name that repeats an earlier column gets `_{n}` appended. A row's key is the decoded
-//! record's own `dedupe_key`.
+//! a name that repeats an earlier column gets `_{n}` appended, and one too long for
+//! `PostgreSQL` is shortened with a hash. A row's key is the decoded record's own
+//! `dedupe_key`.
 
 use std::sync::Arc;
 
@@ -21,7 +22,10 @@ use alloy_primitives::B256;
 use crate::wire::envelope::{ChainId, Decoded, DecodedArg};
 use crate::wire::typed::{AbiType, TypedValue};
 
-use super::{Column, ColumnType, PRIMARY_KEY, Row, Schema, TableDef, TableError, TableId, Value};
+use super::{
+    Column, ColumnType, PRIMARY_KEY, Row, Schema, TableDef, TableError, TableId, Value,
+    fit_identifier,
+};
 
 /// The columns before an event's arguments.
 const LEADING: [(&str, ColumnType); 4] = [
@@ -70,7 +74,7 @@ impl Schema {
             if reserved.contains(&column.as_str()) || names.contains(&column) {
                 column = format!("{column}_{position}");
             }
-            names.push(column);
+            names.push(fit_identifier(column));
         }
         let id = TableId::Event(self.events.len());
         let mut table = TableDef::builder(id, name);
@@ -83,7 +87,7 @@ impl Schema {
         for (column, kind) in TRAILING {
             table = table.column(Column::new(column, kind, false));
         }
-        let table = table.reorg_by("block_hash").build()?;
+        let table = table.reorg_by("block_hash", "block_number").build()?;
         self.events.insert(
             (protocol.to_owned(), contract.to_owned(), event_id),
             self.tables.len(),
@@ -189,8 +193,8 @@ fn cell(kind: ColumnType, argument: &DecodedArg) -> Result<Value, serde_json::Er
 /// One decoded scalar, in the column type its table declares.
 ///
 /// The decoder has already checked each value against its declared width, so a `uint64`
-/// fits [`Value::Uint`] and an `int64` fits [`Value::Int`]. A `string` that is not text,
-/// or holds a NUL `PostgreSQL` would reject, is null; the raw log keeps its bytes.
+/// fits [`Value::Uint`] and an `int64` fits [`Value::Int`]. A `string` that is not text
+/// is null; the raw log keeps its bytes.
 fn scalar(kind: ColumnType, value: &TypedValue) -> Value {
     match (kind, value) {
         (ColumnType::Uint, TypedValue::Uint { value, .. }) => Value::Uint(value.saturating_to()),
@@ -209,7 +213,6 @@ fn scalar(kind: ColumnType, value: &TypedValue) -> Value {
         }
         (ColumnType::Text, TypedValue::String { text, .. }) => text
             .as_ref()
-            .filter(|text| !text.contains('\0'))
             .map_or(Value::Null, |text| Value::Text(text.clone())),
         _ => Value::Null,
     }
@@ -452,6 +455,27 @@ mod tests {
         ));
     }
 
+    /// Long argument names sharing a prefix get distinct columns within the limit.
+    #[test]
+    fn long_argument_names_fit_the_identifier_limit_and_stay_distinct() {
+        let long = "x".repeat(70);
+        let mut schema = Schema::new().expect("the dataset tables");
+        schema
+            .add_event(
+                ("p", "C", hash(0x09)),
+                "p_c_long".to_owned(),
+                [format!("{long}a"), format!("{long}b")]
+                    .into_iter()
+                    .map(|name| Column::new(name, ColumnType::Uint, false))
+                    .collect(),
+            )
+            .expect("a new table");
+        let table = schema.tables().last().expect("the event table");
+        let (first, second) = (&table.columns[4].name, &table.columns[5].name);
+        assert!(first.len() <= 63 && second.len() <= 63, "{first}, {second}");
+        assert_ne!(first, second);
+    }
+
     /// A decoded record fills its event's table: wide integers exact with their sign, a
     /// string that is not storable text as null, an array of scalars as a typed list, and
     /// an array of tuples as one document in Allium's `params` form.
@@ -498,7 +522,7 @@ mod tests {
                     "note",
                     TypedValue::String {
                         value: Bytes::from_static(b"a\0b"),
-                        text: Some("a\0b".to_owned()),
+                        text: None,
                     },
                 ),
                 ids(),
@@ -528,7 +552,7 @@ mod tests {
         assert_eq!(
             row.value("note"),
             Some(&Value::Null),
-            "PostgreSQL rejects a NUL"
+            "a string that is not text is null"
         );
         assert_eq!(
             row.value("ids"),

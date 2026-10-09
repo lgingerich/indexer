@@ -252,8 +252,9 @@ that matters most: `decode` must not depend on `ingest`.
   come from those receipts. Logs without transactions use one `eth_getLogs` per
   height. A live `newHeads` notification carries the head's identity, parent hash, and
   timestamp, so a logs-only fetch reuses them and pins `eth_getLogs` to the announced
-  hash instead of re-reading the header; a block or transaction dataset still fetches
-  the body it needs. The whole choice is one table, `FetchPlan`, in
+  hash instead of re-reading the header (an empty answer still reads it, to check the
+  bloom); a block or transaction dataset still fetches the body it needs. The whole
+  choice is one table, `FetchPlan`, in
   `src/ingest/source/evm.rs`. Without transactions, buried backfill fetches up to ten
   heights in one batch — a header per height and one ranged `eth_getLogs` — and retries
   a range the provider fails on, or that times out, in halves.
@@ -302,15 +303,16 @@ that matters most: `decode` must not depend on `ingest`.
   The sliding window retains up to a fixed 4,096 identities. See `src/ingest/pipeline.rs`.
 - **Headless backfill, then live heads.** Startup samples the head once and captures it
   as a backfill target; on an empty store `[ingest] start_block` may request earlier
-  inclusive history but defaults to the head. Backfill then reads consecutive concrete heights and makes no
-  further discovery call — not even while reconciling a fork — until it reaches the
-  target, at which point live heads take over. Decode runs on both paths, so a historical
+  inclusive history but defaults to the head. Backfill then reads consecutive concrete
+  heights until it reaches the target, samples the head again, and continues while the
+  chain buried more meanwhile; then live heads take over. Decode runs on both paths, so a historical
   log is stored raw and, when it matches, decoded. Alloy keeps the WebSocket subscription
   independent of fetches and sink delivery, and reconnects and resubscribes with bounded
   retries. Live notifications are inputs and hints, not a replay log: a duplicate head is
   skipped before any fetch, a gap is filled from the next height, and a 30-second timer
-  reconciles when the subscription is silent. HTTP failures and exhausted subscription
-  recovery are terminal.
+  reconciles when the subscription is silent. A live head the node answers
+  inconsistently is skipped and retried at the next one. HTTP failures and exhausted
+  subscription recovery are terminal.
 - **Resume from the store.** A restart continues after the last block the store
   committed, reconciling a fork that happened while it was down. See
   [Resume from the store](#resume-from-the-store).
@@ -498,14 +500,14 @@ the field:
 | `ingest.datasets` | blocks, transactions, logs | Which datasets are fetched and stored. Transactions include their receipts, and logs selected with them come from those receipts. A dataset that needs the block body still reads it; a logs-only live fetch reuses the notification header |
 | `ingest.start_block` | the sampled head | First height to index on an empty store. Absent starts live at the observed head; a value backfills that inclusive height forward before following live heads. A value above the sampled head is a startup error, and so is a value when the store already holds blocks: a run resumes from the store |
 | `sink.duckdb.batch_records` | `500` | Most records one store commit may cover; a backlog of blocks is folded into one commit up to this, and a block is never split |
-| `sink.duckdb.path` | `indexer.duckdb` | Path to the store. Tables live in a schema named for the chain: `base.logs` |
+| `sink.duckdb.path` | `indexer.duckdb` | Path to the store, relative to the settings file. Tables live in a schema named for the chain: `base.logs` |
 
 **Optional tables:**
 
 | Key | Meaning |
 | --- | --- |
 | `decode.protocols` | Path to the protocol manifests directory, relative to the settings file: the whole tree, a group such as `protocols/uniswap`, or one protocol. Absent means nothing is decoded; a directory with no manifest in it is a startup error |
-| `sink.duckdb.settings` | Any other DuckDB setting, passed straight through |
+| `sink.duckdb.settings` | Any other DuckDB setting, passed straight through; values may be `{ env = "NAME" }` |
 
 `RUST_LOG` is still read from the environment, because a log filter is not deployment
 configuration. When it is unset, a debug build logs at `info` and a release build at

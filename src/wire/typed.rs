@@ -130,7 +130,8 @@ pub enum TypedValue {
     String {
         /// The original bytes, preserved losslessly.
         value: Bytes,
-        /// The UTF-8 text when the original bytes are valid UTF-8; otherwise `None`.
+        /// The UTF-8 text when the original bytes are valid UTF-8 without a NUL;
+        /// otherwise `None`.
         text: Option<String>,
     },
     /// An indexed dynamic or compound argument's opaque topic hash, not its value.

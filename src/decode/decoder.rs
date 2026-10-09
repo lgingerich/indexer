@@ -42,13 +42,14 @@ pub struct StoredContract {
 }
 
 /// One address in the contract set.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct Member {
     entry: EntryId,
-    /// The block hash of the creation log, which a reorg can orphan. `None` for a seed.
-    /// A restored contract keeps its stored block hash: a restart resumes with the
-    /// previous run's undo window, so a reorg can still orphan the block that created it.
-    created: Option<B256>,
+    /// The block hashes of its creation logs, which a reorg can orphan; it leaves the set
+    /// once all are. `None` for a seed. A restored contract keeps its stored block hashes:
+    /// a restart resumes with the previous run's undo window, so a reorg can still orphan
+    /// a block that created it.
+    created: Option<Vec<B256>>,
 }
 
 /// A log decoder over a catalog and a growing set of contracts.
@@ -91,7 +92,7 @@ impl Decoder {
                     address = %contract.address, "stored contract is no longer declared");
                 continue;
             };
-            added += usize::from(self.insert(contract.address, entry, Some(contract.block_hash)));
+            added += usize::from(self.insert(contract.address, entry, contract.block_hash));
         }
         added
     }
@@ -161,7 +162,7 @@ impl Decoder {
         let discovered = children
             .into_iter()
             .map(|(child, address)| {
-                self.insert(address, child, Some(log.block_hash));
+                self.insert(address, child, log.block_hash);
                 let entry = &self.catalog.entries[child];
                 Contract {
                     protocol: entry.protocol.clone(),
@@ -183,28 +184,42 @@ impl Decoder {
         }))
     }
 
-    /// Drops every contract created in one of `orphaned`, returning how many.
+    /// Forgets creations in `orphaned` blocks, dropping contracts left with none, and
+    /// returns how many were dropped.
     ///
     /// Seeds are never dropped. A scan over the set is fine:
     /// reorgs are rare and the set is a hash map of a few hundred thousand entries at most.
     pub fn retract(&mut self, orphaned: &[B256]) -> usize {
         let before = self.contracts.len();
-        self.contracts
-            .retain(|_, member| member.created.is_none_or(|hash| !orphaned.contains(&hash)));
+        self.contracts.retain(|_, member| {
+            member.created.as_mut().is_none_or(|created| {
+                created.retain(|hash| !orphaned.contains(hash));
+                !created.is_empty()
+            })
+        });
         before - self.contracts.len()
     }
 
-    /// Adds `address` as an instance of `entry`, returning whether it was new.
+    /// Adds `address` as an instance of `entry`, created in block `created`, returning
+    /// whether it was new.
     ///
     /// An address already in the set keeps its first entry: a seed stays a seed, and a
     /// contract a second rule also names keeps the entry it was first discovered as.
-    fn insert(&mut self, address: Address, entry: EntryId, created: Option<B256>) -> bool {
+    fn insert(&mut self, address: Address, entry: EntryId, created: B256) -> bool {
         match self.contracts.entry(address) {
             Entry::Vacant(vacant) => {
-                vacant.insert(Member { entry, created });
+                vacant.insert(Member {
+                    entry,
+                    created: Some(vec![created]),
+                });
                 true
             }
-            Entry::Occupied(occupied) => {
+            Entry::Occupied(mut occupied) => {
+                if let Some(blocks) = &mut occupied.get_mut().created
+                    && !blocks.contains(&created)
+                {
+                    blocks.push(created);
+                }
                 if occupied.get().entry != entry {
                     warn!(%address, kept = %self.catalog.label(occupied.get().entry),
                         ignored = %self.catalog.label(entry), "contract already registered as another contract");
@@ -324,17 +339,18 @@ mod tests {
         assert!(swap.discovered.is_empty());
     }
 
-    /// A reorg drops children created in orphaned blocks and nothing else; seeds and
-    /// children of other blocks stay. A restored contract is retracted like one this run
+    /// A reorg drops children created only in orphaned blocks; seeds and children also
+    /// created elsewhere stay. A restored contract is retracted like one this run
     /// discovered, since its creating block may sit in the resumed undo window.
     #[test]
     fn a_reorg_retracts_children_of_orphaned_blocks() {
         let mut decoder = decoder();
-        let (kept, dropped, restored, restored_orphan) = (
+        let (kept, dropped, restored, restored_orphan, twice) = (
             Address::from([0x01; 20]),
             Address::from([0x02; 20]),
             Address::from([0x03; 20]),
             Address::from([0x04; 20]),
+            Address::from([0x05; 20]),
         );
         let (canonical, orphaned) = (B256::with_last_byte(1), B256::with_last_byte(2));
         decoder.restore([
@@ -350,6 +366,9 @@ mod tests {
         decoder
             .decode(&pool_created(dropped, orphaned))
             .expect("decode");
+        for block in [orphaned, canonical] {
+            decoder.decode(&pool_created(twice, block)).expect("decode");
+        }
         let before = decoder.contracts();
 
         assert_eq!(decoder.retract(&[orphaned, B256::ZERO]), 2);
@@ -359,6 +378,7 @@ mod tests {
             (dropped, false),
             (restored, true),
             (restored_orphan, false),
+            (twice, true),
         ] {
             assert_eq!(
                 decoder.decode(&swap(pool)).expect("decode").is_some(),

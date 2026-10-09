@@ -114,6 +114,12 @@ pub enum StoreError {
     /// A table's declaration is inconsistent.
     #[error(transparent)]
     Table(#[from] TableError),
+    /// Another process already writes this database schema.
+    #[error("another indexer is already writing database schema {schema}")]
+    Locked {
+        /// The database schema.
+        schema: String,
+    },
     /// An existing table does not match its definition. Tables are not migrated, so the
     /// store needs a fresh database schema or the table dropped.
     #[error("table {table} does not match its definition: {difference}")]
@@ -389,9 +395,13 @@ impl<E: Engine> SqlStore<E> {
             let Some(delete) = &table.delete else {
                 continue;
             };
-            for (chain, hashes) in &self.batch.orphaned {
+            for (chain, (height, hashes)) in &self.batch.orphaned {
                 for hash in hashes {
-                    let params = [Value::Text(chain.clone()), Value::Text(hash.clone())];
+                    let params = [
+                        Value::Text(chain.clone()),
+                        Value::Uint(*height),
+                        Value::Text(hash.clone()),
+                    ];
                     self.engine
                         .execute(delete, &params)
                         .await
@@ -547,8 +557,9 @@ fn timestamp(column: &'static str, value: &Value) -> Result<u64, InvalidStoredVa
 struct Batch {
     /// Rows to upsert, in publish order.
     rows: Vec<Row>,
-    /// Orphaned block hashes to delete from the store, as `0x` hex, by chain.
-    orphaned: BTreeMap<String, BTreeSet<String>>,
+    /// Orphaned block hashes to delete from the store, as `0x` hex, by chain, with the
+    /// lowest buffered `reorg` height, which none of them is below.
+    orphaned: BTreeMap<String, (u64, BTreeSet<String>)>,
     /// Every table the run writes, which renders each decoded record's typed row.
     schema: Arc<Schema>,
 }
@@ -584,10 +595,12 @@ impl Batch {
             self.rows.retain(|row| {
                 row.chain() != chain || !row.block_hash().is_some_and(|h| hashes.contains(h))
             });
-            self.orphaned
+            let (height, orphaned) = self
+                .orphaned
                 .entry(chain.to_owned())
-                .or_default()
-                .extend(hashes);
+                .or_insert((reorg.height, BTreeSet::new()));
+            *height = (*height).min(reorg.height);
+            orphaned.extend(hashes);
         }
         if let Event::Decoded(decoded) = &envelope.event {
             let row = self

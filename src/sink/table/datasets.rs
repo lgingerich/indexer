@@ -66,8 +66,8 @@ impl<R: 'static> DatasetBuilder<R> {
         self
     }
 
-    fn reorg_by(mut self, column: &'static str) -> Self {
-        self.table = self.table.reorg_by(column);
+    fn reorg_by(mut self, hash: &'static str, number: &'static str) -> Self {
+        self.table = self.table.reorg_by(hash, number);
         self
     }
 
@@ -106,7 +106,7 @@ fn blocks() -> Result<Dataset<Block>, TableError> {
         .col("parent_beacon_block_root", |b| b.parent_beacon_block_root)
         .col_ref("ommers", |b| &b.ommers)
         .col_ref("transaction_hashes", |b| &b.transaction_hashes)
-        .reorg_by("hash")
+        .reorg_by("hash", "number")
         .build()
 }
 
@@ -145,7 +145,7 @@ fn transactions() -> Result<Dataset<Transaction>, TableError> {
         .col("block_timestamp", |t| Timestamp(t.block_timestamp))
         .col("block_number", |t| t.block_number)
         .col("block_hash", |t| t.block_hash)
-        .reorg_by("block_hash")
+        .reorg_by("block_hash", "block_number")
         .build()
 }
 
@@ -164,7 +164,7 @@ fn logs() -> Result<Dataset<Log>, TableError> {
         .col("block_number", |l| l.block_number)
         .col("block_hash", |l| l.block_hash)
         .col("block_timestamp", |l| Timestamp(l.block_timestamp))
-        .reorg_by("block_hash")
+        .reorg_by("block_hash", "block_number")
         .build()
 }
 
@@ -189,7 +189,7 @@ fn decoded_logs() -> Result<Dataset<Decoded>, TableError> {
         .col("block_number", |d| d.block_number)
         .col("block_hash", |d| d.block_hash)
         .col("block_timestamp", |d| Timestamp(d.block_timestamp))
-        .reorg_by("block_hash")
+        .reorg_by("block_hash", "block_number")
         .build()
 }
 
@@ -207,7 +207,7 @@ fn contracts() -> Result<Dataset<Contract>, TableError> {
         .col("block_number", |c| c.block_number)
         .col("block_hash", |c| c.block_hash)
         .col("block_timestamp", |c| Timestamp(c.block_timestamp))
-        .reorg_by("block_hash")
+        .reorg_by("block_hash", "block_number")
         .build()
 }
 
@@ -227,7 +227,7 @@ fn accepted_blocks() -> Result<Dataset<AcceptedBlock>, TableError> {
         .col("hash", |a| a.hash)
         .col("parent_hash", |a| a.parent_hash)
         .col("timestamp", |a| Timestamp(a.timestamp))
-        .reorg_by("hash")
+        .reorg_by("hash", "height")
         .build()
 }
 

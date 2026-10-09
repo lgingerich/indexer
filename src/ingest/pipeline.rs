@@ -1,14 +1,14 @@
 //! Reorg-aware, block-at-a-time ingestion that resumes from what the store committed.
 //!
-//! Startup samples the head once and splits the work at the reorg window. Heights at or
+//! Startup samples the head and splits the work at the reorg window. Heights at or
 //! below `head - window` are buried: they sit a full window behind the sampled head, so
 //! no fork reaches them and backfill indexes them straight through without asking the
 //! source where the chain is. On a chain shorter than the window the bound clamps to
-//! genesis, which is equally unreorgable. Everything above that boundary is the
-//! reorgable tail, and startup owns it too — from the buried bound it fills to the
-//! sampled head through the reorg-aware path before any live head is consumed, so a run
-//! never leaves a gap under its start. A start already inside the window makes that fill
-//! the whole run. The live phase then follows `newHeads`, reuses the announced metadata,
+//! genesis, which is equally unreorgable. Reaching that bound, backfill samples the head
+//! again and continues while the chain has buried more. Everything above the bound is the
+//! reorgable tail, and startup owns it too — it fills to the last sampled head through
+//! the reorg-aware path before any live head is consumed, so a run never leaves a gap
+//! under its start. A start already inside the window makes that fill the whole run. The live phase then follows `newHeads`, reuses the announced metadata,
 //! and reconciles gaps and forks over HTTP. Every accepted block's identity is retained
 //! in a sliding window so a fork within it is retracted; deeper forks stop rather than
 //! guess.
@@ -148,8 +148,6 @@ pub enum State {
         next: u64,
         /// Last height backfill indexes directly; above it the live path takes over.
         end: u64,
-        /// The head sampled at startup, which startup converges to before going live.
-        head: BlockMeta,
     },
     /// Reconcile the live tail, including ordinary catch-up.
     Syncing,
@@ -335,11 +333,9 @@ impl<S, K> Machine<S, K> {
         self.ring.at(height)
     }
 
-    /// Reads a fetched block's identity and parent from its metadata.
-    /// Rejects a number different from the requested height.
+    /// Checks that a block read for `height` is at that height.
     /// Does not establish canonicality or validate linkage to another block.
-    fn marker(block: &FetchedBlock, height: u64) -> Result<BlockMeta, PipelineError> {
-        let meta = block.meta;
+    fn marker(meta: BlockMeta, height: u64) -> Result<BlockMeta, PipelineError> {
         if meta.height != height {
             return Err(PipelineError::IdentityMismatch {
                 expected: Box::new(BlockMeta { height, ..meta }),
@@ -375,16 +371,17 @@ impl<S: BlockSource, K: EnvelopeSink> Machine<S, K> {
     ///
     /// Backfill indexes only buried heights, which cannot reorg; once it reaches the
     /// reorgable window the live phase owns the tail. Notifications are hints, not a
-    /// replay log: HTTP reconciliation fills gaps and resolves reorgs. Source errors
-    /// still propagate without retries; the source owns connection maintenance.
+    /// replay log: HTTP reconciliation fills gaps and resolves reorgs. A live head the
+    /// source answers inconsistently is skipped; every other error propagates. The source
+    /// owns connection maintenance.
     ///
     /// # Errors
     /// Consumes this instance. An error or cancellation drops its source, sink, and
     /// history, so partially delivered output cannot be followed by reuse.
     /// Returns permanent source, invariant, or sink failures.
     pub async fn run(mut self) -> Result<(), PipelineError> {
-        // Backfill is headless: it captures its target once in `start` and reads
-        // concrete heights only, so the subscription is opened after it converges.
+        // Backfill is headless: it samples its target itself and reads concrete heights
+        // only, so the subscription is opened after it converges.
         // A notification consumed during backfill would only be a hint anyway. A run
         // already backfilled through `backfill` is live, so it does not re-sample.
         if matches!(self.state, State::Starting) {
@@ -393,18 +390,26 @@ impl<S: BlockSource, K: EnvelopeSink> Machine<S, K> {
         while self.step().await? {}
         let mut heads = self.source.subscribe_heads().await?;
         loop {
-            tokio::select! {
+            let result = tokio::select! {
                 // A head and the reconcile timer can be ready together; checking the head
                 // first makes the choice the same every time instead of tokio's random
                 // pick. Either order is correct: a reconcile reads the head itself.
                 biased;
                 head = heads.next() => match head {
-                    Some(head) => { self.process_head(head?).await?; }
+                    Some(head) => self.process_head(head?).await,
                     None => return Err(PipelineError::SubscriptionClosed),
                 },
                 () = tokio::time::sleep(std::time::Duration::from_secs(30)) => {
-                    self.reconcile().await?;
+                    self.reconcile().await
                 }
+            };
+            match result {
+                // Accepted history matches what was delivered, so the next head retries.
+                Err(
+                    error @ (PipelineError::UnstableSource
+                    | PipelineError::Source(SourceError::Inconsistent { .. })),
+                ) => warn!(%error, "skipping a live head the source answered inconsistently"),
+                result => result?,
             }
         }
     }
@@ -413,8 +418,7 @@ impl<S: BlockSource, K: EnvelopeSink> Machine<S, K> {
     ///
     /// Returns ownership only on success, allowing the result to be passed to `run`.
     /// Failure or cancellation drops the instance and any buffered partial output.
-    /// Makes no head-discovery call: the head is sampled once, and a fork reconciles
-    /// against the same capture while the live phase processes it.
+    /// Samples the head at the start and again at the buried bound.
     ///
     /// # Errors
     /// Returns an error if called after startup, if `from` is above the sampled head,
@@ -433,8 +437,8 @@ impl<S: BlockSource, K: EnvelopeSink> Machine<S, K> {
     /// `false` once the live phase should wait for a notification or timer.
     async fn step(&mut self) -> Result<bool, PipelineError> {
         match self.state {
-            State::Backfilling { next, end, head } => {
-                self.backfill_step(next, end, head).await?;
+            State::Backfilling { next, end } => {
+                self.backfill_step(next, end).await?;
                 Ok(true)
             }
             State::Starting | State::Syncing => Ok(false),
@@ -483,7 +487,7 @@ impl<S: BlockSource, K: EnvelopeSink> Machine<S, K> {
             self.accept(next, fetched).await?;
             self.settle_tail(head).await?;
         } else {
-            self.state = State::Backfilling { next, end, head };
+            self.state = State::Backfilling { next, end };
         }
         Ok(())
     }
@@ -508,9 +512,9 @@ impl<S: BlockSource, K: EnvelopeSink> Machine<S, K> {
             self.state = State::Syncing;
             return self.process_head(head).await;
         }
-        if self.source.fetch_header(Some(tip.height)).await?.hash != tip.hash {
-            let current = self.source.fetch_block(tip.height, None).await?;
-            self.handle_reorg(current, tip.height).await?;
+        let current = self.header(tip.height).await?;
+        if current.hash != tip.hash {
+            self.handle_reorg(current).await?;
         }
         let tip = self.ring.tip().ok_or(PipelineError::UnstableSource)?;
         let next = Self::next(tip.height)?;
@@ -518,7 +522,7 @@ impl<S: BlockSource, K: EnvelopeSink> Machine<S, K> {
         if next > end {
             self.settle_tail(head).await?;
         } else {
-            self.state = State::Backfilling { next, end, head };
+            self.state = State::Backfilling { next, end };
         }
         Ok(())
     }
@@ -532,7 +536,7 @@ impl<S: BlockSource, K: EnvelopeSink> Machine<S, K> {
     /// failure here is a source fault: this is the buried path, where no fork is
     /// reachable.
     async fn accept(&mut self, height: u64, fetched: FetchedBlock) -> Result<(), PipelineError> {
-        let meta = Self::marker(&fetched, height)?;
+        let meta = Self::marker(fetched.meta, height)?;
         if let Some(tip) = self.ring.tip() {
             Self::validate_link(tip, meta)?;
         }
@@ -572,18 +576,14 @@ impl<S: BlockSource, K: EnvelopeSink> Machine<S, K> {
     /// as it chooses, in order. No reorg handling: no fork this deep is reachable, and
     /// invalid linkage is a source fault rather than a fork to replay. The cursor moves
     /// past each block as it is accepted, so a failure partway through leaves it at the
-    /// first block not taken. At the buried bound, the remaining reorgable tail is filled
-    /// through [`Self::settle_tail`] before the run goes live.
+    /// first block not taken. At the buried bound the head is sampled again: backfill goes
+    /// on to the new bound if the chain buried more meanwhile, and otherwise fills the
+    /// reorgable tail through [`Self::settle_tail`].
     ///
     /// # Errors
     /// Returns [`PipelineError::InvalidRange`] when the source returns no blocks or blocks
     /// past `end`, before any of them is published.
-    async fn backfill_step(
-        &mut self,
-        next: u64,
-        end: u64,
-        head: BlockMeta,
-    ) -> Result<(), PipelineError> {
+    async fn backfill_step(&mut self, next: u64, end: u64) -> Result<(), PipelineError> {
         let blocks = self.source.fetch_blocks(next, end).await?;
         let last = u64::try_from(blocks.len())
             .ok()
@@ -601,12 +601,21 @@ impl<S: BlockSource, K: EnvelopeSink> Machine<S, K> {
                 self.state = State::Backfilling {
                     next: Self::next(height)?,
                     end,
-                    head,
                 };
             }
         }
         if last >= end {
-            self.settle_tail(head).await?;
+            let head = self.source.fetch_header(None).await?;
+            self.sink.observe_head(head.height);
+            let buried = head.height.saturating_sub(MAX_UNFINALIZED_BLOCKS as u64);
+            if buried > end {
+                self.state = State::Backfilling {
+                    next: Self::next(end)?,
+                    end: buried,
+                };
+            } else {
+                self.settle_tail(head).await?;
+            }
         }
         Ok(())
     }
@@ -642,11 +651,10 @@ impl<S: BlockSource, K: EnvelopeSink> Machine<S, K> {
             return self.catch_up(tip, head).await;
         }
         // The head is at or below the tip: a same-height or deeper fork.
-        let candidate = self.source.fetch_block(head.height, Some(&head)).await?;
-        if Self::marker(&candidate, head.height)? != head {
+        if self.header(head.height).await? != head {
             return Err(PipelineError::UnstableSource);
         }
-        self.handle_reorg(candidate, head.height).await
+        self.handle_reorg(head).await
     }
 
     /// Fetches consecutive heights from `tip` to the observed `target`.
@@ -663,7 +671,7 @@ impl<S: BlockSource, K: EnvelopeSink> Machine<S, K> {
             let next = Self::next(tip.height)?;
             let fetch_head = (next == target.height).then_some(&target);
             let block = self.source.fetch_block(next, fetch_head).await?;
-            let meta = Self::marker(&block, next)?;
+            let meta = Self::marker(block.meta, next)?;
             if Self::validate_link(tip, meta).is_ok() {
                 self.commit(meta, block.events).await?;
                 tip = meta;
@@ -671,29 +679,28 @@ impl<S: BlockSource, K: EnvelopeSink> Machine<S, K> {
             }
             // Re-read the announced target by height; it must still match before any
             // retraction is emitted.
-            let recheck = self.source.fetch_block(target.height, None).await?;
-            if Self::marker(&recheck, target.height)? != target {
+            if self.header(target.height).await? != target {
                 return Err(PipelineError::UnstableSource);
             }
-            return self.handle_reorg(recheck, target.height).await;
+            return self.handle_reorg(target).await;
         }
         Ok(())
     }
 
-    /// Resolves a candidate branch in one bounded walk-and-replay operation.
+    /// Resolves the branch ending at `target` in one bounded walk-and-replay operation.
     ///
-    /// Validates backward edges, finds a retained ancestor — or reaches the first block
-    /// ever indexed, below which nothing needs one — and rechecks the target before
-    /// output. Retracts only a nonempty old suffix, then publishes replacements
-    /// ascending and returns to `Syncing`. Discovery failures leave history untouched;
-    /// delivery can be partial on error, so public callers consume the instance.
-    async fn handle_reorg(&mut self, head: FetchedBlock, height: u64) -> Result<(), PipelineError> {
-        let target = Self::marker(&head, height)?;
-        // Newest first while walking; replay consumes this vector in reverse.
-        let mut branch = vec![(height, head)];
+    /// Walks back by header to a retained ancestor — or to the first block ever indexed,
+    /// below which nothing needs one — and rechecks the target before output. Retracts
+    /// only a nonempty old suffix, then fetches and publishes the replacements ascending
+    /// and returns to `Syncing`. A replay failure leaves the accepted history at what was
+    /// delivered, and the first replacement is fetched before the retraction, so that
+    /// history is never empty. Delivery can be partial on error, so public callers consume
+    /// the instance.
+    async fn handle_reorg(&mut self, target: BlockMeta) -> Result<(), PipelineError> {
+        // Newest first while walking; replay reads this vector in reverse.
+        let mut branch = vec![target];
         let ancestor = loop {
-            let (at, first) = branch.last().ok_or(PipelineError::UnstableSource)?;
-            let meta = Self::marker(first, *at)?;
+            let meta = *branch.last().ok_or(PipelineError::UnstableSource)?;
             let parent_height =
                 meta.height
                     .checked_sub(1)
@@ -730,21 +737,22 @@ impl<S: BlockSource, K: EnvelopeSink> Machine<S, K> {
                 walked_to = parent_height,
                 "reconciling a fork, walking back toward an accepted ancestor"
             );
-            let below = self.source.fetch_block(parent_height, None).await?;
-            let below_meta = Self::marker(&below, parent_height)?;
-            if below_meta.hash != meta.parent_hash {
+            let below = self.header(parent_height).await?;
+            if below.hash != meta.parent_hash {
                 return Err(PipelineError::UnstableSource);
             }
-            Self::validate_link(below_meta, meta)?;
-            branch.push((parent_height, below));
+            Self::validate_link(below, meta)?;
+            branch.push(below);
         };
 
         // The source may change branches during discovery. Recheck the candidate at its
         // fixed height before publishing any retraction.
-        let current = self.source.fetch_block(target.height, None).await?;
-        if Self::marker(&current, target.height)? != target {
+        if self.header(target.height).await? != target {
             return Err(PipelineError::UnstableSource);
         }
+        let mut replay = branch.into_iter().rev();
+        let lowest = replay.next().ok_or(PipelineError::UnstableSource)?;
+        let block = self.replacement(lowest).await?;
 
         self.sink.observe_head(target.height);
         let orphaned = self.ring.orphaned(ancestor);
@@ -756,14 +764,28 @@ impl<S: BlockSource, K: EnvelopeSink> Machine<S, K> {
             })])
             .await?;
             self.ring.rewind(ancestor);
-            // No source reads remain. Dropping during any replay delivery is terminal.
         }
-        for (height, block) in branch.into_iter().rev() {
-            let meta = Self::marker(&block, height)?;
+        self.commit(lowest, block.events).await?;
+        for meta in replay {
+            let block = self.replacement(meta).await?;
             self.commit(meta, block.events).await?;
         }
         self.state = State::Syncing;
         Ok(())
+    }
+
+    /// Fetches the block a fork walk found at `meta`, refusing any other.
+    async fn replacement(&self, meta: BlockMeta) -> Result<FetchedBlock, PipelineError> {
+        let block = self.source.fetch_block(meta.height, Some(&meta)).await?;
+        if Self::marker(block.meta, meta.height)? != meta {
+            return Err(PipelineError::UnstableSource);
+        }
+        Ok(block)
+    }
+
+    /// Reads the header at `height`, checking it is at that height.
+    async fn header(&self, height: u64) -> Result<BlockMeta, PipelineError> {
+        Self::marker(self.source.fetch_header(Some(height)).await?, height)
     }
 
     /// Moves events to the sink in order and flushes their batch, including control-only
@@ -798,7 +820,7 @@ mod tests {
     }
 
     /// A deterministic chain source. `head` moves when `fork` or a test edits it,
-    /// `head_calls` counts discovery so a test can prove backfill makes none, and
+    /// `head_calls` counts discovery so a test can bound what backfill makes, and
     /// `block_calls` counts full block fetches.
     struct Source {
         chain: ChainId,
@@ -1039,22 +1061,34 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn backfill_covers_only_buried_heights_and_makes_one_discovery_call() {
+    async fn backfill_covers_buried_heights_and_samples_the_head_again_at_the_bound() {
         // A head beyond the window leaves buried history for backfill to index.
-        let head = MAX_UNFINALIZED_BLOCKS as u64 + 5;
-        let mut machine = Machine::new(Source::linear(head), Sink::default(), Vec::new());
+        let window = MAX_UNFINALIZED_BLOCKS as u64;
+        let head = window + 5;
+        let moved = head + 10;
+        let mut source = Source::linear(moved);
+        source.data.head = head;
+        let mut machine = Machine::new(source, Sink::default(), Vec::new());
         machine.start(Some(0)).await.expect("start");
-        assert!(matches!(machine.state(), State::Backfilling { .. }));
-        // The chain advances while backfilling; the captured head must not move, so
-        // startup converges on the originally sampled head rather than the moved one.
-        machine.source.data.head = head + 10;
+        assert!(matches!(machine.state(), State::Backfilling { end: 5, .. }));
+        // The chain advances while backfilling. At the buried bound the head is sampled
+        // again, and the heights the chain buried meanwhile are backfilled too, rather
+        // than left to the reorg-aware path a height at a time.
+        machine.source.data.head = moved;
+        for _ in 0..=5 {
+            machine.step().await.expect("step");
+        }
+        assert!(matches!(
+            machine.state(),
+            State::Backfilling { next: 6, end: 15 }
+        ));
         catch_up(&mut machine).await;
         assert!(matches!(machine.state(), State::Syncing));
-        assert_eq!(machine.tip().expect("tip").height, head);
+        assert_eq!(machine.tip().expect("tip").height, moved);
         assert_eq!(
             machine.source.data.head_calls.load(Ordering::Relaxed),
-            1,
-            "backfill must discover exactly once, at startup"
+            3,
+            "backfill discovers at startup and at each buried bound only"
         );
     }
 
@@ -1132,6 +1166,17 @@ mod tests {
         settle(&mut machine, Some(3)).await;
         // The window holds only the first block; its replacement descends from height 1.
         machine.source.data.blocks.insert(3, (hash(103), hash(1)));
+        // The replacement is fetched before the first block is retracted, so a failure
+        // cannot leave the window empty.
+        machine.source.data.fail_once.store(true, Ordering::Relaxed);
+        assert!(
+            machine
+                .process_head(machine.source.head_meta())
+                .await
+                .is_err()
+        );
+        assert!(reorgs(&machine).is_empty());
+        assert_eq!(machine.tip().expect("tip").hash, hash(3));
         machine
             .process_head(machine.source.head_meta())
             .await
@@ -1289,14 +1334,14 @@ mod tests {
             .insert(head, (hash(head + 100), hash(head - 1)));
         let candidate = machine
             .source
-            .fetch_block(head, None)
+            .fetch_header(Some(head))
             .await
             .expect("candidate");
-        // Injection fires on the backward walk's read of the tip's predecessor, before
-        // any retraction, so the accepted history must survive intact.
+        // Injection fires on the replacement's fetch, which precedes any retraction, so the
+        // accepted history must survive intact.
         machine.source.data.fail_once.store(true, Ordering::Relaxed);
         assert!(matches!(
-            machine.handle_reorg(candidate, head).await,
+            machine.handle_reorg(candidate).await,
             Err(PipelineError::Source(_))
         ));
         assert_eq!(machine.tip().expect("tip").hash, hash(head));
@@ -1310,7 +1355,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn live_driver_returns_source_errors_without_retrying() {
+    async fn startup_returns_source_errors_without_retrying() {
         let source = Source::linear(3);
         source.data.fail_once.store(true, Ordering::Relaxed);
         assert!(matches!(
@@ -1328,6 +1373,8 @@ mod tests {
         source: Source,
         head: Arc<AtomicU64>,
         forked: Arc<AtomicBool>,
+        /// Set to answer the next block fetch inconsistently.
+        inconsistent: Arc<AtomicBool>,
         hints: std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<BlockMeta>>>,
     }
     impl BlockSource for LiveSource {
@@ -1371,6 +1418,12 @@ mod tests {
             height: u64,
             head: Option<&BlockMeta>,
         ) -> Result<FetchedBlock, SourceError> {
+            if self.inconsistent.swap(false, Ordering::Relaxed) {
+                return Err(SourceError::Inconsistent {
+                    context: "test".into(),
+                    detail: "injected inconsistency".into(),
+                });
+            }
             let mut block = self.source.fetch_block(height, head).await?;
             if self.forked.load(Ordering::Relaxed) && height >= 3 {
                 block.meta.hash = hash(height + 100);
@@ -1406,12 +1459,14 @@ mod tests {
         let recovery = async {
             let head = Arc::new(AtomicU64::new(1));
             let forked = Arc::new(AtomicBool::new(false));
+            let inconsistent = Arc::new(AtomicBool::new(false));
             let (hints, hint_stream) = tokio::sync::mpsc::unbounded_channel();
             let (events, mut received) = tokio::sync::mpsc::unbounded_channel();
             let source = LiveSource {
                 source: Source::linear(6),
                 head: Arc::clone(&head),
                 forked: Arc::clone(&forked),
+                inconsistent: Arc::clone(&inconsistent),
                 hints: std::sync::Mutex::new(Some(hint_stream)),
             };
             // The source's head is at 1, so the default start lands there — the live-only
@@ -1474,6 +1529,49 @@ mod tests {
             .expect("silent recovery must converge within four fallback intervals");
     }
 
+    /// A live head the source answers inconsistently is skipped, not fatal: nothing was
+    /// delivered for it, so the next head catches up from the same tip.
+    #[tokio::test(start_paused = true)]
+    async fn an_inconsistent_live_answer_skips_the_head() {
+        let inconsistent = Arc::new(AtomicBool::new(false));
+        let (hints, hint_stream) = tokio::sync::mpsc::unbounded_channel();
+        let (events, mut received) = tokio::sync::mpsc::unbounded_channel();
+        let source = LiveSource {
+            source: Source::linear(6),
+            head: Arc::new(AtomicU64::new(1)),
+            forked: Arc::default(),
+            inconsistent: Arc::clone(&inconsistent),
+            hints: std::sync::Mutex::new(Some(hint_stream)),
+        };
+        let run = tokio::spawn(Machine::new(source, LiveSink(events), Vec::new()).run());
+        let Some(Event::Block(block)) = received.recv().await else {
+            panic!("startup delivers block 1");
+        };
+        assert_eq!(block.number, 1);
+        inconsistent.store(true, Ordering::Relaxed);
+        for height in [2, 3] {
+            hints
+                .send(BlockMeta {
+                    height,
+                    hash: hash(height),
+                    parent_hash: hash(height - 1),
+                    timestamp: height,
+                })
+                .expect("hint");
+        }
+        for expected in [2, 3] {
+            let Some(Event::Block(block)) = received.recv().await else {
+                panic!("the next head catches up");
+            };
+            assert_eq!(block.number, expected);
+        }
+        drop(hints);
+        assert!(matches!(
+            run.await.expect("driver task"),
+            Err(PipelineError::SubscriptionClosed)
+        ));
+    }
+
     #[test]
     fn wrong_height_and_noncontiguous_parent_are_rejected() {
         let marker = BlockMeta {
@@ -1487,7 +1585,7 @@ mod tests {
             events: vec![],
         };
         assert!(matches!(
-            Machine::<Source, Sink>::marker(&fetched, 3),
+            Machine::<Source, Sink>::marker(fetched.meta, 3),
             Err(PipelineError::IdentityMismatch { .. })
         ));
         assert!(matches!(

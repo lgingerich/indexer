@@ -199,10 +199,29 @@ pub struct TableDef {
     /// The column naming each row's block, which a reorg deletes by; `None` for a table
     /// whose rows belong to no block.
     pub block_hash: Option<Cow<'static, str>>,
+    /// The column holding that block's number, which bounds a reorg's delete from below.
+    pub block_number: Option<Cow<'static, str>>,
 }
 
 /// The primary key every table shares, in key order.
 pub const PRIMARY_KEY: [&str; 2] = ["chain", "dedupe_key"];
+
+/// `PostgreSQL`'s identifier limit, in bytes; a longer name is silently truncated.
+pub(crate) const MAX_IDENTIFIER: usize = 63;
+
+/// `name`, or, when it would pass [`MAX_IDENTIFIER`], `name` cut short with a hash of the
+/// whole of it, so two long names never truncate to one.
+pub(crate) fn fit_identifier(name: String) -> String {
+    if name.len() <= MAX_IDENTIFIER {
+        return name;
+    }
+    let hash = alloy_primitives::hex::encode(&alloy_primitives::keccak256(&name)[..4]);
+    let mut end = MAX_IDENTIFIER - hash.len() - 1;
+    while !name.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}_{hash}", &name[..end])
+}
 
 impl TableDef {
     /// Starts the table `name`, identified as `id`.
@@ -215,6 +234,7 @@ impl TableDef {
                 columns: Vec::new(),
                 indexes: Vec::new(),
                 block_hash: None,
+                block_number: None,
             },
         }
     }
@@ -258,13 +278,15 @@ pub enum TableError {
         /// The missing column.
         column: String,
     },
-    /// The column a reorg deletes by does not hold a block hash: it must be required text.
-    #[error("{table}.{column} names each row's block, so it must be required text")]
-    BlockHashColumn {
+    /// A column a reorg deletes by is nullable or of the wrong type.
+    #[error("{table}.{column} names each row's block, so it must be a required {expected}")]
+    BlockColumn {
         /// The table.
         table: String,
         /// The column.
         column: String,
+        /// What the column must hold.
+        expected: &'static str,
     },
     /// A table is already named this.
     #[error("a table is already named {table}")]
@@ -316,12 +338,13 @@ impl TableBuilder {
         self
     }
 
-    /// Names the column holding each row's block hash, and indexes it under `chain`, so a
-    /// reorg deletes an orphaned block's rows by index.
+    /// Names the columns holding each row's block hash and number, and indexes the hash
+    /// under `chain`, so a reorg deletes an orphaned block's rows by index.
     #[must_use]
-    pub fn reorg_by(mut self, column: &'static str) -> Self {
-        self.def.block_hash = Some(column.into());
-        self.index(&["chain", column])
+    pub fn reorg_by(mut self, hash: &'static str, number: &'static str) -> Self {
+        self.def.block_hash = Some(hash.into());
+        self.def.block_number = Some(number.into());
+        self.index(&["chain", hash])
     }
 
     /// Finishes the table, appending `chain` and `dedupe_key`.
@@ -330,8 +353,8 @@ impl TableBuilder {
     ///
     /// Returns [`TableError::DuplicateColumn`] when a column name repeats,
     /// [`TableError::UnknownColumn`] when an index or the reorg column names a column the
-    /// table does not have, and [`TableError::BlockHashColumn`] when the reorg column is
-    /// not required text.
+    /// table does not have, and [`TableError::BlockColumn`] when a reorg column is
+    /// nullable or of the wrong type.
     pub fn build(mut self) -> Result<TableDef, TableError> {
         for name in PRIMARY_KEY {
             self.def
@@ -350,12 +373,17 @@ impl TableBuilder {
         for name in def.indexes.iter().flat_map(|index| &index.columns) {
             def.require(name)?;
         }
-        if let Some(name) = &def.block_hash {
+        for (name, kind, expected) in [
+            (&def.block_hash, ColumnType::Text, "text"),
+            (&def.block_number, ColumnType::Uint, "unsigned integer"),
+        ] {
+            let Some(name) = name else { continue };
             let column = &def.columns[def.require(name)?];
-            if column.kind != ColumnType::Text || column.nullable {
-                return Err(TableError::BlockHashColumn {
+            if column.kind != kind || column.nullable {
+                return Err(TableError::BlockColumn {
                     table: def.name.clone(),
                     column: name.to_string(),
+                    expected,
                 });
             }
         }

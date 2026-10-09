@@ -320,6 +320,12 @@ impl Settings {
         // directory rather than the process's working directory. A bare filename's
         // parent is empty, and joining onto an empty path is the path as written.
         settings.dir = path.parent().unwrap_or_else(|| Path::new("")).to_path_buf();
+        #[cfg(feature = "duckdb")]
+        if let Sink::DuckDb(duckdb) = &mut settings.sink
+            && duckdb.path != Path::new(":memory:")
+        {
+            duckdb.path = settings.dir.join(&duckdb.path);
+        }
         Ok(settings)
     }
 
@@ -385,6 +391,31 @@ ws_url = "wss://example.invalid"
         let settings = Settings::from_file(&path).expect("settings load");
         assert_eq!(settings.protocols_path(), Some(dir.join("protocols")));
 
+        std::fs::remove_dir_all(&dir).expect("clean up");
+    }
+
+    /// A `DuckDB` path resolves against the settings file's directory too.
+    #[cfg(feature = "duckdb")]
+    #[test]
+    fn a_duckdb_path_resolves_against_the_settings_file() {
+        let dir = std::env::temp_dir().join(format!("indexer-duckdb-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let path = dir.join("indexer.toml");
+        for (written, resolved) in [
+            ("store.duckdb", dir.join("store.duckdb")),
+            (":memory:", ":memory:".into()),
+        ] {
+            let text = minimal().replace(
+                "[sink.stdout]",
+                &format!("[sink.duckdb]\npath = \"{written}\""),
+            );
+            std::fs::write(&path, text).expect("write settings");
+            let settings = Settings::from_file(&path).expect("settings load");
+            let super::Sink::DuckDb(duckdb) = settings.sink else {
+                panic!("a DuckDB sink");
+            };
+            assert_eq!(duckdb.path, resolved);
+        }
         std::fs::remove_dir_all(&dir).expect("clean up");
     }
 

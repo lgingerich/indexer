@@ -132,6 +132,16 @@ pub enum SourceError {
         /// Which invariant failed.
         detail: String,
     },
+    /// The node's answers disagree with each other — the chain moved mid-fetch, or a
+    /// backend lags the block it announced — so, unlike [`Self::Malformed`], asking again
+    /// can succeed.
+    #[error("inconsistent data from {context}: {detail}")]
+    Inconsistent {
+        /// What was being read.
+        context: String,
+        /// Which answers disagreed.
+        detail: String,
+    },
 }
 
 /// A chain data source: one live subscription plus on-demand block fetches.

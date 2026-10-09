@@ -8,7 +8,7 @@
 
 use std::fmt::Write as _;
 
-use crate::sink::table::{ColumnType, Index, PRIMARY_KEY, TableDef, TableError};
+use crate::sink::table::{ColumnType, Index, PRIMARY_KEY, TableDef, TableError, fit_identifier};
 
 /// What an engine says differently.
 pub trait Dialect {
@@ -99,22 +99,10 @@ pub(crate) fn create_indexes<D: Dialect>(table: &TableDef) -> Vec<String> {
         .collect()
 }
 
-/// `PostgreSQL`'s identifier limit, in bytes; a longer name is silently truncated.
-const MAX_IDENTIFIER: usize = 63;
-
-/// `{table}_{columns}_index`, or, when that would pass [`MAX_IDENTIFIER`], cut short with
-/// a hash of the whole name, so two long tables never truncate to one index name.
+/// `{table}_{columns}_index`, fitted to `PostgreSQL`'s identifier limit by
+/// [`fit_identifier`].
 fn index_name(table: &str, index: &Index) -> String {
-    let name = format!("{table}_{}_index", index.columns.join("_"));
-    if name.len() <= MAX_IDENTIFIER {
-        return name;
-    }
-    let hash = alloy_primitives::hex::encode(&alloy_primitives::keccak256(&name)[..4]);
-    let mut end = MAX_IDENTIFIER - hash.len() - 1;
-    while !name.is_char_boundary(end) {
-        end -= 1;
-    }
-    format!("{}_{hash}", &name[..end])
+    fit_identifier(format!("{table}_{}_index", index.columns.join("_")))
 }
 
 /// Merges `staging` into `table`, replacing a row whose primary key is already stored.
@@ -142,15 +130,17 @@ pub(crate) fn upsert<D: Dialect>(table: &TableDef, staging: &str) -> String {
     )
 }
 
-/// Deletes chain `$1`'s rows of block `$2`, for a table whose rows belong to a block.
+/// Deletes chain `$1`'s rows of block `$3`, which is at height `$2` or above, for a table
+/// whose rows belong to a block. The height bound lets `DuckDB`, which keeps no index on
+/// the hash, skip the row groups below the reorg.
 pub(crate) fn delete_block(table: &TableDef) -> Option<String> {
-    table.block_hash.as_ref().map(|column| {
-        format!(
-            "DELETE FROM {} WHERE \"chain\" = $1 AND {} = $2",
-            ident(&table.name),
-            ident(column)
-        )
-    })
+    let (hash, number) = table.block_hash.as_ref().zip(table.block_number.as_ref())?;
+    Some(format!(
+        "DELETE FROM {} WHERE \"chain\" = $1 AND {} >= $2 AND {} = $3",
+        ident(&table.name),
+        ident(number),
+        ident(hash)
+    ))
 }
 
 /// Deletes chain `$1`'s rows whose `column` is below `$2`.
@@ -239,6 +229,7 @@ impl<'a> Select<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sink::table::MAX_IDENTIFIER;
 
     /// Two long tables that share a prefix get distinct index names within the limit.
     #[test]

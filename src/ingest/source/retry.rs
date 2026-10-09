@@ -12,9 +12,10 @@
 //! or restarting backend, a timeout, or a dropped connection. Every call this source
 //! makes is a read, so a retry cannot apply anything twice.
 //!
-//! One timeout is not transient: an `eth_getLogs` over more than one height. A range
-//! that ran out of time is too large for the provider, and resending it would only wait
-//! out the same timeout again, so it is returned at once for the source to retry smaller.
+//! Two failures are not transient for an `eth_getLogs` over more than one height: a
+//! timeout, and Infura's `-32005`, which there means the result is too large rather than
+//! a rate limit. Resending the same range would only fail again, so both are returned at
+//! once for the source to retry smaller.
 //!
 //! A failure to reach the provider at all is a [`NetworkError`], whatever transport
 //! raised it: the layer converts the HTTP client's own errors into one, so the
@@ -26,12 +27,16 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
-use alloy_json_rpc::{RequestPacket, ResponsePacket, RpcError};
+use alloy_json_rpc::{RequestPacket, ResponsePacket, RpcError, SerializedRequest};
 use alloy_transport::{TransportError, TransportErrorKind, TransportFut};
 use serde::Deserialize;
 use thiserror::Error;
 use tower::{Layer, Service};
 use tracing::warn;
+
+/// Infura's code for a refused rate, also answered to a log query whose result is too
+/// large.
+const LIMIT_EXCEEDED: i64 = -32005;
 
 /// Retries after the first attempt. The waits add up to at most a few minutes: long
 /// enough to ride out a provider's rate window, short enough that a dead endpoint
@@ -239,10 +244,10 @@ where
                     .call(request.clone())
                     .await
                     .map_err(NetworkError::from_transport);
-                if timed_out(&result) && spans_heights(&request) {
+                if timed_out(&result) && request.requests().iter().any(spans_heights) {
                     return result;
                 }
-                let Some(cause) = transient(&result) else {
+                let Some(cause) = transient(&request, &result) else {
                     pacing.speed_up();
                     return result;
                 };
@@ -268,13 +273,28 @@ where
 ///
 /// A batch is retried whole when any call in it was refused for load. One whose errors
 /// are all permanent, like a `-32601` for `eth_getBlockReceipts`, passes through for
-/// the source to handle.
-fn transient(result: &Result<ResponsePacket, TransportError>) -> Option<String> {
+/// the source to handle, as does a ranged log query's [`LIMIT_EXCEEDED`].
+fn transient(
+    request: &RequestPacket,
+    result: &Result<ResponsePacket, TransportError>,
+) -> Option<String> {
     match result {
-        Ok(response) => response
-            .iter_errors()
-            .find(|error| error.is_retry_err())
-            .map(|error| format!("rpc error {}: {}", error.code, error.message)),
+        Ok(response) => {
+            let ranged: Vec<_> = request
+                .requests()
+                .iter()
+                .filter(|call| spans_heights(call))
+                .map(SerializedRequest::id)
+                .collect();
+            response
+                .responses()
+                .iter()
+                .filter_map(|response| Some((&response.id, response.payload.as_error()?)))
+                .find(|(id, error)| {
+                    error.is_retry_err() && !(error.code == LIMIT_EXCEEDED && ranged.contains(id))
+                })
+                .map(|(_, error)| format!("rpc error {}: {}", error.code, error.message))
+        }
         Err(RpcError::Transport(TransportErrorKind::HttpError(error))) => {
             matches!(error.status, 408 | 429 | 500 | 502 | 503 | 504)
                 .then(|| format!("http status {}", error.status))
@@ -300,22 +320,20 @@ fn timed_out(result: &Result<ResponsePacket, TransportError>) -> bool {
     )
 }
 
-/// Whether `request` carries an `eth_getLogs` over more than one height. A query pinned
-/// to a block hash, or bounded by one height, does not.
-fn spans_heights(request: &RequestPacket) -> bool {
+/// Whether `call` is an `eth_getLogs` over more than one height. A query pinned to a
+/// block hash, or bounded by one height, is not.
+fn spans_heights(call: &SerializedRequest) -> bool {
     #[derive(Deserialize)]
     #[serde(rename_all = "camelCase")]
     struct Range {
         from_block: Option<String>,
         to_block: Option<String>,
     }
-    request.requests().iter().any(|call| {
-        call.method() == "eth_getLogs"
-            && call
-                .params()
-                .and_then(|params| serde_json::from_str::<(Range,)>(params.get()).ok())
-                .is_some_and(|(range,)| range.from_block != range.to_block)
-    })
+    call.method() == "eth_getLogs"
+        && call
+            .params()
+            .and_then(|params| serde_json::from_str::<(Range,)>(params.get()).ok())
+            .is_some_and(|(range,)| range.from_block != range.to_block)
 }
 
 #[cfg(test)]
@@ -465,6 +483,35 @@ mod tests {
             .await;
             result.expect_err("times out");
             assert_eq!(calls, expected, "{filter}");
+        }
+    }
+
+    /// `-32005` is returned at once for a ranged log query, and retried otherwise.
+    #[tokio::test(start_paused = true)]
+    async fn only_a_ranged_log_query_limit_exceeded_is_returned_at_once() {
+        for (method, filter, expected) in [
+            (
+                "eth_getLogs",
+                json!([{"fromBlock": "0x64", "toBlock": "0x6d"}]),
+                1,
+            ),
+            (
+                "eth_getLogs",
+                json!([{"fromBlock": "0x64", "toBlock": "0x64"}]),
+                2,
+            ),
+            ("eth_blockNumber", Value::Null, 2),
+        ] {
+            let (result, calls) = send_call(&RetryLayer::new(0), method, filter, |n| {
+                Ok(response(if n == 0 {
+                    r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32005,"message":"query returned more than 10000 results"}}"#
+                } else {
+                    r#"{"jsonrpc":"2.0","id":1,"result":[]}"#
+                }))
+            })
+            .await;
+            assert!(result.is_ok(), "{method}");
+            assert_eq!(calls, expected, "{method}");
         }
     }
 }

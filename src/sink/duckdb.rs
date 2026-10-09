@@ -20,6 +20,7 @@ use duckdb::{Connection, appender_params_from_iter, params_from_iter};
 use serde::Deserialize;
 use tracing::info;
 
+use crate::config::Secret;
 use crate::sink::sql::{Dialect, ident};
 use crate::sink::store::{Engine, EngineError, Operation, SqlStore, StoreError};
 use crate::sink::table::{ColumnType, Row, Schema, TableDef, Value};
@@ -44,7 +45,8 @@ const DEFAULT_BATCH_RECORDS: usize = 500;
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct DuckDbSettings {
-    /// The `DuckDB` database file to write. Defaults to `indexer.duckdb`.
+    /// The `DuckDB` database file to write, relative to the settings file. Defaults to
+    /// `indexer.duckdb`.
     pub path: PathBuf,
     /// The most records one store commit may cover.
     ///
@@ -69,8 +71,11 @@ pub struct DuckDbSettings {
     /// [sink.duckdb.settings]
     /// threads = "4"
     /// max_memory = "1GB"
+    /// s3_secret_access_key = { env = "S3_SECRET" }
     /// ```
-    pub settings: BTreeMap<String, String>,
+    ///
+    /// Values are [`Secret`]s, since some are credentials.
+    pub settings: BTreeMap<String, Secret>,
 }
 
 impl Default for DuckDbSettings {
@@ -106,7 +111,7 @@ impl DuckDbSink {
     ) -> Result<Self, StoreError> {
         let mut config = duckdb::Config::default();
         for (key, value) in &settings.settings {
-            config = config.with(key, value).map_err(|error| {
+            config = config.with(key, value.expose()).map_err(|error| {
                 StoreError::engine(Operation::Configure, Some(key))(error.into())
             })?;
         }
@@ -341,6 +346,22 @@ mod tests {
     /// The `reorgs` table's DDL, to recreate it after a test drops it.
     fn reorg_ddl() -> String {
         crate::sink::sql::create_table::<super::DuckDb>(datasets().dataset(Table::Reorg))
+    }
+
+    /// An engine setting can be a credential, so its value is never printed.
+    #[test]
+    fn engine_setting_values_are_redacted() {
+        let settings: super::DuckDbSettings =
+            toml::from_str("[settings]\ns3_secret_access_key = 'hunter2'").expect("settings");
+        assert_eq!(
+            settings.settings["s3_secret_access_key"].expose(),
+            "hunter2"
+        );
+        let printed = format!("{settings:?}");
+        assert!(
+            printed.contains("s3_secret_access_key") && !printed.contains("hunter2"),
+            "{printed}"
+        );
     }
 
     async fn sink() -> DuckDbSink {

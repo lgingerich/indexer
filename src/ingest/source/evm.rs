@@ -253,6 +253,13 @@ fn malformed(context: &str, detail: impl fmt::Display) -> SourceError {
     }
 }
 
+fn inconsistent(context: &str, detail: impl fmt::Display) -> SourceError {
+    SourceError::Inconsistent {
+        context: context.to_owned(),
+        detail: detail.to_string(),
+    }
+}
+
 fn invalid_json(context: &'static str, source: serde_json::Error) -> SourceError {
     SourceError::Json { context, source }
 }
@@ -349,8 +356,7 @@ pub fn decode_block(batch: RpcBatch) -> Result<FetchedBlock, SourceError> {
 ///
 /// `eth_getLogs` answering nothing for a header whose `logsBloom` is set is an error
 /// too: the block has logs, and a backend that has not indexed it can answer an empty
-/// list rather than fail. A notification carries no bloom, so a reused head is not
-/// checked.
+/// list rather than fail.
 fn project(
     meta: BlockMeta,
     block: Option<&AnyRpcBlock>,
@@ -390,7 +396,7 @@ fn project(
             && let Some(block) = block
             && block.0.inner.header.inner.logs_bloom != Bloom::ZERO
         {
-            return Err(malformed(
+            return Err(inconsistent(
                 LOGS,
                 "no logs returned for a block whose logsBloom is set",
             ));
@@ -442,7 +448,7 @@ fn append_body(
         let tx_index = position as u64;
         let receipt_block = receipt.block_hash.unwrap_or_default();
         if receipt_block != meta.hash {
-            return Err(malformed(
+            return Err(inconsistent(
                 RECEIPTS,
                 format!(
                     "receipt belongs to block {receipt_block}, not {}; the chain reorganised mid-request",
@@ -499,7 +505,7 @@ fn get_logs_record(
         .block_hash
         .ok_or_else(|| malformed(LOGS, "log has no blockHash"))?;
     if got != block_hash {
-        return Err(malformed(
+        return Err(inconsistent(
             LOGS,
             format!("log belongs to block {got}, not {block_hash}"),
         ));
@@ -796,12 +802,15 @@ impl<C: PubSubConnect + Clone> BlockSource for EvmSource<C> {
         // the plan reads nothing else from the block body it stands in for the block
         // read entirely. A head for a different height is no use, so it is ignored
         // rather than mistrusted.
+        // An empty answer is not trusted without the header's bloom, so it falls through.
         if let Some(meta) = head.filter(|meta| meta.height == height && self.plan.reuse_head) {
             let logs = self.fetch_logs(meta.hash).await?;
-            return Ok(FetchedBlock {
-                meta: *meta,
-                events: project(*meta, None, None, Some(&logs), self.plan)?,
-            });
+            if !logs.is_empty() {
+                return Ok(FetchedBlock {
+                    meta: *meta,
+                    events: project(*meta, None, None, Some(&logs), self.plan)?,
+                });
+            }
         }
         if self.plan.ranged() {
             return self
@@ -1233,6 +1242,37 @@ mod tests {
         assert_eq!(fetched.events.len(), 1);
     }
 
+    /// A reused head's empty `eth_getLogs` answer falls through to the header read, which
+    /// checks it against the bloom.
+    #[tokio::test]
+    async fn a_reused_head_with_no_logs_reads_the_header() {
+        let head = BlockMeta {
+            height: 100,
+            hash: hash(100).parse().expect("hash"),
+            parent_hash: hash(99).parse().expect("hash"),
+            timestamp: TIMESTAMP,
+        };
+        for (logs, bloom_at, requests) in [
+            (vec![log_at(100, 0)], None, 1),
+            (vec![], None, 2),
+            (vec![], Some(100), 2),
+        ] {
+            let (url, server) = rpc_server(requests, move |request| {
+                if request.is_array() {
+                    return range_reply(request, &logs, bloom_at);
+                }
+                assert_eq!(request["params"][0]["blockHash"], json!(hash(100)));
+                json!({"jsonrpc": "2.0", "id": request["id"], "result": logs})
+            });
+            let fetched = logs_only(url).fetch_block(100, Some(&head)).await;
+            assert_eq!(server.join().expect("server").len(), requests);
+            match bloom_at {
+                None => assert_eq!(fetched.expect("fetch").meta, head),
+                Some(_) => assert!(matches!(fetched, Err(SourceError::Inconsistent { .. }))),
+            }
+        }
+    }
+
     /// A range the provider refuses is retried for its first half, rounded up, down to
     /// one height, and only a single height's failure is returned. The first attempt is
     /// capped at the batch limit, however far the caller allows.
@@ -1296,7 +1336,10 @@ mod tests {
             let (url, server) = rpc_server(1, move |request| range_reply(request, &logs, bloom_at));
             let error = logs_only(url).fetch_blocks(100, 102).await.expect_err(case);
             assert!(
-                matches!(error, SourceError::Malformed { .. }),
+                matches!(
+                    error,
+                    SourceError::Malformed { .. } | SourceError::Inconsistent { .. }
+                ),
                 "{case}: {error}"
             );
             assert_eq!(server.join().expect("server").len(), 1, "{case}");

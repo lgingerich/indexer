@@ -394,7 +394,11 @@ fn convert(ty: &DynSolType, value: &DynSolValue) -> Result<TypedValue, DecodeErr
         },
         (DynSolType::String, DynSolValue::Bytes(value)) => TypedValue::String {
             value: Bytes::copy_from_slice(value),
-            text: std::str::from_utf8(value).ok().map(str::to_owned),
+            // `PostgreSQL` rejects NUL in `text` and `jsonb`.
+            text: std::str::from_utf8(value)
+                .ok()
+                .filter(|text| !text.contains('\0'))
+                .map(str::to_owned),
         },
         (DynSolType::Array(inner), DynSolValue::Array(values)) => TypedValue::Array {
             value: values
@@ -505,12 +509,13 @@ mod tests {
     }
 
     #[test]
-    fn invalid_utf8_and_nested_strings_remain_bytes() {
+    fn invalid_utf8_nul_and_nested_strings_remain_bytes() {
         let result = decode(
             r#"[{"type":"event","name":"Text","anonymous":false,"inputs":[{"name":"s","type":"string[]","indexed":false}]}]"#,
             &[DynSolValue::Array(vec![
                 DynSolValue::Bytes(vec![0xff]),
                 DynSolValue::Bytes(b"hello".to_vec()),
+                DynSolValue::Bytes(b"a\0b".to_vec()),
             ])],
             None,
         );
@@ -529,6 +534,13 @@ mod tests {
             TypedValue::String {
                 value: Bytes::from_static(b"hello"),
                 text: Some("hello".into())
+            }
+        );
+        assert_eq!(
+            value[2],
+            TypedValue::String {
+                value: Bytes::from_static(b"a\0b"),
+                text: None
             }
         );
     }

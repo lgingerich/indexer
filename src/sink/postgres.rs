@@ -61,12 +61,13 @@ impl Drop for Postgres {
 }
 
 impl PostgresSink {
-    /// Connects using platform TLS and creates the tables in `database_schema` before
-    /// ingest starts.
+    /// Connects using platform TLS, takes the single-writer lock on `database_schema`, and
+    /// creates its tables before ingest starts.
     ///
     /// # Errors
     ///
-    /// Returns [`StoreError::Engine`] when TLS, the connection, or table creation fails.
+    /// Returns [`StoreError::Engine`] when TLS, the connection, or table creation fails,
+    /// and [`StoreError::Locked`] when another process holds the lock.
     pub async fn open(
         settings: &PostgresSettings,
         schema: Arc<Schema>,
@@ -85,6 +86,21 @@ impl PostgresSink {
                 tracing::error!(%error, "PostgreSQL connection stopped");
             }
         });
+        // One writer per database schema, held for the life of this connection.
+        let locked: bool = client
+            .query_one(
+                "SELECT pg_try_advisory_lock(hashtext('indexer'), hashtext($1))",
+                &[&database_schema],
+            )
+            .await
+            .and_then(|row| row.try_get(0))
+            .map_err(|error| open()(error.into()))?;
+        if !locked {
+            task.abort();
+            return Err(StoreError::Locked {
+                schema: database_schema.to_owned(),
+            });
+        }
         let engine = Postgres {
             client,
             connection_task: Some(task),
@@ -554,6 +570,27 @@ mod tests {
             .await
             .expect("count rows")
             .get(0)
+    }
+
+    /// A second writer of a database schema is refused while the first holds it.
+    #[tokio::test]
+    #[ignore = "requires INDEXER_TEST_POSTGRES_URL pointing to PostgreSQL 18"]
+    async fn a_second_writer_of_a_schema_is_refused() {
+        let url = std::env::var("INDEXER_TEST_POSTGRES_URL").expect("test database URL");
+        let settings: PostgresSettings =
+            toml::from_str(&format!("connection_string = '{url}'")).expect("settings");
+        let schema = format!("lock_test_{}", std::process::id());
+        let first = PostgresSink::open(&settings, datasets(), &schema)
+            .await
+            .expect("the first writer opens");
+        assert!(matches!(
+            PostgresSink::open(&settings, datasets(), &schema).await,
+            Err(StoreError::Locked { .. })
+        ));
+        db(&first)
+            .batch_execute(&format!("DROP SCHEMA \"{schema}\" CASCADE"))
+            .await
+            .expect("drop test schema");
     }
 
     /// A stored contract reads back scoped to its chain, and is deleted once a reorg
