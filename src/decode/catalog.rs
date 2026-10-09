@@ -61,7 +61,7 @@
 //! table = "pool"                  # uniswap_v3_pool_swap, not uniswap_v3_uniswap_v3_pool_swap
 //! ```
 //!
-//! A name longer than [`MAX_TABLE_NAME`] bytes, which `PostgreSQL` would silently
+//! A name longer than `PostgreSQL`'s 63-byte identifier limit, which it would silently
 //! truncate, is a startup error asking for a shorter `table`. So is a name produced twice:
 //! two contracts given the same `table`, or one contract declaring two events by one name.
 
@@ -73,12 +73,8 @@ use alloy_primitives::Address;
 use serde::Deserialize;
 
 use super::abi::{Abi, AbiError, EventKey, InputSpec};
-use crate::sink::table::{Column, ColumnType, Schema, TableError, snake_case};
+use crate::sink::table::{Column, ColumnType, MAX_IDENTIFIER, Schema, TableError, snake_case};
 use crate::wire::envelope::ChainId;
-
-/// The longest event table name: `PostgreSQL`'s identifier limit, past which it would
-/// silently truncate the name and two tables could collide.
-pub const MAX_TABLE_NAME: usize = 63;
 
 /// The file each protocol directory must hold.
 const MANIFEST: &str = "protocol.toml";
@@ -264,7 +260,7 @@ impl Catalog {
             for event in abi.events() {
                 let table = format!("{}_{prefix}_{}", manifest.protocol, snake_case(event.name));
                 let contract = || format!("{}.{name}", manifest.protocol);
-                if table.len() > MAX_TABLE_NAME {
+                if table.len() > MAX_IDENTIFIER {
                     return Err(CatalogError::TableName {
                         table,
                         contract: contract(),
@@ -506,9 +502,9 @@ pub enum CatalogError {
         /// How many events by that name the parent declares; exactly one is required.
         found: usize,
     },
-    /// An event table's name is longer than [`MAX_TABLE_NAME`].
+    /// An event table's name is longer than `PostgreSQL`'s identifier limit.
     #[error(
-        "event table {table} is longer than {MAX_TABLE_NAME} bytes; give {contract} a shorter `table`"
+        "event table {table} is longer than {MAX_IDENTIFIER} bytes; give {contract} a shorter `table`"
     )]
     TableName {
         /// The table.
@@ -636,7 +632,7 @@ addresses = { base = ["0x33128a8fC17869897dcE68Ed026d694621f6FDfD"], ethereum = 
     fn the_shipped_protocols_have_event_tables() {
         let catalog = Catalog::load(repository(), &ChainId::new("base")).expect("loads");
         let names = table_names(&catalog);
-        assert!(names.iter().all(|name| name.len() <= super::MAX_TABLE_NAME));
+        assert!(names.iter().all(|name| name.len() <= super::MAX_IDENTIFIER));
         assert!(names.contains(&"uniswap_v3_uniswap_v3_factory_pool_created".to_owned()));
         assert!(names.contains(&"uniswap_v4_pool_manager_swap".to_owned()));
         let swap = catalog

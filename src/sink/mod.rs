@@ -13,7 +13,6 @@
 //! - `channel` — the one hop that crosses tasks: a bounded in-process channel of
 //!   blocks, from decode to storage. It is what lets a slow store stall without stalling
 //!   ingest. Commit progress is logged from `progress`, not from the channel.
-//! - `datasets` — which datasets a run fetches and keeps.
 //! - `duckdb` — an embedded `DuckDB` database.
 //! - `postgres` — a remote `PostgreSQL` 18 database with asynchronous transactional COPY.
 //! - [`table`] — the tables a store persists, declared once; `sql` renders their
@@ -30,7 +29,6 @@
 /// [`runtime`](crate::runtime). A stdout-only build has no storage task or channel.
 #[cfg(any(feature = "duckdb", feature = "postgres"))]
 pub(crate) mod channel;
-mod datasets;
 #[cfg(feature = "duckdb")]
 pub mod duckdb;
 #[cfg(feature = "postgres")]
@@ -47,7 +45,6 @@ pub mod table;
 #[cfg(feature = "postgres")]
 pub use postgres::{PostgresSettings, PostgresSink};
 
-pub use datasets::Datasets;
 #[cfg(feature = "duckdb")]
 pub use duckdb::{DuckDbSettings, DuckDbSink};
 pub use stdout::{StdoutJsonSink, StdoutSettings};
@@ -113,8 +110,9 @@ pub trait EnvelopeSink: Send {
 #[derive(Debug, Error)]
 pub enum SinkError {
     /// An internal decoding invariant failed; continuing could publish incorrect data.
-    #[error(transparent)]
-    Decode(#[from] crate::decode::DecodeError),
+    /// Boxed so this layer does not name the decoder's error type.
+    #[error("decoding invariant failed: {0}")]
+    Decode(#[source] Box<dyn std::error::Error + Send + Sync>),
     /// The store this sink writes to has stopped, so the batch cannot be delivered.
     ///
     /// Distinct from a *failed* store: nothing went wrong, the destination is simply

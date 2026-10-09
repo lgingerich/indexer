@@ -20,11 +20,10 @@ use std::sync::Arc;
 
 use thiserror::Error;
 
-use crate::decode::StoredContract;
 use crate::sink::sql::{self, Dialect};
 use crate::sink::table::{Row, Schema, Table, TableDef, TableError, TableId, Value};
 use crate::sink::{EnvelopeSink, SinkError};
-use crate::wire::envelope::{AcceptedBlock, ChainId, Envelope, Event};
+use crate::wire::envelope::{BlockMeta, ChainId, Envelope, Event, StoredContract};
 
 /// An engine's own error, carried as its cause.
 pub type EngineError = Box<dyn std::error::Error + Send + Sync>;
@@ -328,7 +327,7 @@ impl<E: Engine> SqlStore<E> {
         &mut self,
         chain: &ChainId,
         limit: usize,
-    ) -> Result<Vec<AcceptedBlock>, StoreError> {
+    ) -> Result<Vec<BlockMeta>, StoreError> {
         let read = || StoreError::engine(Operation::Read, Some("accepted_blocks"));
         let limit = Value::Int(i64::try_from(limit).unwrap_or(i64::MAX));
         let rows = self
@@ -339,7 +338,7 @@ impl<E: Engine> SqlStore<E> {
         let mut ledger = rows
             .iter()
             .map(|row| {
-                Ok(AcceptedBlock {
+                Ok(BlockMeta {
                     height: uint("accepted_blocks.height", column(row, 0))?,
                     hash: parse("accepted_blocks.hash", column(row, 1))?,
                     parent_hash: parse("accepted_blocks.parent_hash", column(row, 2))?,

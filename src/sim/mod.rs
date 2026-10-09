@@ -41,10 +41,11 @@ use self::node::{SimHeads, SimNode};
 use self::store::FaultyEngine;
 use crate::decode::Catalog;
 use crate::ingest::pipeline::PipelineError;
+use crate::ingest::source::Datasets;
 use crate::ingest::source::{EvmSource, RetryLayer};
 use crate::runtime::{Pipeline, RuntimeError};
 use crate::sink::duckdb::DuckDb;
-use crate::sink::{Datasets, SinkError, SqlStore};
+use crate::sink::{SinkError, SqlStore};
 
 const CHAIN: &str = "sim";
 

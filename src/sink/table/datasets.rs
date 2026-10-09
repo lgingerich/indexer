@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use crate::wire::envelope::{
-    AcceptedBlock, Block, ChainId, Contract, Decoded, Event, Log, Reorg, Transaction,
+    Block, BlockMeta, ChainId, Contract, Decoded, Event, Log, Reorg, Transaction,
 };
 
 use super::{
@@ -221,8 +221,8 @@ fn reorgs() -> Result<Dataset<Reorg>, TableError> {
 }
 
 /// The identity and linkage a restart needs, and nothing else.
-fn accepted_blocks() -> Result<Dataset<AcceptedBlock>, TableError> {
-    DatasetBuilder::<AcceptedBlock>::new(Table::AcceptedBlock)
+fn accepted_blocks() -> Result<Dataset<BlockMeta>, TableError> {
+    DatasetBuilder::<BlockMeta>::new(Table::AcceptedBlock)
         .col("height", |a| a.height)
         .col("hash", |a| a.hash)
         .col("parent_hash", |a| a.parent_hash)
@@ -239,7 +239,7 @@ pub(super) struct Datasets {
     decoded_logs: Dataset<Decoded>,
     contracts: Dataset<Contract>,
     reorgs: Dataset<Reorg>,
-    accepted_blocks: Dataset<AcceptedBlock>,
+    accepted_blocks: Dataset<BlockMeta>,
 }
 
 impl std::fmt::Debug for Datasets {
@@ -296,7 +296,7 @@ mod tests {
     use alloy_primitives::{Address, B256, TxHash, U256};
 
     use crate::wire::envelope::{
-        AcceptedBlock, Block, ChainId, Contract, Decoded, Event, Log, Reorg, Transaction,
+        Block, BlockMeta, ChainId, Contract, Decoded, Event, Log, Reorg, Transaction,
     };
 
     use std::sync::Arc;
@@ -381,7 +381,7 @@ mod tests {
                 new_head_hash: hash(0x01),
                 orphaned_hashes: vec![hash(0x02)],
             }),
-            Event::AcceptedBlock(AcceptedBlock {
+            Event::AcceptedBlock(BlockMeta {
                 height: 100,
                 hash: hash(0x01),
                 parent_hash: hash(0x02),

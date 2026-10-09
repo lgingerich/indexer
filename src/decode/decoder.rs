@@ -15,7 +15,7 @@ use tracing::warn;
 
 use super::abi::DecodeError;
 use super::catalog::{Catalog, EntryId};
-use crate::wire::envelope::{Contract, Decoded, Log, TypedValue};
+use crate::wire::envelope::{Contract, Decoded, Log, StoredContract, TypedValue};
 
 /// What one log produced: its decoded record, and any contracts its event created.
 #[derive(Debug)]
@@ -24,21 +24,6 @@ pub struct Decoding {
     pub decoded: Decoded,
     /// The contracts this log created, in rule order.
     pub discovered: Vec<Contract>,
-}
-
-/// A contract a previous run discovered, as a store reads it back: only what is needed
-/// to decode it again.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct StoredContract {
-    /// The protocol its manifest declares.
-    pub protocol: String,
-    /// Its contract name within that protocol, for example `UniswapV3Pool`.
-    pub name: String,
-    /// The contract.
-    pub address: Address,
-    /// The hash of the block whose creation log discovered it, so a reorg that orphans
-    /// that block after a restart still retracts it.
-    pub block_hash: B256,
 }
 
 /// One address in the contract set.
@@ -238,8 +223,9 @@ mod tests {
     use alloy_dyn_abi::DynSolValue;
     use alloy_primitives::{Address, B256, keccak256};
 
-    use super::{Decoder, StoredContract};
+    use super::Decoder;
     use crate::decode::Catalog;
+    use crate::wire::envelope::StoredContract;
     use crate::wire::envelope::{ChainId, Envelope, Event, Log};
 
     const FACTORY: &str = "0x33128a8fC17869897dcE68Ed026d694621f6FDfD";

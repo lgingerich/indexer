@@ -21,7 +21,7 @@ use tokio_postgres::Client;
 use tokio_postgres::binary_copy::BinaryCopyInWriter;
 use tokio_postgres::types::{FromSql, IsNull, Kind, ToSql, Type, to_sql_checked};
 
-use crate::config::Secret;
+use crate::secret::Secret;
 use crate::sink::sql::{self, Dialect, ident};
 use crate::sink::store::{Engine, EngineError, Operation, SqlStore, StoreError};
 use crate::sink::table::{ColumnType, Row, Schema, TableDef, Value};
@@ -433,10 +433,9 @@ impl<'a> FromSql<'a> for Value {
 mod tests {
     use alloy_primitives::B256;
 
-    use crate::decode::StoredContract;
     use crate::sink::table::Table;
     use crate::sink::{EnvelopeSink as _, SinkError};
-    use crate::wire::envelope::{ChainId, Envelope, Event, Reorg};
+    use crate::wire::envelope::{ChainId, Envelope, Event, Reorg, StoredContract};
 
     use super::*;
 
@@ -679,7 +678,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires INDEXER_TEST_POSTGRES_URL pointing to PostgreSQL 18"]
     async fn the_ledger_reads_back_the_newest_canonical_window_and_prunes_below_it() {
-        use crate::wire::envelope::AcceptedBlock;
+        use crate::wire::envelope::BlockMeta;
 
         let url = std::env::var("INDEXER_TEST_POSTGRES_URL").expect("test database URL");
         let (client, connection) = tokio_postgres::connect(&url, tokio_postgres::NoTls)
@@ -695,7 +694,7 @@ mod tests {
             .expect("test schema");
         let mut sink = dataset_sink(client, &schema).await;
         let chain = ChainId::new("base");
-        let accepted = |height: u64| AcceptedBlock {
+        let accepted = |height: u64| BlockMeta {
             height,
             hash: B256::with_last_byte(u8::try_from(height).expect("small heights")),
             parent_hash: B256::with_last_byte(u8::try_from(height - 1).expect("small heights")),
@@ -760,7 +759,7 @@ mod tests {
     #[ignore = "requires INDEXER_TEST_POSTGRES_URL pointing to PostgreSQL 18"]
     async fn a_reorg_deletes_orphaned_blocks_under_a_publication() {
         use crate::wire::datasets::evm::{Block, Log};
-        use crate::wire::envelope::AcceptedBlock;
+        use crate::wire::envelope::BlockMeta;
 
         let url = std::env::var("INDEXER_TEST_POSTGRES_URL").expect("test database URL");
         let (client, connection) = tokio_postgres::connect(&url, tokio_postgres::NoTls)
@@ -795,7 +794,7 @@ mod tests {
                     block_hash: hash,
                     ..Log::default()
                 })),
-                Event::AcceptedBlock(AcceptedBlock {
+                Event::AcceptedBlock(BlockMeta {
                     height: 100,
                     hash,
                     parent_hash: B256::ZERO,

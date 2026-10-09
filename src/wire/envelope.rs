@@ -11,7 +11,7 @@
 //!   produces from a log — its typed arguments under their ABI names, or the contract a
 //!   factory's creation event names. They are datasets, not control signals, and each
 //!   always follows the log it came from.
-//! - **Control** ([`Reorg`], [`AcceptedBlock`]): signals about the indexer's own state,
+//! - **Control** ([`Reorg`], [`Event::AcceptedBlock`]): signals about the indexer's own state,
 //!   not records of a chain. They carry no verbatim payload and exist to drive a
 //!   consumer's state machine, so they are defined here.
 //!
@@ -119,16 +119,17 @@ pub struct Reorg {
     pub orphaned_hashes: Vec<B256>,
 }
 
-/// A block the pipeline accepted: the last envelope of every block's batch.
+/// A block's identity, parent hash, and timestamp: what a `newHeads` notification
+/// carries, what a fetched block is anchored to, and, as [`Event::AcceptedBlock`], the
+/// marker that ends every block's batch.
 ///
-/// A control signal rather than a dataset. It is published for every block, empty ones
-/// included and whatever datasets are selected, so a store holding these rows has a
-/// contiguous, parent-linked record of what it committed. That record is what a restart
-/// resumes from; see `ingest::pipeline`. Because it rides in the block's own batch, it
-/// commits in the same transaction as the block's rows, never ahead of them.
+/// As that marker it is a control signal, published for every block whatever datasets
+/// are selected, so a store keeps a contiguous, parent-linked record of what it committed,
+/// in the same transaction as the block's rows. A restart resumes from it; see
+/// `ingest::pipeline`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AcceptedBlock {
-    /// Block height.
+pub struct BlockMeta {
+    /// Block height, or slot on slot-based chains.
     #[serde(with = "alloy_serde::quantity")]
     pub height: u64,
     /// Block hash.
@@ -295,6 +296,21 @@ pub struct Contract {
     pub block_timestamp: u64,
 }
 
+/// A contract a previous run discovered, as a store reads it back: only what decode
+/// needs to decode it again. Not published.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredContract {
+    /// The protocol its manifest declares.
+    pub protocol: String,
+    /// Its contract name within that protocol, for example `UniswapV3Pool`.
+    pub name: String,
+    /// The contract.
+    pub address: Address,
+    /// The hash of the block whose creation log discovered it, so a reorg that orphans
+    /// that block after a restart still retracts it.
+    pub block_hash: B256,
+}
+
 impl Contract {
     /// A key that is stable across redelivery and unique per discovery:
     /// `block_hash:transaction_hash:log_index:address:contract`.
@@ -331,7 +347,7 @@ pub enum Event {
     /// A discontinuity in the published chain.
     Reorg(Reorg),
     /// A block the pipeline accepted, published last in its batch.
-    AcceptedBlock(AcceptedBlock),
+    AcceptedBlock(BlockMeta),
 }
 
 impl Event {
@@ -428,7 +444,7 @@ impl Envelope {
 mod tests {
     use alloy_primitives::{Address, B256, TxHash};
 
-    use super::{AcceptedBlock, Block, Contract, Decoded, Event, Log, Reorg, Transaction};
+    use super::{Block, BlockMeta, Contract, Decoded, Event, Log, Reorg, Transaction};
 
     fn contract(block_hash: B256) -> Contract {
         Contract {
@@ -567,7 +583,7 @@ mod tests {
             format!("0x{block_hex}:reorg")
         );
         assert_eq!(
-            Event::AcceptedBlock(AcceptedBlock {
+            Event::AcceptedBlock(BlockMeta {
                 height: 100,
                 hash: block_hash,
                 parent_hash: hash(0xdd),

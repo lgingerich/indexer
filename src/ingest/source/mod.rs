@@ -23,59 +23,19 @@
 use std::future::Future;
 use std::pin::Pin;
 
-use alloy_primitives::B256;
 use futures_util::Stream;
 use thiserror::Error;
 
+mod datasets;
 pub mod evm;
 mod retry;
+pub use datasets::Datasets;
 pub use evm::EvmSource;
 // The simulation builds its client the way `evm::http_client` does, over its own node.
 #[cfg(all(test, feature = "duckdb"))]
 pub(crate) use retry::{NetworkError, RetryLayer};
 
-use crate::wire::envelope::{AcceptedBlock, ChainId, Event};
-
-/// A block's identity and the header fields the pipeline needs without its events.
-///
-/// Carried by both a live `newHeads` notification and a fetched block, so a single
-/// type covers every identity comparison the pipeline makes. The parent hash is what
-/// makes linkage checkable before a block's events exist, and the timestamp is stamped
-/// onto every dataset row for that block, so it is needed even when the `blocks` dataset
-/// itself is not stored.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct BlockMeta {
-    /// Block height, or slot on slot-based chains.
-    pub height: u64,
-    /// Block hash.
-    pub hash: B256,
-    /// The block's parent hash, for linkage.
-    pub parent_hash: B256,
-    /// The block's timestamp, stamped onto its dataset rows.
-    pub timestamp: u64,
-}
-
-impl From<AcceptedBlock> for BlockMeta {
-    fn from(accepted: AcceptedBlock) -> Self {
-        Self {
-            height: accepted.height,
-            hash: accepted.hash,
-            parent_hash: accepted.parent_hash,
-            timestamp: accepted.timestamp,
-        }
-    }
-}
-
-impl From<BlockMeta> for AcceptedBlock {
-    fn from(meta: BlockMeta) -> Self {
-        Self {
-            height: meta.height,
-            hash: meta.hash,
-            parent_hash: meta.parent_hash,
-            timestamp: meta.timestamp,
-        }
-    }
-}
+use crate::wire::envelope::{BlockMeta, ChainId, Event};
 
 /// One block, already turned into events, with the metadata it was fetched under.
 #[derive(Debug)]

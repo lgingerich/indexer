@@ -50,11 +50,11 @@ use tracing::{info, warn};
 
 use crate::config::{Settings, SettingsError, Sink};
 use crate::decode::{Catalog, CatalogError, Decoder, DecodingSink};
+#[cfg(any(feature = "duckdb", feature = "postgres"))]
+use crate::ingest::pipeline::MAX_UNFINALIZED_BLOCKS;
 use crate::ingest::pipeline::{Machine, PipelineError};
 use crate::ingest::source::evm::{http_client, ws_connect};
 use crate::ingest::source::{BlockSource, EvmSource, SourceError};
-#[cfg(any(feature = "duckdb", feature = "postgres"))]
-use crate::ingest::{pipeline::MAX_UNFINALIZED_BLOCKS, source::BlockMeta};
 #[cfg(any(feature = "duckdb", feature = "postgres"))]
 use crate::sink;
 #[cfg(feature = "duckdb")]
@@ -63,9 +63,9 @@ use crate::sink::table::Schema;
 use crate::sink::{SinkError, StdoutJsonSink};
 #[cfg(any(feature = "duckdb", feature = "postgres"))]
 use crate::sink::{SqlStore, store::Engine};
-#[cfg(any(feature = "duckdb", feature = "postgres"))]
-use crate::wire::envelope::AcceptedBlock;
 use crate::wire::envelope::ChainId;
+#[cfg(any(feature = "duckdb", feature = "postgres"))]
+use crate::wire::envelope::{BlockMeta, StoredContract};
 
 /// Why the indexer stopped.
 ///
@@ -262,11 +262,7 @@ impl<B: BlockSource> Pipeline<B> {
 
 /// Adds the contracts a previous run discovered, as the store read them back.
 #[cfg(any(feature = "duckdb", feature = "postgres"))]
-fn restore(
-    mut decoder: Decoder,
-    chain: &ChainId,
-    stored: Vec<crate::decode::StoredContract>,
-) -> Decoder {
+fn restore(mut decoder: Decoder, chain: &ChainId, stored: Vec<StoredContract>) -> Decoder {
     let restored = decoder.restore(stored);
     info!(%chain, restored, contracts = decoder.contracts(), "discovered contracts restored");
     decoder
@@ -278,14 +274,14 @@ const LEDGER_WINDOW: usize = MAX_UNFINALIZED_BLOCKS + 1;
 
 /// The accepted blocks a previous run committed, as ingest takes them.
 #[cfg(any(feature = "duckdb", feature = "postgres"))]
-fn ledger(chain: &ChainId, stored: Vec<AcceptedBlock>) -> Vec<BlockMeta> {
+fn ledger(chain: &ChainId, stored: Vec<BlockMeta>) -> Vec<BlockMeta> {
     if let (Some(oldest), Some(tip)) = (stored.first(), stored.last()) {
         info!(%chain, from = oldest.height, tip = tip.height, hash = %tip.hash,
             "accepted blocks restored");
     } else {
         info!(%chain, "no accepted blocks stored; starting fresh");
     }
-    stored.into_iter().map(BlockMeta::from).collect()
+    stored
 }
 
 /// Reports how the two tasks stopped.
@@ -342,13 +338,13 @@ mod tests {
     use std::sync::Arc;
 
     use crate::config::Settings;
-    use crate::decode::{Catalog, Decoder, DecodingSink, StoredContract};
+    use crate::decode::{Catalog, Decoder, DecodingSink};
     use crate::ingest::pipeline::{Machine, PipelineError};
-    use crate::ingest::source::{BlockMeta, BlockSource, FetchedBlock, HeadStream, SourceError};
+    use crate::ingest::source::{BlockSource, FetchedBlock, HeadStream, SourceError};
     use crate::sink::table::Schema;
     use crate::sink::{self, DuckDbSink, EnvelopeSink as _, SinkError};
     use crate::sink::{Operation, StoreError};
-    use crate::wire::envelope::{ChainId, Envelope, Event, Log, Reorg};
+    use crate::wire::envelope::{BlockMeta, ChainId, Envelope, Event, Log, Reorg, StoredContract};
 
     use super::{LEDGER_WINDOW, Pipeline, RuntimeError, finish, ledger};
 

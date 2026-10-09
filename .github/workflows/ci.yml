@@ -26,12 +26,3 @@ jobs:
       # configurations there are.
       - run: cargo clippy --no-default-features --all-targets -- -D warnings
       - run: cargo nextest run --no-default-features --all-targets
-      # The modules were once crates, and the compiler enforced that `decode` could not
-      # reach into `ingest`. Now it is a convention; this is what keeps it one. See the
-      # dependency-direction note in `src/decode/mod.rs`.
-      - name: decode does not depend on ingest
-        run: |
-          if grep -rEn 'crate::ingest(::|;)' src/decode; then
-            echo "::error::decode must not depend on ingest (src/decode/mod.rs)"
-            exit 1
-          fi

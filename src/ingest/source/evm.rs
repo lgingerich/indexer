@@ -54,10 +54,9 @@ use serde::Deserialize;
 use tracing::warn;
 
 use super::retry::RetryLayer;
-use super::{BlockMeta, BlockSource, FetchedBlock, HeadStream, METHOD_NOT_FOUND, SourceError};
-use crate::sink::Datasets;
+use super::{BlockSource, Datasets, FetchedBlock, HeadStream, METHOD_NOT_FOUND, SourceError};
 use crate::wire::datasets::evm::{Block, Log, Transaction};
-use crate::wire::envelope::{ChainId, Event};
+use crate::wire::envelope::{BlockMeta, ChainId, Event};
 
 /// The most calls one JSON-RPC batch carries.
 ///
@@ -316,7 +315,7 @@ pub struct RpcBatch {
 /// Turns a parsed batch into ordered dataset events and its metadata.
 ///
 /// Projects every row in the batch, whatever a deployment would have selected: the
-/// caller filters with [`Datasets::keeps`](crate::sink::Datasets::keeps) if it wants
+/// caller filters with [`Datasets::keeps`] if it wants
 /// less. Order is the block row, then each transaction followed by its logs, all in
 /// index order, so a consumer sees every transaction before its logs. A body is only
 /// required for the rows that read one, so a logs-only block with no fetched block
@@ -1027,8 +1026,9 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::{EvmSource, RpcBatch, decode_block, http_client, ws_connect};
-    use crate::ingest::source::{BlockMeta, BlockSource, SourceError};
-    use crate::sink::Datasets;
+    use crate::ingest::source::Datasets;
+    use crate::ingest::source::{BlockSource, SourceError};
+    use crate::wire::envelope::BlockMeta;
     use crate::wire::envelope::Event;
 
     /// A source over real HTTP and WebSocket endpoints, as a deployment builds one.

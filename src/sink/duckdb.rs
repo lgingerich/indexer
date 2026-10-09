@@ -20,7 +20,7 @@ use duckdb::{Connection, appender_params_from_iter, params_from_iter};
 use serde::Deserialize;
 use tracing::info;
 
-use crate::config::Secret;
+use crate::secret::Secret;
 use crate::sink::sql::{Dialect, ident};
 use crate::sink::store::{Engine, EngineError, Operation, SqlStore, StoreError};
 use crate::sink::table::{ColumnType, Row, Schema, TableDef, Value};
@@ -330,7 +330,7 @@ mod tests {
 
     use crate::sink::EnvelopeSink as _;
     use crate::wire::envelope::{
-        AcceptedBlock, Block, ChainId, Contract, Envelope, Event, Log, Reorg, Transaction,
+        Block, BlockMeta, ChainId, Contract, Envelope, Event, Log, Reorg, Transaction,
     };
     use std::sync::Arc;
 
@@ -455,7 +455,7 @@ mod tests {
             ),
             Envelope::new(
                 chain(),
-                Event::AcceptedBlock(AcceptedBlock {
+                Event::AcceptedBlock(BlockMeta {
                     height: 100,
                     hash: hash(0x01),
                     parent_hash: hash(0x02),
@@ -920,8 +920,8 @@ mod tests {
         }
     }
 
-    fn accepted(height: u64) -> AcceptedBlock {
-        AcceptedBlock {
+    fn accepted(height: u64) -> BlockMeta {
+        BlockMeta {
             height,
             hash: hash(u8::try_from(height).expect("small heights")),
             parent_hash: hash(u8::try_from(height - 1).expect("small heights")),

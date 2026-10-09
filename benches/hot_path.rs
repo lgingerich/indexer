@@ -129,7 +129,7 @@ fn synthetic_batch(tx_count: usize, logs_per_tx: usize) -> RpcBatch {
         .parse()
         .expect("block hash fixture");
     RpcBatch {
-        meta: indexer::ingest::source::BlockMeta {
+        meta: indexer::wire::envelope::BlockMeta {
             height: 18_000_000,
             hash: block_hash,
             parent_hash,

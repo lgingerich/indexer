@@ -15,7 +15,7 @@
 //!
 //! # Resume
 //!
-//! Every block's batch ends with an [`AcceptedBlock`] marker, so a store commits a
+//! Every block's batch ends with an [`Event::AcceptedBlock`] marker, so a store commits a
 //! block's identity in the same transaction as its rows — empty blocks included, and
 //! whatever datasets are selected. Sink flushing is acceptance, not durability, so a
 //! restart does not trust a previous process's memory: it reads the newest window of
@@ -36,9 +36,9 @@
 //! that block, the walk stops there, retracts everything above it, and adopts the new
 //! branch from the start height, as the first block itself was adopted.
 
-use crate::ingest::source::{BlockMeta, BlockSource, FetchedBlock, SourceError};
+use crate::ingest::source::{BlockSource, FetchedBlock, SourceError};
 use crate::sink::{EnvelopeSink, SinkError};
-use crate::wire::envelope::{AcceptedBlock, Envelope, Event, Reorg};
+use crate::wire::envelope::{BlockMeta, Envelope, Event, Reorg};
 use alloy_primitives::B256;
 use futures_util::StreamExt as _;
 use std::collections::VecDeque;
@@ -484,7 +484,7 @@ impl<S: BlockSource, K: EnvelopeSink> Machine<S, K> {
 
     /// Delivers a block's events, then records its identity.
     ///
-    /// The batch ends with the block's [`AcceptedBlock`] marker, so a store commits the
+    /// The batch ends with the block's [`Event::AcceptedBlock`] marker, so a store commits the
     /// identity a restart resumes from in the same transaction as the block's rows, and
     /// an empty block still reaches the store. The order is the whole point: a delivery
     /// that fails leaves the identity unrecorded, so the accepted history never claims a
@@ -494,7 +494,7 @@ impl<S: BlockSource, K: EnvelopeSink> Machine<S, K> {
         meta: BlockMeta,
         mut events: Vec<Event>,
     ) -> Result<(), PipelineError> {
-        events.push(Event::AcceptedBlock(AcceptedBlock::from(meta)));
+        events.push(Event::AcceptedBlock(meta));
         self.deliver(events).await?;
         self.ring.push(meta);
         Ok(())
@@ -1533,10 +1533,7 @@ mod tests {
         let mut machine = Machine::new(Source::linear(3), Sink::default(), Vec::new());
         let meta = machine.source.head_meta();
         machine.commit(meta, Vec::new()).await.expect("commit");
-        assert_eq!(
-            machine.sink.events,
-            [Event::AcceptedBlock(AcceptedBlock::from(meta))]
-        );
+        assert_eq!(machine.sink.events, [Event::AcceptedBlock(meta)]);
         assert_eq!(machine.sink.flushes, 1, "the empty block is its own batch");
         assert_eq!(machine.tip(), Some(meta));
     }

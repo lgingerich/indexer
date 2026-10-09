@@ -52,7 +52,7 @@ impl<K: EnvelopeSink> DecodingSink<K> {
                 Ok(events)
             }
             Ok(None) => Ok(Vec::new()),
-            Err(error @ DecodeError::Shape) => Err(SinkError::Decode(error)),
+            Err(error @ DecodeError::Shape) => Err(SinkError::Decode(Box::new(error))),
             Err(error) => {
                 warn!(%chain, address = %log.address,
                     block = log.block_number, block_hash = %log.block_hash,
