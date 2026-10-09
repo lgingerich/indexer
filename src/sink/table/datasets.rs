@@ -232,7 +232,7 @@ fn accepted_blocks() -> Result<Dataset<BlockMeta>, TableError> {
 }
 
 /// Every dataset table, declared once per run.
-pub(super) struct Datasets {
+pub(super) struct DatasetTables {
     blocks: Dataset<Block>,
     transactions: Dataset<Transaction>,
     logs: Dataset<Log>,
@@ -242,13 +242,13 @@ pub(super) struct Datasets {
     accepted_blocks: Dataset<BlockMeta>,
 }
 
-impl std::fmt::Debug for Datasets {
+impl std::fmt::Debug for DatasetTables {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Datasets").finish_non_exhaustive()
+        f.debug_struct("DatasetTables").finish_non_exhaustive()
     }
 }
 
-impl Datasets {
+impl DatasetTables {
     /// Declares every dataset table.
     pub(super) fn new() -> Result<Self, TableError> {
         Ok(Self {

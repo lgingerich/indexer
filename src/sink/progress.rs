@@ -61,7 +61,7 @@ impl Progress {
 
     /// Logs a catch-up summary still held when storage stops.
     pub(crate) fn finish(&mut self, head: Option<u64>, now: Instant) {
-        if let Some(line) = self.window.take(head, true, now) {
+        if let Some(line) = self.window.take(head, now) {
             line.log();
         }
     }
@@ -204,7 +204,7 @@ impl Window {
     ) -> [Option<ProgressLine>; 2] {
         let near = head.is_some_and(|head| head.saturating_sub(commit.to) <= NEAR_HEAD_BLOCKS);
         if near {
-            let summary = self.take(head, true, now);
+            let summary = self.take(head, now);
             self.last_emit = Some(now);
             return [summary, Some(ProgressLine::commit(commit, head))];
         }
@@ -213,7 +213,7 @@ impl Window {
             .last_emit
             .is_none_or(|then| now.saturating_duration_since(then) >= SUMMARY_EVERY);
         if due {
-            [self.take(head, true, now), None]
+            [self.take(head, now), None]
         } else {
             [None, None]
         }
@@ -233,13 +233,14 @@ impl Window {
         self.elapsed_ms = self.elapsed_ms.saturating_add(commit.elapsed_ms);
     }
 
-    fn take(&mut self, head: Option<u64>, summary: bool, now: Instant) -> Option<ProgressLine> {
+    /// Empties the window into a catch-up summary line, or `None` when it holds nothing.
+    fn take(&mut self, head: Option<u64>, now: Instant) -> Option<ProgressLine> {
         if self.blocks == 0 {
             return None;
         }
         let chain = self.chain.take()?;
         let line = ProgressLine {
-            summary,
+            summary: true,
             chain,
             from: self.from,
             to: self.to,

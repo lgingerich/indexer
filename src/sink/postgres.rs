@@ -210,6 +210,8 @@ fn params(values: &[Value]) -> Vec<&(dyn ToSql + Sync)> {
 }
 
 impl Engine for Postgres {
+    type Dialect = Self;
+
     async fn execute(&mut self, sql: &str, values: &[Value]) -> Result<(), EngineError> {
         if values.is_empty() {
             self.client.batch_execute(sql).await?;

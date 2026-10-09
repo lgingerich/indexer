@@ -732,7 +732,7 @@ or re-indexed with `DROP SCHEMA base CASCADE`. Every row still carries its `chai
 column, so rows unioned across chains stay self-describing. DuckDB does the same within
 its file.
 
-The sink creates the same tables as DuckDB: the eight dataset tables, and the
+The sink creates the same tables as DuckDB: the seven dataset tables, and the
 [event tables](#protocol-manifests). Columns the chain always
 provides are `NOT NULL`; fields it can omit stay nullable. Each table's primary key is
 `(chain, dedupe_key)`, and every table but `reorgs` is indexed on its block hash for

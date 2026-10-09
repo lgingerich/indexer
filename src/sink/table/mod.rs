@@ -486,7 +486,7 @@ impl Row {
 #[derive(Debug, Clone)]
 pub struct Schema {
     /// The dataset tables and how each reads its record.
-    datasets: Arc<datasets::Datasets>,
+    datasets: Arc<datasets::DatasetTables>,
     tables: Vec<Arc<TableDef>>,
     /// Each event table's position in `tables`, by the record's protocol, contract, and
     /// event definition.
@@ -500,7 +500,7 @@ impl Schema {
     ///
     /// Returns a [`TableError`] when a dataset table's declaration is inconsistent.
     pub fn new() -> Result<Self, TableError> {
-        let datasets = datasets::Datasets::new()?;
+        let datasets = datasets::DatasetTables::new()?;
         Ok(Self {
             tables: Table::ALL
                 .iter()

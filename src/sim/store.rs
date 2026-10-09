@@ -9,9 +9,8 @@
 use std::sync::Arc;
 
 use super::chain::{Shared, lock};
-use crate::sink::sql::Dialect;
 use crate::sink::store::{Engine, EngineError};
-use crate::sink::table::{ColumnType, Row, TableDef, Value};
+use crate::sink::table::{Row, TableDef, Value};
 
 /// An engine that fails as the world's fault profile says.
 #[derive(Debug)]
@@ -89,6 +88,8 @@ async fn after(world: &Shared, crash_after: bool, committed: bool) -> Result<(),
 }
 
 impl<E: Engine> Engine for FaultyEngine<E> {
+    type Dialect = E::Dialect;
+
     async fn execute(&mut self, sql: &str, params: &[Value]) -> Result<(), EngineError> {
         let crash_after = before(&self.world).await?;
         let result = self.inner.execute(sql, params).await;
@@ -113,34 +114,5 @@ impl<E: Engine> Engine for FaultyEngine<E> {
         let result = self.inner.load(table, staging, rows).await;
         after(&self.world, crash_after, false).await?;
         result
-    }
-}
-
-impl<E: Dialect> Dialect for FaultyEngine<E> {
-    const INDEXES: bool = E::INDEXES;
-    const DESCRIBE: &'static str = E::DESCRIBE;
-
-    fn type_name(kind: ColumnType) -> String {
-        E::type_name(kind)
-    }
-
-    fn use_schema(schema: &str) -> String {
-        E::use_schema(schema)
-    }
-
-    fn create_staging(table: &TableDef, staging: &str) -> String {
-        E::create_staging(table, staging)
-    }
-
-    fn staging(staging: &str) -> String {
-        E::staging(staging)
-    }
-
-    fn drop_staging(staging: &str) -> Option<String> {
-        E::drop_staging(staging)
-    }
-
-    fn reported_type(kind: ColumnType) -> String {
-        E::reported_type(kind)
     }
 }

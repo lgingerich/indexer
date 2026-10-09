@@ -183,6 +183,8 @@ impl Dialect for DuckDb {
 }
 
 impl Engine for DuckDb {
+    type Dialect = Self;
+
     async fn execute(&mut self, sql: &str, values: &[Value]) -> Result<(), EngineError> {
         if values.is_empty() {
             self.connection.execute_batch(sql)?;

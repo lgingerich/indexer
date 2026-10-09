@@ -105,7 +105,7 @@ pub struct IngestSettings {
     pub http_url: Secret,
     /// The WebSocket endpoint used for heads. Required; a [`Secret`], like `http_url`.
     pub ws_url: Secret,
-    /// Which datasets to fetch and store. Omitted means all four.
+    /// Which datasets to fetch and store. Omitted means all three.
     #[serde(default)]
     pub datasets: crate::ingest::source::Datasets,
     /// The first height to index on an empty store. Omitted starts at the observed head,

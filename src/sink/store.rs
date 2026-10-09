@@ -29,7 +29,10 @@ use crate::wire::envelope::{BlockMeta, ChainId, Envelope, Event, StoredContract}
 pub type EngineError = Box<dyn std::error::Error + Send + Sync>;
 
 /// What runs a [`SqlStore`]'s statements.
-pub trait Engine: Dialect + Send {
+pub trait Engine: Send {
+    /// The SQL this engine speaks. A wrapper around another engine names the inner one's.
+    type Dialect: Dialect;
+
     /// Runs one statement. With no parameters it may run as plain SQL, for statements an
     /// engine will not prepare, such as `BEGIN`.
     fn execute(
@@ -241,7 +244,7 @@ impl<E: Engine> SqlStore<E> {
     ) -> Result<Self, StoreError> {
         for statement in [
             sql::create_schema(database_schema),
-            E::use_schema(database_schema),
+            E::Dialect::use_schema(database_schema),
         ] {
             engine
                 .execute(&statement, &[])
@@ -253,8 +256,8 @@ impl<E: Engine> SqlStore<E> {
             .await
             .map_err(StoreError::engine(Operation::Begin, None))?;
         for def in schema.tables() {
-            for statement in
-                std::iter::once(sql::create_table::<E>(def)).chain(sql::create_indexes::<E>(def))
+            for statement in std::iter::once(sql::create_table::<E::Dialect>(def))
+                .chain(sql::create_indexes::<E::Dialect>(def))
             {
                 engine
                     .execute(&statement, &[])
@@ -275,7 +278,7 @@ impl<E: Engine> SqlStore<E> {
                 .tables()
                 .iter()
                 .enumerate()
-                .map(|(position, def)| Prepared::new::<E>(position, def))
+                .map(|(position, def)| Prepared::new::<E::Dialect>(position, def))
                 .collect(),
             reads: Reads::new(&schema)?,
             batch: Batch::new(schema),
@@ -454,7 +457,7 @@ impl<E: Engine> EnvelopeSink for SqlStore<E> {
 /// first write.
 async fn check<E: Engine>(engine: &mut E, table: &TableDef) -> Result<(), StoreError> {
     let rows = engine
-        .query(E::DESCRIBE, &[Value::Text(table.name.clone())])
+        .query(E::Dialect::DESCRIBE, &[Value::Text(table.name.clone())])
         .await
         .map_err(StoreError::engine(Operation::Read, Some(&table.name)))?;
     let mut stored = Vec::with_capacity(rows.len());
@@ -469,7 +472,7 @@ async fn check<E: Engine>(engine: &mut E, table: &TableDef) -> Result<(), StoreE
         difference,
     };
     for column in &table.columns {
-        let expected = E::reported_type(column.kind);
+        let expected = E::Dialect::reported_type(column.kind);
         match stored.iter().find(|(name, _)| *name == column.name) {
             None => return Err(drift(format!("it has no {} column", column.name))),
             Some((_, found)) if !found.eq_ignore_ascii_case(&expected) => {
