@@ -890,6 +890,9 @@ cargo doc --no-deps --all-features
 cargo nextest run --all-targets --all-features
 ```
 
+The default nextest profile skips the deterministic simulation (`src/sim/`); run it with
+`--ignore-default-filter`.
+
 ## Compatibility policy
 
 The published shape is versioned by `wire::envelope::SCHEMA_VERSION`, stamped on

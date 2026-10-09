@@ -5,5 +5,8 @@
 # is a `harness = false` benchmark whose `main` runs a ~40-second measurement, so
 # without this filter `--all-targets` appears to hang. `cargo bench` is unaffected
 # and still runs it.
+#
+# The deterministic simulation (`sim::simulate`) is skipped too; run it on purpose with
+# `--ignore-default-filter`.
 [profile.default]
-default-filter = "not binary(hot_path)"
+default-filter = "not binary(hot_path) and not test(sim::simulate)"

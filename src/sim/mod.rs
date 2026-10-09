@@ -20,7 +20,8 @@
 //!
 //! `SIM_SEED=n` replays one seed; `SIM_SEEDS=n` runs seeds `0..n` (default 4; a long run
 //! is faster with `--release`). `SIM_TRACE` prints each seed's trace, and a run with
-//! `--no-capture` prints which scenarios the seeds reached.
+//! `--no-capture` prints which scenarios the seeds reached. The default
+//! nextest profile skips it, so a run needs `--ignore-default-filter`.
 
 mod chain;
 mod node;

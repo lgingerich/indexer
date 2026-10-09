@@ -59,6 +59,10 @@ cargo doc --no-deps --all-features
 cargo nextest run --all-targets --all-features
 ```
 
+Never run the deterministic simulation (`sim::simulate`, `SIM_SEED`/`SIM_SEEDS`, or
+`--ignore-default-filter`) unless the user asks for it. The default nextest profile
+skips it.
+
 ## Communication
 
 - Never open with filler phrases like "Great question", "Of course", or "Certainly". Start with the answer or action.

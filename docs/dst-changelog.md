@@ -4,7 +4,7 @@ Bugs found by the deterministic simulation (`src/sim/`), newest first. One row p
 the linked PR carries the cause, the fix, and how it was verified.
 
 Replay a seed on the commit it was found on (later changes reshuffle seeds) with
-`SIM_SEED=<n> SIM_TRACE=1 cargo nextest run --all-features simulate --no-capture`.
+`SIM_SEED=<n> SIM_TRACE=1 cargo nextest run --ignore-default-filter --all-features simulate --no-capture`.
 
 | ID | Found | Seeds | Bug | Impact | Fix |
 | --- | --- | --- | --- | --- | --- |
