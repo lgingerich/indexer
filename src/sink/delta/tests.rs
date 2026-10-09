@@ -19,7 +19,7 @@ use deltalake::{DeltaTable, ensure_table_uri};
 
 use super::{DeltaSettings, DeltaSink, in_texts, texts, texts_of};
 use crate::sink::table::{Schema, Table, TableId};
-use crate::sink::{EnvelopeSink, StoreError, fixtures};
+use crate::sink::{EnvelopeSink, Store as _, StoreError, fixtures};
 use crate::wire::envelope::{Block, BlockMeta, ChainId, Envelope, Event, Log, Reorg, Transaction};
 
 const CHAIN: &str = "base";
@@ -38,11 +38,12 @@ impl Dir {
         Self(path)
     }
 
-    /// Settings that commit on every flush, unless `interval` says otherwise.
-    fn settings(&self, interval: u64) -> DeltaSettings {
+    /// Settings for a lake in this directory. The sink commits on every flush; how
+    /// often that is, the drain decides.
+    fn settings(&self) -> DeltaSettings {
         DeltaSettings {
             uri: self.0.display().to_string(),
-            commit_interval_secs: interval,
+            commit_interval_secs: 30,
             max_buffer_bytes: usize::MAX,
             storage: std::collections::BTreeMap::new(),
         }
@@ -60,9 +61,9 @@ impl Drop for Dir {
     }
 }
 
-async fn open(dir: &Dir, interval: u64) -> DeltaSink {
+async fn open(dir: &Dir) -> DeltaSink {
     DeltaSink::open(
-        &dir.settings(interval),
+        &dir.settings(),
         Arc::new(Schema::new().expect("the dataset tables")),
         CHAIN,
     )
@@ -125,10 +126,21 @@ fn block(height: u64, branch: u8) -> Vec<Envelope> {
         .collect()
 }
 
-async fn publish(sink: &mut DeltaSink, envelopes: Vec<Envelope>) {
+/// The ledger a restart resumes from, as the lake restores it.
+async fn ledger(sink: &mut DeltaSink) -> Vec<BlockMeta> {
+    sink.restore().await.expect("the lake restores").ledger
+}
+
+/// Hands `envelopes` to the lake without committing them.
+async fn buffer(sink: &mut DeltaSink, envelopes: Vec<Envelope>) {
     for envelope in envelopes {
         sink.publish(envelope).await.expect("accepted");
     }
+}
+
+/// Hands `envelopes` to the lake and commits them.
+async fn publish(sink: &mut DeltaSink, envelopes: Vec<Envelope>) {
+    buffer(sink, envelopes).await;
     sink.flush().await.expect("flushed");
 }
 
@@ -171,18 +183,20 @@ fn expected(blocks: &[(u64, u8)]) -> BTreeSet<String> {
 #[tokio::test]
 async fn committed_blocks_survive_a_reopen() {
     let dir = Dir::new();
-    let mut sink = open(&dir, 0).await;
+    let mut sink = open(&dir).await;
     for height in 1..=12 {
         publish(&mut sink, block(height, 0)).await;
     }
-    sink.close().await.expect("closes");
     drop(sink);
 
-    let mut sink = open(&dir, 0).await;
-    let ledger = sink.ledger(5);
+    let mut sink = open(&dir).await;
     assert_eq!(
-        ledger.iter().map(|block| block.height).collect::<Vec<_>>(),
-        [8, 9, 10, 11, 12]
+        ledger(&mut sink)
+            .await
+            .iter()
+            .map(|block| block.height)
+            .collect::<Vec<_>>(),
+        (1..=12).collect::<Vec<_>>()
     );
     let heights: Vec<(u64, u8)> = (1..=12).map(|height| (height, 0)).collect();
     assert_eq!(blocks(&sink).await, expected(&heights));
@@ -201,11 +215,11 @@ async fn committed_blocks_survive_a_reopen() {
 #[tokio::test]
 async fn a_reorg_of_buffered_blocks_never_reaches_the_lake() {
     let dir = Dir::new();
-    let mut sink = open(&dir, 3600).await;
+    let mut sink = open(&dir).await;
     for height in 1..=3 {
-        publish(&mut sink, block(height, 0)).await;
+        buffer(&mut sink, block(height, 0)).await;
     }
-    publish(
+    buffer(
         &mut sink,
         vec![Envelope::new(
             ChainId::new(CHAIN),
@@ -218,7 +232,6 @@ async fn a_reorg_of_buffered_blocks_never_reaches_the_lake() {
     )
     .await;
     publish(&mut sink, block(3, 1)).await;
-    sink.close().await.expect("closes");
 
     assert_eq!(blocks(&sink).await, expected(&[(1, 0), (2, 0), (3, 1)]));
     assert_eq!(stored(&sink, Table::Reorg, "new_head_hash").await.len(), 1);
@@ -229,7 +242,7 @@ async fn a_reorg_of_buffered_blocks_never_reaches_the_lake() {
 #[tokio::test]
 async fn a_reorg_of_committed_blocks_deletes_them_everywhere() {
     let dir = Dir::new();
-    let mut sink = open(&dir, 0).await;
+    let mut sink = open(&dir).await;
     for height in 1..=12 {
         publish(&mut sink, block(height, 0)).await;
     }
@@ -246,8 +259,8 @@ async fn a_reorg_of_committed_blocks_deletes_them_everywhere() {
     assert_eq!(blocks(&sink).await, expected(&canonical));
     drop(sink);
 
-    let mut sink = open(&dir, 0).await;
-    let ledger = sink.ledger(usize::MAX);
+    let mut sink = open(&dir).await;
+    let ledger = ledger(&mut sink).await;
     assert_eq!(ledger.last().map(|block| block.hash), Some(hash(12, 1)));
     assert_eq!(blocks(&sink).await, expected(&canonical));
     assert_eq!(retractions(&sink).await, expected(&[(12, 1)]));
@@ -288,14 +301,14 @@ async fn append_only(sink: &mut DeltaSink, envelope: &Envelope) {
 #[tokio::test]
 async fn opening_deletes_a_retraction_the_ledger_never_saw() {
     let dir = Dir::new();
-    let mut sink = open(&dir, 0).await;
+    let mut sink = open(&dir).await;
     for height in 1..=3 {
         publish(&mut sink, block(height, 0)).await;
     }
     append_only(&mut sink, &reorg(3..=3, 1)).await;
     drop(sink);
 
-    let mut sink = open(&dir, 0).await;
+    let mut sink = open(&dir).await;
     assert!(retractions(&sink).await.is_empty());
     assert_eq!(blocks(&sink).await, expected(&[(1, 0), (2, 0), (3, 0)]));
 
@@ -304,7 +317,7 @@ async fn opening_deletes_a_retraction_the_ledger_never_saw() {
     publish(&mut sink, replacement).await;
     drop(sink);
 
-    let sink = open(&dir, 0).await;
+    let sink = open(&dir).await;
     assert_eq!(retractions(&sink).await, expected(&[(3, 1)]));
     assert_eq!(blocks(&sink).await, expected(&[(1, 0), (2, 0), (3, 1)]));
 }
@@ -315,21 +328,21 @@ async fn opening_deletes_a_retraction_the_ledger_never_saw() {
 #[tokio::test]
 async fn a_retraction_out_of_the_ledger_keeps_its_record() {
     let dir = Dir::new();
-    let mut sink = open(&dir, 0).await;
+    let mut sink = open(&dir).await;
     for height in 1..=3 {
         publish(&mut sink, block(height, 0)).await;
     }
     append_only(&mut sink, &reorg(3..=3, 1)).await;
-    let ledger = sink.positions[&TableId::Dataset(Table::AcceptedBlock)];
-    sink.delete(ledger, in_texts("hash", &[hex(hash(3, 0))]))
+    let position = sink.positions[&TableId::Dataset(Table::AcceptedBlock)];
+    sink.delete(position, in_texts("hash", &[hex(hash(3, 0))]))
         .await
         .expect("deleted");
     drop(sink);
 
-    let mut sink = open(&dir, 0).await;
+    let mut sink = open(&dir).await;
     assert_eq!(retractions(&sink).await, expected(&[(3, 1)]));
     assert_eq!(blocks(&sink).await, expected(&[(1, 0), (2, 0)]));
-    assert_eq!(sink.ledger(usize::MAX).len(), 2);
+    assert_eq!(ledger(&mut sink).await.len(), 2);
 }
 
 /// A commit that stopped after writing rows but before their ledger entry leaves rows the
@@ -338,7 +351,7 @@ async fn a_retraction_out_of_the_ledger_keeps_its_record() {
 #[tokio::test]
 async fn opening_repairs_rows_a_stopped_commit_left_behind() {
     let dir = Dir::new();
-    let mut sink = open(&dir, 0).await;
+    let mut sink = open(&dir).await;
     for height in 1..=3 {
         publish(&mut sink, block(height, 0)).await;
     }
@@ -361,9 +374,9 @@ async fn opening_repairs_rows_a_stopped_commit_left_behind() {
     }
     drop(sink);
 
-    let mut sink = open(&dir, 0).await;
+    let mut sink = open(&dir).await;
     assert_eq!(blocks(&sink).await, expected(&[(1, 0), (2, 0), (3, 0)]));
-    assert_eq!(sink.ledger(usize::MAX).len(), 3);
+    assert_eq!(ledger(&mut sink).await.len(), 3);
 }
 
 /// With no ledger at all, no block row counts: the first commit stopped before its
@@ -371,7 +384,7 @@ async fn opening_repairs_rows_a_stopped_commit_left_behind() {
 #[tokio::test]
 async fn opening_with_no_ledger_keeps_no_block_rows() {
     let dir = Dir::new();
-    let mut sink = open(&dir, 0).await;
+    let mut sink = open(&dir).await;
     let schema = Schema::new().expect("the dataset tables");
     let chain = ChainId::new(CHAIN);
     let position = sink.positions[&TableId::Dataset(Table::Block)];
@@ -381,26 +394,27 @@ async fn opening_with_no_ledger_keeps_no_block_rows() {
     sink.append(position, &[&row]).await.expect("appended");
     drop(sink);
 
-    let mut sink = open(&dir, 0).await;
+    let mut sink = open(&dir).await;
     assert!(stored(&sink, Table::Block, "hash").await.is_empty());
-    assert!(sink.ledger(usize::MAX).is_empty());
+    assert!(ledger(&mut sink).await.is_empty());
 }
 
-/// A buffer past its byte limit commits at the next flush, long before its interval; one
-/// under it waits for the interval, or for the close.
+/// The lake reports what it buffers, so the drain can commit by size: it grows with
+/// every block, shrinks when a reorg drops buffered blocks, and is empty after a commit.
 #[tokio::test]
-async fn a_full_buffer_commits_before_its_interval() {
+async fn the_lake_reports_what_it_buffers() {
     let dir = Dir::new();
-    let mut sink = open(&dir, 3600).await;
-    publish(&mut sink, block(1, 0)).await;
-    assert!(
-        blocks(&sink).await.is_empty(),
-        "under the limit, nothing commits"
-    );
-
-    sink.max_buffer_bytes = 1;
-    publish(&mut sink, block(2, 0)).await;
-    assert_eq!(blocks(&sink).await, expected(&[(1, 0), (2, 0)]));
+    let mut sink = open(&dir).await;
+    assert_eq!(sink.buffered_bytes(), 0);
+    buffer(&mut sink, block(1, 0)).await;
+    let one = sink.buffered_bytes();
+    assert!(one > 0);
+    buffer(&mut sink, block(2, 0)).await;
+    assert!(sink.buffered_bytes() > one);
+    buffer(&mut sink, vec![reorg(2..=2, 1)]).await;
+    assert!(sink.buffered_bytes() < 2 * one);
+    sink.flush().await.expect("commits");
+    assert_eq!(sink.buffered_bytes(), 0);
 }
 
 /// A reorg that orphans committed blocks and buffered ones at once deletes the first and
@@ -408,25 +422,23 @@ async fn a_full_buffer_commits_before_its_interval() {
 #[tokio::test]
 async fn a_reorg_across_committed_and_buffered_blocks_keeps_only_its_replacements() {
     let dir = Dir::new();
-    let mut sink = open(&dir, 3600).await;
+    let mut sink = open(&dir).await;
     for height in 1..=3 {
         publish(&mut sink, block(height, 0)).await;
     }
-    sink.close().await.expect("commits");
     for height in 4..=5 {
-        publish(&mut sink, block(height, 0)).await;
+        buffer(&mut sink, block(height, 0)).await;
     }
     let mut replacements = vec![reorg(3..=5, 1)];
     for height in 3..=5 {
         replacements.extend(block(height, 1));
     }
     publish(&mut sink, replacements).await;
-    sink.close().await.expect("commits");
 
     let canonical = [(1, 0), (2, 0), (3, 1), (4, 1), (5, 1)];
     assert_eq!(blocks(&sink).await, expected(&canonical));
     drop(sink);
-    let sink = open(&dir, 0).await;
+    let sink = open(&dir).await;
     assert_eq!(blocks(&sink).await, expected(&canonical));
 }
 
@@ -435,11 +447,10 @@ async fn a_reorg_across_committed_and_buffered_blocks_keeps_only_its_replacement
 #[tokio::test]
 async fn a_block_orphaned_and_canonical_again_in_one_buffer_is_stored() {
     let dir = Dir::new();
-    let mut sink = open(&dir, 3600).await;
+    let mut sink = open(&dir).await;
     for height in 1..=3 {
         publish(&mut sink, block(height, 0)).await;
     }
-    sink.close().await.expect("commits");
     let mut flips = vec![reorg(3..=3, 1)];
     flips.extend(block(3, 1));
     flips.push(Envelope::new(
@@ -452,7 +463,6 @@ async fn a_block_orphaned_and_canonical_again_in_one_buffer_is_stored() {
     ));
     flips.extend(block(3, 0));
     publish(&mut sink, flips).await;
-    sink.close().await.expect("commits");
 
     assert_eq!(blocks(&sink).await, expected(&[(1, 0), (2, 0), (3, 0)]));
     assert!(sink.committed.contains_key(&hex(hash(3, 0))));
@@ -463,7 +473,7 @@ async fn a_block_orphaned_and_canonical_again_in_one_buffer_is_stored() {
 #[tokio::test]
 async fn opening_finishes_a_retraction_stopped_between_tables() {
     let dir = Dir::new();
-    let mut sink = open(&dir, 0).await;
+    let mut sink = open(&dir).await;
     for height in 1..=3 {
         publish(&mut sink, block(height, 0)).await;
     }
@@ -476,7 +486,7 @@ async fn opening_finishes_a_retraction_stopped_between_tables() {
     }
     drop(sink);
 
-    let sink = open(&dir, 0).await;
+    let sink = open(&dir).await;
     assert_eq!(retractions(&sink).await, expected(&[(3, 1)]));
     assert_eq!(blocks(&sink).await, expected(&[(1, 0), (2, 0)]));
 }
@@ -486,15 +496,16 @@ async fn opening_finishes_a_retraction_stopped_between_tables() {
 #[tokio::test]
 async fn the_ledger_is_read_from_its_newest_partitions() {
     let dir = Dir::new();
-    let mut sink = open(&dir, 0).await;
+    let mut sink = open(&dir).await;
     for height in [1, 199_999, 200_000, 200_001] {
         publish(&mut sink, block(height, 0)).await;
     }
     drop(sink);
 
-    let mut sink = open(&dir, 0).await;
+    let mut sink = open(&dir).await;
     assert_eq!(
-        sink.ledger(usize::MAX)
+        ledger(&mut sink)
+            .await
             .iter()
             .map(|block| block.height)
             .collect::<Vec<_>>(),
@@ -509,7 +520,7 @@ async fn the_ledger_is_read_from_its_newest_partitions() {
 async fn a_decoded_record_fills_its_event_table_with_typed_lists() {
     let dir = Dir::new();
     let schema = fixtures::schema();
-    let mut sink = DeltaSink::open(&dir.settings(0), Arc::clone(&schema), CHAIN)
+    let mut sink = DeltaSink::open(&dir.settings(), Arc::clone(&schema), CHAIN)
         .await
         .expect("the lake opens with the event tables");
     let created = fixtures::decoded_pool_created();
@@ -583,7 +594,7 @@ async fn opening_over_a_different_table_is_drift() {
         .await
         .expect("a stranger's table");
 
-    let error = DeltaSink::open(&dir.settings(0), Arc::new(schema), CHAIN)
+    let error = DeltaSink::open(&dir.settings(), Arc::new(schema), CHAIN)
         .await
         .expect_err("drift stops the open");
     assert!(

@@ -30,6 +30,7 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use tokio::sync::mpsc;
 use tokio::time::Instant;
@@ -44,6 +45,37 @@ use crate::wire::envelope::Envelope;
 /// buffer only delays the moment the lag is felt, and everything in it is lost on a
 /// crash. Not a setting; if a deployment needs more headroom the store is too slow.
 const CAPACITY: usize = 32;
+
+/// When the drain flushes: how many blocks it gathers into one commit.
+///
+/// A flush happens once the blocks gathered reach [`records`](Self::records) envelopes or
+/// the store [reports](EnvelopeSink::buffered_bytes) [`bytes`](Self::bytes) buffered,
+/// once the oldest of them has waited [`wait`](Self::wait), or when the channel closes.
+/// A block is never split, so a flush may pass either limit by one block.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Batching {
+    /// The most envelopes one flush gathers.
+    pub(crate) records: usize,
+    /// The most bytes the store may hold unflushed, as it reports them.
+    pub(crate) bytes: usize,
+    /// The longest a gathered block waits for its flush, counted from when it arrived.
+    /// Zero flushes as soon as what is already waiting is gathered.
+    pub(crate) wait: Duration,
+}
+
+impl Batching {
+    /// Flushes as soon as the blocks already waiting are gathered, up to `records`
+    /// envelopes: one block per flush at the tip, the backlog in larger ones behind it.
+    /// What the SQL stores commit by.
+    #[cfg(any(feature = "duckdb", feature = "postgres", test))]
+    pub(crate) const fn eager(records: usize) -> Self {
+        Self {
+            records,
+            bytes: usize::MAX,
+            wait: Duration::ZERO,
+        }
+    }
+}
 
 /// The sending half: buffers a block's envelopes and sends them on flush.
 #[derive(Debug)]
@@ -120,11 +152,12 @@ impl ChannelReceiver {
     /// Drains blocks into `sink` until the sending half is dropped, returning how many
     /// envelopes it stored.
     ///
-    /// Each pass takes one block, then whatever else is already waiting, up to
-    /// `max_records` envelopes, and flushes once. Caught up, that is one block per flush;
-    /// behind, the backlog goes in fewer, larger commits, which is how a store recovers
-    /// from a stall. A block is never split across flushes, so a commit boundary is
-    /// always a block boundary.
+    /// Blocks are gathered into one flush as [`Batching`] says. Each block arrives whole
+    /// and is published at once, then whatever else is already waiting joins it while
+    /// the flush is under its limits. Waiting for the next block is bounded by the
+    /// oldest gathered block's deadline, so a stalled chain still flushes on time; with
+    /// nothing gathered, it waits for as long as the chain does. When the sending half is
+    /// dropped, whatever is gathered is flushed before the drain ends.
     ///
     /// A successful flush is reported by the progress log: one line per commit near the
     /// sampled head, and one line per second while catching up.
@@ -136,32 +169,43 @@ impl ChannelReceiver {
     pub(crate) async fn drain<K: EnvelopeSink>(
         mut self,
         sink: &mut K,
-        max_records: usize,
+        batching: Batching,
     ) -> Result<u64, SinkError> {
         let mut stored = 0_u64;
-        while let Some(first) = self.receiver.recv().await {
-            let mut pending = first.len();
-            for envelope in first {
-                self.progress.note(&envelope);
-                sink.publish(envelope).await?;
-            }
-            while pending < max_records {
+        let mut pending = 0_usize;
+        // When the oldest gathered block must be flushed; `None` with nothing gathered.
+        let mut deadline: Option<Instant> = None;
+        loop {
+            let next = match deadline {
+                None => self.receiver.recv().await,
+                Some(at) => {
+                    if let Ok(next) = tokio::time::timeout_at(at, self.receiver.recv()).await {
+                        next
+                    } else {
+                        stored += self.flush(sink, &mut pending).await?;
+                        deadline = None;
+                        continue;
+                    }
+                }
+            };
+            let Some(block) = next else {
+                break;
+            };
+            let due = *deadline.get_or_insert_with(|| Instant::now() + batching.wait);
+            self.publish(sink, block, &mut pending).await?;
+            while !full(sink, pending, batching) {
                 let Ok(block) = self.receiver.try_recv() else {
                     break;
                 };
-                pending += block.len();
-                for envelope in block {
-                    self.progress.note(&envelope);
-                    sink.publish(envelope).await?;
-                }
+                self.publish(sink, block, &mut pending).await?;
             }
-            let started = Instant::now();
-            sink.flush().await?;
-            let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
-            let head = progress::sampled_head(self.head.load(Ordering::Acquire));
-            self.progress
-                .committed(pending as u64, elapsed_ms, head, Instant::now());
-            stored += pending as u64;
+            if full(sink, pending, batching) || Instant::now() >= due {
+                stored += self.flush(sink, &mut pending).await?;
+                deadline = None;
+            }
+        }
+        if pending > 0 {
+            stored += self.flush(sink, &mut pending).await?;
         }
         self.progress.finish(
             progress::sampled_head(self.head.load(Ordering::Acquire)),
@@ -169,6 +213,42 @@ impl ChannelReceiver {
         );
         Ok(stored)
     }
+
+    async fn publish<K: EnvelopeSink>(
+        &mut self,
+        sink: &mut K,
+        block: Vec<Envelope>,
+        pending: &mut usize,
+    ) -> Result<(), SinkError> {
+        *pending += block.len();
+        for envelope in block {
+            self.progress.note(&envelope);
+            sink.publish(envelope).await?;
+        }
+        Ok(())
+    }
+
+    /// Flushes what is gathered and reports the commit, returning how many envelopes it
+    /// held.
+    async fn flush<K: EnvelopeSink>(
+        &mut self,
+        sink: &mut K,
+        pending: &mut usize,
+    ) -> Result<u64, SinkError> {
+        let started = Instant::now();
+        sink.flush().await?;
+        let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        let head = progress::sampled_head(self.head.load(Ordering::Acquire));
+        let records = std::mem::take(pending) as u64;
+        self.progress
+            .committed(records, elapsed_ms, head, Instant::now());
+        Ok(records)
+    }
+}
+
+/// Whether what is gathered has reached a limit of `batching`.
+fn full<K: EnvelopeSink>(sink: &K, pending: usize, batching: Batching) -> bool {
+    pending >= batching.records || sink.buffered_bytes() >= batching.bytes
 }
 
 #[cfg(test)]
@@ -184,7 +264,7 @@ mod tests {
     use crate::sink::{EnvelopeSink, SinkError};
     use crate::wire::envelope::{Block, ChainId, Envelope, Event};
 
-    use super::ChannelSink;
+    use super::{Batching, ChannelSink};
 
     /// A block at `height`, which stands in for a block's worth of envelopes. The
     /// channel carries no field of its own, so a test needs a value to tell one
@@ -222,6 +302,11 @@ mod tests {
             self.flushed.push(std::mem::take(&mut self.open));
             Ok(())
         }
+
+        /// Ten bytes an envelope, so a test can state a byte limit in envelopes.
+        fn buffered_bytes(&self) -> usize {
+            self.open.len() * 10
+        }
     }
 
     /// The keys [`envelope`] produces for these heights, so a test states what it
@@ -253,7 +338,7 @@ mod tests {
             tokio::time::timeout(Duration::from_millis(50), async {
                 let mut store = Batches::default();
                 // Sender still alive and nothing flushed, so this waits.
-                receiver.drain(&mut store, 100).await
+                receiver.drain(&mut store, Batching::eager(100)).await
             })
             .await
             .is_err(),
@@ -264,7 +349,10 @@ mod tests {
         send_block(&mut sink, 0..3).await;
         drop(sink);
         let mut store = Batches::default();
-        let stored = receiver.drain(&mut store, 100).await.expect("drain");
+        let stored = receiver
+            .drain(&mut store, Batching::eager(100))
+            .await
+            .expect("drain");
         assert_eq!(stored, 3);
         assert_eq!(store.flushed, [keys(0..3)]);
     }
@@ -282,9 +370,61 @@ mod tests {
         // Bound of 4: the first block (3) is under it, so the second joins (6); the
         // third would start past the bound and gets its own flush.
         let mut store = Batches::default();
-        let stored = receiver.drain(&mut store, 4).await.expect("drain");
+        let stored = receiver
+            .drain(&mut store, Batching::eager(4))
+            .await
+            .expect("drain");
         assert_eq!(stored, 9);
         assert_eq!(store.flushed, [keys(0..6), keys(6..9)]);
+    }
+
+    /// With a wait, blocks are gathered until the oldest has waited that long, even when
+    /// no block follows to notice it: a stalled chain still flushes on time. What is
+    /// gathered when the channel closes is flushed too.
+    #[tokio::test(start_paused = true)]
+    async fn a_gathered_block_is_flushed_by_its_deadline_in_a_stall() {
+        let (mut sink, receiver) = ChannelSink::new();
+        let batching = Batching {
+            records: usize::MAX,
+            bytes: usize::MAX,
+            wait: Duration::from_secs(30),
+        };
+        let storage = tokio::spawn(async move {
+            let mut store = Batches::default();
+            receiver.drain(&mut store, batching).await.expect("drain");
+            store.flushed
+        });
+        send_block(&mut sink, 0..1).await;
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        send_block(&mut sink, 1..2).await;
+        // The chain stalls past the first block's deadline.
+        tokio::time::sleep(Duration::from_mins(1)).await;
+        send_block(&mut sink, 2..3).await;
+        drop(sink);
+
+        let flushed = storage.await.expect("storage ends");
+        assert_eq!(flushed, [keys(0..2), keys(2..3)]);
+    }
+
+    /// Past the store's byte limit, what is gathered flushes at once, long before its
+    /// wait; a block is never split to stay under it.
+    #[tokio::test]
+    async fn a_store_past_its_byte_limit_flushes_early() {
+        let (mut sink, receiver) = ChannelSink::new();
+        for height in 0..4 {
+            send_block(&mut sink, height..height + 1).await;
+        }
+        drop(sink);
+
+        // Ten bytes an envelope: the third crosses 25.
+        let batching = Batching {
+            records: usize::MAX,
+            bytes: 25,
+            wait: Duration::from_hours(1),
+        };
+        let mut store = Batches::default();
+        receiver.drain(&mut store, batching).await.expect("drain");
+        assert_eq!(store.flushed, [keys(0..3), keys(3..4)]);
     }
 
     /// The channel is bounded, so a stalled store is felt as a waiting sender rather
@@ -339,7 +479,7 @@ mod tests {
         let (mut sink, receiver) = ChannelSink::new();
         send_block(&mut sink, 0..1).await;
         let error = receiver
-            .drain(&mut OutOfSpace, 100)
+            .drain(&mut OutOfSpace, Batching::eager(100))
             .await
             .expect_err("the sink failed");
         assert!(

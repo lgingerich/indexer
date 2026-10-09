@@ -70,14 +70,17 @@ pub use store_error::{InvalidStoredValue, Operation, StoreError};
 use thiserror::Error;
 
 use crate::wire::envelope::Envelope;
+#[cfg(feature = "store")]
+use crate::wire::envelope::{BlockMeta, StoredContract};
 
 /// Receives envelopes in per-chain order, as the pipeline publishes them.
 ///
 /// The driver holds the sink through an exclusive borrow, so it may buffer across calls
 /// — a rendered row, an open appender, a block awaiting its send — instead of paying the
 /// engine's per-record cost. [`flush`](EnvelopeSink::flush) is the batch boundary; the
-/// ingest pipeline calls it once per block, so everything published between two flushes
-/// is one block's worth. A slow sink applies backpressure to whatever drives it.
+/// ingest pipeline calls it once per block, and the storage drain once per batch of
+/// whole blocks it gathers for a store. A slow sink applies backpressure to whatever
+/// drives it.
 pub trait EnvelopeSink: Send {
     /// Accepts one envelope.
     ///
@@ -103,6 +106,14 @@ pub trait EnvelopeSink: Send {
         async { Ok(()) }
     }
 
+    /// Roughly how many bytes the sink holds that the next flush would write, as they
+    /// sit in memory. The storage drain flushes early once this passes its limit.
+    ///
+    /// The default is zero: a sink that does not count is bounded by records alone.
+    fn buffered_bytes(&self) -> usize {
+        0
+    }
+
     /// Records the newest sampled canonical head, so a commit can report its lag.
     ///
     /// The default ignores it. The storage channel keeps the latest sample for its
@@ -110,6 +121,32 @@ pub trait EnvelopeSink: Send {
     fn observe_head(&mut self, height: u64) {
         let _ = height;
     }
+}
+
+/// What a previous run left in a store for the next one: the contracts it discovered,
+/// and the accepted blocks ingest resumes from.
+#[cfg(feature = "store")]
+#[derive(Debug, Default)]
+pub struct Restored {
+    /// Every contract discovered on the store's chain, each from a canonical block.
+    pub contracts: Vec<StoredContract>,
+    /// The newest [`LEDGER_WINDOW`](crate::ingest::pipeline::LEDGER_WINDOW) accepted
+    /// blocks, oldest first: the undo window a restart resumes from.
+    pub ledger: Vec<BlockMeta>,
+}
+
+/// A sink that persists, for one chain: what the storage task writes, and what a restart
+/// reads back before it ingests.
+#[cfg(feature = "store")]
+pub trait Store: EnvelopeSink + 'static {
+    /// Reads back what a previous run left, once, at startup and before the first
+    /// envelope is published.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::Engine`] when a read fails and [`StoreError::Restore`] when
+    /// a stored value does not parse.
+    fn restore(&mut self) -> impl Future<Output = Result<Restored, StoreError>> + Send;
 }
 
 /// Why a sink could not accept, render, or deliver an envelope.

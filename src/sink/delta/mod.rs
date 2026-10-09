@@ -10,11 +10,13 @@
 //!
 //! # Writing at the tip
 //!
-//! Blocks are written as they are accepted, not held back until they are final. Rows are
-//! buffered and committed every [`commit_interval_secs`](DeltaSettings::commit_interval_secs),
-//! or sooner once [`max_buffer_bytes`](DeltaSettings::max_buffer_bytes) are buffered, so
-//! a commit holds many blocks. Each commit writes one file per table and partition it
-//! touches, so the buffer sets the file size; nothing compacts them afterwards.
+//! Blocks are written as they are accepted, not held back until they are final. The
+//! storage drain gathers them into one flush, and so one commit, until the oldest has
+//! waited [`commit_interval_secs`](DeltaSettings::commit_interval_secs) or
+//! [`max_buffer_bytes`](DeltaSettings::max_buffer_bytes) are buffered, so a commit
+//! holds many blocks. Each commit writes one
+//! file per table and partition it touches, so the buffer sets the file size; nothing
+//! compacts them afterwards.
 //!
 //! A `reorg` drops the orphaned blocks still in the buffer, which most are, since a reorg
 //! is a few blocks deep and a commit holds tens of seconds of them. Orphaned blocks
@@ -80,9 +82,10 @@ use tracing::{info, warn};
 use crate::ingest::pipeline::LEDGER_WINDOW;
 use crate::secret::Secret;
 use crate::sink::batch::Batch;
+use crate::sink::channel::Batching;
 use crate::sink::store_error::{EngineError, InvalidStoredValue, Operation, StoreError};
 use crate::sink::table::{Row, Schema, Table, TableDef, TableError, TableId};
-use crate::sink::{EnvelopeSink, SinkError};
+use crate::sink::{EnvelopeSink, Restored, SinkError, Store};
 use crate::wire::envelope::{BlockMeta, ChainId, Envelope, StoredContract};
 
 use self::arrow::{PARTITION, UINT_PRECISION};
@@ -119,7 +122,8 @@ pub struct DeltaSettings {
     /// right by default.
     #[serde(deserialize_with = "crate::config::non_empty")]
     pub uri: String,
-    /// The longest rows wait in the buffer before a commit, in seconds. Defaults to 30.
+    /// The longest a block waits in the buffer before a commit, in seconds, counted from
+    /// when it arrived; a stalled chain still commits on time. Defaults to 30.
     ///
     /// At the tip this sets the file size: shorter puts rows in the lake sooner and makes
     /// more, smaller files.
@@ -138,6 +142,19 @@ pub struct DeltaSettings {
     /// Credentials may also come from the standard `AWS_*` environment variables.
     #[serde(default)]
     pub storage: BTreeMap<String, Secret>,
+}
+
+impl DeltaSettings {
+    /// When the storage drain commits: once the oldest buffered block has waited
+    /// [`commit_interval_secs`](Self::commit_interval_secs), or once
+    /// [`max_buffer_bytes`](Self::max_buffer_bytes) are buffered, whichever is first.
+    pub(crate) fn batching(&self) -> Batching {
+        Batching {
+            records: usize::MAX,
+            bytes: self.max_buffer_bytes,
+            wait: Duration::from_secs(self.commit_interval_secs),
+        }
+    }
 }
 
 const fn default_commit_interval_secs() -> u64 {
@@ -214,11 +231,6 @@ pub struct DeltaSink {
     batch: Batch,
     /// The committed blocks a reorg could still orphan, by hash, with their heights.
     committed: HashMap<String, u64>,
-    /// The ledger as opening the store read it, oldest first, until ingest takes it.
-    restored: Vec<BlockMeta>,
-    last_commit: Instant,
-    commit_interval: Duration,
-    max_buffer_bytes: usize,
     writer: WriterProperties,
 }
 
@@ -268,10 +280,6 @@ impl DeltaSink {
             batch: Batch::new(Arc::clone(&schema)),
             schema,
             committed: HashMap::new(),
-            restored: Vec::new(),
-            last_commit: Instant::now(),
-            commit_interval: Duration::from_secs(settings.commit_interval_secs),
-            max_buffer_bytes: settings.max_buffer_bytes,
             writer: WriterProperties::builder()
                 .set_compression(Compression::ZSTD(ZstdLevel::default()))
                 .build(),
@@ -283,19 +291,13 @@ impl DeltaSink {
             .map(|block| (hex(&block.hash), block.height))
             .collect();
         info!(%chain, uri = root, tables = sink.lakes.len(), tip = ?sink.tip(), "delta lake opened");
-        sink.restored = ledger;
         Ok(sink)
     }
 
     /// The contracts discovered on this chain that the lake holds, every one canonical:
     /// one created in an orphaned block was deleted with it, and one the ledger does not
     /// name was deleted when the store opened.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`StoreError::Engine`] when the read fails and [`StoreError::Restore`]
-    /// when a stored value does not parse.
-    pub async fn contracts(&self) -> Result<Vec<StoredContract>, StoreError> {
+    async fn contracts(&self) -> Result<Vec<StoredContract>, StoreError> {
         let batches = self
             .lake(Table::Contract)
             .read(|frame| {
@@ -321,25 +323,6 @@ impl DeltaSink {
             }
         }
         Ok(contracts)
-    }
-
-    /// The newest `limit` accepted blocks, oldest first: the undo window ingest resumes
-    /// from, as read when the store opened.
-    pub fn ledger(&mut self, limit: usize) -> Vec<BlockMeta> {
-        let mut ledger = std::mem::take(&mut self.restored);
-        let skip = ledger.len().saturating_sub(limit);
-        ledger.drain(..skip);
-        ledger
-    }
-
-    /// Commits whatever is still buffered. Called once storage has drained, so a clean
-    /// stop leaves nothing to fetch again.
-    ///
-    /// # Errors
-    ///
-    /// As [`EnvelopeSink::flush`].
-    pub async fn close(&mut self) -> Result<(), StoreError> {
-        self.commit().await
     }
 
     fn lake(&self, table: Table) -> &Lake {
@@ -584,7 +567,6 @@ impl DeltaSink {
         let first = accepted.iter().filter_map(|row| row.block_number()).min();
         let orphaned = orphans.map(|(_, hashes)| hashes).unwrap_or_default();
         self.advance(&orphaned, &accepted);
-        self.last_commit = Instant::now();
         info!(
             chain = %self.chain,
             rows,
@@ -647,12 +629,16 @@ impl DeltaSink {
     fn position(&self, table: Table) -> usize {
         self.positions[&TableId::Dataset(table)]
     }
+}
 
-    /// Whether the batch is due: old enough, or large enough.
-    fn due(&self) -> bool {
-        !self.batch.is_empty()
-            && (self.batch.bytes() >= self.max_buffer_bytes
-                || self.last_commit.elapsed() >= self.commit_interval)
+/// Opening the lake already repaired it, so a restore only reads back: the ledger as the
+/// repair left it, and the contracts it kept.
+impl Store for DeltaSink {
+    async fn restore(&mut self) -> Result<Restored, StoreError> {
+        Ok(Restored {
+            contracts: self.contracts().await?,
+            ledger: self.read_ledger().await?,
+        })
     }
 }
 
@@ -664,13 +650,15 @@ impl EnvelopeSink for DeltaSink {
         self.batch.push(&envelope)
     }
 
-    /// Commits when the batch is due. Accepting a block is not making it durable: a
-    /// block buffered when the process stops is fetched again from the ledger's tip.
+    /// Commits the batch. The drain decides how many blocks it holds; a block still
+    /// buffered when the process stops is fetched again from the ledger's tip.
     async fn flush(&mut self) -> Result<(), SinkError> {
-        if self.due() {
-            self.commit().await?;
-        }
+        self.commit().await?;
         Ok(())
+    }
+
+    fn buffered_bytes(&self) -> usize {
+        self.batch.bytes()
     }
 }
 

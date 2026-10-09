@@ -16,11 +16,12 @@
 
 use std::sync::Arc;
 
+use crate::ingest::pipeline::LEDGER_WINDOW;
 use crate::sink::batch::Batch;
 use crate::sink::sql::{self, Dialect};
 use crate::sink::store_error::{EngineError, InvalidStoredValue, Operation, StoreError};
 use crate::sink::table::{Row, Schema, Table, TableDef, TableError, Value};
-use crate::sink::{EnvelopeSink, SinkError};
+use crate::sink::{EnvelopeSink, Restored, SinkError, Store};
 use crate::wire::envelope::{BlockMeta, ChainId, Envelope, StoredContract};
 
 /// What runs a [`SqlStore`]'s statements.
@@ -114,18 +115,21 @@ impl Reads {
 #[derive(Debug)]
 pub struct SqlStore<E> {
     pub(crate) engine: E,
+    /// The chain a [`restore`](Store::restore) reads back.
+    chain: ChainId,
     batch: Batch,
     tables: Vec<Prepared>,
     reads: Reads,
 }
 
 impl<E: Engine> SqlStore<E> {
-    /// Creates every table in `schema`, with its indexes, in the database schema
-    /// `database_schema`, which becomes the session's default.
+    /// Creates every table in `schema`, with its indexes, in the database schema named
+    /// for `chain`, which becomes the session's default.
     ///
-    /// A run names that schema for its chain — `base.logs` — so chains sharing a
-    /// database keep their tables apart. Existing tables are reused, not migrated, and
-    /// checked against their definitions.
+    /// Each chain's tables live in its own schema — `base.logs` — so chains sharing a
+    /// database keep their tables apart, and a [`restore`](Store::restore) reads back
+    /// `chain`'s rows. Existing tables are reused, not migrated, and checked against
+    /// their definitions.
     ///
     /// # Errors
     ///
@@ -135,16 +139,13 @@ impl<E: Engine> SqlStore<E> {
     pub(crate) async fn new(
         mut engine: E,
         schema: Arc<Schema>,
-        database_schema: &str,
+        chain: &str,
     ) -> Result<Self, StoreError> {
-        for statement in [
-            sql::create_schema(database_schema),
-            E::Dialect::use_schema(database_schema),
-        ] {
+        for statement in [sql::create_schema(chain), E::Dialect::use_schema(chain)] {
             engine
                 .execute(&statement, &[])
                 .await
-                .map_err(StoreError::engine(Operation::Create, Some(database_schema)))?;
+                .map_err(StoreError::engine(Operation::Create, Some(chain)))?;
         }
         engine
             .execute("BEGIN", &[])
@@ -169,6 +170,7 @@ impl<E: Engine> SqlStore<E> {
         }
         Ok(Self {
             engine,
+            chain: ChainId::new(chain),
             tables: schema
                 .tables()
                 .iter()
@@ -183,14 +185,17 @@ impl<E: Engine> SqlStore<E> {
     /// The contracts discovered on `chain` that this store holds. One created in a block a
     /// `reorg` orphaned was deleted with that block, so every row here is canonical.
     ///
-    /// Read once at startup, before the first write, so a restart decodes every contract
-    /// a previous run discovered.
+    /// Read by [`restore`](Store::restore), so a restart decodes every contract a
+    /// previous run discovered.
     ///
     /// # Errors
     ///
     /// Returns [`StoreError::Engine`] when the query fails and [`StoreError::Restore`]
     /// when a stored value does not parse.
-    pub async fn contracts(&mut self, chain: &ChainId) -> Result<Vec<StoredContract>, StoreError> {
+    pub(crate) async fn contracts(
+        &mut self,
+        chain: &ChainId,
+    ) -> Result<Vec<StoredContract>, StoreError> {
         let rows = self
             .engine
             .query(&self.reads.contracts, &[chain_param(chain)])
@@ -212,8 +217,8 @@ impl<E: Engine> SqlStore<E> {
     /// older row. An orphaned block's row was deleted by its `reorg`, so these are
     /// canonical.
     ///
-    /// Read once at startup, before the first write: the result is the undo window a
-    /// restart resumes from. Rows below the oldest one returned can never be read again,
+    /// Read by [`restore`](Store::restore), before the first write: the result is the
+    /// undo window a restart resumes from. Rows below the oldest one returned can never be read again,
     /// so they are deleted here, which is what keeps the ledger from growing without
     /// bound across restarts. Contiguity is not checked; the pipeline does that.
     ///
@@ -221,7 +226,7 @@ impl<E: Engine> SqlStore<E> {
     ///
     /// Returns [`StoreError::Engine`] when the query or the delete fails and
     /// [`StoreError::Restore`] when a stored value does not parse.
-    pub async fn ledger(
+    pub(crate) async fn ledger(
         &mut self,
         chain: &ChainId,
         limit: usize,
@@ -333,6 +338,16 @@ impl<E: Engine> SqlStore<E> {
             }
         }
         Ok(())
+    }
+}
+
+impl<E: Engine + 'static> Store for SqlStore<E> {
+    async fn restore(&mut self) -> Result<Restored, StoreError> {
+        let chain = self.chain.clone();
+        Ok(Restored {
+            contracts: self.contracts(&chain).await?,
+            ledger: self.ledger(&chain, LEDGER_WINDOW).await?,
+        })
     }
 }
 

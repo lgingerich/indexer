@@ -50,8 +50,6 @@ use tracing::{info, warn};
 
 use crate::config::{Settings, SettingsError, Sink};
 use crate::decode::{Catalog, CatalogError, Decoder, DecodingSink};
-#[cfg(feature = "store")]
-use crate::ingest::pipeline::LEDGER_WINDOW;
 use crate::ingest::pipeline::{Machine, PipelineError};
 use crate::ingest::source::evm::{http_client, ws_connect};
 use crate::ingest::source::{BlockSource, EvmSource, SourceError};
@@ -61,10 +59,10 @@ use crate::sink;
 use crate::sink::DeltaSink;
 #[cfg(feature = "duckdb")]
 use crate::sink::DuckDbSink;
+#[cfg(feature = "store")]
+use crate::sink::channel::Batching;
 use crate::sink::table::Schema;
 use crate::sink::{SinkError, StdoutJsonSink};
-#[cfg(any(feature = "duckdb", feature = "postgres"))]
-use crate::sink::{SqlStore, store::Engine};
 use crate::wire::envelope::ChainId;
 #[cfg(feature = "store")]
 use crate::wire::envelope::{BlockMeta, StoredContract};
@@ -209,7 +207,7 @@ impl<B: BlockSource> Pipeline<B> {
                     &settings.ingest.chain,
                 )
                 .await?;
-                Box::pin(self.run_with_store(store, postgres.batch_records)).await
+                Box::pin(self.run_with_store(store, Batching::eager(postgres.batch_records))).await
             }
             #[cfg(feature = "duckdb")]
             Sink::DuckDb(duckdb) => {
@@ -218,31 +216,29 @@ impl<B: BlockSource> Pipeline<B> {
                 let store =
                     DuckDbSink::open(duckdb, Arc::clone(&self.schema), &settings.ingest.chain)
                         .await?;
-                Box::pin(self.run_with_store(store, duckdb.batch_records)).await
+                Box::pin(self.run_with_store(store, Batching::eager(duckdb.batch_records))).await
             }
             #[cfg(feature = "delta")]
             Sink::Delta(delta) => {
                 let store =
                     DeltaSink::open(delta, Arc::clone(&self.schema), &settings.ingest.chain)
                         .await?;
-                // The lake commits on its own interval, not per flush, so the drain may
-                // fold any backlog into one pass; the bound only caps a pass's memory.
-                Box::pin(self.run_with_store(store, LAKE_BATCH_RECORDS)).await
+                Box::pin(self.run_with_store(store, delta.batching())).await
             }
         }
     }
 
     /// Runs against an open `store`: restores what it holds, then ingests into it,
-    /// committing at most `batch_records` records per flush.
+    /// committing as `batching` says.
     ///
     /// # Errors
     ///
     /// As [`Pipeline::run`], less opening the store.
     #[cfg(feature = "store")]
-    pub(crate) async fn run_with_store<S: Store>(
+    pub(crate) async fn run_with_store<S: sink::Store>(
         self,
         mut store: S,
-        batch_records: usize,
+        batching: Batching,
     ) -> Result<(), RuntimeError> {
         let Self {
             source,
@@ -251,19 +247,16 @@ impl<B: BlockSource> Pipeline<B> {
             ..
         } = self;
         let chain = source.chain().clone();
-        let decoder = restore(decoder, &chain, store.contracts(&chain).await?);
-        let ledger = ledger(&chain, store.ledger(&chain, LEDGER_WINDOW).await?);
+        let restored = store.restore().await?;
+        let decoder = restore(decoder, &chain, restored.contracts);
+        let ledger = ledger(&chain, restored.ledger);
 
         let (blocks, receiver) = sink::channel::ChannelSink::new();
         // `ponytail:` the store's writes block, so this holds one runtime worker for the
         // length of each flush. Fine on the multi-threaded runtime the binary uses; a
         // dedicated blocking thread is the upgrade if the store gets slow enough to
         // starve other tasks.
-        let storage = tokio::spawn(async move {
-            let stored = receiver.drain(&mut store, batch_records).await?;
-            store.close().await?;
-            Ok(stored)
-        });
+        let storage = tokio::spawn(async move { receiver.drain(&mut store, batching).await });
 
         let ingest = Machine::new(source, DecodingSink::new(decoder, blocks), ledger)
             .run(start_block)
@@ -274,70 +267,6 @@ impl<B: BlockSource> Pipeline<B> {
         finish(storage.await, ingest)
     }
 }
-
-/// What [`Pipeline::run_with_store`] needs of a store beyond accepting envelopes: what a
-/// previous run left in it, and a last chance to make buffered rows durable.
-#[cfg(feature = "store")]
-pub(crate) trait Store: sink::EnvelopeSink + Send + 'static {
-    /// The contracts a previous run discovered on `chain`.
-    fn contracts(
-        &mut self,
-        chain: &ChainId,
-    ) -> impl Future<Output = Result<Vec<StoredContract>, RuntimeError>> + Send;
-
-    /// The newest `limit` accepted blocks on `chain`, oldest first.
-    fn ledger(
-        &mut self,
-        chain: &ChainId,
-        limit: usize,
-    ) -> impl Future<Output = Result<Vec<BlockMeta>, RuntimeError>> + Send;
-
-    /// Makes whatever is still buffered durable, once storage has drained. A store that
-    /// commits every flush has nothing left.
-    fn close(&mut self) -> impl Future<Output = Result<(), SinkError>> + Send {
-        async { Ok(()) }
-    }
-}
-
-#[cfg(any(feature = "duckdb", feature = "postgres"))]
-impl<E: Engine + 'static> Store for SqlStore<E> {
-    async fn contracts(&mut self, chain: &ChainId) -> Result<Vec<StoredContract>, RuntimeError> {
-        Ok(Self::contracts(self, chain).await?)
-    }
-
-    async fn ledger(
-        &mut self,
-        chain: &ChainId,
-        limit: usize,
-    ) -> Result<Vec<BlockMeta>, RuntimeError> {
-        Ok(Self::ledger(self, chain, limit).await?)
-    }
-}
-
-/// A Delta Lake table is one chain's, so the chain is already chosen at open.
-#[cfg(feature = "delta")]
-impl Store for DeltaSink {
-    async fn contracts(&mut self, _chain: &ChainId) -> Result<Vec<StoredContract>, RuntimeError> {
-        Ok(Self::contracts(self).await?)
-    }
-
-    async fn ledger(
-        &mut self,
-        _chain: &ChainId,
-        limit: usize,
-    ) -> Result<Vec<BlockMeta>, RuntimeError> {
-        Ok(Self::ledger(self, limit))
-    }
-
-    async fn close(&mut self) -> Result<(), SinkError> {
-        Ok(Self::close(self).await?)
-    }
-}
-
-/// The most envelopes one drain pass hands the lake before flushing. A flush only
-/// commits once the lake's own interval or size is reached.
-#[cfg(feature = "delta")]
-const LAKE_BATCH_RECORDS: usize = 10_000;
 
 /// Adds the contracts a previous run discovered, as the store read them back.
 #[cfg(feature = "store")]
@@ -417,11 +346,11 @@ mod tests {
     use crate::ingest::pipeline::{Machine, PipelineError};
     use crate::ingest::source::{BlockSource, FetchedBlock, HeadStream, SourceError};
     use crate::sink::table::Schema;
-    use crate::sink::{self, DuckDbSink, EnvelopeSink as _, SinkError};
+    use crate::sink::{self, DuckDbSink, EnvelopeSink as _, SinkError, Store as _};
     use crate::sink::{Operation, StoreError};
     use crate::wire::envelope::{BlockMeta, ChainId, Envelope, Event, Log, Reorg, StoredContract};
 
-    use super::{LEDGER_WINDOW, Pipeline, RuntimeError, finish, ledger};
+    use super::{Pipeline, RuntimeError, finish, ledger};
 
     /// The shipped protocols, as an absolute path so [`Settings::from_str`] carries no
     /// directory to resolve it against.
@@ -557,7 +486,11 @@ ws_url = "wss://example.invalid"
             .await
             .expect("create tables");
         let (blocks, receiver) = sink::channel::ChannelSink::new();
-        let storage = tokio::spawn(async move { receiver.drain(&mut store, 500).await });
+        let storage = tokio::spawn(async move {
+            receiver
+                .drain(&mut store, sink::channel::Batching::eager(500))
+                .await
+        });
 
         let mut decoding = DecodingSink::new(decoder(), blocks);
         decoding
@@ -728,7 +661,7 @@ ws_url = "wss://example.invalid"
         let catalog =
             Catalog::load(protocols(), &ChainId::new("base")).expect("shipped protocols load");
         let result = Pipeline::new(chain, start, catalog)
-            .run_with_store(store, 500)
+            .run_with_store(store, sink::channel::Batching::eager(500))
             .await;
         assert!(
             matches!(
@@ -816,9 +749,9 @@ ws_url = "wss://example.invalid"
             DuckDbSink::connected(connection.try_clone().expect("handle"), schema(), "base")
                 .await
                 .expect("open");
-        let chain = ChainId::new("base");
-        assert!(store.contracts(&chain).await.expect("contracts").is_empty());
-        let canonical = store.ledger(&chain, LEDGER_WINDOW).await.expect("ledger");
+        let restored = store.restore().await.expect("restore");
+        assert!(restored.contracts.is_empty());
+        let canonical = restored.ledger;
         assert_eq!(
             canonical
                 .iter()
@@ -845,10 +778,7 @@ ws_url = "wss://example.invalid"
                 .await
                 .expect("open");
         let chain = ChainId::new("base");
-        let restored = ledger(
-            &chain,
-            store.ledger(&chain, LEDGER_WINDOW).await.expect("ledger"),
-        );
+        let restored = ledger(&chain, store.restore().await.expect("restore").ledger);
         let machine = Machine::new(FakeChain::new(5, 0xa0), store, restored);
         assert!(matches!(
             machine.run(Some(1)).await,

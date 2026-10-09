@@ -99,7 +99,8 @@ pub struct DuckDb {
 }
 
 impl DuckDbSink {
-    /// Opens the database the settings name and creates the tables in `database_schema`.
+    /// Opens the database the settings name and creates the tables in the database
+    /// schema named for `chain`.
     ///
     /// # Errors
     ///
@@ -108,7 +109,7 @@ impl DuckDbSink {
     pub async fn open(
         settings: &DuckDbSettings,
         schema: Arc<Schema>,
-        database_schema: &str,
+        chain: &str,
     ) -> Result<Self, StoreError> {
         let mut config = duckdb::Config::default();
         for (key, value) in &settings.settings {
@@ -120,11 +121,11 @@ impl DuckDbSink {
         let connection = Connection::open_with_flags(&settings.path, config)
             .map_err(StoreError::engine(Operation::Open, Some(&path)))?;
         info!(store = %path, "storage opened");
-        Self::connected(connection, schema, database_schema).await
+        Self::connected(connection, schema, chain).await
     }
 
     /// Takes an open connection and creates every table in `schema` in the database
-    /// schema `database_schema`.
+    /// schema named for `chain`.
     ///
     /// # Errors
     ///
@@ -132,9 +133,9 @@ impl DuckDbSink {
     pub async fn connected(
         connection: Connection,
         schema: Arc<Schema>,
-        database_schema: &str,
+        chain: &str,
     ) -> Result<Self, StoreError> {
-        SqlStore::new(DuckDb { connection }, schema, database_schema).await
+        SqlStore::new(DuckDb { connection }, schema, chain).await
     }
 }
 
