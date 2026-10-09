@@ -50,8 +50,7 @@ use tracing::{info, warn};
 
 use crate::config::{Settings, SettingsError, Sink};
 use crate::decode::{Catalog, CatalogError, Decoder, DecodingSink};
-use crate::ingest::Ingest;
-use crate::ingest::pipeline::PipelineError;
+use crate::ingest::pipeline::{Machine, PipelineError};
 use crate::ingest::source::evm::{http_client, ws_connect};
 use crate::ingest::source::{BlockSource, EvmSource, SourceError};
 #[cfg(any(feature = "duckdb", feature = "postgres"))]
@@ -123,7 +122,9 @@ pub enum RuntimeError {
 /// chain; a deployment's is the [`EvmSource`] [`Pipeline::from_settings`] builds.
 #[derive(Debug)]
 pub(crate) struct Pipeline<B = EvmSource> {
-    ingest: Ingest<B>,
+    source: B,
+    /// A fresh run's first height; `None` starts at the head.
+    start_block: Option<u64>,
     decoder: Decoder,
     /// Every table a store creates: the dataset tables and each decoded event's.
     schema: Arc<Schema>,
@@ -160,7 +161,8 @@ impl<B: BlockSource> Pipeline<B> {
     /// Assembles a pipeline reading `source` and decoding what `catalog` declares.
     pub(crate) fn new(source: B, start_block: Option<u64>, catalog: Catalog) -> Self {
         Self {
-            ingest: Ingest::new(source, start_block),
+            source,
+            start_block,
             schema: Arc::new(catalog.schema().clone()),
             decoder: Decoder::new(catalog),
         }
@@ -185,16 +187,15 @@ impl<B: BlockSource> Pipeline<B> {
                 // No store, so no tables and nothing to restore: a run starts fresh from the
                 // manifests' seeds.
                 let Self {
-                    ingest,
+                    source,
+                    start_block,
                     decoder,
                     schema,
                 } = self;
                 drop(schema);
-                ingest
-                    .run(
-                        DecodingSink::new(decoder, StdoutJsonSink::new()),
-                        Vec::new(),
-                    )
+                let sink = DecodingSink::new(decoder, StdoutJsonSink::new());
+                Machine::new(source, sink, Vec::new())
+                    .run(start_block)
                     .await?;
                 Ok(())
             }
@@ -233,9 +234,12 @@ impl<B: BlockSource> Pipeline<B> {
         batch_records: usize,
     ) -> Result<(), RuntimeError> {
         let Self {
-            ingest, decoder, ..
+            source,
+            start_block,
+            decoder,
+            ..
         } = self;
-        let chain = ingest.chain().clone();
+        let chain = source.chain().clone();
         let decoder = restore(decoder, &chain, store.contracts(&chain).await?);
         let ledger = ledger(&chain, store.ledger(&chain, LEDGER_WINDOW).await?);
 
@@ -246,7 +250,9 @@ impl<B: BlockSource> Pipeline<B> {
         // starve other tasks.
         let storage = tokio::spawn(async move { receiver.drain(&mut store, batch_records).await });
 
-        let ingest = ingest.run(DecodingSink::new(decoder, blocks), ledger).await;
+        let ingest = Machine::new(source, DecodingSink::new(decoder, blocks), ledger)
+            .run(start_block)
+            .await;
 
         // Ingest's half of the channel is gone by now, so storage drains what is
         // queued and ends. The join order is [`finish`].
@@ -774,7 +780,7 @@ ws_url = "wss://example.invalid"
         );
         let machine = Machine::new(FakeChain::new(5, 0xa0), store, restored);
         assert!(matches!(
-            machine.backfill(1).await.map(drop),
+            machine.run(Some(1)).await,
             Err(PipelineError::StartWithHistory { start: 1, tip: 3 })
         ));
     }
