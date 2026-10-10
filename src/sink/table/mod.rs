@@ -34,12 +34,12 @@ mod datasets;
 mod events;
 
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use alloy_primitives::B256;
 
-use crate::wire::envelope::{ChainId, Event};
+use crate::wire::envelope::{ChainId, Decoded, Event};
 
 pub use cell::{Cell, Timestamp, Value};
 pub use events::snake_case;
@@ -149,6 +149,14 @@ impl Table {
             Self::Reorg => "reorgs",
             Self::AcceptedBlock => "accepted_blocks",
         }
+    }
+
+    /// Whether every store writes this table, whatever it is routed: the ledger a
+    /// restart resumes from, the retractions it applied, and the contracts decode
+    /// restores.
+    #[must_use]
+    pub const fn is_bookkeeping(self) -> bool {
+        matches!(self, Self::Contract | Self::Reorg | Self::AcceptedBlock)
     }
 }
 
@@ -492,15 +500,23 @@ impl Row {
     }
 }
 
-/// Every table a run writes: the dataset tables, then one typed table per decoded event.
+/// The tables a store writes: the dataset tables, then one typed table per decoded event.
+///
+/// A run's schema holds every table. A store that is routed only some of them writes a
+/// [`select`](Self::select)ion of it, which still knows every event's table — a decoded
+/// record names its event whether or not the store writes it — but creates, checks, and
+/// fills only its own.
 #[derive(Debug, Clone)]
 pub struct Schema {
     /// The dataset tables and how each reads its record.
     datasets: Arc<datasets::DatasetTables>,
+    /// The tables written, dataset tables first.
     tables: Vec<Arc<TableDef>>,
-    /// Each event table's position in `tables`, by the record's protocol, contract, and
-    /// event definition.
-    events: HashMap<(String, String, B256), usize>,
+    /// The ids of `tables`.
+    written: HashSet<TableId>,
+    /// Every event's table, written or not, by the record's protocol, contract, and event
+    /// definition.
+    events: HashMap<(String, String, B256), Arc<TableDef>>,
 }
 
 impl Schema {
@@ -516,15 +532,53 @@ impl Schema {
                 .iter()
                 .map(|&table| Arc::clone(datasets.def(table)))
                 .collect(),
+            written: Table::ALL.iter().map(|&table| table.into()).collect(),
             datasets: Arc::new(datasets),
             events: HashMap::new(),
         })
     }
 
-    /// Every table, dataset tables first.
+    /// The tables `keep` names, and the bookkeeping tables, which every store writes.
+    #[must_use]
+    pub fn select(&self, keep: &HashSet<TableId>) -> Self {
+        let kept = |id: &TableId| {
+            keep.contains(id) || matches!(id, TableId::Dataset(table) if table.is_bookkeeping())
+        };
+        let tables: Vec<Arc<TableDef>> = self
+            .tables
+            .iter()
+            .filter(|def| kept(&def.id))
+            .cloned()
+            .collect();
+        Self {
+            datasets: Arc::clone(&self.datasets),
+            written: tables.iter().map(|def| def.id).collect(),
+            tables,
+            events: self.events.clone(),
+        }
+    }
+
+    /// Every table written, dataset tables first.
     #[must_use]
     pub fn tables(&self) -> &[Arc<TableDef>] {
         &self.tables
+    }
+
+    /// Whether the table `id` is written.
+    #[must_use]
+    pub fn writes(&self, id: TableId) -> bool {
+        self.written.contains(&id)
+    }
+
+    /// The table a decoded record's event has, written or not; `None` when no table
+    /// holds its event, which a record decoded against the same catalog never is.
+    #[must_use]
+    pub fn event_table(&self, decoded: &Decoded) -> Option<&Arc<TableDef>> {
+        self.events.get(&(
+            decoded.protocol.clone(),
+            decoded.contract.clone(),
+            decoded.event_id,
+        ))
     }
 
     /// A dataset table's definition.

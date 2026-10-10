@@ -1,7 +1,6 @@
 # Every setting the indexer accepts, in one file. The uncommented minimum is a
 # runnable deployment; each commented block is an optional feature to switch on.
-# Exactly one `[sink.<backend>]` may be present, so enabling a second sink means
-# commenting the first back out. Every key is documented in `src/config.rs`.
+# Every key is documented in `src/config.rs`.
 #
 # Secrets — the RPC endpoints and the PostgreSQL connection string — are written either
 # as the value or as `{ env = "NAME" }`, naming the environment variable that holds it.
@@ -21,12 +20,6 @@ http_url = "https://base-rpc.publicnode.com"
 ws_url = "wss://base-rpc.publicnode.com"
 # ws_url = { env = "INDEXER_WS_URL" }
 
-# Which datasets to fetch and store: any combination of these three, but not empty.
-# Omitted means all three. Transactions include their receipts, and logs selected
-# with them come from those receipts. Logs without transactions use eth_getLogs,
-# over a range of up to ten heights in backfill; transactions read the block body.
-# datasets = ["blocks", "transactions", "logs"]
-
 # First height to index on an empty store. Omitted starts at the observed head,
 # skipping earlier history; a value indexes that height onward before following live
 # heads. A value above the current head is a startup error rather than a silent clamp.
@@ -34,14 +27,32 @@ ws_url = "wss://base-rpc.publicnode.com"
 # is a startup error, so remove it once the first run has committed.
 # start_block = 12345678
 
-# Where records go. The backend is the table, so exactly one of these may be named.
+# Where records go: any combination of the stores below, at most one of each. Every
+# sink lists the tables it writes, as exact names, `*` globs over names, or
+# `contract_events` for every contract's decoded event table (one per event of every
+# protocol manifest, such as `uniswap_v3_pool_swap`, including protocols added later).
+# The tables are `blocks`, `transactions`, `logs`, `decoded_logs`, and the event
+# tables. Every store also writes `accepted_blocks`, `reorgs`, and `contracts` on its
+# own; they are not listed.
+#
+# What ingest fetches follows from the tables: blocks and transactions when a sink
+# writes them, and logs when a sink writes logs or anything decoded from them. Logs
+# without transactions use eth_getLogs, over a range of up to ten heights in backfill;
+# transactions read the block body and its receipts, and logs come from those.
+#
+# On a restart every store is brought back to the newest block they all hold, and
+# ingest resumes from there. A store added to a running deployment starts where the
+# others resume; earlier blocks are not backfilled into it.
 
 # Print the stream as newline-delimited JSON and keep nothing. Available in every
-# build; takes no settings.
+# build. Runs alone: it cannot be named beside a store. The decoded tables exist only
+# with `[decode] protocols` set, so they are added here once it is.
 [sink.stdout]
+tables = ["blocks", "transactions", "logs"]
 
 # An embedded DuckDB database. Requires the `duckdb` feature.
 # [sink.duckdb]
+# tables = ["blocks", "transactions", "logs", "decoded_logs", "contract_events"]
 # path = "indexer.duckdb"
 # The most records one commit may cover. Blocks are folded into one commit up to
 # this many when storage has fallen behind; a block is never split.
@@ -57,6 +68,7 @@ ws_url = "wss://base-rpc.publicnode.com"
 # string is a secret, since it carries the password: URL or keyword syntax, with TLS
 # following its sslmode.
 # [sink.postgres]
+# tables = ["contract_events"]
 # connection_string = { env = "INDEXER_POSTGRES_URL" }
 # batch_records = 500
 
@@ -65,6 +77,7 @@ ws_url = "wss://base-rpc.publicnode.com"
 # orphaned rows. `uri` is an `s3://` URL (any S3-compatible store) or a local directory.
 # Run one indexer per chain and `uri`: unlike the databases, nothing locks out a second.
 # [sink.delta]
+# tables = ["blocks", "transactions", "logs", "decoded_logs"]
 # uri = "s3://indexer-lake"
 # Rows are committed this often, or sooner once this many bytes are buffered; the two
 # set the lake's file size.

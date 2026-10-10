@@ -15,7 +15,8 @@ use crate::wire::envelope::{Envelope, Event};
 /// blocks a buffered `reorg` retracted.
 ///
 /// A decoded record is two rows: its generic `decoded_logs` row, and its event's typed
-/// row, from the run's [`Schema`].
+/// row, from the store's [`Schema`]. A row of a table the store does not write is not
+/// kept, so a store routed only one of the two keeps only that one.
 ///
 /// A store holds only the canonical chain. A `reorg` orphans blocks that are either
 /// already committed or still in this buffer — blocks are published in order and the
@@ -97,6 +98,9 @@ impl Batch {
     }
 
     fn keep(&mut self, row: Row) {
+        if !self.schema.writes(row.table().id) {
+            return;
+        }
         #[cfg(feature = "delta")]
         {
             self.bytes += row_size(&row);

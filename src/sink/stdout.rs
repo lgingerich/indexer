@@ -9,17 +9,17 @@ use crate::wire::envelope::Envelope;
 use serde::Deserialize;
 use tokio::io::AsyncWriteExt as _;
 
+use crate::sink::route::Tables;
 use crate::sink::{EnvelopeSink, SinkError};
 
-/// `[sink.stdout]` takes no settings, and this is the type that says so.
-///
-/// Empty, so there is nothing an operator can set — but a distinct type rather than
-/// `()`, so serde can answer a stray key with a list of what is valid. Every message
-/// reaches the user through [`SettingsError`](crate::config::SettingsError), so an
-/// unexplained empty list is a real error text, not a debug artifact.
-#[derive(Debug, Default, Deserialize)]
-#[serde(deny_unknown_fields, default)]
-pub struct StdoutSettings {}
+/// `[sink.stdout]`'s settings: only which tables to print, since printing has nothing
+/// else to configure.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StdoutSettings {
+    /// The tables whose envelopes are printed. Required.
+    pub tables: Tables,
+}
 
 /// Writes newline-delimited JSON to standard output.
 ///

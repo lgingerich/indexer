@@ -87,33 +87,26 @@ impl Schema {
         for (column, kind) in TRAILING {
             table = table.column(Column::new(column, kind, false));
         }
-        let table = table.reorg_by("block_hash", "block_number").build()?;
+        let table = Arc::new(table.reorg_by("block_hash", "block_number").build()?);
         self.events.insert(
             (protocol.to_owned(), contract.to_owned(), event_id),
-            self.tables.len(),
+            Arc::clone(&table),
         );
-        self.tables.push(Arc::new(table));
+        self.written.insert(id);
+        self.tables.push(table);
         Ok(())
     }
 
-    /// A decoded record's row in its event's table, or `None` when no table holds its
-    /// event — which a record decoded against the same catalog never is.
+    /// A decoded record's row in its event's table, whether or not that table is
+    /// written, or `None` when no table holds its event — which a record decoded against
+    /// the same catalog never is.
     ///
     /// # Errors
     ///
     /// Returns [`TableError::Width`] when the record's arguments do not fill its table, and
     /// [`TableError::Json`] when an argument's document does not render.
     pub fn event_row(&self, chain: &ChainId, decoded: &Decoded) -> Result<Option<Row>, TableError> {
-        let key = (
-            decoded.protocol.clone(),
-            decoded.contract.clone(),
-            decoded.event_id,
-        );
-        let Some(table) = self
-            .events
-            .get(&key)
-            .and_then(|&index| self.tables.get(index))
-        else {
+        let Some(table) = self.event_table(decoded) else {
             return Ok(None);
         };
         let mut arguments: Vec<&DecodedArg> = decoded.indexed.iter().chain(&decoded.body).collect();

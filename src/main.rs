@@ -100,7 +100,7 @@ ws_url = "wss://example.invalid"
         let shown = RuntimeError::from(error).to_string();
         assert!(shown.contains("settings could not be loaded"), "{shown}");
         assert!(shown.contains("invalid settings"), "{shown}");
-        assert!(shown.contains("unknown variant `nope`"), "{shown}");
+        assert!(shown.contains("unknown field `nope`"), "{shown}");
         assert!(
             !shown.contains("THE DOCUMENT IS NOT THE MESSAGE"),
             "the raw document is not the message: {shown}"

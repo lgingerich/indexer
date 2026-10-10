@@ -22,6 +22,7 @@ use tokio_postgres::binary_copy::BinaryCopyInWriter;
 use tokio_postgres::types::{FromSql, IsNull, Kind, ToSql, Type, to_sql_checked};
 
 use crate::secret::Secret;
+use crate::sink::route::Tables;
 use crate::sink::sql::{self, Dialect, ident};
 use crate::sink::store::{Engine, SqlStore};
 use crate::sink::store_error::{EngineError, Operation, StoreError};
@@ -31,6 +32,8 @@ use crate::sink::table::{ColumnType, Row, Schema, TableDef, Value};
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PostgresSettings {
+    /// The tables this store writes. Required.
+    pub tables: Tables,
     /// `PostgreSQL` URL or keyword connection string. Required; a [`Secret`], since it
     /// carries the password, so a deployment names it as `{ env = "NAME" }`.
     pub connection_string: Secret,
@@ -540,15 +543,16 @@ mod tests {
 
     #[test]
     fn settings_require_a_connection_reject_typos_and_redact_credentials() {
-        let settings: PostgresSettings =
-            toml::from_str("connection_string = 'postgres://user:secret@localhost/indexer'")
-                .expect("settings");
+        let settings: PostgresSettings = toml::from_str(
+            "tables = ['logs']\nconnection_string = 'postgres://user:secret@localhost/indexer'",
+        )
+        .expect("settings");
         assert_eq!(settings.batch_records, 500);
         assert!(!format!("{settings:?}").contains("secret"));
-        assert!(toml::from_str::<PostgresSettings>("").is_err());
+        assert!(toml::from_str::<PostgresSettings>("tables = ['logs']").is_err());
         assert!(
             toml::from_str::<PostgresSettings>(
-                "connection_string = 'host=localhost'\nbatch_record = 1"
+                "tables = ['logs']\nconnection_string = 'host=localhost'\nbatch_record = 1"
             )
             .is_err()
         );

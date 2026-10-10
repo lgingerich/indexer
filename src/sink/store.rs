@@ -86,6 +86,8 @@ struct Reads {
     contracts: String,
     ledger: String,
     prune_ledger: String,
+    /// The hashes of the ledger's blocks above a height, which a rewind deletes.
+    ledger_above: String,
 }
 
 impl Reads {
@@ -103,6 +105,10 @@ impl Reads {
                 .limit()
                 .render()?,
             prune_ledger: sql::delete_below(ledger, "height")?,
+            ledger_above: sql::hashes_above(ledger).ok_or_else(|| TableError::UnknownColumn {
+                table: ledger.name.clone(),
+                column: "height".to_owned(),
+            })?,
         })
     }
 }
@@ -291,6 +297,41 @@ impl<E: Engine> SqlStore<E> {
         Ok(())
     }
 
+    /// Deletes every block above `height` from each table whose rows belong to one.
+    ///
+    /// The blocks are the ledger's: a block's rows commit with its ledger entry, so every
+    /// block above `height` with rows is named there. Each is deleted by hash, as a reorg
+    /// deletes, so the delete uses the hash index rather than scanning by height.
+    async fn delete_above(&mut self, height: u64) -> Result<(), StoreError> {
+        let chain = chain_param(&self.chain);
+        let rows = self
+            .engine
+            .query(
+                &self.reads.ledger_above,
+                &[chain.clone(), Value::Uint(height)],
+            )
+            .await
+            .map_err(StoreError::engine(Operation::Read, Some("accepted_blocks")))?;
+        let hashes = rows
+            .iter()
+            .map(|row| Ok(text("accepted_blocks.hash", column(row, 0))?.to_owned()))
+            .collect::<Result<Vec<String>, StoreError>>()?;
+        let floor = Value::Uint(height.saturating_add(1));
+        for table in &self.tables {
+            let Some(delete) = &table.delete else {
+                continue;
+            };
+            for hash in &hashes {
+                let params = [chain.clone(), floor.clone(), Value::Text(hash.clone())];
+                self.engine
+                    .execute(delete, &params)
+                    .await
+                    .map_err(StoreError::engine(Operation::Delete, Some(&table.def.name)))?;
+            }
+        }
+        Ok(())
+    }
+
     /// The deletes, then each table's stage, load, and merge.
     async fn write_tables(&mut self) -> Result<(), StoreError> {
         for table in &self.tables {
@@ -348,6 +389,22 @@ impl<E: Engine + 'static> Store for SqlStore<E> {
             contracts: self.contracts(&chain).await?,
             ledger: self.ledger(&chain, LEDGER_WINDOW).await?,
         })
+    }
+
+    /// One transaction, so a stop part-way leaves the store as it was.
+    async fn rewind(&mut self, height: u64) -> Result<(), StoreError> {
+        self.engine
+            .execute("BEGIN", &[])
+            .await
+            .map_err(StoreError::engine(Operation::Begin, None))?;
+        if let Err(error) = self.delete_above(height).await {
+            let _ = self.engine.execute("ROLLBACK", &[]).await;
+            return Err(error);
+        }
+        self.engine
+            .execute("COMMIT", &[])
+            .await
+            .map_err(StoreError::engine(Operation::Commit, None))
     }
 }
 

@@ -4,64 +4,72 @@
 //! settings file already states. This module reads them and builds the pipeline, so the
 //! binary is "load the settings, run it" rather than a place that names every layer.
 //!
-//! # Two tasks, one channel
+//! # One ingest task, a task per store
 //!
 //! ```text
-//! task 1:  ingest ─▶ DecodingSink ─▶ ChannelSink ══╗
-//!                    (direct calls, no queue)      ║  bounded channel of blocks
-//! task 2:  DuckDbSink ◀─ ChannelReceiver::drain ◀══╝
+//! task 1:  ingest ─▶ DecodingSink ─▶ Router ─┬─ ChannelSink ══╗ bounded channel of blocks
+//!                    (direct calls, no queue) └─ ChannelSink ══╬═══════╗
+//! task 2:  DeltaSink    ◀─ ChannelReceiver::drain ◀════════════╝       ║
+//! task 3:  PostgresSink ◀─ ChannelReceiver::drain ◀════════════════════╝
 //! ```
 //!
 //! Ingest and decode are one task because decoding a block is far cheaper than the block
-//! time and needs no decoupling. Storage is its own task because a store stalls, and the
-//! channel between them is what keeps a stall from stopping ingest; see
-//! `crate::sink::channel`. The store gets its own task — spawned, not merely polled
+//! time and needs no decoupling. Each store is its own task because a store stalls, and
+//! the channel in front of it is what keeps a stall from stopping ingest; see
+//! `crate::sink::channel`. A store gets its own task — spawned, not merely polled
 //! alongside ingest — because its writes block, and a blocked poll would stall ingest
-//! anyway.
+//! anyway. The router hands each store the envelopes of the tables it writes; see
+//! [`crate::sink::route`].
 //!
 //! # What the settings decide
 //!
-//! - **Ingest** follows the chain `[ingest]` names. It is required, so it always runs.
+//! - **The sinks** are the `[sink.<backend>]` tables, each with the `tables` it writes.
+//!   With `[sink.stdout]` no store is opened at all: the stream is printed instead.
+//! - **Ingest** follows the chain `[ingest]` names, fetching what the sinks' tables
+//!   need and nothing else.
 //! - **Decode** uses the protocol manifests `[decode] protocols` names. Leaving it out
 //!   decodes nothing, which is a legitimate way to run and is said at startup; a directory
 //!   with no manifest in it is a startup error.
-//!   Contracts a previous run discovered are read back from the store before ingest
+//!   Contracts a previous run discovered are read back from the stores before ingest
 //!   starts, so a restart decodes them; `[sink.stdout]` has no store and starts with the
 //!   manifests' seeds only.
-//! - **Where ingest starts.** A store's ledger of accepted blocks is read back before
-//!   ingest starts, and a run resumes after its tip; see `crate::ingest::pipeline`. An
-//!   empty ledger starts at `ingest.start_block` or the head, and `[sink.stdout]`, which
+//! - **Where ingest starts.** Every store's ledger of accepted blocks is read back before
+//!   ingest starts, every store is brought to the newest block they all hold (see
+//!   `crate::sink::resume`), and a run resumes after it; see `crate::ingest::pipeline`.
+//!   Empty ledgers start at `ingest.start_block` or the head, and `[sink.stdout]`, which
 //!   has no store, always starts fresh.
-//! - **The sink** is the `[sink.<backend>]` table. With `[sink.stdout]` no store is
-//!   opened at all: the stream is printed instead.
 //!
 //! # Shutdown
 //!
-//! Ingest ends only by failing, and when it does its half of the channel closes, so
-//! storage drains the blocks already queued and stops. If the store fails first, ingest
-//! finds out at its next block, when the send fails. Either way the store's error is
-//! reported ahead of ingest's, since a dead store is the cause and a failed send the
-//! symptom.
+//! Ingest ends only by failing, and when it does the router's channels close, so every
+//! store drains the blocks already queued and stops. If a store fails first, ingest
+//! finds out at its next block, when the send to it fails, and stops the rest the same
+//! way. Either way a store's error is reported ahead of ingest's, since a dead store is
+//! the cause and a failed send the symptom.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use thiserror::Error;
-use tracing::{info, warn};
+use tracing::info;
+#[cfg(feature = "store")]
+use tracing::{Instrument as _, info_span};
 
-use crate::config::{Settings, SettingsError, Sink};
+use crate::config::{Settings, SettingsError};
 use crate::decode::{Catalog, CatalogError, Decoder, DecodingSink};
 use crate::ingest::pipeline::{Machine, PipelineError};
 use crate::ingest::source::evm::{http_client, ws_connect};
 use crate::ingest::source::{BlockSource, EvmSource, SourceError};
 #[cfg(feature = "store")]
 use crate::sink;
-#[cfg(feature = "delta")]
-use crate::sink::DeltaSink;
-#[cfg(feature = "duckdb")]
-use crate::sink::DuckDbSink;
 #[cfg(feature = "store")]
+use crate::sink::any_store::AnyStore;
+#[cfg(any(feature = "duckdb", feature = "postgres"))]
 use crate::sink::channel::Batching;
-use crate::sink::table::Schema;
+#[cfg(feature = "store")]
+use crate::sink::resume::{Opened, ResumeError};
+use crate::sink::route::{self, Backend, RouteError, Router};
+use crate::sink::table::{Schema, TableId};
 use crate::sink::{SinkError, StdoutJsonSink};
 use crate::wire::envelope::ChainId;
 #[cfg(feature = "store")]
@@ -88,30 +96,53 @@ pub enum RuntimeError {
     /// The protocol manifests could not be loaded, so nothing would have decoded.
     #[error("protocol manifests could not be loaded: {0}")]
     Catalog(#[from] CatalogError),
+    /// A sink's `tables` name something the run does not have.
+    #[error("[sink.{store}] tables: {source}")]
+    Route {
+        /// The sink.
+        store: Backend,
+        /// What was wrong with its list.
+        source: RouteError,
+    },
     /// The chain source could not be built from its endpoints.
     #[error("chain source could not be built: {0}")]
     Source(#[from] SourceError),
-    /// The store could not be opened or read back, so there was nowhere to write.
+    /// A store could not be opened, so there was nowhere to write.
     #[cfg(feature = "store")]
-    #[error("storage could not be opened: {0}")]
-    OpenStore(#[from] sink::StoreError),
+    #[error("{store} could not be opened: {source}")]
+    OpenStore {
+        /// The store.
+        store: Backend,
+        /// Why it could not be opened.
+        source: sink::StoreError,
+    },
+    /// The stores could not be read back and brought to one block.
+    #[cfg(feature = "store")]
+    #[error("storage could not resume: {0}")]
+    Resume(#[from] ResumeError),
     /// Ingest stopped: a source failed, a sink refused an envelope, or the head
     /// subscription ended.
     #[error("ingest stopped: {0}")]
     Ingest(#[from] PipelineError),
-    /// Storage stopped. Reported ahead of ingest's error, because a dead store is the
+    /// A store stopped. Reported ahead of ingest's error, because a dead store is the
     /// cause there and the failed send is only the symptom.
-    #[error("storage stopped: {0}")]
-    Storage(#[from] SinkError),
-    /// The storage task panicked instead of returning an error, so nothing below it
-    /// ever ran to explain why.
+    #[error("{store} stopped: {source}")]
+    Storage {
+        /// The store.
+        store: Backend,
+        /// Why it stopped.
+        source: SinkError,
+    },
+    /// A store's task panicked instead of returning an error, so nothing below it ever
+    /// ran to explain why.
     ///
     /// Its own variant because `JoinError` says the task died, not that the store
     /// failed, and a panic in a writer is a different bug from a rejected write.
-    #[error("storage task panicked: {source}")]
+    #[error("{store} task panicked: {source}")]
     StorageTaskPanicked {
+        /// The store.
+        store: Backend,
         /// `tokio`'s join error, which carries the panic payload.
-        #[from]
         source: tokio::task::JoinError,
     },
 }
@@ -126,34 +157,54 @@ pub(crate) struct Pipeline<B = EvmSource> {
     /// A fresh run's first height; `None` starts at the head.
     start_block: Option<u64>,
     decoder: Decoder,
-    /// Every table a store creates: the dataset tables and each decoded event's.
+    /// Every table the run has: the dataset tables and each decoded event's.
     schema: Arc<Schema>,
+    /// Each sink the settings name and the tables it writes. Empty for a pipeline built
+    /// with [`Pipeline::new`], whose caller hands its stores their tables directly.
+    routes: Vec<(Backend, HashSet<TableId>)>,
 }
 
 impl Pipeline {
     /// Assembles the pipeline the settings describe.
     ///
-    /// Opens nothing: the store is connected in [`Pipeline::run`], and the source's
+    /// Opens nothing: the stores are connected in [`Pipeline::run`], and the source's
     /// WebSocket at its first subscription, so building fails on unreadable manifests
-    /// without touching a database file or the network.
+    /// or a sink's unknown table without touching a database file or the network.
     ///
     /// # Errors
     ///
-    /// Returns [`RuntimeError::Catalog`] when the manifests cannot be loaded, and
+    /// Returns [`RuntimeError::Catalog`] when the manifests cannot be loaded,
+    /// [`RuntimeError::Route`] when a sink's `tables` do not resolve, and
     /// [`RuntimeError::Source`] when the HTTP client cannot be built.
     pub(crate) fn from_settings(settings: &Settings) -> Result<Self, RuntimeError> {
-        let source = EvmSource::new(
-            settings.ingest.chain.as_str(),
-            http_client(settings.ingest.http_url.expose())?,
-            ws_connect(settings.ingest.ws_url.expose()),
-            settings.ingest.datasets,
-        );
         let catalog = settings
             .protocols_path()
             .map_or_else(Catalog::empty, |path| {
                 Catalog::load(path, &ChainId::new(&settings.ingest.chain))
             })?;
-        Ok(Self::new(source, settings.ingest.start_block, catalog))
+        let routes = settings
+            .sink
+            .tables()
+            .into_iter()
+            .map(|(store, tables)| {
+                let resolved = tables
+                    .resolve(catalog.schema())
+                    .map_err(|source| RuntimeError::Route { store, source })?;
+                Ok((store, resolved))
+            })
+            .collect::<Result<Vec<_>, RuntimeError>>()?;
+        let datasets = route::datasets(routes.iter().map(|(_, tables)| tables));
+        info!(%datasets, "fetching what the sinks write");
+        let source = EvmSource::new(
+            settings.ingest.chain.as_str(),
+            http_client(settings.ingest.http_url.expose())?,
+            ws_connect(settings.ingest.ws_url.expose()),
+            datasets,
+        );
+        Ok(Self {
+            routes,
+            ..Self::new(source, settings.ingest.start_block, catalog)
+        })
     }
 }
 
@@ -165,6 +216,7 @@ impl<B: BlockSource> Pipeline<B> {
             start_block,
             schema: Arc::new(catalog.schema().clone()),
             decoder: Decoder::new(catalog),
+            routes: Vec::new(),
         }
     }
 
@@ -172,103 +224,171 @@ impl<B: BlockSource> Pipeline<B> {
     ///
     /// # Errors
     ///
-    /// Returns [`RuntimeError::OpenStore`] when the store cannot be opened, and
+    /// Returns [`RuntimeError::OpenStore`] when a store cannot be opened,
+    /// [`RuntimeError::Resume`] when the stores cannot be brought to one block, and
     /// [`RuntimeError::Ingest`] or [`RuntimeError::Storage`] when a part fails. Each
     /// carries that part's own error, because "storage stopped" says nothing about why.
     pub(crate) async fn run(self, settings: &Settings) -> Result<(), RuntimeError> {
-        if !settings.ingest.datasets.logs && self.decoder.contracts() > 0 {
-            warn!("`logs` dataset is not selected; registered contracts will not decode");
+        // The settings never name stdout beside a store, so a run either prints or
+        // stores.
+        #[cfg(feature = "store")]
+        if self
+            .routes
+            .iter()
+            .all(|(backend, _)| *backend != Backend::Stdout)
+        {
+            let stores = self.open(settings).await?;
+            return Box::pin(self.run_with_stores(stores)).await;
         }
-
-        // The settings' backend is the branch, so a backend this build does not have is
-        // already a startup error and each arm here opens exactly what it named.
-        match &settings.sink {
-            Sink::Stdout(_) => {
-                // No store, so no tables and nothing to restore: a run starts fresh from the
-                // manifests' seeds.
-                let Self {
-                    source,
-                    start_block,
-                    decoder,
-                    schema,
-                } = self;
-                drop(schema);
-                let sink = DecodingSink::new(decoder, StdoutJsonSink::new());
-                Machine::new(source, sink, Vec::new())
-                    .run(start_block)
-                    .await?;
-                Ok(())
-            }
-            #[cfg(feature = "postgres")]
-            Sink::Postgres(postgres) => {
-                let store = sink::PostgresSink::open(
-                    postgres,
-                    Arc::clone(&self.schema),
-                    &settings.ingest.chain,
-                )
-                .await?;
-                Box::pin(self.run_with_store(store, Batching::eager(postgres.batch_records))).await
-            }
-            #[cfg(feature = "duckdb")]
-            Sink::DuckDb(duckdb) => {
-                // Open the store before ingest starts, so a bad path fails at startup
-                // rather than after the first block.
-                let store =
-                    DuckDbSink::open(duckdb, Arc::clone(&self.schema), &settings.ingest.chain)
-                        .await?;
-                Box::pin(self.run_with_store(store, Batching::eager(duckdb.batch_records))).await
-            }
-            #[cfg(feature = "delta")]
-            Sink::Delta(delta) => {
-                let store =
-                    DeltaSink::open(delta, Arc::clone(&self.schema), &settings.ingest.chain)
-                        .await?;
-                Box::pin(self.run_with_store(store, delta.batching())).await
-            }
-        }
+        #[cfg(not(feature = "store"))]
+        let _ = settings;
+        self.print().await
     }
 
-    /// Runs against an open `store`: restores what it holds, then ingests into it,
-    /// committing as `batching` says.
+    /// Prints the tables `[sink.stdout]` names. No store, so no tables and nothing to
+    /// restore: a run starts fresh from the manifests' seeds.
+    async fn print(self) -> Result<(), RuntimeError> {
+        let Self {
+            source,
+            start_block,
+            decoder,
+            schema,
+            routes,
+        } = self;
+        let sinks = routes
+            .into_iter()
+            .map(|(_, tables)| (StdoutJsonSink::new(), tables))
+            .collect();
+        let sink = DecodingSink::new(decoder, Router::new(schema, sinks));
+        Machine::new(source, sink, Vec::new())
+            .run(start_block)
+            .await?;
+        Ok(())
+    }
+
+    /// Opens every store the settings name, each with the tables routed to it. Opened
+    /// before ingest starts, so a bad path or connection fails at startup rather than
+    /// after the first block.
+    #[cfg(feature = "store")]
+    async fn open(&self, settings: &Settings) -> Result<Vec<Opened<AnyStore>>, RuntimeError> {
+        let chain = settings.ingest.chain.as_str();
+        let mut stores = Vec::new();
+        #[cfg(feature = "duckdb")]
+        if let Some(duckdb) = &settings.sink.duckdb {
+            let (schema, tables) = self.route(Backend::DuckDb);
+            let store = sink::DuckDbSink::open(duckdb, schema, chain)
+                .await
+                .map_err(opening(Backend::DuckDb))?;
+            stores.push(Opened {
+                backend: Backend::DuckDb,
+                store: AnyStore::DuckDb(store),
+                batching: Batching::eager(duckdb.batch_records),
+                tables,
+            });
+        }
+        #[cfg(feature = "postgres")]
+        if let Some(postgres) = &settings.sink.postgres {
+            let (schema, tables) = self.route(Backend::Postgres);
+            let store = sink::PostgresSink::open(postgres, schema, chain)
+                .await
+                .map_err(opening(Backend::Postgres))?;
+            stores.push(Opened {
+                backend: Backend::Postgres,
+                store: AnyStore::Postgres(store),
+                batching: Batching::eager(postgres.batch_records),
+                tables,
+            });
+        }
+        #[cfg(feature = "delta")]
+        if let Some(delta) = &settings.sink.delta {
+            let (schema, tables) = self.route(Backend::Delta);
+            let store = sink::DeltaSink::open(delta, schema, chain)
+                .await
+                .map_err(opening(Backend::Delta))?;
+            stores.push(Opened {
+                backend: Backend::Delta,
+                store: AnyStore::Delta(Box::new(store)),
+                batching: delta.batching(),
+                tables,
+            });
+        }
+        Ok(stores)
+    }
+
+    /// The tables routed to `backend`, and the schema of them a store opens with.
+    #[cfg(feature = "store")]
+    fn route(&self, backend: Backend) -> (Arc<Schema>, HashSet<TableId>) {
+        let tables = self
+            .routes
+            .iter()
+            .find(|(named, _)| *named == backend)
+            .map(|(_, tables)| tables.clone())
+            .unwrap_or_default();
+        (Arc::new(self.schema.select(&tables)), tables)
+    }
+
+    /// Runs against open `stores`: brings them to one block, then ingests into each the
+    /// tables routed to it, every store committing as its batching says.
     ///
     /// # Errors
     ///
-    /// As [`Pipeline::run`], less opening the store.
+    /// As [`Pipeline::run`], less opening the stores.
     #[cfg(feature = "store")]
-    pub(crate) async fn run_with_store<S: sink::Store>(
+    pub(crate) async fn run_with_stores<S: sink::Store>(
         self,
-        mut store: S,
-        batching: Batching,
+        mut stores: Vec<Opened<S>>,
     ) -> Result<(), RuntimeError> {
         let Self {
             source,
             start_block,
             decoder,
+            schema,
             ..
         } = self;
         let chain = source.chain().clone();
-        let restored = store.restore().await?;
-        let decoder = restore(decoder, &chain, restored.contracts);
-        let ledger = ledger(&chain, restored.ledger);
+        let resumed = sink::resume::resume(&mut stores).await?;
+        let decoder = restore(decoder, &chain, resumed.contracts);
+        let ledger = ledger(&chain, resumed.ledger);
 
-        let (blocks, receiver) = sink::channel::ChannelSink::new();
-        // `ponytail:` the store's writes block, so this holds one runtime worker for the
-        // length of each flush. Fine on the multi-threaded runtime the binary uses; a
-        // dedicated blocking thread is the upgrade if the store gets slow enough to
-        // starve other tasks.
-        let storage = tokio::spawn(async move { receiver.drain(&mut store, batching).await });
+        let mut sinks = Vec::with_capacity(stores.len());
+        let mut drains = Vec::with_capacity(stores.len());
+        for Opened {
+            backend,
+            mut store,
+            batching,
+            tables,
+        } in stores
+        {
+            let (sender, receiver) = sink::channel::ChannelSink::new();
+            // `ponytail:` the store's writes block, so this holds one runtime worker for
+            // the length of each flush. Fine on the multi-threaded runtime the binary
+            // uses; a dedicated blocking thread is the upgrade if a store gets slow
+            // enough to starve other tasks.
+            let drain = async move { receiver.drain(&mut store, batching).await }
+                .instrument(info_span!("storage", store = %backend));
+            drains.push((backend, tokio::spawn(drain)));
+            sinks.push((sender, tables));
+        }
 
-        let ingest = Machine::new(source, DecodingSink::new(decoder, blocks), ledger)
-            .run(start_block)
-            .await;
+        let ingest = Machine::new(
+            source,
+            DecodingSink::new(decoder, Router::new(schema, sinks)),
+            ledger,
+        )
+        .run(start_block)
+        .await;
 
-        // Ingest's half of the channel is gone by now, so storage drains what is
+        // Ingest's halves of the channels are gone by now, so each store drains what is
         // queued and ends. The join order is [`finish`].
-        finish(storage.await, ingest)
+        let mut stopped = Vec::with_capacity(drains.len());
+        for (backend, drain) in drains {
+            stopped.push((backend, drain.await));
+        }
+        finish(stopped, ingest)
     }
 }
 
-/// Adds the contracts a previous run discovered, as the store read them back.
+/// Adds the contracts a previous run discovered, as the stores read them back.
 #[cfg(feature = "store")]
 fn restore(mut decoder: Decoder, chain: &ChainId, stored: Vec<StoredContract>) -> Decoder {
     let restored = decoder.restore(stored);
@@ -288,20 +408,36 @@ fn ledger(chain: &ChainId, stored: Vec<BlockMeta>) -> Vec<BlockMeta> {
     stored
 }
 
-/// Reports how the two tasks stopped.
-///
-/// Storage comes first. Its error is a rejected write, and its panic is a `JoinError`:
-/// the writer died outside the store's own error path (an unwrap on a row width, say),
-/// which is neither a store failure nor an ingest failure. Ingest's error on this path
-/// is the failed send that followed — [`crate::sink::SinkError::StorageClosed`] — so it
-/// is returned only when the store itself finished.
+/// The error for `store` failing to open.
 #[cfg(feature = "store")]
-fn finish(
-    storage: Result<Result<u64, SinkError>, tokio::task::JoinError>,
-    ingest: Result<(), PipelineError>,
-) -> Result<(), RuntimeError> {
-    let stored = storage??;
-    info!(stored, "storage stopped");
+fn opening(store: Backend) -> impl FnOnce(sink::StoreError) -> RuntimeError {
+    move |source| RuntimeError::OpenStore { store, source }
+}
+
+/// How each store's drain ended, as its task returned it.
+#[cfg(feature = "store")]
+type Stopped = (
+    Backend,
+    Result<Result<u64, SinkError>, tokio::task::JoinError>,
+);
+
+/// Reports how the tasks stopped.
+///
+/// The stores come first, in the order they were opened. A store's error is a rejected
+/// write, and its panic is a `JoinError`: the writer died outside the store's own error
+/// path (an unwrap on a row width, say), which is neither a store failure nor an ingest
+/// failure. Ingest's error on this path is the failed send that followed —
+/// [`crate::sink::SinkError::StorageClosed`] — so it is returned only when every store
+/// itself finished.
+#[cfg(feature = "store")]
+fn finish(stopped: Vec<Stopped>, ingest: Result<(), PipelineError>) -> Result<(), RuntimeError> {
+    for (store, drained) in stopped {
+        match drained {
+            Ok(Ok(stored)) => info!(%store, stored, "storage stopped"),
+            Ok(Err(source)) => return Err(RuntimeError::Storage { store, source }),
+            Err(source) => return Err(RuntimeError::StorageTaskPanicked { store, source }),
+        }
+    }
     ingest?;
     Ok(())
 }
@@ -345,6 +481,9 @@ mod tests {
     use crate::decode::{Catalog, Decoder, DecodingSink};
     use crate::ingest::pipeline::{Machine, PipelineError};
     use crate::ingest::source::{BlockSource, FetchedBlock, HeadStream, SourceError};
+    use crate::sink::channel::Batching;
+    use crate::sink::resume::Opened;
+    use crate::sink::route::Backend;
     use crate::sink::table::Schema;
     use crate::sink::{self, DuckDbSink, EnvelopeSink as _, SinkError, Store as _};
     use crate::sink::{Operation, StoreError};
@@ -365,6 +504,7 @@ http_url = "https://example.invalid"
 ws_url = "wss://example.invalid"
 
 [sink.duckdb]
+tables = ["blocks", "transactions", "logs", "decoded_logs", "contract_events"]
 "#;
 
     /// The store's write error is the one returned when ingest then fails because the
@@ -386,14 +526,18 @@ ws_url = "wss://example.invalid"
         })));
         let ingest = Err(PipelineError::Sink(SinkError::StorageClosed));
 
-        let error = finish(storage, ingest).expect_err("the store rejected the batch");
+        let error = finish(vec![(Backend::DuckDb, storage)], ingest)
+            .expect_err("the store rejected the batch");
         assert!(
             matches!(
                 &error,
-                RuntimeError::Storage(SinkError::Store(StoreError::Engine {
-                    target: Some(table),
-                    ..
-                })) if table == "blocks"
+                RuntimeError::Storage {
+                    store: Backend::DuckDb,
+                    source: SinkError::Store(StoreError::Engine {
+                        target: Some(table),
+                        ..
+                    }),
+                } if table == "blocks"
             ),
             "the append error must be the one reported, not the closed send: {error:?}"
         );
@@ -411,6 +555,16 @@ ws_url = "wss://example.invalid"
     /// decodes.
     fn schema() -> Arc<Schema> {
         sink::fixtures::schema()
+    }
+
+    /// `store`, writing every table of [`schema`].
+    fn every_table<S>(backend: Backend, store: S, batching: Batching) -> Opened<S> {
+        Opened {
+            backend,
+            store,
+            batching,
+            tables: schema().tables().iter().map(|def| def.id).collect(),
+        }
     }
 
     fn decoder() -> Decoder {
@@ -486,11 +640,8 @@ ws_url = "wss://example.invalid"
             .await
             .expect("create tables");
         let (blocks, receiver) = sink::channel::ChannelSink::new();
-        let storage = tokio::spawn(async move {
-            receiver
-                .drain(&mut store, sink::channel::Batching::eager(500))
-                .await
-        });
+        let storage =
+            tokio::spawn(async move { receiver.drain(&mut store, Batching::eager(500)).await });
 
         let mut decoding = DecodingSink::new(decoder(), blocks);
         decoding
@@ -661,7 +812,11 @@ ws_url = "wss://example.invalid"
         let catalog =
             Catalog::load(protocols(), &ChainId::new("base")).expect("shipped protocols load");
         let result = Pipeline::new(chain, start, catalog)
-            .run_with_store(store, sink::channel::Batching::eager(500))
+            .run_with_stores(vec![every_table(
+                Backend::DuckDb,
+                store,
+                Batching::eager(500),
+            )])
             .await;
         assert!(
             matches!(
@@ -808,10 +963,15 @@ ws_url = "wss://example.invalid"
             .expect("the lake opens");
         let catalog =
             Catalog::load(protocols(), &ChainId::new("base")).expect("shipped protocols load");
-        let result = Box::pin(
-            Pipeline::new(chain, start, catalog).run_with_store(store, settings.batching()),
-        )
-        .await;
+        let result =
+            Box::pin(
+                Pipeline::new(chain, start, catalog).run_with_stores(vec![every_table(
+                    Backend::Delta,
+                    store,
+                    settings.batching(),
+                )]),
+            )
+            .await;
         assert!(
             matches!(
                 result,
@@ -844,6 +1004,7 @@ ws_url = "wss://example.invalid"
             std::env::temp_dir().join(format!("indexer-runtime-lake-{}", std::process::id())),
         );
         let settings = sink::DeltaSettings {
+            tables: serde_json::from_str(r#"["contract_events"]"#).expect("tables"),
             uri: dir.0.display().to_string(),
             commit_interval_secs: 3600,
             max_buffer_bytes: usize::MAX,
@@ -890,5 +1051,108 @@ ws_url = "wss://example.invalid"
             "the restored ledger is one linked chain"
         );
         assert_eq!(after.ledger[6].hash, block_hash(0xb0, 7));
+    }
+
+    /// Two stores, the database ahead of the lake when the process stops, and the chain
+    /// forked below the database's tip while nothing ran. The restart rewinds the
+    /// database to the block both hold, so neither keeps the orphaned branch and the lake
+    /// is never handed a block it has; both end on the same canonical chain.
+    #[cfg(feature = "delta")]
+    #[tokio::test]
+    async fn stores_at_different_heights_resume_from_the_block_they_share() {
+        use crate::sink::any_store::AnyStore;
+
+        let dir = LakeDir(
+            std::env::temp_dir().join(format!("indexer-runtime-two-{}", std::process::id())),
+        );
+        let settings = sink::DeltaSettings {
+            tables: serde_json::from_str(r#"["blocks"]"#).expect("tables"),
+            uri: dir.0.display().to_string(),
+            commit_interval_secs: 3600,
+            max_buffer_bytes: usize::MAX,
+            maintenance: false,
+            vacuum_retention_hours: 168,
+            storage: std::collections::BTreeMap::new(),
+        };
+        let connection = duckdb::Connection::open_in_memory().expect("open in-memory DuckDB");
+        let pool = Address::from([0xd0; 20]);
+        let both = async |chain: FakeChain, start: Option<u64>| {
+            let database =
+                DuckDbSink::connected(connection.try_clone().expect("handle"), schema(), "base")
+                    .await
+                    .expect("open");
+            let lake = sink::DeltaSink::open(&settings, schema(), "base")
+                .await
+                .expect("the lake opens");
+            let catalog =
+                Catalog::load(protocols(), &ChainId::new("base")).expect("shipped protocols load");
+            let stores = vec![
+                every_table(
+                    Backend::DuckDb,
+                    AnyStore::DuckDb(database),
+                    Batching::eager(500),
+                ),
+                every_table(
+                    Backend::Delta,
+                    AnyStore::Delta(Box::new(lake)),
+                    settings.batching(),
+                ),
+            ];
+            let result =
+                Box::pin(Pipeline::new(chain, start, catalog).run_with_stores(stores)).await;
+            assert!(
+                matches!(
+                    result,
+                    Err(RuntimeError::Ingest(PipelineError::SubscriptionClosed))
+                ),
+                "{result:?}"
+            );
+        };
+
+        both(FakeChain::new(4, 0xa0), Some(1)).await;
+
+        // The database alone runs on: it holds 5 and 6, and a pool created at 6.
+        let mut grown = FakeChain::new(6, 0xa0);
+        grown.log(6, pool_created(pool, B256::ZERO));
+        run_once(&connection, grown, None).await;
+        assert_eq!(heights(&connection).len(), 6);
+        assert_eq!(count(&connection, "contracts"), 1);
+
+        // While down, 5 and 6 were replaced.
+        let mut forked = FakeChain::new(6, 0xa0);
+        forked.branch(5, 7, 0xb0);
+        both(forked, None).await;
+
+        let expected: Vec<(u64, String)> = (1..=7)
+            .map(|height| {
+                let tag = if height < 5 { 0xa0 } else { 0xb0 };
+                (height, format!("{:#x}", block_hash(tag, height)))
+            })
+            .collect();
+        assert_eq!(
+            heights(&connection),
+            expected,
+            "the database holds one chain"
+        );
+        assert_eq!(
+            count(&connection, "contracts"),
+            0,
+            "the pool went with its rewound block"
+        );
+        assert_eq!(
+            count(&connection, "reorgs"),
+            0,
+            "a rewind retracts nothing from the chain"
+        );
+        let restored = restored(&settings).await;
+        assert_eq!(
+            restored
+                .ledger
+                .iter()
+                .map(|block| (block.height, format!("{:#x}", block.hash)))
+                .collect::<Vec<_>>(),
+            expected,
+            "the lake holds the same chain"
+        );
     }
 }

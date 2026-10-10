@@ -42,6 +42,7 @@ impl Dir {
     /// often that is, the drain decides. A test runs maintenance itself.
     fn settings(&self) -> DeltaSettings {
         DeltaSettings {
+            tables: serde_json::from_str(r#"["contract_events"]"#).expect("tables"),
             uri: self.0.display().to_string(),
             commit_interval_secs: 30,
             max_buffer_bytes: usize::MAX,
@@ -460,6 +461,38 @@ async fn a_replayed_block_is_refused() {
         .map(deltalake::arrow::array::RecordBatch::num_rows)
         .sum();
     assert_eq!(rows, 3, "nothing of the replay was written");
+}
+
+/// A rewind deletes every block above its height from every table, keeps no record of
+/// it, and lets the blocks it took be written again — on the same branch or another —
+/// without counting as a replay.
+#[tokio::test]
+async fn a_rewind_takes_the_blocks_above_it_and_they_can_be_written_again() {
+    let dir = Dir::new();
+    let mut sink = open(&dir).await;
+    for height in 1..=5 {
+        publish(&mut sink, block(height, 0)).await;
+    }
+    sink.rewind(3).await.expect("rewound");
+    assert_eq!(blocks(&sink).await, expected(&[(1, 0), (2, 0), (3, 0)]));
+    assert!(retractions(&sink).await.is_empty());
+
+    publish(&mut sink, block(4, 0)).await;
+    publish(&mut sink, block(5, 1)).await;
+    drop(sink);
+    let mut sink = open(&dir).await;
+    assert_eq!(
+        blocks(&sink).await,
+        expected(&[(1, 0), (2, 0), (3, 0), (4, 0), (5, 1)])
+    );
+    assert_eq!(
+        ledger(&mut sink)
+            .await
+            .iter()
+            .map(|block| block.height)
+            .collect::<Vec<_>>(),
+        [1, 2, 3, 4, 5]
+    );
 }
 
 /// The lake reports what it buffers, so the drain can commit by size: it grows with

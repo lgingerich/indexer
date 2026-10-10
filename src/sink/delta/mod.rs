@@ -92,6 +92,7 @@ use crate::ingest::pipeline::LEDGER_WINDOW;
 use crate::secret::Secret;
 use crate::sink::batch::Batch;
 use crate::sink::channel::Batching;
+use crate::sink::route::Tables;
 use crate::sink::store_error::{EngineError, InvalidStoredValue, Operation, StoreError};
 use crate::sink::table::{Row, Schema, Table, TableDef, TableError, TableId};
 use crate::sink::{EnvelopeSink, Restored, SinkError, Store};
@@ -114,6 +115,7 @@ const REORG_COLUMNS: [&str; 3] = ["height", "dedupe_key", "orphaned_hashes"];
 ///
 /// ```toml
 /// [sink.delta]
+/// tables = ["blocks", "transactions", "logs"]
 /// uri = "s3://indexer-lake"          # or a local directory
 /// commit_interval_secs = 30
 /// max_buffer_bytes = 268435456
@@ -129,6 +131,8 @@ const REORG_COLUMNS: [&str; 3] = ["height", "dedupe_key", "orphaned_hashes"];
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DeltaSettings {
+    /// The tables this store writes. Required.
+    pub tables: Tables,
     /// Where the tables live: an `s3://bucket/prefix` URL, or a local directory. Each
     /// chain's tables go under `<uri>/<chain>/`. Required: there is no location that is
     /// right by default.
@@ -705,6 +709,19 @@ impl DeltaSink {
         Ok(())
     }
 
+    /// Deletes every block above `height`, for [`rewind`](Store::rewind).
+    async fn delete_above(&mut self, height: u64) -> Result<(), StoreError> {
+        let ledger = self.position(Table::AcceptedBlock);
+        let others = (0..self.lakes.len()).filter(|&position| position != ledger);
+        for position in std::iter::once(ledger).chain(others) {
+            if let Some((_, number)) = self.lakes[position].block_columns() {
+                let predicate = at_or_above(number, height.saturating_add(1));
+                self.delete(position, predicate).await?;
+            }
+        }
+        Ok(())
+    }
+
     /// Moves the window of blocks a reorg could still orphan past a commit: its orphans
     /// out, the blocks it accepted in, and anything below the window dropped.
     fn advance(&mut self, orphaned: &[String], accepted: &[&Row]) {
@@ -743,6 +760,24 @@ impl Store for DeltaSink {
             contracts: self.contracts().await?,
             ledger: self.read_ledger().await?,
         })
+    }
+
+    /// Deletes in the order a retraction does: the blocks out of the ledger first, then
+    /// out of every other table. A stop part-way leaves rows of blocks the ledger no
+    /// longer names, which the next open deletes.
+    ///
+    /// Final on failure, as a commit is: every later write is refused with
+    /// [`StoreError::Failed`] until the store is reopened.
+    async fn rewind(&mut self, height: u64) -> Result<(), StoreError> {
+        if self.failed {
+            return Err(StoreError::Failed);
+        }
+        let rewound = self.delete_above(height).await;
+        self.failed = rewound.is_err();
+        rewound?;
+        self.committed.retain(|_, committed| *committed <= height);
+        self.publish_tip();
+        Ok(())
     }
 }
 

@@ -143,6 +143,19 @@ pub(crate) fn delete_block(table: &TableDef) -> Option<String> {
     ))
 }
 
+/// Selects the hash of chain `$1`'s every block above height `$2`, for a table whose rows
+/// belong to a block. Read from the ledger, it names the blocks a rewind deletes through
+/// [`delete_block`], which the hash index serves; a delete by height alone would scan.
+pub(crate) fn hashes_above(table: &TableDef) -> Option<String> {
+    let (hash, number) = table.block_hash.as_ref().zip(table.block_number.as_ref())?;
+    Some(format!(
+        "SELECT {} FROM {} WHERE \"chain\" = $1 AND {} > $2",
+        ident(hash),
+        ident(&table.name),
+        ident(number)
+    ))
+}
+
 /// Deletes chain `$1`'s rows whose `column` is below `$2`.
 ///
 /// # Errors

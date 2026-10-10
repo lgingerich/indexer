@@ -2,14 +2,18 @@
 //!
 //! Ingest hands each envelope of a block to one sink and flushes at the block boundary.
 //! [`DecodingSink`](crate::decode::DecodingSink) wraps a sink and adds decoded records to
-//! what it forwards, so the layers compose by nesting rather than by a queue between
-//! each pair:
+//! what it forwards, and the `Router` hands each store the envelopes of the tables it
+//! writes, so the layers compose by nesting rather than by a queue between each pair:
 //!
 //! ```text
-//! ingest ─▶ DecodingSink ─▶ ChannelSink ═ channel ═▶ ChannelReceiver::drain ─▶ DuckDbSink
-//!           (same task, direct calls)                (own task, the store's writer)
+//! ingest ─▶ DecodingSink ─▶ Router ─┬─ ChannelSink ═ channel ═▶ drain ─▶ DeltaSink
+//!           (same task, direct calls) └─ ChannelSink ═ channel ═▶ drain ─▶ PostgresSink
+//!                                                        (each store's own task)
 //! ```
 //!
+//! - [`route`] — which tables each store writes, the fetch that follows from them, and
+//!   the router that splits the stream. `resume` brings every store to one block before
+//!   ingest resumes, and `any_store` lets one run hold stores of different backends.
 //! - `channel` — the one hop that crosses tasks: a bounded in-process channel of
 //!   blocks, from decode to storage. It is what lets a slow store stall without stalling
 //!   ingest. Commit progress is logged from `progress`, not from the channel.
@@ -28,6 +32,9 @@
 //! Stores take a connection or open one from their own settings, so client settings
 //! live beside the backend that knows how to apply them.
 
+/// One opened store of any backend the build has.
+#[cfg(feature = "store")]
+pub(crate) mod any_store;
 /// The rows a store buffers between commits, which every store fills the same way.
 #[cfg(feature = "store")]
 mod batch;
@@ -45,6 +52,10 @@ pub mod duckdb;
 pub mod postgres;
 #[cfg(feature = "store")]
 mod progress;
+/// Bringing every store to one block before ingest resumes.
+#[cfg(feature = "store")]
+pub mod resume;
+pub mod route;
 #[cfg(any(feature = "duckdb", feature = "postgres"))]
 pub mod sql;
 pub mod stdout;
@@ -147,6 +158,20 @@ pub trait Store: EnvelopeSink + 'static {
     /// Returns [`StoreError::Engine`] when a read fails and [`StoreError::Restore`] when
     /// a stored value does not parse.
     fn restore(&mut self) -> impl Future<Output = Result<Restored, StoreError>> + Send;
+
+    /// Deletes every block above `height` — its rows and its ledger entry — so the store
+    /// holds the chain up to `height` and nothing after it. Run at startup, before the
+    /// first envelope, to bring a store that committed further than the others back to
+    /// the block they all hold (see `sink::resume`).
+    ///
+    /// Writes no `reorgs` row: the blocks are not retracted from the chain, only from
+    /// this store, and are written again as ingest resumes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::Engine`] when a delete fails, and [`StoreError::Failed`]
+    /// for a store that already refuses writes.
+    fn rewind(&mut self, height: u64) -> impl Future<Output = Result<(), StoreError>> + Send;
 }
 
 /// Why a sink could not accept, render, or deliver an envelope.
@@ -198,9 +223,9 @@ pub enum SinkError {
     Store(#[from] StoreError),
 }
 
-/// Fixtures the store tests share: the shipped catalog's event tables, and a real decoded
+/// Fixtures the sink tests share: the shipped catalog's event tables, and a real decoded
 /// record to write into them.
-#[cfg(all(test, feature = "store"))]
+#[cfg(test)]
 #[expect(clippy::expect_used)]
 pub(crate) mod fixtures {
     use std::sync::Arc;
@@ -243,6 +268,7 @@ pub(crate) mod fixtures {
     /// A Metric `PoolCreated` carrying a real Base pool's arguments, decoded against the
     /// shipped catalog: an `address[]`, a tuple of `uint256`s, and `uint256[]`s of packed
     /// words beside scalars up to `type(uint256).max`.
+    #[cfg(feature = "store")]
     pub(crate) fn decoded_pool_created() -> Decoded {
         use alloy_dyn_abi::DynSolValue;
         use alloy_json_abi::JsonAbi;

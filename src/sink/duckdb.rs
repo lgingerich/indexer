@@ -21,6 +21,7 @@ use serde::Deserialize;
 use tracing::info;
 
 use crate::secret::Secret;
+use crate::sink::route::Tables;
 use crate::sink::sql::{Dialect, ident};
 use crate::sink::store::{Engine, SqlStore};
 use crate::sink::store_error::{EngineError, Operation, StoreError};
@@ -41,13 +42,16 @@ const DEFAULT_BATCH_RECORDS: usize = 500;
 /// Beside the sink rather than in [`crate::config`] because these are `DuckDB`'s: the
 /// engine settings are opaque keys the engine validates, and a build without the
 /// `duckdb` feature has no use for either. What the *file* may say about `DuckDB` is the
-/// `[sink.duckdb]` table, which [`Sink::DuckDb`](crate::config::Sink::DuckDb)
-/// names.
+/// `[sink.duckdb]` table, which [`Sinks::duckdb`](crate::config::Sinks::duckdb)
+/// holds.
 #[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields, default)]
+#[serde(deny_unknown_fields)]
 pub struct DuckDbSettings {
+    /// The tables this store writes. Required.
+    pub tables: Tables,
     /// The `DuckDB` database file to write, relative to the settings file. Defaults to
     /// `indexer.duckdb`.
+    #[serde(default = "default_path")]
     pub path: PathBuf,
     /// The most records one store commit may cover.
     ///
@@ -59,6 +63,7 @@ pub struct DuckDbSettings {
     /// The bound only applies to the blocks already waiting, so a single block carrying
     /// this many envelopes commits on its own no matter what this is set to. Below that,
     /// a larger value folds more of a backlog into one transaction.
+    #[serde(default = "default_batch_records")]
     pub batch_records: usize,
     /// Any other `DuckDB` setting, passed straight through.
     ///
@@ -76,17 +81,16 @@ pub struct DuckDbSettings {
     /// ```
     ///
     /// Values are [`Secret`]s, since some are credentials.
+    #[serde(default)]
     pub settings: BTreeMap<String, Secret>,
 }
 
-impl Default for DuckDbSettings {
-    fn default() -> Self {
-        Self {
-            path: PathBuf::from(DEFAULT_PATH),
-            batch_records: DEFAULT_BATCH_RECORDS,
-            settings: BTreeMap::default(),
-        }
-    }
+fn default_path() -> PathBuf {
+    PathBuf::from(DEFAULT_PATH)
+}
+
+const fn default_batch_records() -> usize {
+    DEFAULT_BATCH_RECORDS
 }
 
 /// A store in `DuckDB`.
@@ -338,7 +342,7 @@ mod tests {
     };
     use std::sync::Arc;
 
-    use crate::sink::table::{Schema, Table, Value};
+    use crate::sink::table::{Schema, Table, TableId, Value};
 
     use super::DuckDbSink;
 
@@ -356,7 +360,8 @@ mod tests {
     #[test]
     fn engine_setting_values_are_redacted() {
         let settings: super::DuckDbSettings =
-            toml::from_str("[settings]\ns3_secret_access_key = 'hunter2'").expect("settings");
+            toml::from_str("tables = ['logs']\n[settings]\ns3_secret_access_key = 'hunter2'")
+                .expect("settings");
         assert_eq!(
             settings.settings["s3_secret_access_key"].expose(),
             "hunter2"
@@ -1065,6 +1070,55 @@ mod tests {
         sink.flush().await.expect("the reorg commits");
         assert_eq!(row_count(&sink, "uniswap_v3_pool_swap"), 0);
         assert_eq!(row_count(&sink, "decoded_logs"), 0);
+    }
+
+    /// A store routed only the event tables creates and fills those and the bookkeeping
+    /// tables: a decoded record's `decoded_logs` row, and a raw log, are not kept.
+    #[tokio::test]
+    async fn a_store_writes_only_the_tables_routed_to_it() {
+        let schema = crate::sink::fixtures::schema();
+        let events = schema
+            .tables()
+            .iter()
+            .filter(|def| matches!(def.id, TableId::Event(_)))
+            .map(|def| def.id)
+            .collect();
+        let mut sink = DuckDbSink::connected(
+            Connection::open_in_memory().expect("open DuckDB"),
+            Arc::new(schema.select(&events)),
+            "base",
+        )
+        .await
+        .expect("create the routed tables");
+        let swap = crate::sink::fixtures::decoded_swap();
+        let log = Log {
+            block_number: swap.block_number,
+            block_hash: swap.block_hash,
+            ..Log::default()
+        };
+        sink.publish(Envelope::new(chain(), Event::Decoded(Box::new(swap))))
+            .await
+            .expect("row buffers");
+        sink.publish(Envelope::new(chain(), Event::Log(Box::new(log))))
+            .await
+            .expect("row buffers");
+        sink.flush().await.expect("batch commits");
+
+        assert_eq!(row_count(&sink, "uniswap_v3_pool_swap"), 1);
+        for table in ["accepted_blocks", "reorgs", "contracts"] {
+            assert_eq!(row_count(&sink, table), 0, "{table} exists");
+        }
+        for table in ["blocks", "transactions", "logs", "decoded_logs"] {
+            assert!(
+                sink.engine
+                    .connection
+                    .query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
+                        row.get::<_, i64>(0)
+                    })
+                    .is_err(),
+                "{table} is not created"
+            );
+        }
     }
 
     /// Two chains sharing a database write to their own schemas, so each keeps its own

@@ -1,9 +1,9 @@
 # Settings for a standard single-chain deployment.
 #
 # `[ingest]` names the chain to follow, `[decode] protocols` names the contracts to decode,
-# and `[sink.<backend>]` says where it all goes. Ingest and decode run together in one
-# task; storage runs in another, joined by an in-process channel. Every key is documented
-# in `src/config.rs`.
+# and each `[sink.<backend>]` says which tables go to that store. Ingest and decode run
+# together in one task; each store runs in another, joined by an in-process channel.
+# Every key is documented in `src/config.rs`.
 
 [ingest]
 chain = "base"
@@ -11,19 +11,16 @@ chain = "base"
 # environment variable that holds it instead: http_url = { env = "INDEXER_HTTP_URL" }.
 http_url = { env = "INDEXER_HTTP_URL" }
 ws_url = { env = "INDEXER_WS_URL" }
-# Datasets to fetch and store. Omitted means all three. Transactions include their
-# receipts, and logs selected with them come from those receipts. Logs without
-# transactions use eth_getLogs: live, for one height, reusing the notification's
-# metadata so no block read is issued; in backfill, over a range of up to ten heights.
-# datasets = ["blocks", "transactions", "logs"]
-datasets = ["logs"]
 start_block = 52266840
 
 # A remote PostgreSQL 18 database, written with transactional binary COPY and
 # upserted on (chain, dedupe_key). Requires the `postgres` feature. The connection
 # string is a secret, since it carries the password: URL or keyword syntax, with TLS
-# following its sslmode.
+# following its sslmode. Writing logs and what is decoded from them, and no blocks or
+# transactions, means ingest fetches logs alone: eth_getLogs, live for one height and
+# reusing the notification's metadata, and in backfill over up to ten heights.
 [sink.postgres]
+tables = ["logs", "decoded_logs", "contract_events"]
 connection_string = { env = "INDEXER_POSTGRES_URL" }
 batch_records = 500
 

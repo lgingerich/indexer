@@ -209,6 +209,15 @@ How each crash point resolves:
 is a startup error rather than a choice between the two, since starting elsewhere would
 recreate the gaps resume closes. `[sink.stdout]` has no store, so it always starts fresh.
 
+With several stores, each commits on its own schedule — the lake every half minute, a
+database every block — so a restart can find them at different heights, or on different
+branches after a reorg the process did not live to finish. Before ingest starts,
+`sink::resume` finds the newest block every store's ledger holds with the same hash,
+rewinds each store that committed past it, and resumes from there. A rewind deletes
+the store's rows above that block and writes no `reorgs` row; ingest fetches those
+blocks again. A store with an empty ledger joins where the others resume, without the
+earlier blocks. See `docs/multi-store-open-items.md` for what this leaves open.
+
 Resume guarantees contiguity from the restored tip forward, not before it: gaps that
 runs before resume existed left behind are not backfilled. And `MAX(block_number)` of a
 dataset is not a substitute for the ledger — empty blocks write no rows, and a maximum
@@ -246,10 +255,10 @@ that matters most: `decode` must not depend on `ingest`.
 ## What works
 
 - **EVM ingestion.** Live heads over WebSocket (`eth_subscribe`/`newHeads`), and
-  each block fetched over JSON-RPC in one batched request. `[ingest] datasets`
-  chooses which of block, transaction, and log are fetched and stored; omitted, all
-  three are. Transactions fetch the block's receipts too, and logs selected alongside
-  come from those receipts. Logs without transactions use one `eth_getLogs` per
+  each block fetched over JSON-RPC in one batched request. Which of block,
+  transaction, and log are fetched follows from the tables the sinks write: logs are
+  fetched when a sink writes logs or anything decoded from them. Transactions fetch the
+  block's receipts too, and logs fetched alongside come from those receipts. Logs without transactions use one `eth_getLogs` per
   height. A live `newHeads` notification carries the head's identity, parent hash, and
   timestamp, so a logs-only fetch reuses them and pins `eth_getLogs` to the announced
   hash instead of re-reading the header (an empty answer still reads it, to check the
@@ -437,7 +446,7 @@ handled yet:
 
 - **`Pipeline::run` reads the settings twice.** `Pipeline::from_settings` builds the
   pipeline from `Settings`, then `Pipeline::run(settings)` takes the whole `Settings`
-  again, though it uses only `sink` and `ingest.datasets`. `Pipeline` could keep the sink
+  again, though it uses only `sink` and `ingest.chain`. `Pipeline` could keep the sink
   choice itself, so `run` takes no settings.
 
 Also not built, and not on the path above: mempool ingestion and a Parquet archive.
@@ -453,8 +462,9 @@ process, because continuing without it would leave a stream that looks alive but
 - **Decode uses `[decode] protocols`.** Leaving it out decodes nothing, which is a
   legitimate way to run and is said at startup; a directory with no manifest in it is a
   startup error.
-- **Storage is the `[sink.<backend>]` table.** With `[sink.stdout]` no store is
-  opened and the stream is printed instead.
+- **Storage is the `[sink.<backend>]` tables**, any combination of stores, each with
+  the `tables` it writes. With `[sink.stdout]` no store is opened and the stream is
+  printed instead.
 
 Settings come from a TOML file, named by the first argument or defaulting to
 `indexer.toml`. `indexer.toml` in the repository is a working example. What decode decodes
@@ -472,23 +482,38 @@ http_url = "https://base-rpc.publicnode.com"
 ws_url = "wss://base-rpc.publicnode.com"
 
 [sink.duckdb]
+tables = ["blocks", "transactions", "logs", "decoded_logs", "contract_events"]
 path = "indexer.duckdb"
 
 [decode]
 protocols = "protocols"
 ```
 
+Raw data in the lake and decoded events in PostgreSQL, from one fetch:
+
+```toml
+[sink.delta]
+tables = ["blocks", "transactions", "logs", "decoded_logs"]
+uri = "s3://indexer-lake"
+
+[sink.postgres]
+tables = ["contract_events"]
+connection_string = { env = "INDEXER_POSTGRES_URL" }
+```
+
 Each table names what owns its fields, not where a field was first needed:
 
 - `[ingest]` — the chain to follow and its endpoints.
-- `[sink.<backend>]` — where records go, and by what. Exactly one backend table may be
-  present, and it is required: a run with no store and the next with one are different
-  deployments, and there is no default right for both. Naming a backend is naming its
-  table, so a second backend (ClickHouse, Postgres) is a new table rather than another
-  top-level `database` whose owner a reader has to guess — and a key only that backend
-  understands has nowhere else to sit. Commit batching is part of this, because it is a
-  property of the store: `DuckDB` folds a backlog into larger transactions, where a
-  remote backend would batch unconditionally.
+- `[sink.<backend>]` — where records go, and by what. At least one is required, any
+  combination of stores may be named, at most one of each, and `[sink.stdout]` runs
+  alone. Naming a backend is naming its table, so a key only that backend understands
+  has nowhere else to sit. Every sink lists the `tables` it writes — exact names
+  (`logs`), `*` globs over names (`uniswap_v3_*`), or `contract_events` for every
+  contract's decoded event table, including protocols added later. There is no
+  default: what lands where is read off the file. `accepted_blocks`, `reorgs`, and
+  `contracts` are written to every store and are not listed. Commit batching is part
+  of this, because it is a property of the store: `DuckDB` folds a backlog into larger
+  transactions, where the lake commits on a timer.
 - `[decode]` — the protocol manifests.
 
 **Required** — no value could be right by accident, so each errors at startup naming
@@ -499,13 +524,13 @@ the field:
 | `ingest.chain` | Chain id stamped on every event |
 | `ingest.http_url` | JSON-RPC endpoint for blocks, receipts, and logs. A [secret](#secrets) |
 | `ingest.ws_url` | WebSocket endpoint for `newHeads`. A [secret](#secrets) |
-| one `[sink.<backend>]` table | Which backend writes. `duckdb` persists; `stdout` prints and opens no store |
+| at least one `[sink.<backend>]` table | Which backends write. `duckdb`, `postgres`, and `delta` persist; `stdout` prints, opens no store, and runs alone |
+| `sink.<backend>.tables` | The tables that sink writes: names, `*` globs, or `contract_events`. An entry matching no table is a startup error |
 
 **Defaulted** — correct for a standard deployment; override for a non-standard one:
 
 | Key | Default | Meaning |
 | --- | --- | --- |
-| `ingest.datasets` | blocks, transactions, logs | Which datasets are fetched and stored. Transactions include their receipts, and logs selected with them come from those receipts. A dataset that needs the block body still reads it; a logs-only live fetch reuses the notification header |
 | `ingest.start_block` | the sampled head | First height to index on an empty store. Absent starts live at the observed head; a value backfills that inclusive height forward before following live heads. A value above the sampled head is a startup error, and so is a value when the store already holds blocks: a run resumes from the store |
 | `sink.duckdb.batch_records` | `500` | Most records one store commit may cover; a backlog of blocks is folded into one commit up to this, and a block is never split |
 | `sink.duckdb.path` | `indexer.duckdb` | Path to the store, relative to the settings file. Tables live in a schema named for the chain: `base.logs` |
@@ -712,10 +737,11 @@ wire rather than re-derived downstream.
 
 Build with `cargo run --release --features postgres -- indexer.toml`
 (or name both features to keep DuckDB support as well). Replace
-`[sink.duckdb]` with exactly one PostgreSQL sink table:
+`[sink.duckdb]` with a PostgreSQL sink table, or add one beside it:
 
 ```toml
 [sink.postgres]
+tables = ["contract_events"]
 connection_string = { env = "INDEXER_POSTGRES_URL" }
 batch_records = 500
 ```

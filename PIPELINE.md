@@ -14,8 +14,9 @@ runtime::Pipeline { source, start_block }
        └─ live loop             follow heads until the subscription ends
 ```
 
-- `ledger` is the accepted blocks a store read back, oldest first. It is empty for a
-  fresh run, and always empty for `[sink.stdout]`.
+- `ledger` is the accepted blocks the stores read back, oldest first, after
+  `sink::resume` brought every store to the newest block they all hold. It is empty for
+  a fresh run, and always empty for `[sink.stdout]`.
 - `start_block` is a fresh run's first height; `None` starts at the head. Giving one
   together with a non-empty ledger is refused.
 

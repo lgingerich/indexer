@@ -46,6 +46,8 @@ use crate::ingest::source::{EvmSource, RetryLayer};
 use crate::runtime::{Pipeline, RuntimeError};
 use crate::sink::channel::Batching;
 use crate::sink::duckdb::DuckDb;
+use crate::sink::resume::Opened;
+use crate::sink::route::Backend;
 use crate::sink::{SinkError, SqlStore};
 
 const CHAIN: &str = "sim";
@@ -232,11 +234,20 @@ fn live(world: &Shared, path: &Path, plan: Plan, lifetime: u64, crash: Option<Du
             })
         });
         let run = async {
+            let tables = schema.tables().iter().map(|def| def.id).collect();
             let store = SqlStore::new(engine, schema, CHAIN)
                 .await
-                .map_err(RuntimeError::OpenStore)?;
+                .map_err(|source| RuntimeError::OpenStore {
+                    store: Backend::DuckDb,
+                    source,
+                })?;
             pipeline
-                .run_with_store(store, Batching::eager(plan.batch_records))
+                .run_with_stores(vec![Opened {
+                    backend: Backend::DuckDb,
+                    store,
+                    batching: Batching::eager(plan.batch_records),
+                    tables,
+                }])
                 .await
         };
         let end = tokio::select! {
@@ -282,7 +293,9 @@ fn unexpected(end: &End, world: &World, faults: bool) -> Option<String> {
                     | PipelineError::StartAboveHead { .. }
                     | PipelineError::Sink(SinkError::StorageClosed)
             ),
-            RuntimeError::Storage(_) | RuntimeError::OpenStore(_) => world.store_faulted,
+            RuntimeError::Storage { .. }
+            | RuntimeError::OpenStore { .. }
+            | RuntimeError::Resume(_) => world.store_faulted,
             _ => false,
         };
     (!expected).then(|| format!("unexpected stop: {error:?}"))

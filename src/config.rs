@@ -7,17 +7,18 @@
 //!   names the field. Required `String`s also carry `deserialize_with = "non_empty"`,
 //!   since `chain = ""` is present, not absent.
 //! - **A typo is a startup error, not a silent default.** Every table is
-//!   `deny_unknown_fields`, and an unknown [`Sink`] backend is refused rather than
-//!   falling back to another one.
+//!   `deny_unknown_fields`, and an unknown sink backend is refused rather than falling
+//!   back to another one.
 //! - **A secret is named, not written.** A [`Secret`] field takes `{ env = "NAME" }`, read
 //!   from the environment as the file loads, so the file stays in git while the platform
 //!   injects the value. A literal is accepted too, for a public endpoint or local
 //!   development.
 //!
-//! Where records end up. The backend is the table: `[sink.duckdb]` selects `DuckDB` and
-//! holds its settings, `[sink.stdout]` selects printing and takes none. Required,
-//! because one run with no store and the next with one are different deployments, and
-//! exactly one table may be named. Every other field not shown below may be omitted.
+//! Where records end up. The backend is the table: `[sink.duckdb]` opens `DuckDB` and
+//! holds its settings, `[sink.delta]` the lake, and so on — any combination, one of
+//! each, every one listing the `tables` it writes (see [`Sinks`]). `[sink.stdout]` prints
+//! instead, and is the only sink when named. Every other field not shown below may be
+//! omitted.
 //!
 //! Named for [`crate::sink`] rather than for storage: a sink is where envelopes go, and
 //! not all of them are kept. `stdout` is a sink that writes nowhere, and a webhook or a
@@ -30,12 +31,14 @@
 //! ws_url = "wss://base-rpc.publicnode.com"
 //!
 //! [sink.duckdb]
+//! tables = ["blocks", "transactions", "logs", "decoded_logs", "contract_events"]
 //! path = "indexer.duckdb"
 //!
 //! [sink.duckdb.settings]
 //! threads = "4"
 //!
-//! # ...or `[sink.stdout]`, to print the stream and open no store.
+//! # ...beside `[sink.postgres]` or `[sink.delta]`, or instead `[sink.stdout]`, to
+//! # print the stream and open no store.
 //!
 //! [decode]
 //! protocols = "protocols"      # the protocol manifests; optional
@@ -47,6 +50,7 @@ use serde::Deserialize;
 use serde::de::{self, Unexpected};
 
 use crate::secret::Secret;
+use crate::sink::route::{Backend, Tables};
 
 /// Deserializes a required string, refusing an empty or whitespace-only one.
 ///
@@ -75,9 +79,8 @@ where
 pub struct Settings {
     /// The chain to follow. Required: the pipeline starts at ingest.
     pub ingest: IngestSettings,
-    /// Where records go. Required: a run with nowhere to send them is not a deployment,
-    /// and the table that is named is what says which one.
-    pub sink: Sink,
+    /// Where records go. Required: a run with nowhere to send them is not a deployment.
+    pub sink: Sinks,
     /// What the decode stage decodes.
     #[serde(default)]
     pub decode: DecodeSettings,
@@ -104,10 +107,10 @@ pub struct IngestSettings {
     /// a provider's URL usually carries its API key.
     pub http_url: Secret,
     /// The WebSocket endpoint used for heads. Required; a [`Secret`], like `http_url`.
+    ///
+    /// What ingest fetches is not set here: it is what the sinks' `tables` need (see
+    /// [`crate::sink::route::datasets`]).
     pub ws_url: Secret,
-    /// Which datasets to fetch and store. Omitted means all three.
-    #[serde(default)]
-    pub datasets: crate::ingest::source::Datasets,
     /// The first height to index on an empty store. Omitted starts at the observed head,
     /// which skips earlier history; a value indexes that height and every one after it
     /// before following live heads. A value above the sampled head is a startup error
@@ -118,53 +121,88 @@ pub struct IngestSettings {
     pub start_block: Option<u64>,
 }
 
-/// Where records go, and by which backend.
+/// Where records go: one table per backend, each holding that backend's settings and the
+/// [`Tables`] it writes.
 ///
-/// The backend *is* the table, which is what makes `duckdb`-specific keys unambiguous:
-/// `[sink.duckdb.settings]` is inside the table that named `DuckDB`, so switching to
-/// another backend means switching tables, and a key that only `DuckDB` understands has
-/// nowhere else to sit. The variant is load-bearing, not a label — `runtime` matches on
-/// it rather than reading a field of a table the tag already selected.
+/// The backend *is* the table, which is what makes backend-specific keys unambiguous:
+/// `[sink.duckdb.settings]` is inside the table that named `DuckDB`. A run writes any
+/// combination of stores, at most one of each, and every store says which tables it
+/// writes — there is no default, so what lands where is read off the file. What ingest
+/// fetches follows from the union (see [`crate::sink::route`]).
 ///
-/// Exactly one table may be named, and naming none is an error: a run with no store and
-/// the next with one are different deployments, and there is no default that is right for
-/// both. Serde refuses an unknown backend, so a typo here is a startup error rather than
-/// a silent fallback.
+/// ```toml
+/// [sink.delta]
+/// tables = ["blocks", "transactions", "logs", "decoded_logs"]
+/// uri = "s3://indexer-lake"
 ///
-/// A sink is not necessarily a store. [`Sink::Stdout`] keeps nothing, and that is the
-/// point of the wider name: the layer is where envelopes go, and a webhook or a Kafka
-/// topic would sit here beside the databases.
+/// [sink.postgres]
+/// tables = ["contract_events"]
+/// connection_string = { env = "INDEXER_POSTGRES_URL" }
+/// ```
 ///
-/// Each backend's settings live in that backend's sink — `DuckDB`'s are
-/// [`DuckDbSettings`](crate::sink::duckdb::DuckDbSettings), `stdout`'s are
-/// [`StdoutSettings`](crate::sink::stdout::StdoutSettings) — so where to look for a
-/// backend's keys is one rule, and this file says only which backends exist. The
-/// `duckdb` variant is behind its feature, so a build without the engine does not carry
-/// a store it cannot open: there, naming `[sink.duckdb]` is an unknown backend — a
-/// startup error naming the table, rather than settings that parse and fail later.
+/// Naming none is an error, and so is `[sink.stdout]` beside a store: printing keeps no
+/// ledger, so it cannot resume with the stores (see `crate::sink::resume`). A store
+/// backend is behind its feature, so a build without the engine does not carry a store
+/// it cannot open: there, naming `[sink.duckdb]` is an unknown key — a startup error
+/// naming the table, rather than settings that parse and fail later.
+///
+/// A sink is not necessarily a store. `stdout` keeps nothing, and that is the point of
+/// the wider name: the layer is where envelopes go.
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Sink {
+#[serde(deny_unknown_fields)]
+pub struct Sinks {
     /// Print the stream as newline-delimited JSON, for watching what the indexer would
     /// write. No store is opened and nothing is persisted.
-    ///
-    /// A payload rather than a unit variant so a key under `[sink.stdout]` is answered
-    /// with what is valid — which is nothing — rather than an empty `available keys:`
-    /// list. See [`StdoutSettings`](crate::sink::stdout::StdoutSettings).
-    Stdout(crate::sink::stdout::StdoutSettings),
+    #[serde(default)]
+    pub stdout: Option<crate::sink::stdout::StdoutSettings>,
     /// An embedded `DuckDB` database, opened and committed by its own task.
-    ///
-    /// Renamed explicitly because `snake_case` would spell the table `duck_db`, and the
-    /// engine's own name is the one operators already know.
     #[cfg(feature = "duckdb")]
-    #[serde(rename = "duckdb")]
-    DuckDb(crate::sink::duckdb::DuckDbSettings),
+    #[serde(default)]
+    pub duckdb: Option<crate::sink::duckdb::DuckDbSettings>,
     /// A remote `PostgreSQL` database, using asynchronous transactional COPY.
     #[cfg(feature = "postgres")]
-    Postgres(crate::sink::postgres::PostgresSettings),
+    #[serde(default)]
+    pub postgres: Option<crate::sink::postgres::PostgresSettings>,
     /// Delta Lake tables on S3 or an S3-compatible store: the cheap raw-data lake.
     #[cfg(feature = "delta")]
-    Delta(crate::sink::delta::DeltaSettings),
+    #[serde(default)]
+    pub delta: Option<crate::sink::delta::DeltaSettings>,
+}
+
+impl Sinks {
+    /// Each named sink and the tables it writes, in a fixed order.
+    #[must_use]
+    pub fn tables(&self) -> Vec<(Backend, &Tables)> {
+        let mut named = Vec::new();
+        if let Some(stdout) = &self.stdout {
+            named.push((Backend::Stdout, &stdout.tables));
+        }
+        #[cfg(feature = "duckdb")]
+        if let Some(duckdb) = &self.duckdb {
+            named.push((Backend::DuckDb, &duckdb.tables));
+        }
+        #[cfg(feature = "postgres")]
+        if let Some(postgres) = &self.postgres {
+            named.push((Backend::Postgres, &postgres.tables));
+        }
+        #[cfg(feature = "delta")]
+        if let Some(delta) = &self.delta {
+            named.push((Backend::Delta, &delta.tables));
+        }
+        named
+    }
+
+    /// Refuses a file that names no sink, or `stdout` beside a store.
+    fn check(&self) -> Result<(), SettingsError> {
+        let named = self.tables();
+        if named.is_empty() {
+            return Err(SettingsError::NoSink);
+        }
+        if self.stdout.is_some() && named.len() > 1 {
+            return Err(SettingsError::StdoutBesideStore);
+        }
+        Ok(())
+    }
 }
 
 /// What the decode stage decodes: a directory of protocol manifests.
@@ -206,6 +244,12 @@ pub enum SettingsError {
         /// `toml`'s error, which carries the line and column.
         source: toml::de::Error,
     },
+    /// No `[sink.<backend>]` is named, so there is nowhere to write.
+    #[error("invalid settings: name at least one [sink.<backend>]")]
+    NoSink,
+    /// `[sink.stdout]` is named beside a store.
+    #[error("invalid settings: [sink.stdout] cannot be named beside a store")]
+    StdoutBesideStore,
 }
 
 impl std::str::FromStr for Settings {
@@ -213,14 +257,17 @@ impl std::str::FromStr for Settings {
     type Err = SettingsError;
 
     /// Parses settings from TOML text, filling defaults and rejecting what is required
-    /// but absent.
+    /// but absent, and sinks that cannot run together.
     ///
     /// This is the in-memory form of [`Settings::from_file`], for a caller that has the
     /// text already. A relative path in the text resolves against the process's working
     /// directory rather than a file's, since there is no file; prefer
     /// [`Settings::from_file`].
     fn from_str(text: &str) -> Result<Self, SettingsError> {
-        toml::from_str(text).map_err(|source| SettingsError::Parse { source })
+        let settings: Self =
+            toml::from_str(text).map_err(|source| SettingsError::Parse { source })?;
+        settings.sink.check()?;
+        Ok(settings)
     }
 }
 
@@ -229,8 +276,10 @@ impl Settings {
     ///
     /// # Errors
     ///
-    /// Returns [`SettingsError::Read`] when the file cannot be read and
-    /// [`SettingsError::Parse`] when it does not parse or a required value is absent. A
+    /// Returns [`SettingsError::Read`] when the file cannot be read,
+    /// [`SettingsError::Parse`] when it does not parse or a required value is absent, and
+    /// [`SettingsError::NoSink`] or [`SettingsError::StdoutBesideStore`] when its sinks
+    /// cannot run. A
     /// malformed file reports its line and column; an unknown field is an error rather
     /// than being ignored, so a misspelled key is caught at startup instead of silently
     /// leaving a setting at its default.
@@ -246,7 +295,7 @@ impl Settings {
         // parent is empty, and joining onto an empty path is the path as written.
         settings.dir = path.parent().unwrap_or_else(|| Path::new("")).to_path_buf();
         #[cfg(feature = "duckdb")]
-        if let Sink::DuckDb(duckdb) = &mut settings.sink
+        if let Some(duckdb) = &mut settings.sink.duckdb
             && duckdb.path != Path::new(":memory:")
         {
             duckdb.path = settings.dir.join(&duckdb.path);
@@ -277,7 +326,9 @@ impl Settings {
 mod tests {
     use std::str::FromStr as _;
 
-    use super::Settings;
+    use super::{Settings, SettingsError};
+    #[cfg(all(feature = "duckdb", feature = "postgres", feature = "delta"))]
+    use crate::sink::route::Backend;
 
     /// The minimum a file needs: a chain, its endpoints, and a store.
     fn minimal() -> &'static str {
@@ -288,16 +339,20 @@ http_url = "https://example.invalid"
 ws_url = "wss://example.invalid"
 
 [sink.stdout]
+tables = ["blocks"]
 "#
     }
 
-    /// `indexer.example.toml` documents every key, so it must parse as shipped; it names
-    /// `[sink.stdout]`, which every build has. It is the fixture rather than
-    /// `indexer.toml`, which is a deployment's own settings and changes with it.
+    /// `indexer.example.toml` documents every key, so it must run as shipped: it parses,
+    /// and its sinks' tables resolve against the tables it declares. It names
+    /// `[sink.stdout]`, which every build has, and comments out the stores. It is the
+    /// fixture rather than `indexer.toml`, which is a deployment's own settings and
+    /// changes with it.
     #[test]
-    fn the_example_settings_file_parses() {
-        Settings::from_str(include_str!("../indexer.example.toml"))
+    fn the_example_settings_file_assembles() {
+        let settings = Settings::from_str(include_str!("../indexer.example.toml"))
             .expect("indexer.example.toml parses");
+        crate::runtime::Pipeline::from_settings(&settings).expect("indexer.example.toml assembles");
     }
 
     /// A protocols path resolves against the settings file's own directory, not the
@@ -336,12 +391,66 @@ ws_url = "wss://example.invalid"
             );
             std::fs::write(&path, text).expect("write settings");
             let settings = Settings::from_file(&path).expect("settings load");
-            let super::Sink::DuckDb(duckdb) = settings.sink else {
-                panic!("a DuckDB sink");
-            };
+            let duckdb = settings.sink.duckdb.expect("a DuckDB sink");
             assert_eq!(duckdb.path, resolved);
         }
         std::fs::remove_dir_all(&dir).expect("clean up");
+    }
+
+    /// Every sink lists its tables, at least one sink is named, and printing runs alone.
+    #[test]
+    fn sinks_name_their_tables_and_stdout_runs_alone() {
+        let without_sink = minimal().replace("[sink.stdout]\ntables = [\"blocks\"]\n", "[sink]\n");
+        assert!(matches!(
+            Settings::from_str(&without_sink),
+            Err(SettingsError::NoSink)
+        ));
+        let without_tables = minimal().replace("tables = [\"blocks\"]\n", "");
+        let error = Settings::from_str(&without_tables).expect_err("tables are required");
+        assert!(error.to_string().contains("tables"), "{error}");
+        let empty = minimal().replace("[\"blocks\"]", "[]");
+        assert!(Settings::from_str(&empty).is_err());
+        let unknown = format!("{}\n[sink.kafka]\ntables = [\"logs\"]\n", minimal());
+        assert!(Settings::from_str(&unknown).is_err());
+    }
+
+    /// Printing keeps no ledger, so it cannot resume beside a store.
+    #[cfg(feature = "duckdb")]
+    #[test]
+    fn stdout_beside_a_store_is_refused() {
+        let both = format!("{}\n[sink.duckdb]\ntables = [\"logs\"]\n", minimal());
+        assert!(matches!(
+            Settings::from_str(&both),
+            Err(SettingsError::StdoutBesideStore)
+        ));
+    }
+
+    /// Any combination of stores parses, each with its own tables.
+    #[cfg(all(feature = "duckdb", feature = "postgres", feature = "delta"))]
+    #[test]
+    fn every_store_may_run_together() {
+        let text = minimal().replace(
+            "[sink.stdout]\ntables = [\"blocks\"]\n",
+            r#"[sink.duckdb]
+tables = ["blocks"]
+
+[sink.postgres]
+tables = ["contract_events"]
+connection_string = "postgres://example.invalid"
+
+[sink.delta]
+tables = ["logs", "decoded_logs"]
+uri = "/tmp/lake"
+"#,
+        );
+        let settings = Settings::from_str(&text).expect("settings parse");
+        let named: Vec<_> = settings
+            .sink
+            .tables()
+            .into_iter()
+            .map(|(backend, _)| backend)
+            .collect();
+        assert_eq!(named, [Backend::DuckDb, Backend::Postgres, Backend::Delta]);
     }
 
     /// A secret is the value or the environment variable that holds it, and either way it
@@ -358,6 +467,7 @@ http_url = "https://example.invalid/v2/literal-key"
 ws_url = { env = "PATH" }
 
 [sink.stdout]
+tables = ["blocks"]
 "#,
         )
         .expect("both forms parse");
