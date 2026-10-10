@@ -119,6 +119,15 @@ pub struct IngestSettings {
     /// once the first run has committed.
     #[serde(default)]
     pub start_block: Option<u64>,
+    /// The last height to index. Omitted follows live heads without end; a value indexes
+    /// through that height and exits instead of following the chain. A value above the
+    /// sampled head, or below where the run starts, is a startup error. A store that
+    /// already holds it has nothing to do, and the run exits without indexing.
+    ///
+    /// A stop inside the reorg window under the head is indexed as the chain stood then:
+    /// a fork that later replaces it is not retracted, since no run follows it.
+    #[serde(default)]
+    pub stop_block: Option<u64>,
 }
 
 /// Where records go: one table per backend, each holding that backend's settings and the

@@ -220,7 +220,7 @@ fn live(world: &Shared, path: &Path, plan: Plan, lifetime: u64, crash: Option<Du
             world: Arc::clone(world),
         };
         let source = EvmSource::new(CHAIN, http, heads, plan.datasets);
-        let pipeline = Pipeline::new(source, start, catalog);
+        let pipeline = Pipeline::new(source, start, None, catalog);
 
         // The chain grows while faults run, and holds still for the final catch-up.
         let chain = Arc::clone(world);

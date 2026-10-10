@@ -37,12 +37,12 @@
 //!   ingest starts, every store is brought to the newest block they all hold (see
 //!   `crate::sink::resume`), and a run resumes after it; see `crate::ingest::pipeline`.
 //!   Empty ledgers start at `ingest.start_block` or the head, and `[sink.stdout]`, which
-//!   has no store, always starts fresh.
+//!   has no store, always starts fresh. A run with `ingest.stop_block` ends there.
 //!
 //! # Shutdown
 //!
-//! Ingest ends only by failing, and when it does the router's channels close, so every
-//! store drains the blocks already queued and stops. If a store fails first, ingest
+//! Ingest ends by failing, or by reaching `ingest.stop_block`, and when it does the
+//! router's channels close, so every store drains the blocks already queued and stops. If a store fails first, ingest
 //! finds out at its next block, when the send to it fails, and stops the rest the same
 //! way. Either way a store's error is reported ahead of ingest's, since a dead store is
 //! the cause and a failed send the symptom.
@@ -156,6 +156,8 @@ pub(crate) struct Pipeline<B = EvmSource> {
     source: B,
     /// A fresh run's first height; `None` starts at the head.
     start_block: Option<u64>,
+    /// The last height to index; `None` follows live heads.
+    stop_block: Option<u64>,
     decoder: Decoder,
     /// Every table the run has: the dataset tables and each decoded event's.
     schema: Arc<Schema>,
@@ -203,17 +205,28 @@ impl Pipeline {
         );
         Ok(Self {
             routes,
-            ..Self::new(source, settings.ingest.start_block, catalog)
+            ..Self::new(
+                source,
+                settings.ingest.start_block,
+                settings.ingest.stop_block,
+                catalog,
+            )
         })
     }
 }
 
 impl<B: BlockSource> Pipeline<B> {
     /// Assembles a pipeline reading `source` and decoding what `catalog` declares.
-    pub(crate) fn new(source: B, start_block: Option<u64>, catalog: Catalog) -> Self {
+    pub(crate) fn new(
+        source: B,
+        start_block: Option<u64>,
+        stop_block: Option<u64>,
+        catalog: Catalog,
+    ) -> Self {
         Self {
             source,
             start_block,
+            stop_block,
             schema: Arc::new(catalog.schema().clone()),
             decoder: Decoder::new(catalog),
             routes: Vec::new(),
@@ -251,6 +264,7 @@ impl<B: BlockSource> Pipeline<B> {
         let Self {
             source,
             start_block,
+            stop_block,
             decoder,
             schema,
             routes,
@@ -261,7 +275,7 @@ impl<B: BlockSource> Pipeline<B> {
             .collect();
         let sink = DecodingSink::new(decoder, Router::new(schema, sinks));
         Machine::new(source, sink, Vec::new())
-            .run(start_block)
+            .run(start_block, stop_block)
             .await?;
         Ok(())
     }
@@ -341,6 +355,7 @@ impl<B: BlockSource> Pipeline<B> {
         let Self {
             source,
             start_block,
+            stop_block,
             decoder,
             schema,
             ..
@@ -375,7 +390,7 @@ impl<B: BlockSource> Pipeline<B> {
             DecodingSink::new(decoder, Router::new(schema, sinks)),
             ledger,
         )
-        .run(start_block)
+        .run(start_block, stop_block)
         .await;
 
         // Ingest's halves of the channels are gone by now, so each store drains what is
@@ -811,7 +826,7 @@ tables = ["blocks", "transactions", "logs", "decoded_logs", "contract_events"]
                 .expect("open");
         let catalog =
             Catalog::load(protocols(), &ChainId::new("base")).expect("shipped protocols load");
-        let result = Pipeline::new(chain, start, catalog)
+        let result = Pipeline::new(chain, start, None, catalog)
             .run_with_stores(vec![every_table(
                 Backend::DuckDb,
                 store,
@@ -936,7 +951,7 @@ tables = ["blocks", "transactions", "logs", "decoded_logs", "contract_events"]
         let restored = ledger(&chain, store.restore().await.expect("restore").ledger);
         let machine = Machine::new(FakeChain::new(5, 0xa0), store, restored);
         assert!(matches!(
-            machine.run(Some(1)).await,
+            machine.run(Some(1), None).await,
             Err(PipelineError::StartWithHistory { start: 1, tip: 3 })
         ));
     }
@@ -963,15 +978,14 @@ tables = ["blocks", "transactions", "logs", "decoded_logs", "contract_events"]
             .expect("the lake opens");
         let catalog =
             Catalog::load(protocols(), &ChainId::new("base")).expect("shipped protocols load");
-        let result =
-            Box::pin(
-                Pipeline::new(chain, start, catalog).run_with_stores(vec![every_table(
-                    Backend::Delta,
-                    store,
-                    settings.batching(),
-                )]),
-            )
-            .await;
+        let result = Box::pin(
+            Pipeline::new(chain, start, None, catalog).run_with_stores(vec![every_table(
+                Backend::Delta,
+                store,
+                settings.batching(),
+            )]),
+        )
+        .await;
         assert!(
             matches!(
                 result,
@@ -1099,7 +1113,7 @@ tables = ["blocks", "transactions", "logs", "decoded_logs", "contract_events"]
                 ),
             ];
             let result =
-                Box::pin(Pipeline::new(chain, start, catalog).run_with_stores(stores)).await;
+                Box::pin(Pipeline::new(chain, start, None, catalog).run_with_stores(stores)).await;
             assert!(
                 matches!(
                     result,
