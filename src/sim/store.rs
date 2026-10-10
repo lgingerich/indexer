@@ -9,7 +9,8 @@
 use std::sync::Arc;
 
 use super::chain::{Shared, lock};
-use crate::sink::store::{Engine, EngineError};
+use crate::sink::store::Engine;
+use crate::sink::store_error::EngineError;
 use crate::sink::table::{Row, TableDef, Value};
 
 /// An engine that fails as the world's fault profile says.

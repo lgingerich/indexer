@@ -19,49 +19,68 @@
 //!   statements, and [`store`] is the write path both stores share. Both upsert on
 //!   `(chain, dedupe_key)`.
 //! - [`stdout`] — newline-delimited JSON, for watching the stream.
+//! - `delta` — Delta Lake tables on object storage: the cheap raw-data lake. Not a SQL
+//!   store: it appends, and holds replays out with its ledger instead of upserting.
+//! - `batch` — the rows a store buffers between commits, with a `reorg`'s orphans
+//!   dropped and the last copy of each row kept, the same for all three stores.
+//! - `store_error` — the `StoreError` all three stores return.
 //!
 //! Stores take a connection or open one from their own settings, so client settings
 //! live beside the backend that knows how to apply them.
 
+/// The rows a store buffers between commits, which every store fills the same way.
+#[cfg(feature = "store")]
+mod batch;
 /// The bounded channel from decode to storage: the one hop that crosses tasks.
 ///
-/// Enabled with either store feature: its consumer is the store's writer in
+/// Enabled with any store feature: its consumer is the store's writer in
 /// [`runtime`](crate::runtime). A stdout-only build has no storage task or channel.
-#[cfg(any(feature = "duckdb", feature = "postgres"))]
+#[cfg(feature = "store")]
 pub(crate) mod channel;
+#[cfg(feature = "delta")]
+pub mod delta;
 #[cfg(feature = "duckdb")]
 pub mod duckdb;
 #[cfg(feature = "postgres")]
 pub mod postgres;
-#[cfg(any(feature = "duckdb", feature = "postgres"))]
+#[cfg(feature = "store")]
 mod progress;
 #[cfg(any(feature = "duckdb", feature = "postgres"))]
 pub mod sql;
 pub mod stdout;
 #[cfg(any(feature = "duckdb", feature = "postgres"))]
 pub mod store;
+#[cfg(feature = "store")]
+pub mod store_error;
 pub mod table;
 
 #[cfg(feature = "postgres")]
 pub use postgres::{PostgresSettings, PostgresSink};
 
+#[cfg(feature = "delta")]
+pub use delta::{DeltaSettings, DeltaSink};
 #[cfg(feature = "duckdb")]
 pub use duckdb::{DuckDbSettings, DuckDbSink};
 pub use stdout::{StdoutJsonSink, StdoutSettings};
 #[cfg(any(feature = "duckdb", feature = "postgres"))]
-pub use store::{InvalidStoredValue, Operation, SqlStore, StoreError};
+pub use store::SqlStore;
+#[cfg(feature = "store")]
+pub use store_error::{InvalidStoredValue, Operation, StoreError};
 
 use thiserror::Error;
 
 use crate::wire::envelope::Envelope;
+#[cfg(feature = "store")]
+use crate::wire::envelope::{BlockMeta, StoredContract};
 
 /// Receives envelopes in per-chain order, as the pipeline publishes them.
 ///
 /// The driver holds the sink through an exclusive borrow, so it may buffer across calls
 /// — a rendered row, an open appender, a block awaiting its send — instead of paying the
 /// engine's per-record cost. [`flush`](EnvelopeSink::flush) is the batch boundary; the
-/// ingest pipeline calls it once per block, so everything published between two flushes
-/// is one block's worth. A slow sink applies backpressure to whatever drives it.
+/// ingest pipeline calls it once per block, and the storage drain once per batch of
+/// whole blocks it gathers for a store. A slow sink applies backpressure to whatever
+/// drives it.
 pub trait EnvelopeSink: Send {
     /// Accepts one envelope.
     ///
@@ -87,6 +106,14 @@ pub trait EnvelopeSink: Send {
         async { Ok(()) }
     }
 
+    /// Roughly how many bytes the sink holds that the next flush would write, as they
+    /// sit in memory. The storage drain flushes early once this passes its limit.
+    ///
+    /// The default is zero: a sink that does not count is bounded by records alone.
+    fn buffered_bytes(&self) -> usize {
+        0
+    }
+
     /// Records the newest sampled canonical head, so a commit can report its lag.
     ///
     /// The default ignores it. The storage channel keeps the latest sample for its
@@ -94,6 +121,32 @@ pub trait EnvelopeSink: Send {
     fn observe_head(&mut self, height: u64) {
         let _ = height;
     }
+}
+
+/// What a previous run left in a store for the next one: the contracts it discovered,
+/// and the accepted blocks ingest resumes from.
+#[cfg(feature = "store")]
+#[derive(Debug, Default)]
+pub struct Restored {
+    /// Every contract discovered on the store's chain, each from a canonical block.
+    pub contracts: Vec<StoredContract>,
+    /// The newest [`LEDGER_WINDOW`](crate::ingest::pipeline::LEDGER_WINDOW) accepted
+    /// blocks, oldest first: the undo window a restart resumes from.
+    pub ledger: Vec<BlockMeta>,
+}
+
+/// A sink that persists, for one chain: what the storage task writes, and what a restart
+/// reads back before it ingests.
+#[cfg(feature = "store")]
+pub trait Store: EnvelopeSink + 'static {
+    /// Reads back what a previous run left, once, at startup and before the first
+    /// envelope is published.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::Engine`] when a read fails and [`StoreError::Restore`] when
+    /// a stored value does not parse.
+    fn restore(&mut self) -> impl Future<Output = Result<Restored, StoreError>> + Send;
 }
 
 /// Why a sink could not accept, render, or deliver an envelope.
@@ -140,14 +193,14 @@ pub enum SinkError {
     #[error(transparent)]
     Table(#[from] table::TableError),
     /// A store could not be opened, read, or written.
-    #[cfg(any(feature = "duckdb", feature = "postgres"))]
+    #[cfg(feature = "store")]
     #[error(transparent)]
     Store(#[from] StoreError),
 }
 
 /// Fixtures the store tests share: the shipped catalog's event tables, and a real decoded
 /// record to write into them.
-#[cfg(all(test, any(feature = "duckdb", feature = "postgres")))]
+#[cfg(all(test, feature = "store"))]
 #[expect(clippy::expect_used)]
 pub(crate) mod fixtures {
     use std::sync::Arc;

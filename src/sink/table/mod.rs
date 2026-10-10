@@ -480,6 +480,16 @@ impl Row {
     pub fn block_hash(&self) -> Option<&str> {
         self.text(self.table.block_hash.as_deref()?)
     }
+
+    /// The height of the block this row belongs to; `None` for a table whose rows belong
+    /// to no block. The builder holds that column to a required unsigned integer.
+    #[must_use]
+    pub fn block_number(&self) -> Option<u64> {
+        match self.value(self.table.block_number.as_deref()?)? {
+            Value::Uint(height) => Some(*height),
+            _ => None,
+        }
+    }
 }
 
 /// Every table a run writes: the dataset tables, then one typed table per decoded event.

@@ -44,6 +44,7 @@ use crate::ingest::pipeline::PipelineError;
 use crate::ingest::source::Datasets;
 use crate::ingest::source::{EvmSource, RetryLayer};
 use crate::runtime::{Pipeline, RuntimeError};
+use crate::sink::channel::Batching;
 use crate::sink::duckdb::DuckDb;
 use crate::sink::{SinkError, SqlStore};
 
@@ -234,7 +235,9 @@ fn live(world: &Shared, path: &Path, plan: Plan, lifetime: u64, crash: Option<Du
             let store = SqlStore::new(engine, schema, CHAIN)
                 .await
                 .map_err(RuntimeError::OpenStore)?;
-            pipeline.run_with_store(store, plan.batch_records).await
+            pipeline
+                .run_with_store(store, Batching::eager(plan.batch_records))
+                .await
         };
         let end = tokio::select! {
             biased;

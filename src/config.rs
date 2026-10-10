@@ -55,7 +55,7 @@ use crate::secret::Secret;
 /// nothing, and `chain = ""` stamps every event with a blank chain. Putting the check on
 /// the field keeps it with the field's documentation and lets serde name it, rather than
 /// a hand-written pass over every required key after the fact.
-fn non_empty<'de, D>(deserializer: D) -> Result<String, D::Error>
+pub(crate) fn non_empty<'de, D>(deserializer: D) -> Result<String, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
@@ -162,6 +162,9 @@ pub enum Sink {
     /// A remote `PostgreSQL` database, using asynchronous transactional COPY.
     #[cfg(feature = "postgres")]
     Postgres(crate::sink::postgres::PostgresSettings),
+    /// Delta Lake tables on S3 or an S3-compatible store: the cheap raw-data lake.
+    #[cfg(feature = "delta")]
+    Delta(crate::sink::delta::DeltaSettings),
 }
 
 /// What the decode stage decodes: a directory of protocol manifests.

@@ -14,19 +14,15 @@
 //! stored. On failure the transaction rolls back and the whole batch stays buffered for a
 //! retry, which deletes nothing it already deleted and upserts onto itself.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::fmt;
 use std::sync::Arc;
 
-use thiserror::Error;
-
+use crate::ingest::pipeline::LEDGER_WINDOW;
+use crate::sink::batch::Batch;
 use crate::sink::sql::{self, Dialect};
-use crate::sink::table::{Row, Schema, Table, TableDef, TableError, TableId, Value};
-use crate::sink::{EnvelopeSink, SinkError};
-use crate::wire::envelope::{BlockMeta, ChainId, Envelope, Event, StoredContract};
-
-/// An engine's own error, carried as its cause.
-pub type EngineError = Box<dyn std::error::Error + Send + Sync>;
+use crate::sink::store_error::{EngineError, InvalidStoredValue, Operation, StoreError};
+use crate::sink::table::{Row, Schema, Table, TableDef, TableError, Value};
+use crate::sink::{EnvelopeSink, Restored, SinkError, Store};
+use crate::wire::envelope::{BlockMeta, ChainId, Envelope, StoredContract};
 
 /// What runs a [`SqlStore`]'s statements.
 pub trait Engine: Send {
@@ -55,106 +51,6 @@ pub trait Engine: Send {
         staging: &str,
         rows: &[&Row],
     ) -> impl Future<Output = Result<(), EngineError>> + Send;
-}
-
-/// What a store was doing when its engine failed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Operation {
-    /// Applying a setting.
-    Configure,
-    /// Opening or connecting to the database.
-    Open,
-    /// Creating the database schema, tables, or indexes.
-    Create,
-    /// Starting a flush's transaction.
-    Begin,
-    /// Deleting an orphaned block's rows.
-    Delete,
-    /// Creating, loading, or dropping a staging table.
-    Stage,
-    /// Merging staged rows into their table.
-    Merge,
-    /// Committing a flush.
-    Commit,
-    /// Reading stored contracts or accepted blocks at startup.
-    Read,
-}
-
-impl fmt::Display for Operation {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            Self::Configure => "apply setting",
-            Self::Open => "open store",
-            Self::Create => "create",
-            Self::Begin => "begin transaction",
-            Self::Delete => "delete orphaned rows of",
-            Self::Stage => "stage",
-            Self::Merge => "upsert",
-            Self::Commit => "commit transaction",
-            Self::Read => "read",
-        })
-    }
-}
-
-/// Why a store could not be opened, read, or written.
-#[derive(Debug, Error)]
-pub enum StoreError {
-    /// The engine failed during `operation`, on `target` — a table, a setting, or a path —
-    /// when there is one.
-    #[error("{operation}{}: {source}", target.as_ref().map(|target| format!(" {target}")).unwrap_or_default())]
-    Engine {
-        /// What the store was doing.
-        operation: Operation,
-        /// What it was doing it to.
-        target: Option<String>,
-        /// The engine's own error.
-        source: EngineError,
-    },
-    /// A value read back at startup did not parse.
-    #[error(transparent)]
-    Restore(#[from] InvalidStoredValue),
-    /// A table's declaration is inconsistent.
-    #[error(transparent)]
-    Table(#[from] TableError),
-    /// Another process already writes this database schema.
-    #[error("another indexer is already writing database schema {schema}")]
-    Locked {
-        /// The database schema.
-        schema: String,
-    },
-    /// An existing table does not match its definition. Tables are not migrated, so the
-    /// store needs a fresh database schema or the table dropped.
-    #[error("table {table} does not match its definition: {difference}")]
-    Drift {
-        /// The table.
-        table: String,
-        /// The first difference found, such as a column with another type.
-        difference: String,
-    },
-}
-
-impl StoreError {
-    /// Wraps an engine error from `operation` on `target`.
-    pub(crate) fn engine(
-        operation: Operation,
-        target: Option<&str>,
-    ) -> impl FnOnce(EngineError) -> Self {
-        move |source| Self::Engine {
-            operation,
-            target: target.map(str::to_owned),
-            source,
-        }
-    }
-}
-
-/// A value read back at startup that does not parse as its column's type.
-#[derive(Debug, Error)]
-#[error("stored {column} is invalid: {value}")]
-pub struct InvalidStoredValue {
-    /// The table and column, for example `contracts.address`.
-    pub column: &'static str,
-    /// The stored value.
-    pub value: String,
 }
 
 /// One table, with every statement a flush runs against it rendered once.
@@ -219,18 +115,21 @@ impl Reads {
 #[derive(Debug)]
 pub struct SqlStore<E> {
     pub(crate) engine: E,
+    /// The chain a [`restore`](Store::restore) reads back.
+    chain: ChainId,
     batch: Batch,
     tables: Vec<Prepared>,
     reads: Reads,
 }
 
 impl<E: Engine> SqlStore<E> {
-    /// Creates every table in `schema`, with its indexes, in the database schema
-    /// `database_schema`, which becomes the session's default.
+    /// Creates every table in `schema`, with its indexes, in the database schema named
+    /// for `chain`, which becomes the session's default.
     ///
-    /// A run names that schema for its chain — `base.logs` — so chains sharing a
-    /// database keep their tables apart. Existing tables are reused, not migrated, and
-    /// checked against their definitions.
+    /// Each chain's tables live in its own schema — `base.logs` — so chains sharing a
+    /// database keep their tables apart, and a [`restore`](Store::restore) reads back
+    /// `chain`'s rows. Existing tables are reused, not migrated, and checked against
+    /// their definitions.
     ///
     /// # Errors
     ///
@@ -240,16 +139,13 @@ impl<E: Engine> SqlStore<E> {
     pub(crate) async fn new(
         mut engine: E,
         schema: Arc<Schema>,
-        database_schema: &str,
+        chain: &str,
     ) -> Result<Self, StoreError> {
-        for statement in [
-            sql::create_schema(database_schema),
-            E::Dialect::use_schema(database_schema),
-        ] {
+        for statement in [sql::create_schema(chain), E::Dialect::use_schema(chain)] {
             engine
                 .execute(&statement, &[])
                 .await
-                .map_err(StoreError::engine(Operation::Create, Some(database_schema)))?;
+                .map_err(StoreError::engine(Operation::Create, Some(chain)))?;
         }
         engine
             .execute("BEGIN", &[])
@@ -274,6 +170,7 @@ impl<E: Engine> SqlStore<E> {
         }
         Ok(Self {
             engine,
+            chain: ChainId::new(chain),
             tables: schema
                 .tables()
                 .iter()
@@ -288,14 +185,17 @@ impl<E: Engine> SqlStore<E> {
     /// The contracts discovered on `chain` that this store holds. One created in a block a
     /// `reorg` orphaned was deleted with that block, so every row here is canonical.
     ///
-    /// Read once at startup, before the first write, so a restart decodes every contract
-    /// a previous run discovered.
+    /// Read by [`restore`](Store::restore), so a restart decodes every contract a
+    /// previous run discovered.
     ///
     /// # Errors
     ///
     /// Returns [`StoreError::Engine`] when the query fails and [`StoreError::Restore`]
     /// when a stored value does not parse.
-    pub async fn contracts(&mut self, chain: &ChainId) -> Result<Vec<StoredContract>, StoreError> {
+    pub(crate) async fn contracts(
+        &mut self,
+        chain: &ChainId,
+    ) -> Result<Vec<StoredContract>, StoreError> {
         let rows = self
             .engine
             .query(&self.reads.contracts, &[chain_param(chain)])
@@ -317,8 +217,8 @@ impl<E: Engine> SqlStore<E> {
     /// older row. An orphaned block's row was deleted by its `reorg`, so these are
     /// canonical.
     ///
-    /// Read once at startup, before the first write: the result is the undo window a
-    /// restart resumes from. Rows below the oldest one returned can never be read again,
+    /// Read by [`restore`](Store::restore), before the first write: the result is the
+    /// undo window a restart resumes from. Rows below the oldest one returned can never be read again,
     /// so they are deleted here, which is what keeps the ledger from growing without
     /// bound across restarts. Contiguity is not checked; the pipeline does that.
     ///
@@ -326,7 +226,7 @@ impl<E: Engine> SqlStore<E> {
     ///
     /// Returns [`StoreError::Engine`] when the query or the delete fails and
     /// [`StoreError::Restore`] when a stored value does not parse.
-    pub async fn ledger(
+    pub(crate) async fn ledger(
         &mut self,
         chain: &ChainId,
         limit: usize,
@@ -441,6 +341,16 @@ impl<E: Engine> SqlStore<E> {
     }
 }
 
+impl<E: Engine + 'static> Store for SqlStore<E> {
+    async fn restore(&mut self) -> Result<Restored, StoreError> {
+        let chain = self.chain.clone();
+        Ok(Restored {
+            contracts: self.contracts(&chain).await?,
+            ledger: self.ledger(&chain, LEDGER_WINDOW).await?,
+        })
+    }
+}
+
 impl<E: Engine> EnvelopeSink for SqlStore<E> {
     async fn publish(&mut self, envelope: Envelope) -> Result<(), SinkError> {
         self.batch.push(&envelope)
@@ -502,10 +412,7 @@ fn column(row: &[Value], index: usize) -> &Value {
 
 /// A stored value that is not what its column holds.
 fn invalid(column: &'static str, value: &Value) -> InvalidStoredValue {
-    InvalidStoredValue {
-        column,
-        value: format!("{value:?}"),
-    }
+    InvalidStoredValue::new(column, format!("{value:?}"))
 }
 
 fn text<'a>(column: &'static str, value: &'a Value) -> Result<&'a str, InvalidStoredValue> {
@@ -540,116 +447,5 @@ fn timestamp(column: &'static str, value: &Value) -> Result<u64, InvalidStoredVa
     match value {
         Value::Timestamp(seconds) => Ok(*seconds),
         other => Err(invalid(column, other)),
-    }
-}
-
-/// What a store has been handed since its last commit: the rows to write, and the
-/// blocks a buffered `reorg` retracted.
-///
-/// A decoded record is two rows: its generic `decoded_logs` row, and its event's typed
-/// row, from the run's [`Schema`].
-///
-/// A store holds only the canonical chain. A `reorg` orphans blocks that are either
-/// already committed or still in this buffer — blocks are published in order and the
-/// storage channel is FIFO, so an orphaned block can never arrive after its `reorg`.
-/// [`push`](Self::push) drops the buffered ones at once, and the store deletes the
-/// committed ones in the same transaction that writes [`rows`](Self::rows), before
-/// writing them.
-#[derive(Debug)]
-struct Batch {
-    /// Rows to upsert, in publish order.
-    rows: Vec<Row>,
-    /// Orphaned block hashes to delete from the store, as `0x` hex, by chain, with the
-    /// lowest buffered `reorg` height, which none of them is below.
-    orphaned: BTreeMap<String, (u64, BTreeSet<String>)>,
-    /// Every table the run writes, which renders each decoded record's typed row.
-    schema: Arc<Schema>,
-}
-
-impl Batch {
-    fn new(schema: Arc<Schema>) -> Self {
-        Self {
-            rows: Vec::new(),
-            orphaned: BTreeMap::new(),
-            schema,
-        }
-    }
-
-    /// Buffers one envelope's rows. A `reorg` first drops every buffered row of the
-    /// blocks it orphans and records them for deletion; its own row is kept as the
-    /// record of the retraction.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`SinkError::UnknownEvent`] for a decoded record no event table holds,
-    /// which means it was decoded against a different catalog than the store opened with,
-    /// and [`SinkError::Table`] when a row cannot be built.
-    fn push(&mut self, envelope: &Envelope) -> Result<(), SinkError> {
-        if let Event::Reorg(reorg) = &envelope.event
-            && !reorg.orphaned_hashes.is_empty()
-        {
-            let chain = envelope.chain.as_str();
-            let hashes: BTreeSet<String> = reorg
-                .orphaned_hashes
-                .iter()
-                .map(|hash| format!("{hash:#x}"))
-                .collect();
-            self.rows.retain(|row| {
-                row.chain() != chain || !row.block_hash().is_some_and(|h| hashes.contains(h))
-            });
-            let (height, orphaned) = self
-                .orphaned
-                .entry(chain.to_owned())
-                .or_insert((reorg.height, BTreeSet::new()));
-            *height = (*height).min(reorg.height);
-            orphaned.extend(hashes);
-        }
-        if let Event::Decoded(decoded) = &envelope.event {
-            let row = self
-                .schema
-                .event_row(&envelope.chain, decoded)?
-                .ok_or_else(|| SinkError::UnknownEvent {
-                    protocol: decoded.protocol.clone(),
-                    contract: decoded.contract.clone(),
-                    event: decoded.name.clone(),
-                })?;
-            self.rows.push(row);
-        }
-        self.rows
-            .push(self.schema.row(&envelope.chain, &envelope.event)?);
-        Ok(())
-    }
-
-    /// The rows each table should load: the last buffered copy of each
-    /// `(chain, dedupe_key)`, in publish order.
-    ///
-    /// A merge must not see a key twice — both engines refuse to update one conflict row
-    /// twice in a statement — and "last" means last published, which only the buffer
-    /// knows; the staging table's physical order does not promise it.
-    fn by_table(&self) -> HashMap<TableId, Vec<&Row>> {
-        let mut seen = HashSet::new();
-        let mut tables: HashMap<TableId, Vec<&Row>> = HashMap::new();
-        for row in self.rows.iter().rev() {
-            let id = row.table().id;
-            if seen.insert((id, row.chain(), row.dedupe_key())) {
-                tables.entry(id).or_default().push(row);
-            }
-        }
-        for rows in tables.values_mut() {
-            rows.reverse();
-        }
-        tables
-    }
-
-    /// Whether there is nothing to commit. A `reorg` always buffers its own row, so a
-    /// batch with deletions is never empty.
-    fn is_empty(&self) -> bool {
-        self.rows.is_empty()
-    }
-
-    /// Forgets everything, once a commit has made it durable.
-    fn clear(&mut self) {
-        self.rows.clear();
-        self.orphaned.clear();
     }
 }

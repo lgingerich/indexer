@@ -14,15 +14,20 @@ jobs:
         with:
           toolchain: 1.95.0
           components: rustfmt, clippy
+      # The `delta` feature brings DataFusion and the AWS SDK, so a cold build is most of
+      # the job's time. Cached per lockfile and toolchain.
+      - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@nextest
       - run: cargo fmt --check
       - run: cargo clippy --all-targets --all-features -- -D warnings
       - run: cargo doc --no-deps --all-features
       - run: cargo nextest run --all-targets --all-features
-      # `--all-features` alone only ever exercises the engine's presence. The no-engine
+      # `--all-features` alone only ever exercises the engines' presence. The no-engine
       # build is the one that can rot: a `duckdb`-only symbol reaching an ungated test
       # fails to compile, and a fixture naming `[sink.duckdb]` fails to parse, so both
-      # hide until someone runs this. With one optional feature, these two are the only
-      # configurations there are.
+      # hide until someone runs this.
       - run: cargo clippy --no-default-features --all-targets -- -D warnings
       - run: cargo nextest run --no-default-features --all-targets
+      # The lake alone is the one store build that shares nothing SQL with the others,
+      # so a SQL-only item it reaches through the shared store code shows up only here.
+      - run: cargo clippy --no-default-features --features delta --all-targets -- -D warnings

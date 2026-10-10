@@ -23,7 +23,8 @@ use tokio_postgres::types::{FromSql, IsNull, Kind, ToSql, Type, to_sql_checked};
 
 use crate::secret::Secret;
 use crate::sink::sql::{self, Dialect, ident};
-use crate::sink::store::{Engine, EngineError, Operation, SqlStore, StoreError};
+use crate::sink::store::{Engine, SqlStore};
+use crate::sink::store_error::{EngineError, Operation, StoreError};
 use crate::sink::table::{ColumnType, Row, Schema, TableDef, Value};
 
 /// `PostgreSQL` connection and backlog batching settings for `[sink.postgres]`.
@@ -61,8 +62,8 @@ impl Drop for Postgres {
 }
 
 impl PostgresSink {
-    /// Connects using platform TLS, takes the single-writer lock on `database_schema`, and
-    /// creates its tables before ingest starts.
+    /// Connects using platform TLS, takes the single-writer lock on the database schema
+    /// named for `chain`, and creates its tables before ingest starts.
     ///
     /// # Errors
     ///
@@ -71,16 +72,15 @@ impl PostgresSink {
     pub async fn open(
         settings: &PostgresSettings,
         schema: Arc<Schema>,
-        database_schema: &str,
+        chain: &str,
     ) -> Result<Self, StoreError> {
-        let open = || StoreError::engine(Operation::Open, None);
         let connector = MakeTlsConnector::new(
-            native_tls::TlsConnector::new().map_err(|error| open()(error.into()))?,
+            native_tls::TlsConnector::new().map_err(StoreError::engine(Operation::Open, None))?,
         );
         let (client, connection) =
             tokio_postgres::connect(settings.connection_string.expose(), connector)
                 .await
-                .map_err(|error| open()(error.into()))?;
+                .map_err(StoreError::engine(Operation::Open, None))?;
         let task = tokio::spawn(async move {
             if let Err(error) = connection.await {
                 tracing::error!(%error, "PostgreSQL connection stopped");
@@ -90,28 +90,28 @@ impl PostgresSink {
         let locked: bool = client
             .query_one(
                 "SELECT pg_try_advisory_lock(hashtext('indexer'), hashtext($1))",
-                &[&database_schema],
+                &[&chain],
             )
             .await
             .and_then(|row| row.try_get(0))
-            .map_err(|error| open()(error.into()))?;
+            .map_err(StoreError::engine(Operation::Open, None))?;
         if !locked {
             task.abort();
             return Err(StoreError::Locked {
-                schema: database_schema.to_owned(),
+                schema: chain.to_owned(),
             });
         }
         let engine = Postgres {
             client,
             connection_task: Some(task),
         };
-        let store = SqlStore::new(engine, schema, database_schema).await?;
+        let store = SqlStore::new(engine, schema, chain).await?;
         tracing::info!("PostgreSQL storage opened");
         Ok(store)
     }
 
     /// Takes a connected client, whose connection future the caller is already driving,
-    /// and creates every table in `schema` in the database schema `database_schema`.
+    /// and creates every table in `schema` in the database schema named for `chain`.
     ///
     /// # Errors
     ///
@@ -119,13 +119,13 @@ impl PostgresSink {
     pub async fn connected(
         client: Client,
         schema: Arc<Schema>,
-        database_schema: &str,
+        chain: &str,
     ) -> Result<Self, StoreError> {
         let engine = Postgres {
             client,
             connection_task: None,
         };
-        SqlStore::new(engine, schema, database_schema).await
+        SqlStore::new(engine, schema, chain).await
     }
 }
 
