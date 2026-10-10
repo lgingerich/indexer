@@ -265,6 +265,9 @@ pub struct DeltaSink {
     batch: Batch,
     /// The committed blocks a reorg could still orphan, by hash, with their heights.
     committed: HashMap<String, u64>,
+    /// Whether a commit failed part-way. The failed batch is gone, so every later write
+    /// is refused until a reopen repairs the lake.
+    failed: bool,
     writer: WriterProperties,
     /// The highest committed height, as maintenance reads it; zero before the first.
     published_tip: Arc<AtomicU64>,
@@ -314,6 +317,7 @@ impl DeltaSink {
             batch: Batch::new(Arc::clone(&schema)),
             schema,
             committed: HashMap::new(),
+            failed: false,
             writer: WriterProperties::builder()
                 .set_compression(Compression::ZSTD(ZstdLevel::default()))
                 .build(),
@@ -583,12 +587,24 @@ impl DeltaSink {
     /// 3. every table's rows;
     /// 4. the new blocks into the ledger, once their rows are all present.
     ///
-    /// A failure part-way leaves the lake as the next open repairs it, so the batch is
-    /// not retried here: the error stops storage, and a restart resumes from the ledger.
+    /// A failure part-way leaves the lake as the next open repairs it. The batch is not
+    /// kept for a retry: the store refuses every later write with
+    /// [`StoreError::Failed`], and a restart resumes from the ledger.
     async fn commit(&mut self) -> Result<(), StoreError> {
+        if self.failed {
+            return Err(StoreError::Failed);
+        }
         if self.batch.is_empty() {
             return Ok(());
         }
+        let written = self.write().await;
+        self.failed = written.is_err();
+        written
+    }
+
+    /// Writes the batch for [`commit`](Self::commit).
+    async fn write(&mut self) -> Result<(), StoreError> {
+        self.refuse_replays()?;
         let started = Instant::now();
         // Taken out so the commit can borrow its rows while it writes, and put back
         // cleared, keeping its allocation for the next one.
@@ -632,6 +648,33 @@ impl DeltaSink {
         batch.clear();
         self.batch = batch;
         Ok(())
+    }
+
+    /// Refuses a batch that accepts a block already committed, unless the batch orphans
+    /// it first: the lake appends rather than upserts, so the block's rows would be
+    /// written twice. The pipeline resumes above the ledger's tip, so this never happens
+    /// unless an invariant upstream broke.
+    fn refuse_replays(&self) -> Result<(), StoreError> {
+        let replayed = self
+            .batch
+            .rows
+            .iter()
+            .filter(|row| row.table().id == TableId::Dataset(Table::AcceptedBlock))
+            .filter_map(Row::block_hash)
+            .find(|hash| {
+                self.committed.contains_key(*hash)
+                    && !self
+                        .batch
+                        .orphaned
+                        .values()
+                        .any(|(_, orphaned)| orphaned.contains(*hash))
+            });
+        match replayed {
+            Some(block) => Err(StoreError::Replayed {
+                block: block.to_owned(),
+            }),
+            None => Ok(()),
+        }
     }
 
     /// The committed blocks `batch` orphans, with the lowest height any of them is at.
@@ -707,12 +750,20 @@ impl EnvelopeSink for DeltaSink {
     /// Buffers one envelope's rows. A `reorg` first drops every buffered row of the
     /// blocks it orphans; the committed ones are deleted at the next commit, and its own
     /// row is kept as the record of the retraction.
+    ///
+    /// Refused with [`StoreError::Failed`] once a commit has failed.
     async fn publish(&mut self, envelope: Envelope) -> Result<(), SinkError> {
+        if self.failed {
+            return Err(StoreError::Failed.into());
+        }
         self.batch.push(&envelope)
     }
 
     /// Commits the batch. The drain decides how many blocks it holds; a block still
     /// buffered when the process stops is fetched again from the ledger's tip.
+    ///
+    /// A failed flush is final: the batch is not kept, and every later write is refused
+    /// with [`StoreError::Failed`] until the store is reopened.
     async fn flush(&mut self) -> Result<(), SinkError> {
         self.commit().await?;
         Ok(())

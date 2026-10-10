@@ -110,7 +110,9 @@ impl From<String> for ChainId {
 /// chain changing, and has no verbatim payload.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Reorg {
-    /// Height of the new head at which the discontinuity was detected.
+    /// Height of the lowest orphaned block, the first height the new branch replaces;
+    /// no orphan is below it. Stores bound their deletes by it, so a smaller value only
+    /// costs a wider delete, and a larger one would leave orphans behind.
     #[serde(with = "alloy_serde::quantity")]
     pub height: u64,
     /// Hash of the new head.

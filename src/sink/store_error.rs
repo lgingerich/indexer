@@ -92,6 +92,17 @@ pub enum StoreError {
         /// The column.
         column: String,
     },
+    /// An earlier commit failed part-way, so the store refuses further writes: the
+    /// failed batch is gone, and only reopening the store repairs what it left behind.
+    #[error("an earlier commit failed; the store must be reopened")]
+    Failed,
+    /// A batch accepts a block the store already committed, without a `reorg` orphaning
+    /// it first. A store that appends rather than upserts would write it twice.
+    #[error("block {block} is already committed")]
+    Replayed {
+        /// The block's hash, as `0x` hex.
+        block: String,
+    },
     /// An existing table does not match its definition. Tables are not migrated, so the
     /// store needs a fresh location or the table dropped.
     #[error("table {table} does not match its definition: {difference}")]

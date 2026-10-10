@@ -19,7 +19,7 @@ use deltalake::{DeltaTable, ensure_table_uri};
 
 use super::{DeltaSettings, DeltaSink, in_texts, maintenance, texts, texts_of};
 use crate::sink::table::{Schema, Table, TableId};
-use crate::sink::{EnvelopeSink, Store as _, StoreError, fixtures};
+use crate::sink::{EnvelopeSink, SinkError, Store as _, StoreError, fixtures};
 use crate::wire::envelope::{Block, BlockMeta, ChainId, Envelope, Event, Log, Reorg, Transaction};
 
 const CHAIN: &str = "base";
@@ -399,6 +399,67 @@ async fn opening_with_no_ledger_keeps_no_block_rows() {
     let mut sink = open(&dir).await;
     assert!(stored(&sink, Table::Block, "hash").await.is_empty());
     assert!(ledger(&mut sink).await.is_empty());
+}
+
+/// A commit that fails part-way refuses every later write rather than reporting the
+/// lost batch as stored, and the next open repairs what it left behind.
+#[tokio::test]
+async fn a_failed_commit_refuses_every_later_write() {
+    let dir = Dir::new();
+    let mut sink = open(&dir).await;
+    publish(&mut sink, block(1, 0)).await;
+    // A timestamp too large for the lake's microseconds fails the commit part-way.
+    let mut broken = block(2, 0);
+    for envelope in &mut broken {
+        match &mut envelope.event {
+            Event::Block(block) => block.timestamp = u64::MAX,
+            Event::Transaction(transaction) => transaction.block_timestamp = u64::MAX,
+            Event::Log(log) => log.block_timestamp = u64::MAX,
+            _ => {}
+        }
+    }
+    buffer(&mut sink, broken).await;
+    assert!(sink.flush().await.is_err());
+
+    assert!(matches!(
+        sink.flush().await,
+        Err(SinkError::Store(StoreError::Failed))
+    ));
+    assert!(matches!(
+        sink.publish(block(2, 0).remove(0)).await,
+        Err(SinkError::Store(StoreError::Failed))
+    ));
+    drop(sink);
+
+    let mut sink = open(&dir).await;
+    assert_eq!(blocks(&sink).await, expected(&[(1, 0)]));
+    assert_eq!(ledger(&mut sink).await.len(), 1);
+}
+
+/// A batch that accepts a committed block again, with no reorg orphaning it first, is
+/// refused before anything is written: the lake appends, so it would hold the block
+/// twice.
+#[tokio::test]
+async fn a_replayed_block_is_refused() {
+    let dir = Dir::new();
+    let mut sink = open(&dir).await;
+    for height in 1..=3 {
+        publish(&mut sink, block(height, 0)).await;
+    }
+    buffer(&mut sink, block(3, 0)).await;
+    assert!(matches!(
+        sink.flush().await,
+        Err(SinkError::Store(StoreError::Replayed { block })) if block == hex(hash(3, 0))
+    ));
+    let rows: usize = sink
+        .lake(Table::Block)
+        .read(Ok)
+        .await
+        .expect("the table reads")
+        .iter()
+        .map(deltalake::arrow::array::RecordBatch::num_rows)
+        .sum();
+    assert_eq!(rows, 3, "nothing of the replay was written");
 }
 
 /// The lake reports what it buffers, so the drain can commit by size: it grows with
