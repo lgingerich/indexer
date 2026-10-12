@@ -17,8 +17,11 @@ engine and lake-format comparisons, is in git history at `2b750b5`.
 
 ## Open: derived computation
 
-Incremental, layered computation over decoded logs (raw → derived → derived-of-derived) is
-not designed yet. The earlier evaluation shortlisted RisingWave (durable restarts in open
+Derived tables are computed inside the indexer, on the sub-second path to Postgres; see
+`docs/derive-design.md`. Per-event tables are built there. State and aggregate tables
+(raw → derived → derived-of-derived) are designed there and not built.
+
+The engine evaluation that preceded that choice shortlisted RisingWave (durable restarts in open
 source, `rw_int256`), Feldera (cleanest retraction model, but checkpoints are Enterprise-only),
 and Apache Flink (strongest fallback, JVM). Whatever is chosen must propagate retractions
 through every layer: views bucket time by `block_timestamp`, never declare a source

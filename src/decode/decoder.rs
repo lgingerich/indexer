@@ -15,6 +15,7 @@ use tracing::warn;
 
 use super::abi::DecodeError;
 use super::catalog::{Catalog, EntryId};
+use super::derive::Derivation;
 use crate::wire::envelope::{Contract, Decoded, Log, StoredContract, TypedValue};
 
 /// What one log produced: its decoded record, and any contracts its event created.
@@ -80,6 +81,11 @@ impl Decoder {
             added += usize::from(self.insert(contract.address, entry, contract.block_hash));
         }
         added
+    }
+
+    /// The derivations the catalog feeds, which run on every record decoded.
+    pub(super) fn derivations(&self) -> &[Derivation] {
+        &self.catalog.derivations
     }
 
     /// How many addresses decode: seeds plus discovered contracts.

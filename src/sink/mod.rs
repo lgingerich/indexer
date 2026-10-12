@@ -223,8 +223,8 @@ pub enum SinkError {
     Store(#[from] StoreError),
 }
 
-/// Fixtures the sink tests share: the shipped catalog's event tables, and a real decoded
-/// record to write into them.
+/// Fixtures the sink tests share: the shipped catalog's event tables, a derived table, and
+/// records to write into them.
 #[cfg(test)]
 #[expect(clippy::expect_used)]
 pub(crate) mod fixtures {
@@ -232,7 +232,7 @@ pub(crate) mod fixtures {
 
     use crate::decode::{Catalog, Decoder};
     use crate::sink::table::Schema;
-    use crate::wire::envelope::{ChainId, Decoded, Envelope, Event};
+    use crate::wire::envelope::{ChainId, Decoded, Derived, Envelope, Event};
 
     fn catalog() -> Catalog {
         Catalog::load(
@@ -245,6 +245,39 @@ pub(crate) mod fixtures {
     /// The shipped protocols' schema: the dataset tables and their event tables.
     pub(crate) fn schema() -> Arc<Schema> {
         Arc::new(catalog().schema().clone())
+    }
+
+    /// The shipped protocols' schema with a derived table, `test_rows`, beside them, and a
+    /// row of it: a negative 128-bit `amount`, in block `0x…0b` at height 1.
+    pub(crate) fn derived() -> (Arc<Schema>, Derived) {
+        use alloy_primitives::{Address, B256, I256, TxHash};
+
+        use crate::sink::table::ColumnType;
+        use crate::wire::envelope::{DerivedField, TypedValue};
+
+        let mut schema = catalog().schema().clone();
+        schema
+            .add_derived("test_rows", &[("amount", ColumnType::BigInt)])
+            .expect("a new table");
+        let row = Derived {
+            table: "test_rows".to_owned(),
+            address: Address::repeat_byte(0xd0),
+            transaction_hash: TxHash::repeat_byte(0x11),
+            transaction_index: 0,
+            log_index: 3,
+            row: 0,
+            fields: vec![DerivedField {
+                name: "amount".to_owned(),
+                value: TypedValue::Int {
+                    value: I256::try_from(i128::MIN).expect("fits"),
+                    bits: 128,
+                },
+            }],
+            block_number: 1,
+            block_hash: B256::with_last_byte(0x0b),
+            block_timestamp: 1_700_000_000,
+        };
+        (Arc::new(schema), row)
     }
 
     /// The first real Uniswap V3 `Swap` in the fixtures, decoded against the shipped

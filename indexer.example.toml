@@ -31,12 +31,14 @@ ws_url = "wss://base-rpc.publicnode.com"
 # sink lists the tables it writes, as exact names, `*` globs over names, or
 # `contract_events` for every contract's decoded event table (one per event of every
 # protocol manifest, such as `uniswap_v3_pool_swap`, including protocols added later).
-# The tables are `blocks`, `transactions`, `logs`, `decoded_logs`, and the event
-# tables. Every store also writes `accepted_blocks`, `reorgs`, and `contracts` on its
-# own; they are not listed.
+# The tables are `blocks`, `transactions`, `logs`, `decoded_logs`, the event tables,
+# and the derived tables (`src/decode/derive`, such as `metric_v1_swaps`), which a glob also
+# matches but `contract_events` does not. Every store also writes `accepted_blocks`,
+# `reorgs`, and `contracts` on its own; they are not listed.
 #
 # What ingest fetches follows from the tables: blocks and transactions when a sink
-# writes them, and logs when a sink writes logs or anything decoded from them. Logs
+# writes them, and logs when a sink writes logs or anything decoded or derived from
+# them. Logs
 # without transactions use eth_getLogs, over a range of up to ten heights in backfill;
 # transactions read the block body and its receipts, and logs come from those.
 #

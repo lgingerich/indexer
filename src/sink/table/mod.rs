@@ -5,7 +5,8 @@
 //! `DatasetBuilder` that pairs each column with the field it
 //! reads, so the column's type and nullability come from the field's Rust type through
 //! [`Cell`] and cannot disagree with the values written into it. Each decoded event gets a
-//! table generated from its ABI at startup (see [`Schema::add_event`]).
+//! table generated from its ABI at startup (see [`Schema::add_event`]), and each
+//! derivation one declared by the catalog (see [`Schema::add_derived`]).
 //!
 //! Nothing here knows SQL. A store maps [`ColumnType`] to its own types and renders the
 //! statements (see `sink::sql`); a future store reads the same definitions.
@@ -174,6 +175,8 @@ pub enum TableId {
     Dataset(Table),
     /// A decoded event's table.
     Event(usize),
+    /// A derived table.
+    Derived(usize),
 }
 
 impl From<Table> for TableId {
@@ -302,6 +305,12 @@ pub enum TableError {
         /// The repeated name.
         table: String,
     },
+    /// A table's name is longer than a `PostgreSQL` identifier, which would truncate it.
+    #[error("{table} is longer than {MAX_IDENTIFIER} bytes")]
+    LongName {
+        /// The name.
+        table: String,
+    },
     /// A row's values do not line up with its table's columns: a decoded record carrying
     /// a different number of arguments than its event's table has columns.
     #[error("a {table} row has {found} values for {expected} columns")]
@@ -312,6 +321,29 @@ pub enum TableError {
         expected: usize,
         /// The values the row had.
         found: usize,
+    },
+    /// An event has no dataset table: a derived row belongs to its derivation's.
+    #[error("a {kind} event has no dataset table")]
+    NotADataset {
+        /// The event's kind.
+        kind: &'static str,
+    },
+    /// A derived record names a table the schema does not have.
+    #[error("no derived table is named {table}")]
+    UnknownTable {
+        /// The name the record gave.
+        table: String,
+    },
+    /// A derived record's field does not fit its table's column: it is named differently,
+    /// or holds a value the column's type cannot.
+    #[error("{table}.{column}: {reason}")]
+    Field {
+        /// The table.
+        table: String,
+        /// The column.
+        column: String,
+        /// What did not fit.
+        reason: &'static str,
     },
     /// A document value could not be rendered as JSON.
     #[error("render a {table} document: {source}")]
@@ -500,7 +532,8 @@ impl Row {
     }
 }
 
-/// The tables a store writes: the dataset tables, then one typed table per decoded event.
+/// The tables a store writes: the dataset tables, then one typed table per decoded event,
+/// then one per derivation.
 ///
 /// A run's schema holds every table. A store that is routed only some of them writes a
 /// [`select`](Self::select)ion of it, which still knows every event's table — a decoded
@@ -517,6 +550,8 @@ pub struct Schema {
     /// Every event's table, written or not, by the record's protocol, contract, and event
     /// definition.
     events: HashMap<(String, String, B256), Arc<TableDef>>,
+    /// Every derived table, written or not, by name.
+    derived: HashMap<String, Arc<TableDef>>,
 }
 
 impl Schema {
@@ -535,6 +570,7 @@ impl Schema {
             written: Table::ALL.iter().map(|&table| table.into()).collect(),
             datasets: Arc::new(datasets),
             events: HashMap::new(),
+            derived: HashMap::new(),
         })
     }
 
@@ -555,6 +591,7 @@ impl Schema {
             written: tables.iter().map(|def| def.id).collect(),
             tables,
             events: self.events.clone(),
+            derived: self.derived.clone(),
         }
     }
 
@@ -587,15 +624,19 @@ impl Schema {
         self.datasets.def(table)
     }
 
-    /// An event's row in its dataset table.
+    /// An event's row in its dataset table, or a derived record's in its derived table.
     ///
     /// Every event is a row, a control signal included, so a store has no variant to
     /// handle and no event that is silently dropped.
     ///
     /// # Errors
     ///
-    /// Returns [`TableError::Json`] when a document field does not render.
+    /// Returns [`TableError::Json`] when a document field does not render, and for a
+    /// derived record the errors of [`derived_row`](Self::derived_row).
     pub fn row(&self, chain: &ChainId, event: &Event) -> Result<Row, TableError> {
-        self.datasets.row(chain, event)
+        match event {
+            Event::Derived(derived) => self.derived_row(chain, derived),
+            _ => self.datasets.row(chain, event),
+        }
     }
 }

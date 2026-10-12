@@ -275,7 +275,8 @@ impl DatasetTables {
         }
     }
 
-    /// An event's row in its dataset table.
+    /// An event's row in its dataset table. A derived record has none: its table is the
+    /// derivation's, which [`Schema::row`](super::Schema::row) renders instead.
     pub(super) fn row(&self, chain: &ChainId, event: &Event) -> Result<Row, TableError> {
         let key = event.dedupe_key();
         match event {
@@ -284,6 +285,7 @@ impl DatasetTables {
             Event::Log(l) => self.logs.row(l, chain, key),
             Event::Decoded(d) => self.decoded_logs.row(d, chain, key),
             Event::Contract(c) => self.contracts.row(c, chain, key),
+            Event::Derived(_) => Err(TableError::NotADataset { kind: event.kind() }),
             Event::Reorg(r) => self.reorgs.row(r, chain, key),
             Event::AcceptedBlock(a) => self.accepted_blocks.row(a, chain, key),
         }

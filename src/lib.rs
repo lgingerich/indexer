@@ -30,7 +30,8 @@
 //!   retraction with a bounded sliding undo window (see [`ingest::Machine`]), resumed
 //!   from the store's ledger of committed blocks after a restart.
 //! - Decoding a log against a contract ABI into typed, named arguments, as a
-//!   stateless transform (see [`decode::Decoder`]).
+//!   stateless transform (see [`decode::Decoder`]), and deriving a table from one decoded
+//!   event, a row per record, in the same step.
 //! - A local `DuckDB` store of typed per-dataset tables, behind the `duckdb` feature.
 //!
 //! # Not built yet

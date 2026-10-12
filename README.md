@@ -238,7 +238,8 @@ src/
 ├── wire/           the wire contract: envelope, events, and dataset records. Pure data.
 ├── ingest/         block sources and the reorg-aware pipeline.
 ├── decode/         protocol manifests, the log decoder and its contract set, factory
-│                   discovery, and the live decoding sink.
+│                   discovery, the live decoding sink, and `derive/`: tables computed
+│                   from one decoded event each, one file per protocol.
 └── sink/           where envelopes go: the sink trait, the decode→storage channel, the
                     table definitions, the SQL renderer, the shared store, and stdout.
 ```
@@ -294,6 +295,17 @@ that matters most: `decode` must not depend on `ingest`.
   blocks. At startup the store's `contracts` rows are read back, so a restart keeps
   decoding every pool a previous run discovered, and resume replays the blocks missed
   while down, so pools created then are discovered too.
+- **Derived tables.** `src/decode/derive` computes tables from decoded events, rows per
+  record and nothing carried between records, as the last step of decoding it.
+  Metric's are `metric_v1_swaps`, each pool `Swap` with its packed words unpacked into
+  exact signed amounts, fees, and the pool's bin after the swap; `metric_v1_bin_fills`,
+  each bin a swap filled with its balance changes and fees; `metric_v1_liquidity`, each
+  bin of a liquidity add or remove; and `metric_v1_pool_bins`, each bin of a pool's
+  ladder as created, with its edges. A derived
+  row carries its log's block hash, so it commits with its block and a reorg deletes it
+  with the rest. A derivation runs when the catalog declares its event's exact
+  signature, and its rows go to the sinks that list its table. It derives only blocks
+  ingested while it runs; history is not backfilled.
 - **A local store.** The process writes every envelope, raw and decoded, into a local
   `DuckDB` database: one typed table per dataset, with real columns rather than a JSON
   blob, and one per decoded event, with a column per argument. What a table's columns
@@ -363,9 +375,10 @@ contract set in block order, since a contract decodes only from its creation onw
 
 ### Streaming aggregation
 
-Decode emits facts. A swap's tokens, decimals, and windows over those facts are
-joins and derived calculations, and they belong in a streaming layer after the
-store. See [What decode does not do](#what-decode-does-not-do).
+Decode emits facts, and its derivations compute rows from one fact at a time. A swap's
+tokens, decimals, and windows over those facts are joins and state carried across
+records, which decode does not do. See [What decode does not do](#what-decode-does-not-do) and
+`docs/derive-design.md`.
 
 ```
 raw logs + decoded records ──▶ aggregation ──▶ trades, balances, windows
@@ -832,11 +845,12 @@ unknown fields.
 Events fall into three kinds. **Datasets** — `block`, `transaction`, `log` — are durable on-chain records, defined per chain in `src/wire/datasets/evm.rs`. Each
 is a normalized table with a natural key and fully deconstructed fields, the same
 decomposition of the chain's datasets, so a row maps straight to a
-persistence row; children are referenced by scalar key, never embedded. **Derived**
-records — `decoded` and `contract` — are what the decode stage produces from a log:
-typed ABI arguments, whose types travel with them so a consumer can rebuild a typed
-column without reading the ABI, and the contracts a factory created, modeled on the
-provenance columns of Allium's `dex.pools`. **Control
+persistence row; children are referenced by scalar key, never embedded. Records
+**produced from a log** — `decoded`, `contract`, and `derived` — are what the decode
+stage adds after it: typed ABI arguments, whose types travel with them so a
+consumer can rebuild a typed column without reading the ABI; the contracts a factory
+created, modeled on the provenance columns of Allium's `dex.pools`; and rows a
+derivation computed from one decoded log. **Control
 signals** — `reorg` and `accepted_block` — drive a consumer's state machine and carry no
 payload: a `reorg` names the hashes that stopped being canonical, and an `accepted_block`
 closes each block with its identity, so a consumer sees where every block ends, even an

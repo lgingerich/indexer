@@ -142,6 +142,14 @@ impl Abi {
         })
     }
 
+    /// Whether an event has the canonical `signature`, for example
+    /// `Swap(address,address,uint256)`.
+    pub(crate) fn declares(&self, signature: &str) -> bool {
+        self.events
+            .values()
+            .any(|event| event.signature == signature)
+    }
+
     /// The keys of every event declared under `name`.
     pub(crate) fn events_named(&self, name: &str) -> Vec<EventKey> {
         self.events

@@ -2,14 +2,15 @@
 
 use tracing::{info, warn};
 
-use crate::decode::{DecodeError, Decoder};
+use crate::decode::{DecodeError, Decoder, derive};
 use crate::sink::{EnvelopeSink, SinkError};
 use crate::wire::envelope::{ChainId, Envelope, Event, Log};
 
-/// Forwards every raw record and adds decoded logs and discovered contracts.
+/// Forwards every raw record and adds decoded logs, their derived rows, and discovered
+/// contracts.
 ///
-/// After a log it can decode, it publishes the decoded record and then any contract the
-/// log created. A reorg marker is forwarded unchanged and retracts the contracts created
+/// After a log it can decode, it publishes the decoded record, then the rows its
+/// derivations compute from it, then any contract the log created. A reorg marker is forwarded unchanged and retracts the contracts created
 /// in the orphaned blocks.
 pub struct DecodingSink<K> {
     decoder: Decoder,
@@ -41,8 +42,10 @@ impl<K: EnvelopeSink> DecodingSink<K> {
     fn decode(&mut self, chain: &ChainId, log: &Log) -> Result<Vec<Event>, SinkError> {
         match self.decoder.decode(log) {
             Ok(Some(decoding)) => {
-                let mut events = Vec::with_capacity(1 + decoding.discovered.len());
+                let derived = derive::rows(self.decoder.derivations(), chain, &decoding.decoded);
+                let mut events = Vec::with_capacity(1 + derived.len() + decoding.discovered.len());
                 events.push(Event::Decoded(Box::new(decoding.decoded)));
+                events.extend(derived.into_iter().map(|row| Event::Derived(Box::new(row))));
                 events.extend(
                     decoding
                         .discovered
@@ -232,5 +235,27 @@ mod tests {
         sink.publish(reorg(block)).await.expect("reorg");
         sink.publish(log(swap(pool))).await.expect("swap");
         assert_eq!(kinds(&sink)[6..], ["reorg", "log"]);
+    }
+
+    /// A record a derivation reads is followed by its derived row, before anything else
+    /// the log produced.
+    #[tokio::test]
+    async fn a_derived_row_follows_its_decoded_record() {
+        use alloy_primitives::U256;
+
+        use crate::decode::derive::fixtures;
+
+        let mut sink = DecodingSink::new(fixtures::decoder(), Collect::default());
+        let swap = fixtures::swap_log(U256::ZERO, U256::ZERO, U256::ZERO);
+        sink.publish(log(swap.clone())).await.expect("swap");
+        assert_eq!(kinds(&sink), ["log", "decoded", "derived"]);
+        let Event::Derived(derived) = &sink.inner.records[2].event else {
+            panic!("the swap's row");
+        };
+        assert_eq!(derived.table, "metric_v1_swaps");
+        assert_eq!(
+            (derived.log_index, derived.block_hash),
+            (swap.log_index, swap.block_hash)
+        );
     }
 }

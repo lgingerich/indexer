@@ -71,8 +71,10 @@ use std::path::{Path, PathBuf};
 use alloy_dyn_abi::DynSolType;
 use alloy_primitives::Address;
 use serde::Deserialize;
+use tracing::warn;
 
 use super::abi::{Abi, AbiError, EventKey, InputSpec};
+use super::derive::{DERIVATIONS, Derivation};
 use crate::sink::table::{Column, ColumnType, MAX_IDENTIFIER, Schema, TableError, snake_case};
 use crate::wire::envelope::ChainId;
 
@@ -143,6 +145,8 @@ pub(crate) struct Rule {
 pub struct Catalog {
     pub(crate) entries: Vec<Entry>,
     pub(crate) seeds: Vec<(Address, EntryId)>,
+    /// The derivations whose event a manifest declares; see [`super::derive`].
+    pub(super) derivations: Vec<Derivation>,
     schema: Schema,
 }
 
@@ -156,6 +160,7 @@ impl Catalog {
         Ok(Self {
             entries: Vec::new(),
             seeds: Vec::new(),
+            derivations: Vec::new(),
             schema: Schema::new().map_err(|source| CatalogError::Table {
                 contract: "the dataset tables".to_owned(),
                 source,
@@ -206,6 +211,7 @@ impl Catalog {
             }
             catalog.add(manifest, &protocol, chain)?;
         }
+        catalog.add_derivations()?;
         let mut seen = HashMap::new();
         for &(address, entry) in &catalog.seeds {
             if let Some(first) = seen.insert(address, entry) {
@@ -328,6 +334,44 @@ impl Catalog {
         self.entries
             .iter()
             .position(|entry| entry.protocol == protocol && entry.name == name)
+    }
+
+    /// Declares the table of every derivation whose events a manifest declares, and keeps
+    /// those derivations. One whose contract is declared without one of its events is
+    /// skipped with a warning: the contract's ABI changed under it.
+    fn add_derivations(&mut self) -> Result<(), CatalogError> {
+        for derivation in DERIVATIONS {
+            let Derivation {
+                protocol,
+                contract,
+                signatures,
+                table,
+                columns,
+                ..
+            } = derivation;
+            let Some(entry) = self.entry(protocol, contract) else {
+                continue;
+            };
+            let abi = &self.entries[entry].abi;
+            if let Some(missing) = signatures.iter().find(|&&event| !abi.declares(event)) {
+                warn!(
+                    table,
+                    protocol,
+                    contract,
+                    signature = missing,
+                    "the manifest does not declare an event this table derives from"
+                );
+                continue;
+            }
+            self.schema
+                .add_derived(table, columns)
+                .map_err(|source| CatalogError::Table {
+                    contract: self.label(entry),
+                    source,
+                })?;
+            self.derivations.push(derivation);
+        }
+        Ok(())
     }
 
     /// `protocol.name`, for messages.

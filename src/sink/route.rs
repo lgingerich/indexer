@@ -23,7 +23,7 @@ use serde::Deserialize;
 use serde::de::{self, Deserializer};
 
 use crate::ingest::source::Datasets;
-use crate::sink::table::{Schema, Table, TableId};
+use crate::sink::table::{Schema, Table, TableError, TableId};
 use crate::sink::{EnvelopeSink, SinkError};
 use crate::wire::envelope::{Envelope, Event};
 
@@ -118,6 +118,7 @@ impl Tables {
             for def in schema.tables() {
                 let hit = match def.id {
                     TableId::Event(_) => entry == CONTRACT_EVENTS || glob(entry, &def.name),
+                    TableId::Derived(_) => glob(entry, &def.name),
                     TableId::Dataset(table) => !table.is_bookkeeping() && glob(entry, &def.name),
                 };
                 if hit {
@@ -178,7 +179,7 @@ fn glob(pattern: &str, name: &str) -> bool {
 
 /// What ingest fetches so every store gets the tables it writes: blocks and
 /// transactions when a store writes them, and logs when a store writes logs or anything
-/// decoded from them.
+/// decoded or derived from them.
 #[must_use]
 pub fn datasets<'a>(selections: impl IntoIterator<Item = &'a HashSet<TableId>>) -> Datasets {
     let mut datasets = Datasets {
@@ -190,7 +191,9 @@ pub fn datasets<'a>(selections: impl IntoIterator<Item = &'a HashSet<TableId>>) 
         match id {
             TableId::Dataset(Table::Block) => datasets.blocks = true,
             TableId::Dataset(Table::Transaction) => datasets.transactions = true,
-            TableId::Dataset(Table::Log | Table::Decoded) | TableId::Event(_) => {
+            TableId::Dataset(Table::Log | Table::Decoded)
+            | TableId::Event(_)
+            | TableId::Derived(_) => {
                 datasets.logs = true;
             }
             TableId::Dataset(Table::Contract | Table::Reorg | Table::AcceptedBlock) => {}
@@ -203,8 +206,8 @@ pub fn datasets<'a>(selections: impl IntoIterator<Item = &'a HashSet<TableId>>) 
 ///
 /// A block, transaction, or log goes where its table is written. A decoded record goes
 /// where its `decoded_logs` row or its event's own row is; each store keeps the rows it
-/// writes. The bookkeeping envelopes — accepted blocks, reorgs, discovered contracts —
-/// go to every sink. An envelope is moved to the last sink that takes it and cloned
+/// writes. A derived record goes where its derived table is. The bookkeeping envelopes —
+/// accepted blocks, reorgs, discovered contracts — go to every sink. An envelope is moved to the last sink that takes it and cloned
 /// only for the others, so one store costs no copy.
 ///
 /// Every sink sees every block boundary: [`flush`](EnvelopeSink::flush) reaches each,
@@ -241,6 +244,14 @@ impl<K: EnvelopeSink> EnvelopeSink for Router<K> {
                             event: decoded.name.clone(),
                         })?;
                 [Some(Table::Decoded.into()), Some(table.id)]
+            }
+            Event::Derived(derived) => {
+                let table = self.schema.derived_table(&derived.table).ok_or_else(|| {
+                    TableError::UnknownTable {
+                        table: derived.table.clone(),
+                    }
+                })?;
+                [Some(table.id), None]
             }
             Event::Contract(_) | Event::Reorg(_) | Event::AcceptedBlock(_) => [None, None],
         };
@@ -319,11 +330,11 @@ mod tests {
         assert!(!glob("a*a", "a"), "the prefix and suffix may not overlap");
     }
 
-    /// `contract_events` is every event table and no dataset table; names and globs
-    /// select from both.
+    /// `contract_events` is every event table and no dataset or derived table; names and
+    /// globs select from all of them.
     #[test]
     fn entries_resolve_to_tables() {
-        let schema = fixtures::schema();
+        let (schema, _) = fixtures::derived();
         let events = tables(&["contract_events"])
             .resolve(&schema)
             .expect("resolves");
@@ -347,6 +358,13 @@ mod tests {
             .resolve(&schema)
             .expect("resolves");
         assert_eq!(names(&schema, &swaps), ["uniswap_v3_pool_swap"]);
+
+        let derived = tables(&["test_*"]).resolve(&schema).expect("resolves");
+        assert_eq!(names(&schema, &derived), ["test_rows"]);
+        assert!(
+            !events.iter().any(|id| derived.contains(id)),
+            "contract_events is decoded tables only"
+        );
     }
 
     #[test]
@@ -389,10 +407,11 @@ mod tests {
         );
     }
 
-    /// Ingest fetches the union, and logs whenever anything decoded from them is written.
+    /// Ingest fetches the union, and logs whenever anything decoded or derived from them is
+    /// written.
     #[test]
     fn ingest_fetches_what_some_store_writes() {
-        let schema = fixtures::schema();
+        let (schema, _) = fixtures::derived();
         let resolve = |entries: &[&str]| tables(entries).resolve(&schema).expect("resolves");
         let fetch = |stores: &[&[&str]]| {
             let selections: Vec<_> = stores.iter().map(|entries| resolve(entries)).collect();
@@ -405,6 +424,7 @@ mod tests {
         };
         assert_eq!(fetch(&[&["contract_events"]]), only(false, false, true));
         assert_eq!(fetch(&[&["decoded_logs"]]), only(false, false, true));
+        assert_eq!(fetch(&[&["test_rows"]]), only(false, false, true));
         assert_eq!(
             fetch(&[&["blocks", "transactions"], &["contract_events"]]),
             only(true, true, true)
@@ -436,29 +456,31 @@ mod tests {
     }
 
     /// Raw rows go where their table is, a decoded record wherever either of its tables
-    /// is, and the bookkeeping everywhere; every sink sees the flush.
+    /// is, a derived row where its table is, and the bookkeeping everywhere; every sink
+    /// sees the flush.
     #[tokio::test]
     async fn each_sink_gets_the_envelopes_of_its_tables() {
-        let schema = fixtures::schema();
+        let (schema, row) = fixtures::derived();
         let resolve = |entries: &[&str]| tables(entries).resolve(&schema).expect("resolves");
         let mut router = Router::new(
             Arc::clone(&schema),
             vec![
                 (Seen::default(), resolve(&["blocks", "logs"])),
                 (Seen::default(), resolve(&["contract_events"])),
-                (Seen::default(), resolve(&["transactions"])),
+                (Seen::default(), resolve(&["transactions", "test_rows"])),
             ],
         );
         let block = Event::Block(Box::default());
         let log = Event::Log(Box::default());
         let decoded = Event::Decoded(Box::new(fixtures::decoded_swap()));
+        let derived = Event::Derived(Box::new(row));
         let accepted = Event::AcceptedBlock(BlockMeta {
             height: 1,
             hash: B256::with_last_byte(1),
             parent_hash: B256::ZERO,
             timestamp: 1,
         });
-        for event in [&block, &log, &decoded, &accepted] {
+        for event in [&block, &log, &decoded, &derived, &accepted] {
             router
                 .publish(envelope(event.clone()))
                 .await
@@ -474,7 +496,10 @@ mod tests {
             [block.dedupe_key(), log.dedupe_key(), accepted.dedupe_key()]
         );
         assert_eq!(events.0.keys, [decoded.dedupe_key(), accepted.dedupe_key()]);
-        assert_eq!(transactions.0.keys, [accepted.dedupe_key()]);
+        assert_eq!(
+            transactions.0.keys,
+            [derived.dedupe_key(), accepted.dedupe_key()]
+        );
         assert!(router.sinks.iter().all(|(sink, _)| sink.flushes == 1));
     }
 }

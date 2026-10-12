@@ -16,6 +16,7 @@
 mod abi;
 mod catalog;
 mod decoder;
+mod derive;
 mod sink;
 
 pub use abi::{Abi, AbiError, DecodeError, DecodedEvent};

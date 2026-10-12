@@ -1,7 +1,8 @@
-//! Each decoded event's typed table, generated from its ABI at startup.
+//! The tables anchored to one log: each decoded event's, generated from its ABI at startup,
+//! and each derivation's, declared beside them.
 //!
-//! An event's table has the log's columns, then one column per argument in ABI order,
-//! then the block's columns:
+//! Both have the log's columns, then their own, then the block's columns. An event's own
+//! columns are one per argument in ABI order; a derivation's are the ones it declares:
 //!
 //! ```text
 //! uniswap_v3_pool_swap
@@ -12,22 +13,25 @@
 //!
 //! An argument's column is its name in `snake_case`; an unnamed argument is `arg{n}`, and
 //! a name that repeats an earlier column gets `_{n}` appended, and one too long for
-//! `PostgreSQL` is shortened with a hash. A row's key is the decoded record's own
-//! `dedupe_key`.
+//! `PostgreSQL` is shortened with a hash. A row's key is the record's own `dedupe_key`.
+//!
+//! A derived record's fields must name its table's columns in order and hold values of
+//! their types. A derivation is code in this crate, so a field that does not fit is a bug
+//! in it, and building the row fails rather than storing a null or a clipped integer.
 
 use std::sync::Arc;
 
-use alloy_primitives::B256;
+use alloy_primitives::{Address, B256, TxHash};
 
-use crate::wire::envelope::{ChainId, Decoded, DecodedArg};
+use crate::wire::envelope::{ChainId, Decoded, DecodedArg, Derived};
 use crate::wire::typed::{AbiType, TypedValue};
 
 use super::{
-    Column, ColumnType, PRIMARY_KEY, Row, Schema, TableDef, TableError, TableId, Value,
-    fit_identifier,
+    Column, ColumnType, MAX_IDENTIFIER, PRIMARY_KEY, Row, Schema, TableDef, TableError, TableId,
+    Value, fit_identifier,
 };
 
-/// The columns before an event's arguments.
+/// The columns before an event's arguments or a derivation's own.
 const LEADING: [(&str, ColumnType); 4] = [
     ("address", ColumnType::Text),
     ("transaction_hash", ColumnType::Text),
@@ -35,7 +39,7 @@ const LEADING: [(&str, ColumnType); 4] = [
     ("log_index", ColumnType::Uint),
 ];
 
-/// The columns after an event's arguments, before the primary key.
+/// The columns after an event's arguments or a derivation's own, before the primary key.
 const TRAILING: [(&str, ColumnType); 3] = [
     ("block_number", ColumnType::Uint),
     ("block_hash", ColumnType::Text),
@@ -56,9 +60,6 @@ impl Schema {
         name: String,
         params: Vec<Column>,
     ) -> Result<(), TableError> {
-        if self.tables.iter().any(|table| table.name == name) {
-            return Err(TableError::DuplicateTable { table: name });
-        }
         let reserved: Vec<&str> = LEADING
             .iter()
             .chain(&TRAILING)
@@ -76,25 +77,73 @@ impl Schema {
             }
             names.push(fit_identifier(column));
         }
-        let id = TableId::Event(self.events.len());
+        let own = names
+            .into_iter()
+            .zip(params)
+            .map(|(column, param)| Column::new(column, param.kind, param.nullable));
+        let table = self.add_log_table(TableId::Event(self.events.len()), name, own)?;
+        self.events
+            .insert((protocol.to_owned(), contract.to_owned(), event_id), table);
+        Ok(())
+    }
+
+    /// Adds the derived table `name`, whose own columns are `columns`, in order and all
+    /// required.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TableError::DuplicateTable`], adding nothing, when a table is already
+    /// named `name`, [`TableError::LongName`] when `name` would not fit a `PostgreSQL`
+    /// identifier, and [`TableError::DuplicateColumn`] when a column repeats one of the
+    /// log's, the block's, or the key's.
+    pub fn add_derived(
+        &mut self,
+        name: &str,
+        columns: &[(&'static str, ColumnType)],
+    ) -> Result<TableId, TableError> {
+        let id = TableId::Derived(self.derived.len());
+        let own = columns
+            .iter()
+            .map(|&(column, kind)| Column::new(column, kind, false));
+        let table = self.add_log_table(id, name.to_owned(), own)?;
+        self.derived.insert(name.to_owned(), table);
+        Ok(id)
+    }
+
+    /// Adds a table anchored to one log, written: the log's columns, `own`, then the
+    /// block's, reorged by the block.
+    fn add_log_table(
+        &mut self,
+        id: TableId,
+        name: String,
+        own: impl IntoIterator<Item = Column>,
+    ) -> Result<Arc<TableDef>, TableError> {
+        if self.tables.iter().any(|table| table.name == name) {
+            return Err(TableError::DuplicateTable { table: name });
+        }
+        if name.len() > MAX_IDENTIFIER {
+            return Err(TableError::LongName { table: name });
+        }
+        let required = |(name, kind)| Column::new(name, kind, false);
         let mut table = TableDef::builder(id, name);
-        for (column, kind) in LEADING {
-            table = table.column(Column::new(column, kind, false));
-        }
-        for (column, param) in names.into_iter().zip(params) {
-            table = table.column(Column::new(column, param.kind, param.nullable));
-        }
-        for (column, kind) in TRAILING {
-            table = table.column(Column::new(column, kind, false));
+        for column in LEADING
+            .into_iter()
+            .map(required)
+            .chain(own)
+            .chain(TRAILING.into_iter().map(required))
+        {
+            table = table.column(column);
         }
         let table = Arc::new(table.reorg_by("block_hash", "block_number").build()?);
-        self.events.insert(
-            (protocol.to_owned(), contract.to_owned(), event_id),
-            Arc::clone(&table),
-        );
         self.written.insert(id);
-        self.tables.push(table);
-        Ok(())
+        self.tables.push(Arc::clone(&table));
+        Ok(table)
+    }
+
+    /// The derived table named `name`, written or not.
+    #[must_use]
+    pub fn derived_table(&self, name: &str) -> Option<&Arc<TableDef>> {
+        self.derived.get(name)
     }
 
     /// A decoded record's row in its event's table, whether or not that table is
@@ -111,12 +160,12 @@ impl Schema {
         };
         let mut arguments: Vec<&DecodedArg> = decoded.indexed.iter().chain(&decoded.body).collect();
         arguments.sort_by_key(|argument| argument.position);
-        let mut values = vec![
-            hex(decoded.address),
-            hex(decoded.transaction_hash),
-            Value::Uint(decoded.transaction_index),
-            Value::Uint(decoded.log_index),
-        ];
+        let mut values = log_values(
+            decoded.address,
+            decoded.transaction_hash,
+            decoded.transaction_index,
+            decoded.log_index,
+        );
         for (argument, column) in arguments
             .iter()
             .zip(table.columns.iter().skip(LEADING.len()))
@@ -128,12 +177,92 @@ impl Schema {
                 })?,
             );
         }
-        values.extend([
-            Value::Uint(decoded.block_number),
-            hex(decoded.block_hash),
-            Value::Timestamp(decoded.block_timestamp),
-        ]);
+        values.extend(block_values(
+            decoded.block_number,
+            decoded.block_hash,
+            decoded.block_timestamp,
+        ));
         Row::new(table, values, chain.as_str(), decoded.dedupe_key()).map(Some)
+    }
+
+    /// A derived record's row in its table, whether or not that table is written.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TableError::UnknownTable`] when no derived table has the record's name,
+    /// [`TableError::Field`] when a field is named other than its column or holds a value
+    /// the column's type cannot, and [`TableError::Width`] when the record has fewer
+    /// fields than the table has columns. A surplus field lands on a block column and is
+    /// refused by name.
+    pub fn derived_row(&self, chain: &ChainId, derived: &Derived) -> Result<Row, TableError> {
+        let table = self
+            .derived_table(&derived.table)
+            .ok_or_else(|| TableError::UnknownTable {
+                table: derived.table.clone(),
+            })?;
+        let mut values = log_values(
+            derived.address,
+            derived.transaction_hash,
+            derived.transaction_index,
+            derived.log_index,
+        );
+        for (field, column) in derived
+            .fields
+            .iter()
+            .zip(table.columns.iter().skip(LEADING.len()))
+        {
+            let misfit = |reason| TableError::Field {
+                table: table.name.clone(),
+                column: column.name.to_string(),
+                reason,
+            };
+            if field.name != column.name {
+                return Err(misfit("the record names another column here"));
+            }
+            values.push(exact(column.kind, &field.value).ok_or_else(|| {
+                misfit("the record's value is not of the column's type, or does not fit it")
+            })?);
+        }
+        values.extend(block_values(
+            derived.block_number,
+            derived.block_hash,
+            derived.block_timestamp,
+        ));
+        Row::new(table, values, chain.as_str(), derived.dedupe_key())
+    }
+}
+
+/// The log's values, which lead every log-anchored row.
+fn log_values(
+    address: Address,
+    transaction_hash: TxHash,
+    transaction_index: u64,
+    log_index: u64,
+) -> Vec<Value> {
+    vec![
+        hex(address),
+        hex(transaction_hash),
+        Value::Uint(transaction_index),
+        Value::Uint(log_index),
+    ]
+}
+
+/// The block's values, which follow a log-anchored row's own.
+fn block_values(number: u64, hash: B256, timestamp: u64) -> [Value; 3] {
+    [Value::Uint(number), hex(hash), Value::Timestamp(timestamp)]
+}
+
+/// A derived value in its column's type, or `None` when it is of another type or wider
+/// than the column, which [`scalar`] would store as null or clipped.
+fn exact(kind: ColumnType, value: &TypedValue) -> Option<Value> {
+    match (kind, value) {
+        (ColumnType::Uint, TypedValue::Uint { bits, .. })
+        | (ColumnType::Int, TypedValue::Int { bits, .. })
+            if *bits > 64 =>
+        {
+            None
+        }
+        _ => Some(scalar(kind, value)).filter(|value| *value != Value::Null),
     }
 }
 
@@ -287,7 +416,7 @@ mod tests {
     use alloy_primitives::{Address, B256, Bytes, I256, TxHash, U256};
 
     use crate::sink::table::{Column, ColumnType, Schema, TableError, TableId, Value};
-    use crate::wire::envelope::{ChainId, Decoded, DecodedArg};
+    use crate::wire::envelope::{ChainId, Decoded, DecodedArg, Derived, DerivedField};
     use crate::wire::typed::{AbiType, TypedValue};
 
     fn hash(byte: u8) -> B256 {
@@ -574,5 +703,158 @@ mod tests {
                 .expect("no row to build")
                 .is_none()
         );
+    }
+
+    /// A derived table's own columns: `p_rows`.
+    const COLUMNS: [(&str, ColumnType); 3] = [
+        ("amount", ColumnType::BigInt),
+        ("bin", ColumnType::Int),
+        ("buy", ColumnType::Bool),
+    ];
+
+    fn derived_schema() -> Schema {
+        let mut schema = Schema::new().expect("the dataset tables");
+        let id = schema.add_derived("p_rows", &COLUMNS).expect("a new table");
+        assert_eq!(id, TableId::Derived(0));
+        schema
+    }
+
+    fn field(name: &str, value: TypedValue) -> DerivedField {
+        DerivedField {
+            name: name.to_owned(),
+            value,
+        }
+    }
+
+    fn derived(fields: Vec<DerivedField>) -> Derived {
+        Derived {
+            table: "p_rows".to_owned(),
+            address: Address::from([0xd0; 20]),
+            transaction_hash: TxHash::from([0x11; 32]),
+            transaction_index: 3,
+            log_index: 7,
+            row: 0,
+            fields,
+            block_number: 100,
+            block_hash: hash(0x01),
+            block_timestamp: 1_700_000_000,
+        }
+    }
+
+    fn fields() -> Vec<DerivedField> {
+        vec![
+            field(
+                "amount",
+                TypedValue::Int {
+                    value: I256::MINUS_ONE,
+                    bits: 128,
+                },
+            ),
+            field(
+                "bin",
+                TypedValue::Int {
+                    value: I256::try_from(-2).expect("fits"),
+                    bits: 16,
+                },
+            ),
+            field("buy", TypedValue::Bool { value: true }),
+        ]
+    }
+
+    /// A derived table reorgs by its rows' block, which is what retracts them, and a name
+    /// too long for an identifier is refused rather than truncated by the store.
+    #[test]
+    fn a_derived_table_reorgs_by_block_and_fits_an_identifier() {
+        let mut schema = derived_schema();
+        let table = schema.derived_table("p_rows").expect("declared");
+        assert_eq!(table.block_hash.as_deref(), Some("block_hash"));
+        assert_eq!(table.block_number.as_deref(), Some("block_number"));
+        assert!(matches!(
+            schema.add_derived(&"p".repeat(64), &COLUMNS),
+            Err(TableError::LongName { .. })
+        ));
+    }
+
+    /// A record fills its table, keyed by its log and table.
+    #[test]
+    fn a_derived_record_fills_its_table() {
+        let schema = derived_schema();
+        let record = derived(fields());
+        let row = schema
+            .derived_row(&ChainId::new("base"), &record)
+            .expect("a row");
+        assert_eq!(row.table().id, TableId::Derived(0));
+        assert_eq!(row.dedupe_key(), record.dedupe_key());
+        assert_eq!(
+            row.value("amount"),
+            Some(&Value::BigInt {
+                negative: true,
+                magnitude: U256::ONE,
+            })
+        );
+        assert_eq!(row.value("bin"), Some(&Value::Int(-2)));
+        assert_eq!(row.value("buy"), Some(&Value::Bool(true)));
+        assert_eq!(row.block_number(), Some(100));
+        assert_eq!(
+            row.text("address"),
+            Some(format!("{:#x}", record.address).as_str())
+        );
+    }
+
+    /// A field out of order, of the wrong type, too wide for its column, missing, or
+    /// surplus is refused rather than stored.
+    #[test]
+    fn a_record_that_does_not_fit_is_refused() {
+        let schema = derived_schema();
+        let chain = ChainId::new("base");
+
+        let mut swapped = fields();
+        swapped.swap(0, 1);
+        assert!(matches!(
+            schema.derived_row(&chain, &derived(swapped)),
+            Err(TableError::Field { column, .. }) if column == "amount"
+        ));
+
+        let mut mistyped = fields();
+        mistyped[2].value = TypedValue::Address {
+            value: Address::ZERO,
+        };
+        assert!(matches!(
+            schema.derived_row(&chain, &derived(mistyped)),
+            Err(TableError::Field { column, .. }) if column == "buy"
+        ));
+
+        let mut wide = fields();
+        wide[1].value = TypedValue::Int {
+            value: I256::MINUS_ONE,
+            bits: 128,
+        };
+        assert!(matches!(
+            schema.derived_row(&chain, &derived(wide)),
+            Err(TableError::Field { column, .. }) if column == "bin"
+        ));
+
+        let mut surplus = fields();
+        surplus.push(field("extra", TypedValue::Bool { value: false }));
+        assert!(matches!(
+            schema.derived_row(&chain, &derived(surplus)),
+            Err(TableError::Field { column, .. }) if column == "block_number"
+        ));
+
+        let mut short = fields();
+        short.pop();
+        assert!(matches!(
+            schema.derived_row(&chain, &derived(short)),
+            Err(TableError::Width { .. })
+        ));
+
+        let unknown = Derived {
+            table: "p_other".to_owned(),
+            ..derived(fields())
+        };
+        assert!(matches!(
+            schema.derived_row(&chain, &unknown),
+            Err(TableError::UnknownTable { table }) if table == "p_other"
+        ));
     }
 }

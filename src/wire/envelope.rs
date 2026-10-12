@@ -7,10 +7,11 @@
 //!   Each carries its own identity fields and dedupe key. Their shape is per-chain,
 //!   so the EVM records live in [`crate::wire::datasets::evm`]; Solana's would be a sibling
 //!   module and a variant here.
-//! - **Derived** ([`Event::Decoded`], [`Event::Contract`]): records the decode stage
-//!   produces from a log — its typed arguments under their ABI names, or the contract a
-//!   factory's creation event names. They are datasets, not control signals, and each
-//!   always follows the log it came from.
+//! - **Produced from a log** ([`Event::Decoded`], [`Event::Contract`],
+//!   [`Event::Derived`]): records the decode stage produces from a log — its typed
+//!   arguments under their ABI names, or the contract a factory's creation event names —
+//!   and rows its derivations compute from one decoded record. They are datasets, not
+//!   control signals, and each always follows the record it came from.
 //! - **Control** ([`Reorg`], [`Event::AcceptedBlock`]): signals about the indexer's own state,
 //!   not records of a chain. They carry no verbatim payload and exist to drive a
 //!   consumer's state machine, so they are defined here.
@@ -298,6 +299,68 @@ pub struct Contract {
     pub block_timestamp: u64,
 }
 
+/// One row a derivation computed from a single decoded log.
+///
+/// Produced by the decode stage's derivations, after the decoded record it came from. A derivation
+/// names its table, and the record carries that table's values beside the log's own
+/// identity, so a store renders it like an event table's row and a `reorg` deletes it by
+/// its block like any other.
+///
+/// Natural key is `(block_hash, transaction_hash, log_index, table, row)`: a derivation may
+/// compute several rows from one log, numbered in the order it computes them, and the
+/// block hash keeps an orphaned log's rows apart from its replacement's.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Derived {
+    /// The derived table, for example `metric_v1_swaps`.
+    pub table: String,
+    /// The contract that emitted the log.
+    pub address: Address,
+    /// The transaction that emitted the log.
+    pub transaction_hash: TxHash,
+    /// The emitting transaction's position in its block.
+    #[serde(with = "alloy_serde::quantity")]
+    pub transaction_index: u64,
+    /// The log's position in its block.
+    #[serde(with = "alloy_serde::quantity")]
+    pub log_index: u64,
+    /// This row's position among the rows its derivation computed from the log, from 0.
+    #[serde(with = "alloy_serde::quantity")]
+    pub row: u64,
+    /// The table's own values, in its column order.
+    pub fields: Vec<DerivedField>,
+    /// Height of the block containing the log.
+    #[serde(with = "alloy_serde::quantity")]
+    pub block_number: u64,
+    /// Hash of the block containing the log.
+    pub block_hash: B256,
+    /// Timestamp of the block containing the log, denormalized from its header.
+    #[serde(with = "alloy_serde::quantity")]
+    pub block_timestamp: u64,
+}
+
+impl Derived {
+    /// A key that is stable across redelivery and unique per derived row:
+    /// `block_hash:transaction_hash:log_index:table:row`.
+    #[must_use]
+    pub fn dedupe_key(&self) -> String {
+        format!(
+            "{}:{}:{}",
+            log_key(self.block_hash, self.transaction_hash, self.log_index),
+            self.table,
+            self.row
+        )
+    }
+}
+
+/// One value of a [`Derived`] row, under its column's name.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DerivedField {
+    /// The column, for example `amount0_raw`.
+    pub name: String,
+    /// The value, typed as the decoded arguments are.
+    pub value: TypedValue,
+}
+
 /// A contract a previous run discovered, as a store reads it back: only what decode
 /// needs to decode it again. Not published.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -346,6 +409,8 @@ pub enum Event {
     Decoded(Box<Decoded>),
     /// A contract discovered from its creation event. Only the decode stage produces this.
     Contract(Box<Contract>),
+    /// A row computed from one decoded log. Only the decode stage produces this.
+    Derived(Box<Derived>),
     /// A discontinuity in the published chain.
     Reorg(Reorg),
     /// A block the pipeline accepted, published last in its batch.
@@ -362,6 +427,7 @@ impl Event {
             Self::Log(_) => "log",
             Self::Decoded(_) => "decoded",
             Self::Contract(_) => "contract",
+            Self::Derived(_) => "derived",
             Self::Reorg(_) => "reorg",
             Self::AcceptedBlock(_) => "accepted_block",
         }
@@ -388,6 +454,7 @@ impl Event {
             Self::Log(log) => log.dedupe_key(),
             Self::Decoded(decoded) => decoded.dedupe_key(),
             Self::Contract(contract) => contract.dedupe_key(),
+            Self::Derived(derived) => derived.dedupe_key(),
             Self::Reorg(reorg) => format!("{}:reorg", reorg.new_head_hash),
             Self::AcceptedBlock(accepted) => format!("{}:accepted_block", accepted.hash),
         }
@@ -446,7 +513,7 @@ impl Envelope {
 mod tests {
     use alloy_primitives::{Address, B256, TxHash};
 
-    use super::{Block, BlockMeta, Contract, Decoded, Event, Log, Reorg, Transaction};
+    use super::{Block, BlockMeta, Contract, Decoded, Derived, Event, Log, Reorg, Transaction};
 
     fn contract(block_hash: B256) -> Contract {
         Contract {
@@ -574,6 +641,22 @@ mod tests {
         assert_eq!(
             Event::Contract(Box::new(contract(block_hash))).dedupe_key(),
             format!("0x{block_hex}:0x{tx_hex}:3:0x{}:contract", "d0".repeat(20))
+        );
+        assert_eq!(
+            Event::Derived(Box::new(Derived {
+                table: "metric_v1_swaps".to_owned(),
+                address: Address::from([0xd0; 20]),
+                transaction_hash: tx,
+                transaction_index: 0,
+                log_index: 3,
+                row: 2,
+                fields: Vec::new(),
+                block_number: 100,
+                block_hash,
+                block_timestamp: 1_700_000_000,
+            }))
+            .dedupe_key(),
+            format!("0x{block_hex}:0x{tx_hex}:3:metric_v1_swaps:2")
         );
         assert_eq!(
             Event::Reorg(Reorg {
