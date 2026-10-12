@@ -29,6 +29,10 @@
 //! chain = "base"
 //! http_url = "https://base-rpc.publicnode.com"   # or { env = "INDEXER_HTTP_URL" }
 //! ws_url = "wss://base-rpc.publicnode.com"
+//! # ...or, instead of the two endpoints, backfill from `HyperSync` and stop:
+//! # [ingest.hypersync]
+//! # url = "https://8453.hypersync.xyz"
+//! # token = { env = "INDEXER_ENVIO_HYPERSYNC_TOKEN" }
 //!
 //! [sink.duckdb]
 //! tables = ["blocks", "transactions", "logs", "decoded_logs", "contract_events"]
@@ -103,29 +107,39 @@ pub struct Settings {
 
 /// How ingest follows a chain.
 ///
-/// `chain`, `http_url`, and `ws_url` are required — a chain with no endpoint cannot be
-/// followed, and a default would silently index nothing — so they have no serde default
-/// and serde refuses a table that omits them, naming the field.
+/// `chain` is required. So is one source, and only one: `http_url` and `ws_url` together,
+/// a node's JSON-RPC that follows the chain, or `[ingest.hypersync]`, which backfills the
+/// buried heights and stops (see [`HyperSyncSettings`]). A source cannot default — a
+/// default would silently index nothing — so naming neither, half of the pair, or both
+/// is a startup error; see [`IngestSettings::source`].
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct IngestSettings {
     /// The chain id stamped on every event. Required, and non-empty.
     #[serde(deserialize_with = "non_empty")]
     pub chain: String,
-    /// The JSON-RPC endpoint used for blocks, receipts, and logs. Required; a [`Secret`], since
-    /// a provider's URL usually carries its API key.
-    pub http_url: Secret,
-    /// The WebSocket endpoint used for heads. Required; a [`Secret`], like `http_url`.
+    /// The JSON-RPC endpoint used for blocks, receipts, and logs. A [`Secret`], since
+    /// a provider's URL usually carries its API key. Named with `ws_url`, or not at all.
     ///
     /// What ingest fetches is not set here: it is what the sinks' `tables` need (see
     /// [`crate::sink::route::datasets`]).
-    pub ws_url: Secret,
+    #[serde(default)]
+    pub http_url: Option<Secret>,
+    /// The WebSocket endpoint used for heads. A [`Secret`], like `http_url`, and named
+    /// with it.
+    #[serde(default)]
+    pub ws_url: Option<Secret>,
+    /// Backfill from Envio `HyperSync` instead of an RPC node, and stop.
+    #[serde(default)]
+    pub hypersync: Option<HyperSyncSettings>,
     /// The first height to index on an empty store. Omitted starts at the observed head,
     /// which skips earlier history; a value indexes that height and every one after it
     /// before following live heads. A value above the sampled head is a startup error
     /// rather than a silent clamp. A store that already holds accepted blocks resumes
     /// after them instead: a value at or below the block after the stored tip is
     /// ignored, and one above it is a startup error, since it would leave a gap.
+    /// A `HyperSync` backfill on an empty store needs it, since a backfill that starts at
+    /// the head has nothing to do.
     #[serde(default)]
     pub start_block: Option<u64>,
     /// The last height to index. Omitted follows live heads without end; a value indexes
@@ -149,6 +163,66 @@ pub struct IngestSettings {
 /// provider's per-second limit is not the first thing it finds.
 const fn default_backfill_concurrency() -> NonZeroUsize {
     NonZeroUsize::MIN.saturating_add(3)
+}
+
+/// The source `[ingest]` names, as [`IngestSettings::source`] resolves it.
+#[derive(Debug, Clone, Copy)]
+pub enum IngestSource<'a> {
+    /// A node's JSON-RPC for blocks, and its WebSocket for heads.
+    Rpc {
+        /// The JSON-RPC endpoint.
+        http_url: &'a Secret,
+        /// The WebSocket endpoint.
+        ws_url: &'a Secret,
+    },
+    /// Envio `HyperSync`, for a backfill that stops at the reorg window.
+    HyperSync(&'a HyperSyncSettings),
+}
+
+impl IngestSettings {
+    /// The one source these settings name.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SettingsError::IngestSource`] when they name neither an RPC node nor
+    /// `HyperSync`, only one of the RPC node's two endpoints, or both sources.
+    pub fn source(&self) -> Result<IngestSource<'_>, SettingsError> {
+        match (&self.http_url, &self.ws_url, &self.hypersync) {
+            (Some(http_url), Some(ws_url), None) => Ok(IngestSource::Rpc { http_url, ws_url }),
+            (None, None, Some(hypersync)) => Ok(IngestSource::HyperSync(hypersync)),
+            (None, None, None) => Err(SettingsError::IngestSource(
+                "name http_url and ws_url, or [ingest.hypersync]",
+            )),
+            (_, _, Some(_)) => Err(SettingsError::IngestSource(
+                "[ingest.hypersync] replaces http_url and ws_url; name one or the other",
+            )),
+            _ => Err(SettingsError::IngestSource(
+                "http_url and ws_url are named together",
+            )),
+        }
+    }
+}
+
+/// A backfill from [Envio HyperSync](https://docs.envio.dev/docs/`HyperSync`/overview).
+///
+/// `HyperSync` serves a chain's history thousands of blocks per request, but has no live
+/// heads. A run on it indexes the buried heights — everything below the reorg window
+/// under the head — and exits; following the chain is a restart with `http_url` and
+/// `ws_url` in place of this table, which resumes after what the backfill committed.
+///
+/// ```toml
+/// [ingest.hypersync]
+/// url = "https://4663.hypersync.xyz"
+/// token = { env = "INDEXER_ENVIO_HYPERSYNC_TOKEN" }
+/// ```
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HyperSyncSettings {
+    /// The chain's `HyperSync` endpoint, such as `https://4663.hypersync.xyz`. Required.
+    #[serde(deserialize_with = "non_empty")]
+    pub url: String,
+    /// The Envio API token. Required; a [`Secret`].
+    pub token: Secret,
 }
 
 /// Where records go: one table per backend, each holding that backend's settings and the
@@ -280,6 +354,9 @@ pub enum SettingsError {
     /// `[sink.stdout]` is named beside a store.
     #[error("invalid settings: [sink.stdout] cannot be named beside a store")]
     StdoutBesideStore,
+    /// `[ingest]` names no source, half of one, or two.
+    #[error("invalid settings: [ingest] {0}")]
+    IngestSource(&'static str),
 }
 
 impl std::str::FromStr for Settings {
@@ -287,7 +364,8 @@ impl std::str::FromStr for Settings {
     type Err = SettingsError;
 
     /// Parses settings from TOML text, filling defaults and rejecting what is required
-    /// but absent, and sinks that cannot run together.
+    /// but absent, an `[ingest]` that does not name one source, and sinks that cannot
+    /// run together.
     ///
     /// This is the in-memory form of [`Settings::from_file`], for a caller that has the
     /// text already. A relative path in the text resolves against the process's working
@@ -296,6 +374,7 @@ impl std::str::FromStr for Settings {
     fn from_str(text: &str) -> Result<Self, SettingsError> {
         let settings: Self =
             toml::from_str(text).map_err(|source| SettingsError::Parse { source })?;
+        settings.ingest.source()?;
         settings.sink.check()?;
         Ok(settings)
     }
@@ -307,7 +386,8 @@ impl Settings {
     /// # Errors
     ///
     /// Returns [`SettingsError::Read`] when the file cannot be read,
-    /// [`SettingsError::Parse`] when it does not parse or a required value is absent, and
+    /// [`SettingsError::Parse`] when it does not parse or a required value is absent,
+    /// [`SettingsError::IngestSource`] when `[ingest]` does not name one source, and
     /// [`SettingsError::NoSink`] or [`SettingsError::StdoutBesideStore`] when its sinks
     /// cannot run. A
     /// malformed file reports its line and column; an unknown field is an error rather
@@ -444,6 +524,40 @@ tables = ["blocks"]
         assert!(Settings::from_str(&unknown).is_err());
     }
 
+    /// `[ingest]` names one source: both RPC endpoints, or `HyperSync`.
+    #[test]
+    fn ingest_names_one_source() {
+        let hypersync = minimal().replace(
+            "http_url = \"https://example.invalid\"\nws_url = \"wss://example.invalid\"\n",
+            "\n[ingest.hypersync]\nurl = \"https://4663.hypersync.xyz\"\ntoken = \"secret-token\"\n",
+        );
+        let settings = Settings::from_str(&hypersync).expect("hypersync alone parses");
+        let Ok(super::IngestSource::HyperSync(source)) = settings.ingest.source() else {
+            panic!("expected HyperSync");
+        };
+        assert_eq!(source.url, "https://4663.hypersync.xyz");
+        assert!(!format!("{settings:?}").contains("secret-token"));
+
+        let both = format!(
+            "{}\n[ingest.hypersync]\nurl = \"https://4663.hypersync.xyz\"\ntoken = \"t\"\n",
+            minimal().replace("[sink.stdout]\ntables = [\"blocks\"]\n", "")
+        ) + "\n[sink.stdout]\ntables = [\"blocks\"]\n";
+        let neither = minimal().replace(
+            "http_url = \"https://example.invalid\"\nws_url = \"wss://example.invalid\"\n",
+            "",
+        );
+        let half = minimal().replace("ws_url = \"wss://example.invalid\"\n", "");
+        for (case, text) in [("both", both), ("neither", neither), ("half", half)] {
+            assert!(
+                matches!(
+                    Settings::from_str(&text),
+                    Err(SettingsError::IngestSource(_))
+                ),
+                "{case}"
+            );
+        }
+    }
+
     /// Printing keeps no ledger, so it cannot resume beside a store.
     #[cfg(feature = "duckdb")]
     #[test]
@@ -502,11 +616,11 @@ tables = ["blocks"]
         )
         .expect("both forms parse");
 
-        assert_eq!(
-            settings.ingest.http_url.expose(),
-            "https://example.invalid/v2/literal-key"
-        );
-        assert_eq!(settings.ingest.ws_url.expose(), path);
+        let Ok(super::IngestSource::Rpc { http_url, ws_url }) = settings.ingest.source() else {
+            panic!("expected an RPC source");
+        };
+        assert_eq!(http_url.expose(), "https://example.invalid/v2/literal-key");
+        assert_eq!(ws_url.expose(), path);
         let printed = format!("{settings:?}");
         assert!(
             !printed.contains("literal-key") && !printed.contains(&path),

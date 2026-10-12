@@ -512,7 +512,8 @@ connection_string = { env = "INDEXER_POSTGRES_URL" }
 
 Each table names what owns its fields, not where a field was first needed:
 
-- `[ingest]` — the chain to follow and its endpoints.
+- `[ingest]` — the chain to follow and its endpoints, or `[ingest.hypersync]` for a
+  backfill-only run (see [Backfilling from HyperSync](#backfilling-from-hypersync)).
 - `[sink.<backend>]` — where records go, and by what. At least one is required, any
   combination of stores may be named, at most one of each, and `[sink.stdout]` runs
   alone. Naming a backend is naming its table, so a key only that backend understands
@@ -531,8 +532,8 @@ the field:
 | Key | Meaning |
 | --- | --- |
 | `ingest.chain` | Chain id stamped on every event |
-| `ingest.http_url` | JSON-RPC endpoint for blocks, receipts, and logs. A [secret](#secrets) |
-| `ingest.ws_url` | WebSocket endpoint for `newHeads`. A [secret](#secrets) |
+| `ingest.http_url` | JSON-RPC endpoint for blocks, receipts, and logs. A [secret](#secrets). Named with `ws_url`, unless `[ingest.hypersync]` replaces both |
+| `ingest.ws_url` | WebSocket endpoint for `newHeads`. A [secret](#secrets). Named with `http_url` |
 | at least one `[sink.<backend>]` table | Which backends write. `duckdb`, `postgres`, and `delta` persist; `stdout` prints, opens no store, and runs alone |
 | `sink.<backend>.tables` | The tables that sink writes: names, `*` globs, or `contract_events`. An entry matching no table is a startup error |
 
@@ -549,6 +550,7 @@ the field:
 
 | Key | Meaning |
 | --- | --- |
+| `ingest.hypersync` | Backfill from Envio HyperSync instead of `http_url` and `ws_url`, then exit: `url` (the chain's endpoint) and `token` (a [secret](#secrets)). See [Backfilling from HyperSync](#backfilling-from-hypersync) |
 | `decode.protocols` | Path to the protocol manifests directory, relative to the settings file: the whole tree, a group such as `protocols/uniswap`, or one protocol. Absent means nothing is decoded; a directory with no manifest in it is a startup error |
 | `sink.duckdb.settings` | Any other DuckDB setting, passed straight through; values may be `{ env = "NAME" }` |
 
@@ -562,10 +564,38 @@ caught rather than silently leaving a setting at its default. An unknown backend
 likewise an error rather than a silent fallback to another one, and naming two backends at
 once is an error rather than picking one.
 
+### Backfilling from HyperSync
+
+[Envio HyperSync](https://docs.envio.dev/docs/HyperSync/overview) serves a chain's
+history thousands of blocks per request, where an RPC node answers one call per height.
+A run with `[ingest.hypersync]` in place of `http_url` and `ws_url` reads every dataset
+from it — blocks, transactions with their receipts, and logs, so decoding works
+unchanged — up to the reorg window below the head, and exits. HyperSync has no live
+heads, so following the chain is a second run: swap the table back for the two
+endpoints and restart, and the run resumes after the last block the backfill committed.
+
+```toml
+[ingest]
+chain = "robinhood"
+start_block = 63835167   # needed on an empty store; ignored once the store reaches it
+
+[ingest.hypersync]
+url = "https://4663.hypersync.xyz"
+token = { env = "INDEXER_ENVIO_HYPERSYNC_TOKEN" }
+```
+
+Responses are checked as the RPC source checks a node's: every height is present and
+linked to its parent, logs are present when a block's bloom says they are, and with
+transactions read, the receipts' gas adds up to the block's.
+
+Every field matches the RPC source's but two HyperSync does not serve: a block's
+`requests_hash` (EIP-7685) is null, and so is an OP-stack deposit transaction's
+`y_parity`, which an RPC node reports as 0.
+
 ### Secrets
 
-The RPC endpoints (`ingest.http_url`, `ingest.ws_url`) and the PostgreSQL
-`connection_string` are secrets: a provider's URL usually carries its API key, and a
+The RPC endpoints (`ingest.http_url`, `ingest.ws_url`), the HyperSync token
+(`ingest.hypersync.token`), and the PostgreSQL `connection_string` are secrets: a provider's URL usually carries its API key, and a
 connection string its password. Each is written either as the value or as the
 environment variable that holds it:
 
@@ -596,6 +626,7 @@ writers to a chain duplicate rows. The variables the settings files name:
 | `INDEXER_<CHAIN>_HTTP_URL`, `INDEXER_<CHAIN>_WS_URL` | RPC endpoints per chain, for `indexer.<chain>.toml`. A run with `stop_block` never opens the WebSocket, so `wss://unused.invalid` will do |
 | `INDEXER_ETH_HTTP_URL`, `INDEXER_WS_URL` | The endpoints `indexer.toml` names |
 | `INDEXER_POSTGRES_URL` | The PostgreSQL store |
+| `INDEXER_ENVIO_HYPERSYNC_TOKEN` | The Envio API token a [HyperSync backfill](#backfilling-from-hypersync) names |
 | `S3_ENDPOINT`, `S3_ACCESS_KEY_ID`, `S3_SECRET_ACCESS_KEY` | The R2 lake. In `prod`, the `infra` repo writes all three |
 
 Production runs on a Hetzner server that fetches `prod` itself and restarts the
