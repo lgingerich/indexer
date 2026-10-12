@@ -42,7 +42,17 @@ pub struct Derivation {
   log's block hash, so a `reorg` deletes it with the block's other rows, a rewind deletes
   it by height, and a restart has nothing to restore. Any store can hold it, the lake
   included.
-- **The table** is the log's columns, the derivation's own, then the block's, keyed on
+- **The transaction.** Every derived row carries its transaction's sender and recipient,
+  `transaction_from_address` and `transaction_to_address`, as Allium's `dex.trades` does:
+  a swap's trader is the transaction's sender, not the event's `sender`, which is the
+  router. Ingest publishes each transaction just before its logs, so the decode sink
+  remembers the one in flight. Listing a derived table makes ingest fetch transactions,
+  a block's body and receipts in place of one `eth_getLogs`, whether or not a store
+  writes them; route `transactions` to the lake to keep them too. Both columns are
+  nullable: the recipient is null for a contract deployment, and both would be for a
+  log whose transaction was not fetched, which listing the table prevents.
+- **The table** is the log's columns, the transaction's two, the derivation's own, then
+  the block's, keyed on
   `(chain, dedupe_key)` with `dedupe_key = block_hash:transaction_hash:log_index:table:row`,
   `row` numbering a record's rows from 0 in the order the derivation computes them.
   It is declared at startup beside the event tables (`Schema::add_derived`), and a store

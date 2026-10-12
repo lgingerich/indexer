@@ -2,7 +2,9 @@
 //! and each derivation's, declared beside them.
 //!
 //! Both have the log's columns, then their own, then the block's columns. An event's own
-//! columns are one per argument in ABI order; a derivation's are the ones it declares:
+//! columns are one per argument in ABI order. A derivation's are its transaction's sender
+//! and recipient, `transaction_from_address` and `transaction_to_address`, then the ones
+//! it declares:
 //!
 //! ```text
 //! uniswap_v3_pool_swap
@@ -37,6 +39,13 @@ const LEADING: [(&str, ColumnType); 4] = [
     ("transaction_hash", ColumnType::Text),
     ("transaction_index", ColumnType::Uint),
     ("log_index", ColumnType::Uint),
+];
+
+/// A derived table's first own columns: the transaction's sender and recipient, null when
+/// the transaction was not fetched, and the recipient also for a contract deployment.
+const TRANSACTION: [(&str, ColumnType); 2] = [
+    ("transaction_from_address", ColumnType::Text),
+    ("transaction_to_address", ColumnType::Text),
 ];
 
 /// The columns after an event's arguments or a derivation's own, before the primary key.
@@ -87,8 +96,8 @@ impl Schema {
         Ok(())
     }
 
-    /// Adds the derived table `name`, whose own columns are `columns`, in order and all
-    /// required.
+    /// Adds the derived table `name`: the transaction's sender and recipient, then
+    /// `columns`, in order and all required.
     ///
     /// # Errors
     ///
@@ -102,9 +111,14 @@ impl Schema {
         columns: &[(&'static str, ColumnType)],
     ) -> Result<TableId, TableError> {
         let id = TableId::Derived(self.derived.len());
-        let own = columns
+        let own = TRANSACTION
             .iter()
-            .map(|&(column, kind)| Column::new(column, kind, false));
+            .map(|&(column, kind)| Column::new(column, kind, true))
+            .chain(
+                columns
+                    .iter()
+                    .map(|&(column, kind)| Column::new(column, kind, false)),
+            );
         let table = self.add_log_table(id, name.to_owned(), own)?;
         self.derived.insert(name.to_owned(), table);
         Ok(id)
@@ -206,10 +220,17 @@ impl Schema {
             derived.transaction_index,
             derived.log_index,
         );
+        values.extend(
+            [
+                derived.transaction_from_address,
+                derived.transaction_to_address,
+            ]
+            .map(|address| address.map_or(Value::Null, hex)),
+        );
         for (field, column) in derived
             .fields
             .iter()
-            .zip(table.columns.iter().skip(LEADING.len()))
+            .zip(table.columns.iter().skip(LEADING.len() + TRANSACTION.len()))
         {
             let misfit = |reason| TableError::Field {
                 table: table.name.clone(),
@@ -734,6 +755,8 @@ mod tests {
             transaction_index: 3,
             log_index: 7,
             row: 0,
+            transaction_from_address: Some(Address::repeat_byte(0xf0)),
+            transaction_to_address: None,
             fields,
             block_number: 100,
             block_hash: hash(0x01),

@@ -4,16 +4,24 @@ use tracing::{info, warn};
 
 use crate::decode::{DecodeError, Decoder, derive};
 use crate::sink::{EnvelopeSink, SinkError};
+use alloy_primitives::{Address, TxHash};
+
 use crate::wire::envelope::{ChainId, Envelope, Event, Log};
 
 /// Forwards every raw record and adds decoded logs, their derived rows, and discovered
 /// contracts.
 ///
 /// After a log it can decode, it publishes the decoded record, then the rows its
-/// derivations compute from it, then any contract the log created. A reorg marker is forwarded unchanged and retracts the contracts created
-/// in the orphaned blocks.
+/// derivations compute from it, then any contract the log created. A reorg marker is
+/// forwarded unchanged and retracts the contracts created in the orphaned blocks.
+///
+/// A derived row carries its transaction's sender and recipient. Ingest publishes each
+/// transaction just before its logs, so the sink remembers the last one it forwarded; a
+/// log whose transaction was not fetched derives rows without them.
 pub struct DecodingSink<K> {
     decoder: Decoder,
+    /// The hash, sender, and recipient of the last transaction forwarded.
+    transaction: Option<(TxHash, Address, Option<Address>)>,
     inner: K,
 }
 
@@ -32,7 +40,11 @@ impl<K: EnvelopeSink> DecodingSink<K> {
         if decoder.contracts() == 0 {
             warn!("no contracts registered; no log will decode");
         }
-        Self { decoder, inner }
+        Self {
+            decoder,
+            transaction: None,
+            inner,
+        }
     }
 
     /// Decodes one log into the records to publish after it.
@@ -42,7 +54,12 @@ impl<K: EnvelopeSink> DecodingSink<K> {
     fn decode(&mut self, chain: &ChainId, log: &Log) -> Result<Vec<Event>, SinkError> {
         match self.decoder.decode(log) {
             Ok(Some(decoding)) => {
-                let derived = derive::rows(self.decoder.derivations(), chain, &decoding.decoded);
+                let sent = self
+                    .transaction
+                    .filter(|&(hash, ..)| hash == log.transaction_hash)
+                    .map(|(_, from, to)| (from, to));
+                let derived =
+                    derive::rows(self.decoder.derivations(), chain, &decoding.decoded, sent);
                 let mut events = Vec::with_capacity(1 + derived.len() + decoding.discovered.len());
                 events.push(Event::Decoded(Box::new(decoding.decoded)));
                 events.extend(derived.into_iter().map(|row| Event::Derived(Box::new(row))));
@@ -71,6 +88,10 @@ impl<K: EnvelopeSink> DecodingSink<K> {
 impl<K: EnvelopeSink> EnvelopeSink for DecodingSink<K> {
     async fn publish(&mut self, envelope: Envelope) -> Result<(), SinkError> {
         let added = match &envelope.event {
+            Event::Transaction(transaction) => {
+                self.transaction = Some((transaction.hash, transaction.from, transaction.to));
+                Vec::new()
+            }
             Event::Log(log) => self.decode(&envelope.chain, log)?,
             Event::Reorg(reorg) => {
                 let retracted = self.decoder.retract(&reorg.orphaned_hashes);
@@ -238,24 +259,64 @@ mod tests {
     }
 
     /// A record a derivation reads is followed by its derived row, before anything else
-    /// the log produced.
+    /// the log produced. The row carries the sender and recipient of the transaction
+    /// forwarded before the log, and neither when that transaction was not fetched.
     #[tokio::test]
-    async fn a_derived_row_follows_its_decoded_record() {
-        use alloy_primitives::U256;
+    async fn a_derived_row_follows_its_decoded_record_with_its_transaction() {
+        use alloy_primitives::{TxHash, U256};
 
         use crate::decode::derive::fixtures;
+        use crate::wire::envelope::Transaction;
 
         let mut sink = DecodingSink::new(fixtures::decoder(), Collect::default());
-        let swap = fixtures::swap_log(U256::ZERO, U256::ZERO, U256::ZERO);
+        let mut swap = fixtures::swap_log(U256::ZERO, U256::ZERO, U256::ZERO);
+        swap.transaction_hash = TxHash::repeat_byte(0x11);
+        let transaction = Transaction {
+            hash: swap.transaction_hash,
+            from: Address::repeat_byte(0xf0),
+            to: Some(Address::repeat_byte(0xf1)),
+            ..Transaction::default()
+        };
+        sink.publish(Envelope::new(
+            chain(),
+            Event::Transaction(Box::new(transaction)),
+        ))
+        .await
+        .expect("transaction");
         sink.publish(log(swap.clone())).await.expect("swap");
-        assert_eq!(kinds(&sink), ["log", "decoded", "derived"]);
-        let Event::Derived(derived) = &sink.inner.records[2].event else {
+        assert_eq!(kinds(&sink), ["transaction", "log", "decoded", "derived"]);
+        let Event::Derived(derived) = &sink.inner.records[3].event else {
             panic!("the swap's row");
         };
         assert_eq!(derived.table, "metric_v1_swaps");
         assert_eq!(
             (derived.log_index, derived.block_hash),
             (swap.log_index, swap.block_hash)
+        );
+        assert_eq!(
+            (
+                derived.transaction_from_address,
+                derived.transaction_to_address
+            ),
+            (
+                Some(Address::repeat_byte(0xf0)),
+                Some(Address::repeat_byte(0xf1))
+            )
+        );
+
+        swap.transaction_hash = TxHash::repeat_byte(0x22);
+        sink.publish(log(swap))
+            .await
+            .expect("a swap of an unfetched transaction");
+        let Some(Event::Derived(derived)) = sink.inner.records.last().map(|e| &e.event) else {
+            panic!("the second swap's row");
+        };
+        assert_eq!(
+            (
+                derived.transaction_from_address,
+                derived.transaction_to_address
+            ),
+            (None, None)
         );
     }
 }

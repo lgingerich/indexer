@@ -266,6 +266,8 @@ pub(crate) mod fixtures {
             transaction_index: 0,
             log_index: 3,
             row: 0,
+            transaction_from_address: Some(Address::repeat_byte(0xf0)),
+            transaction_to_address: None,
             fields: vec![DerivedField {
                 name: "amount".to_owned(),
                 value: TypedValue::Int {

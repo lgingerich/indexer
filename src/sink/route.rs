@@ -179,7 +179,8 @@ fn glob(pattern: &str, name: &str) -> bool {
 
 /// What ingest fetches so every store gets the tables it writes: blocks and
 /// transactions when a store writes them, and logs when a store writes logs or anything
-/// decoded or derived from them.
+/// decoded or derived from them. A derived table also needs transactions, whose sender
+/// and recipient its rows carry, whether or not a store writes them.
 #[must_use]
 pub fn datasets<'a>(selections: impl IntoIterator<Item = &'a HashSet<TableId>>) -> Datasets {
     let mut datasets = Datasets {
@@ -191,10 +192,12 @@ pub fn datasets<'a>(selections: impl IntoIterator<Item = &'a HashSet<TableId>>) 
         match id {
             TableId::Dataset(Table::Block) => datasets.blocks = true,
             TableId::Dataset(Table::Transaction) => datasets.transactions = true,
-            TableId::Dataset(Table::Log | Table::Decoded)
-            | TableId::Event(_)
-            | TableId::Derived(_) => {
+            TableId::Dataset(Table::Log | Table::Decoded) | TableId::Event(_) => {
                 datasets.logs = true;
+            }
+            TableId::Derived(_) => {
+                datasets.logs = true;
+                datasets.transactions = true;
             }
             TableId::Dataset(Table::Contract | Table::Reorg | Table::AcceptedBlock) => {}
         }
@@ -407,8 +410,8 @@ mod tests {
         );
     }
 
-    /// Ingest fetches the union, and logs whenever anything decoded or derived from them is
-    /// written.
+    /// Ingest fetches the union: logs whenever anything decoded or derived from them is
+    /// written, and transactions too for a derived table.
     #[test]
     fn ingest_fetches_what_some_store_writes() {
         let (schema, _) = fixtures::derived();
@@ -424,7 +427,7 @@ mod tests {
         };
         assert_eq!(fetch(&[&["contract_events"]]), only(false, false, true));
         assert_eq!(fetch(&[&["decoded_logs"]]), only(false, false, true));
-        assert_eq!(fetch(&[&["test_rows"]]), only(false, false, true));
+        assert_eq!(fetch(&[&["test_rows"]]), only(false, true, true));
         assert_eq!(
             fetch(&[&["blocks", "transactions"], &["contract_events"]]),
             only(true, true, true)

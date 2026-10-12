@@ -326,6 +326,12 @@ pub struct Derived {
     /// This row's position among the rows its derivation computed from the log, from 0.
     #[serde(with = "alloy_serde::quantity")]
     pub row: u64,
+    /// The account that sent the transaction, denormalized from it as Allium's
+    /// `dex.trades` carries it. `None` only when the transaction was not fetched.
+    pub transaction_from_address: Option<Address>,
+    /// The transaction's recipient. `None` when it deployed a contract, or was not
+    /// fetched.
+    pub transaction_to_address: Option<Address>,
     /// The table's own values, in its column order.
     pub fields: Vec<DerivedField>,
     /// Height of the block containing the log.
@@ -643,22 +649,6 @@ mod tests {
             format!("0x{block_hex}:0x{tx_hex}:3:0x{}:contract", "d0".repeat(20))
         );
         assert_eq!(
-            Event::Derived(Box::new(Derived {
-                table: "metric_v1_swaps".to_owned(),
-                address: Address::from([0xd0; 20]),
-                transaction_hash: tx,
-                transaction_index: 0,
-                log_index: 3,
-                row: 2,
-                fields: Vec::new(),
-                block_number: 100,
-                block_hash,
-                block_timestamp: 1_700_000_000,
-            }))
-            .dedupe_key(),
-            format!("0x{block_hex}:0x{tx_hex}:3:metric_v1_swaps:2")
-        );
-        assert_eq!(
             Event::Reorg(Reorg {
                 height: 100,
                 new_head_hash: block_hash,
@@ -676,6 +666,33 @@ mod tests {
             })
             .dedupe_key(),
             format!("0x{block_hex}:accepted_block")
+        );
+    }
+
+    /// A derived row's key is its log's, its table, and its position among the log's
+    /// rows, pinned as a literal like every other key.
+    #[test]
+    fn a_derived_rows_dedupe_key_is_the_documented_shape() {
+        let block_hash = hash(0xaa);
+        let tx = TxHash::from([0xbb; 32]);
+        let (block_hex, tx_hex) = ("aa".repeat(32), "bb".repeat(32));
+        assert_eq!(
+            Event::Derived(Box::new(Derived {
+                table: "metric_v1_swaps".to_owned(),
+                address: Address::from([0xd0; 20]),
+                transaction_hash: tx,
+                transaction_index: 0,
+                log_index: 3,
+                row: 2,
+                transaction_from_address: None,
+                transaction_to_address: None,
+                fields: Vec::new(),
+                block_number: 100,
+                block_hash,
+                block_timestamp: 1_700_000_000,
+            }))
+            .dedupe_key(),
+            format!("0x{block_hex}:0x{tx_hex}:3:metric_v1_swaps:2")
         );
     }
 }

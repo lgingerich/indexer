@@ -91,7 +91,7 @@ impl Derivation {
     ///
     /// Returns [`DeriveError::Argument`] when an argument is missing, misnamed, of another
     /// type, or out of the range the contract keeps it in.
-    fn rows(&self, decoded: &Decoded) -> Result<Vec<Derived>, DeriveError> {
+    fn rows(&self, decoded: &Decoded, sent: Sent) -> Result<Vec<Derived>, DeriveError> {
         Ok((self.derive)(decoded)?
             .into_iter()
             .zip(0..)
@@ -102,6 +102,8 @@ impl Derivation {
                 transaction_index: decoded.transaction_index,
                 log_index: decoded.log_index,
                 row,
+                transaction_from_address: sent.map(|(from, _)| from),
+                transaction_to_address: sent.and_then(|(_, to)| to),
                 fields: values
                     .into_iter()
                     .enumerate()
@@ -136,16 +138,26 @@ pub(super) enum DeriveError {
     },
 }
 
-/// The rows `decoded` derives, from every derivation that reads its event.
+/// The sender and recipient of the transaction a log came from, or `None` when the
+/// transaction was not fetched. The recipient is `None` for a contract deployment.
+pub(super) type Sent = Option<(Address, Option<Address>)>;
+
+/// The rows `decoded` derives, from every derivation that reads its event, each carrying
+/// the transaction's sender and recipient.
 ///
 /// A record a derivation cannot read is logged and derives nothing from it.
-pub(super) fn rows(derivations: &[Derivation], chain: &ChainId, decoded: &Decoded) -> Vec<Derived> {
+pub(super) fn rows(
+    derivations: &[Derivation],
+    chain: &ChainId,
+    decoded: &Decoded,
+    sent: Sent,
+) -> Vec<Derived> {
     derivations
         .iter()
         .filter(|derivation| derivation.reads(decoded))
         .flat_map(|derivation| {
             derivation
-                .rows(decoded)
+                .rows(decoded, sent)
                 .inspect_err(|error| {
                     warn!(%chain, table = derivation.table, address = %decoded.address,
                         block = decoded.block_number, block_hash = %decoded.block_hash,
@@ -260,8 +272,8 @@ mod tests {
     fn an_unreadable_record_derives_nothing() {
         let chain = ChainId::new("base");
         let mut swap = fixtures::swap(U256::ZERO, U256::ZERO, U256::ZERO);
-        assert_eq!(rows(&[SWAPS], &chain, &swap).len(), 1);
+        assert_eq!(rows(&[SWAPS], &chain, &swap, None).len(), 1);
         swap.body[0].value = TypedValue::Bool { value: true };
-        assert!(rows(&[SWAPS], &chain, &swap).is_empty());
+        assert!(rows(&[SWAPS], &chain, &swap, None).is_empty());
     }
 }

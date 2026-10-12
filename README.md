@@ -301,7 +301,8 @@ that matters most: `decode` must not depend on `ingest`.
   exact signed amounts, fees, and the pool's bin after the swap; `metric_v1_bin_fills`,
   each bin a swap filled with its balance changes and fees; `metric_v1_liquidity`, each
   bin of a liquidity add or remove; and `metric_v1_pool_bins`, each bin of a pool's
-  ladder as created, with its edges. A derived
+  ladder as created, with its edges. Every derived row also carries its transaction's
+  sender and recipient, so listing a derived table fetches transactions. A derived
   row carries its log's block hash, so it commits with its block and a reorg deletes it
   with the rest. A derivation runs when the catalog declares its event's exact
   signature, and its rows go to the sinks that list its table. It derives only blocks

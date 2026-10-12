@@ -896,7 +896,8 @@ mod tests {
             ),
         ];
         for (derivation, decoded, expected) in cases {
-            let rows = derivation.rows(&decoded).expect("derives");
+            let sent = Some((Address::repeat_byte(0xf0), Some(Address::repeat_byte(0xf1))));
+            let rows = derivation.rows(&decoded, sent).expect("derives");
             assert_eq!(rows.len(), expected, "{}", derivation.table);
             for (row, number) in rows.iter().zip(0..) {
                 assert_eq!(row.row, number);

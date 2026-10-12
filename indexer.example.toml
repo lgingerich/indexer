@@ -37,10 +37,11 @@ ws_url = "wss://base-rpc.publicnode.com"
 # `reorgs`, and `contracts` on its own; they are not listed.
 #
 # What ingest fetches follows from the tables: blocks and transactions when a sink
-# writes them, and logs when a sink writes logs or anything decoded or derived from
-# them. Logs
-# without transactions use eth_getLogs, over a range of up to ten heights in backfill;
-# transactions read the block body and its receipts, and logs come from those.
+# writes them, logs when a sink writes logs or anything decoded or derived from them,
+# and transactions too for a derived table, whose rows carry the transaction's sender
+# and recipient. Logs without transactions use eth_getLogs, over a range of up to ten
+# heights in backfill; transactions read the block body and its receipts, and logs come
+# from those.
 #
 # On a restart every store is brought back to the newest block they all hold, and
 # ingest resumes from there. A store added to a running deployment starts where the
