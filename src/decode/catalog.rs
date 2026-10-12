@@ -729,6 +729,12 @@ addresses = { base = ["0x33128a8fC17869897dcE68Ed026d694621f6FDfD"], ethereum = 
         assert!(catalog.seeds.iter().any(|&(_, entry)| entry == pool));
         assert!(catalog.entry("uniswap_v4", "PoolManager").is_some());
         assert!(catalog.entry("metric_v1", "MetricOmmPool").is_some());
+        assert!(catalog.entry("pyth_lazer", "PythLazer").is_some());
+        assert!(
+            catalog
+                .entry("chainlink_data_streams", "Verifier")
+                .is_some()
+        );
     }
 
     /// A contract is named after its first ABI file, and a rule resolves its parameter's

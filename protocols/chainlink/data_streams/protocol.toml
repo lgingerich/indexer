@@ -1,0 +1,28 @@
+# Chainlink Data Streams, which Metric calls Chainlink Ultra. See `src/decode/catalog.rs`
+# for the manifest format.
+#
+# Reports are verified through one `VerifierProxy` per chain, which routes each report by
+# its config digest to a `Verifier`. The verifier emits `ReportVerified` with the report's
+# feed id and requester: the record of which feeds were brought onchain, by whom. Reports'
+# prices travel only in calldata.
+#
+# Verifiers come from the proxy's `VerifierInitialized` and `VerifierSet`, so a verifier
+# decodes from the block the proxy learned of it. Ethereum's is also seeded, so a run
+# starting after that block still decodes it.
+#
+# The proxy's `table` key keeps its event table names within 63 bytes:
+# `ownership_transfer_requested` would overflow under the default `verifier_proxy` part.
+protocol = "chainlink_data_streams"
+
+[[contract]]
+abi = ["VerifierProxy.json"]
+table = "proxy"
+addresses = { bsc = ["0xF276a4BC8Da323EA3E8c3c195a4E2E7615a898d1"], ethereum = ["0x5A1634A86e9b7BfEf33F0f3f3EA3b1aBBc4CC85F"], robinhood = ["0xcE73c8ad08CBDEaCa6078BF0627C8fe0a9a536E7"] }
+
+[[contract]]
+abi = ["Verifier.json"]
+created_by = [
+    { contract = "VerifierProxy", event = "VerifierInitialized", param = "verifierAddress" },
+    { contract = "VerifierProxy", event = "VerifierSet", param = "verifierAddress" },
+]
+addresses = { ethereum = ["0xfBFff08fE4169853F7B1b5Ac67eC10dc8806801d"] }

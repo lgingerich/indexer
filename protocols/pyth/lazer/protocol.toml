@@ -1,0 +1,15 @@
+# Pyth Lazer (Pyth Pro). See `src/decode/catalog.rs` for the manifest format.
+#
+# One ERC-1967 proxy per chain, at the same address on each, and Metric's `PythOracle`
+# verifies its price updates against it. `verifyUpdate` returns the verified payload
+# without emitting anything, so prices travel only in calldata: these logs carry the
+# contract's administration — initialization, ownership, and upgrades — and no prices.
+#
+# The ABI is the implementation's, verified on Robinhood Chain; the other chains run
+# implementations that declare the same events.
+protocol = "pyth_lazer"
+
+[[contract]]
+abi = ["PythLazer.json"]
+table = "verifier"
+addresses = { bsc = ["0xACeA761c27A909d4D3895128EBe6370FDE2dF481"], ethereum = ["0xACeA761c27A909d4D3895128EBe6370FDE2dF481"], robinhood = ["0xACeA761c27A909d4D3895128EBe6370FDE2dF481"] }
