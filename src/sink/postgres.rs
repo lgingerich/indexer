@@ -42,8 +42,12 @@ pub struct PostgresSettings {
     pub batch_records: usize,
 }
 
+/// Twenty thousand: a backlog then commits in batches that take about half a second,
+/// where each commit's fixed cost — an fsync, a staging table per table, a dozen round
+/// trips — no longer dominates. At the tip it changes nothing: a block commits as soon
+/// as it arrives, alone.
 const fn default_batch_records() -> usize {
-    500
+    20_000
 }
 
 /// A store in `PostgreSQL`.
@@ -565,7 +569,7 @@ mod tests {
             "tables = ['logs']\nconnection_string = 'postgres://user:secret@localhost/indexer'",
         )
         .expect("settings");
-        assert_eq!(settings.batch_records, 500);
+        assert_eq!(settings.batch_records, 20_000);
         assert!(!format!("{settings:?}").contains("secret"));
         assert!(toml::from_str::<PostgresSettings>("tables = ['logs']").is_err());
         assert!(

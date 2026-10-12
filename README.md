@@ -825,7 +825,7 @@ Build with `cargo run --release --features postgres -- indexer.toml`
 [sink.postgres]
 tables = ["contract_events"]
 connection_string = { env = "INDEXER_POSTGRES_URL" }
-batch_records = 500
+batch_records = 20000
 ```
 
 The connection string accepts PostgreSQL URL or keyword syntax, and is a

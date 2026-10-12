@@ -85,7 +85,9 @@ tables = ["blocks", "transactions", "logs"]
 # [sink.postgres]
 # tables = ["contract_events"]
 # connection_string = { env = "INDEXER_POSTGRES_URL" }
-# batch_records = 500
+# The most records one commit may cover while storage is behind; at the tip a block
+# commits alone. Larger commits amortize each commit's fixed cost during a backfill.
+# batch_records = 20000
 
 # Delta Lake tables on object storage, one per table under `<uri>/<chain>/`: the cheap
 # raw-data lake. Requires the `delta` feature. Written at the tip; a reorg deletes the
