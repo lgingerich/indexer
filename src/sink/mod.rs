@@ -234,17 +234,19 @@ pub(crate) mod fixtures {
     use crate::sink::table::Schema;
     use crate::wire::envelope::{ChainId, Decoded, Derived, Envelope, Event};
 
-    fn catalog() -> Catalog {
+    /// The shipped protocols, on `chain`. Which chain does not change the schema, only
+    /// which contracts are seeded: Uniswap's on Base, Metric's on Robinhood Chain.
+    fn catalog(chain: &str) -> Catalog {
         Catalog::load(
             format!("{}/protocols", env!("CARGO_MANIFEST_DIR")),
-            &ChainId::new("base"),
+            &ChainId::new(chain),
         )
         .expect("shipped protocols load")
     }
 
     /// The shipped protocols' schema: the dataset tables and their event tables.
     pub(crate) fn schema() -> Arc<Schema> {
-        Arc::new(catalog().schema().clone())
+        Arc::new(catalog("base").schema().clone())
     }
 
     /// The shipped protocols' schema with a derived table, `test_rows`, beside them, and a
@@ -255,7 +257,7 @@ pub(crate) mod fixtures {
         use crate::sink::table::ColumnType;
         use crate::wire::envelope::{DerivedField, TypedValue};
 
-        let mut schema = catalog().schema().clone();
+        let mut schema = catalog("base").schema().clone();
         schema
             .add_derived("test_rows", &[("amount", ColumnType::BigInt)])
             .expect("a new table");
@@ -293,7 +295,7 @@ pub(crate) mod fixtures {
         let Event::Log(log) = envelope.event else {
             panic!("the fixture is a log");
         };
-        Decoder::new(catalog())
+        Decoder::new(catalog("base"))
             .decode(&log)
             .expect("decodes")
             .expect("a seeded pool's swap")
@@ -355,7 +357,7 @@ pub(crate) mod fixtures {
             block_hash: B256::with_last_byte(0x0b),
             ..crate::wire::envelope::Log::default()
         };
-        Decoder::new(catalog())
+        Decoder::new(catalog("robinhood"))
             .decode(&log)
             .expect("decodes")
             .expect("the seeded factory's event")

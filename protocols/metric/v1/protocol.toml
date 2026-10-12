@@ -1,14 +1,15 @@
 # Metric OMM v1. See `src/decode/catalog.rs` for the manifest format.
 #
-# Base addresses are listed for every contract whose ABI declares events. Pools are not
-# listed: they come from the factory's `PoolCreated`, so every pool decodes from its
-# creating block. Contracts without events, and `OracleProvider`, have no address.
+# Addresses are listed for every contract whose ABI declares events, on every chain Metric
+# runs on: Ethereum, BNB Smart Chain, and Robinhood Chain, at the same addresses on each.
+# Pools are not listed: they come from the factory's `PoolCreated`, so every pool decodes
+# from its creating block. Contracts without events have no address.
 protocol = "metric_v1"
 
 [[contract]]
 abi = ["MetricOmmPoolFactory.json"]
 table = "factory"
-addresses = { base = ["0x2a53833cc95548cf52c7b159110e22D3a9018f32"] }
+addresses = { bsc = ["0x2a53833cc95548cf52c7b159110e22D3a9018f32"], ethereum = ["0x2a53833cc95548cf52c7b159110e22D3a9018f32"], robinhood = ["0x2a53833cc95548cf52c7b159110e22D3a9018f32"] }
 
 [[contract]]
 abi = ["MetricOmmPool.json"]
@@ -22,31 +23,37 @@ abi = ["MetricOmmPoolLiquidityAdder.json"]
 
 [[contract]]
 abi = ["MetricOmmSimpleRouter.json"]
-addresses = { base = ["0x3c6c4fC94f1493b9d76C5e4C4CdEdB444D3CC0A2"] }
+# The router Metric documents, then an earlier one, still deployed.
+addresses = { bsc = ["0x02201E6f13c41506c7Bb635d7543F98826229aB7", "0x3c6c4fC94f1493b9d76C5e4C4CdEdB444D3CC0A2"], ethereum = ["0x02201E6f13c41506c7Bb635d7543F98826229aB7", "0x3c6c4fC94f1493b9d76C5e4C4CdEdB444D3CC0A2"], robinhood = ["0x02201E6f13c41506c7Bb635d7543F98826229aB7", "0x3c6c4fC94f1493b9d76C5e4C4CdEdB444D3CC0A2"] }
 
 [[contract]]
 abi = ["MetricOmmSwapQuoter.json"]
 
 [[contract]]
 abi = ["OracleProvider.json"]
+# The oracles pools' price providers read, each registering pools against a feed: the
+# first verifies Pyth Lazer updates. Seeded, since nothing onchain announces them: they
+# were deployed through CreateX. Both also emit events this ABI does not declare, which
+# stay undecoded until Metric publishes their ABIs.
+addresses = { bsc = ["0x30a88bf894D1b806125a23ebf23D715496fD7102", "0x810A649974f21bB6D3b2E781597EdBDAabe82228"], ethereum = ["0x30a88bf894D1b806125a23ebf23D715496fD7102", "0x810A649974f21bB6D3b2E781597EdBDAabe82228"], robinhood = ["0x30a88bf894D1b806125a23ebf23D715496fD7102", "0x810A649974f21bB6D3b2E781597EdBDAabe82228"] }
 
 [[contract]]
 abi = ["PriceProvider.json"]
 
 [[contract]]
 abi = ["DepositAllowlistExtension.json"]
-addresses = { base = ["0x65FBa4Ee8f50772aB384f19e5520DdA420B1B47D"] }
+addresses = { bsc = ["0x65FBa4Ee8f50772aB384f19e5520DdA420B1B47D"], ethereum = ["0x65FBa4Ee8f50772aB384f19e5520DdA420B1B47D"], robinhood = ["0x65FBa4Ee8f50772aB384f19e5520DdA420B1B47D"] }
 
 [[contract]]
 abi = ["SwapAllowlistExtension.json"]
-addresses = { base = ["0x4Ca8d78873f0a66445CC05f9A1E705f1a58A6582"] }   # retired
+addresses = { bsc = ["0x4Ca8d78873f0a66445CC05f9A1E705f1a58A6582"], ethereum = ["0x4Ca8d78873f0a66445CC05f9A1E705f1a58A6582"], robinhood = ["0x4Ca8d78873f0a66445CC05f9A1E705f1a58A6582"] }   # retired
 
 [[contract]]
 abi = ["OracleValueStopLossExtension.json"]
 table = "stop_loss"
-addresses = { base = ["0xE4038fA09f0bB9963068afaF97BE0c045155090D"] }
+addresses = { bsc = ["0xE4038fA09f0bB9963068afaF97BE0c045155090D"], ethereum = ["0xE4038fA09f0bB9963068afaF97BE0c045155090D"], robinhood = ["0xE4038fA09f0bB9963068afaF97BE0c045155090D"] }
 
 [[contract]]
 abi = ["PriceVelocityGuardExtension.json"]
 table = "velocity_guard"
-addresses = { base = ["0xEbc53e61078976118E384f110c262A263decB84B"] }
+addresses = { bsc = ["0xEbc53e61078976118E384f110c262A263decB84B"], ethereum = ["0xEbc53e61078976118E384f110c262A263decB84B"], robinhood = ["0xEbc53e61078976118E384f110c262A263decB84B"] }

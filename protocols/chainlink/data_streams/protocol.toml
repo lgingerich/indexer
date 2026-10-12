@@ -7,8 +7,8 @@
 # prices travel only in calldata.
 #
 # Verifiers come from the proxy's `VerifierInitialized` and `VerifierSet`, so a verifier
-# decodes from the block the proxy learned of it. Ethereum's is also seeded, so a run
-# starting after that block still decodes it.
+# decodes from the block the proxy learned of it. Each chain's current verifier is also
+# seeded, so a run starting after that block still decodes it.
 #
 # The proxy's `table` key keeps its event table names within 63 bytes:
 # `ownership_transfer_requested` would overflow under the default `verifier_proxy` part.
@@ -25,4 +25,4 @@ created_by = [
     { contract = "VerifierProxy", event = "VerifierInitialized", param = "verifierAddress" },
     { contract = "VerifierProxy", event = "VerifierSet", param = "verifierAddress" },
 ]
-addresses = { ethereum = ["0xfBFff08fE4169853F7B1b5Ac67eC10dc8806801d"] }
+addresses = { bsc = ["0x2e6621e5e3F916d5e512124dD79e06b55E258054"], ethereum = ["0xfBFff08fE4169853F7B1b5Ac67eC10dc8806801d"], robinhood = ["0xb86d1B8a3Bb1c5d7809F5E9EB009311D51d933c6"] }

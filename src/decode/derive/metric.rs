@@ -389,11 +389,11 @@ pub(in crate::decode) mod fixtures {
 
     use super::{BIN_FILLS, LIQUIDITY, POOL_BINS, SWAPS};
 
-    /// The shipped protocols, on Base.
+    /// The shipped protocols, on Robinhood Chain.
     pub(in crate::decode) fn catalog() -> Catalog {
         Catalog::load(
             format!("{}/protocols", env!("CARGO_MANIFEST_DIR")),
-            &ChainId::new("base"),
+            &ChainId::new("robinhood"),
         )
         .expect("shipped protocols load")
     }
