@@ -202,6 +202,7 @@ impl Pipeline {
             http_client(settings.ingest.http_url.expose())?,
             ws_connect(settings.ingest.ws_url.expose()),
             datasets,
+            settings.ingest.backfill_concurrency,
         );
         Ok(Self {
             routes,

@@ -52,6 +52,10 @@ use crate::sink::{SinkError, SqlStore};
 
 const CHAIN: &str = "sim";
 
+/// Backfill fetches in flight, as a deployment's default keeps them, so faults land
+/// while several ranges are outstanding.
+const CONCURRENCY: std::num::NonZeroUsize = std::num::NonZeroUsize::MIN.saturating_add(3);
+
 /// `SplitMix64`: small, fast, and the same sequence for the same seed everywhere.
 #[derive(Debug, Clone)]
 pub(crate) struct Rng(u64);
@@ -219,7 +223,7 @@ fn live(world: &Shared, path: &Path, plan: Plan, lifetime: u64, crash: Option<Du
         let heads = SimHeads {
             world: Arc::clone(world),
         };
-        let source = EvmSource::new(CHAIN, http, heads, plan.datasets);
+        let source = EvmSource::new(CHAIN, http, heads, plan.datasets, CONCURRENCY);
         let pipeline = Pipeline::new(source, start, None, catalog);
 
         // The chain grows while faults run, and holds still for the final catch-up.

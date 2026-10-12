@@ -44,6 +44,7 @@
 //! protocols = "protocols"      # the protocol manifests; optional
 //! ```
 
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
@@ -128,6 +129,18 @@ pub struct IngestSettings {
     /// a fork that later replaces it is not retracted, since no run follows it.
     #[serde(default)]
     pub stop_block: Option<u64>,
+    /// How many backfill fetches are in flight at once. Blocks are still accepted one at a
+    /// time, in height order; this only overlaps the requests, so the node is read while
+    /// the stores write. Zero is refused. Each fetch counts against the provider's rate
+    /// limit, so a provider that throttles hard wants this low.
+    #[serde(default = "default_backfill_concurrency")]
+    pub backfill_concurrency: NonZeroUsize,
+}
+
+/// Four: enough to keep the node busy while a store commits, few enough that a
+/// provider's per-second limit is not the first thing it finds.
+const fn default_backfill_concurrency() -> NonZeroUsize {
+    NonZeroUsize::MIN.saturating_add(3)
 }
 
 /// Where records go: one table per backend, each holding that backend's settings and the

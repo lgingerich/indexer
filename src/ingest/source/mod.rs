@@ -9,7 +9,8 @@
 //! - [`BlockSource::fetch_block`] is the *pull* path. It fetches one block, limited
 //!   to the datasets the source was built with, which is what backfill and reorg
 //!   reconciliation need. [`BlockSource::fetch_blocks`] is its buried-backfill form,
-//!   which may fetch several consecutive heights at once.
+//!   which fetches a range of consecutive heights; backfill keeps several ranges in
+//!   flight at once.
 //! - [`BlockSource::fetch_header`] reads one header, at a height or the head, for when
 //!   only a block's identity is needed: sampling the head, and checking a restored tip.
 //!
@@ -132,13 +133,13 @@ pub trait BlockSource: Send + Sync {
         head: Option<&BlockMeta>,
     ) -> impl Future<Output = Result<FetchedBlock, SourceError>> + Send;
 
-    /// Fetches consecutive blocks from `from`, at most through `to`, in height order,
-    /// with the datasets this source was built for.
+    /// Fetches the blocks `from ..= to`, in height order, with the datasets this source
+    /// was built for.
     ///
     /// The buried-backfill path, where no fork can reach, so no notification is reused.
-    /// The source chooses how many heights to return, but must return at least one, and
-    /// none above `to`; a source that cannot fetch several heights at once returns one.
-    /// All or nothing: an error means no block of the call was returned.
+    /// Every height of the range is returned, however the source splits it into
+    /// requests; backfill asks for [`Self::backfill_span`] heights at a time. All or
+    /// nothing: an error means no block of the call was returned.
     ///
     /// # Errors
     ///
@@ -148,8 +149,30 @@ pub trait BlockSource: Send + Sync {
         from: u64,
         to: u64,
     ) -> impl Future<Output = Result<Vec<FetchedBlock>, SourceError>> + Send {
-        let _ = to;
-        async move { Ok(vec![self.fetch_block(from, None).await?]) }
+        async move {
+            let mut blocks = Vec::new();
+            for height in from..=to {
+                blocks.push(self.fetch_block(height, None).await?);
+            }
+            Ok(blocks)
+        }
+    }
+
+    /// How many heights one [`Self::fetch_blocks`] call should cover right now.
+    ///
+    /// Read each time backfill cuts a range, so a source that learns its provider's
+    /// limits can change it as it goes. At least one; a source that fetches a height at a
+    /// time keeps the default.
+    fn backfill_span(&self) -> u64 {
+        1
+    }
+
+    /// How many [`Self::fetch_blocks`] calls backfill keeps in flight at once.
+    ///
+    /// Blocks are accepted in height order whatever this is; it only overlaps requests.
+    /// At least one.
+    fn backfill_concurrency(&self) -> usize {
+        1
     }
 
     /// One block's header as [`BlockMeta`], fetched on demand: the block at `height`, or

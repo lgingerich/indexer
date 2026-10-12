@@ -44,7 +44,9 @@ use crate::sink::{EnvelopeSink, SinkError};
 use crate::wire::envelope::{BlockMeta, Envelope, Event, Reorg};
 use alloy_primitives::B256;
 use futures_util::StreamExt as _;
+use futures_util::stream::FuturesOrdered;
 use std::collections::VecDeque;
+use std::sync::Arc;
 use thiserror::Error;
 use tracing::{info, warn};
 
@@ -130,12 +132,12 @@ pub enum PipelineError {
         /// The height the run starts at.
         start: u64,
     },
-    /// A range fetch returned no blocks, or blocks past the end of the range.
+    /// A range fetch returned other than one block per requested height.
     #[error("source returned {returned} blocks for heights {from}..={to}")]
     InvalidRange {
         /// First requested height.
         from: u64,
-        /// Last height the fetch could return.
+        /// Last requested height.
         to: u64,
         /// How many blocks it returned.
         returned: usize,
@@ -293,7 +295,8 @@ fn linked_suffix(mut ledger: Vec<BlockMeta>) -> Vec<BlockMeta> {
 /// One process-local driver, consumed by its public asynchronous operations.
 #[derive(Debug)]
 pub struct Machine<S, K> {
-    source: S,
+    /// Shared so backfill's fetches in flight can borrow it while blocks are accepted.
+    source: Arc<S>,
     sink: K,
     ring: UndoRing,
 }
@@ -317,7 +320,11 @@ impl<S, K> Machine<S, K> {
         for meta in linked {
             ring.push(meta);
         }
-        Self { source, sink, ring }
+        Self {
+            source: Arc::new(source),
+            sink,
+            ring,
+        }
     }
 
     /// Highest block accepted by the sink.
@@ -491,17 +498,7 @@ impl<S: BlockSource, K: EnvelopeSink> Machine<S, K> {
             }
             next
         };
-        let bound =
-            |head| stop.map_or_else(|| Self::buried(head), |stop| Self::buried(head).min(stop));
-        let mut end = bound(head);
-        while next <= end {
-            next = self.backfill_range(next, end).await?;
-            // Backfill that ended at the stop has nothing more to wait for.
-            if next > end && stop != Some(end) {
-                head = self.sample_head().await?;
-                end = bound(head);
-            }
-        }
+        (next, head) = self.backfill(next, head, stop).await?;
         let tip = if let Some(tip) = self.ring.tip() {
             tip
         } else {
@@ -567,30 +564,73 @@ impl<S: BlockSource, K: EnvelopeSink> Machine<S, K> {
         Ok(())
     }
 
-    /// Fetches and publishes the buried heights the source returns from `next`, as many
-    /// as it chooses, in order, and returns the height after the last. No reorg handling:
-    /// no fork this deep is reachable, and invalid linkage is a source fault rather than a
-    /// fork to replay.
+    /// Fetches and publishes the buried heights from `next`, and returns the height after
+    /// the last with the head last sampled. No reorg handling: no fork this deep is
+    /// reachable, and invalid linkage is a source fault rather than a fork to replay.
+    ///
+    /// Buried means at or below `head - window`, and at or below `stop`. Reaching that
+    /// bound, the head is sampled again, and backfill continues while the chain has
+    /// buried more; a bound at the stop has nothing more to wait for.
+    ///
+    /// Ranges of [`BlockSource::backfill_span`] heights are requested ahead, up to
+    /// [`BlockSource::backfill_concurrency`] at once, and accepted strictly in order, so
+    /// the source is read while the sink writes. A failed range surfaces only after every
+    /// range below it is accepted; the ranges above it are dropped unpublished, and the
+    /// accepted history ends where the failure began.
     ///
     /// # Errors
-    /// Returns [`PipelineError::InvalidRange`] when the source returns no blocks or blocks
-    /// past `end`, before any of them is published.
-    async fn backfill_range(&mut self, next: u64, end: u64) -> Result<u64, PipelineError> {
-        let blocks = self.source.fetch_blocks(next, end).await?;
-        let last = u64::try_from(blocks.len())
-            .ok()
-            .and_then(|count| count.checked_sub(1))
-            .and_then(|extra| next.checked_add(extra))
-            .filter(|last| *last <= end)
-            .ok_or(PipelineError::InvalidRange {
-                from: next,
-                to: end,
-                returned: blocks.len(),
-            })?;
-        for (height, fetched) in (next..=last).zip(blocks) {
-            self.accept(height, fetched).await?;
+    /// Returns [`PipelineError::InvalidRange`] when the source returns other than one
+    /// block per requested height, before any of that range is published.
+    async fn backfill(
+        &mut self,
+        mut next: u64,
+        mut head: BlockMeta,
+        stop: Option<u64>,
+    ) -> Result<(u64, BlockMeta), PipelineError> {
+        let bound =
+            |head| stop.map_or_else(|| Self::buried(head), |stop| Self::buried(head).min(stop));
+        let mut end = bound(head);
+        if next > end {
+            return Ok((next, head));
         }
-        Self::next(last)
+        let source = Arc::clone(&self.source);
+        let concurrency = source.backfill_concurrency().max(1);
+        let mut fetches = FuturesOrdered::new();
+        // The first height not yet requested; `next` is the first not yet accepted.
+        let mut cut = next;
+        loop {
+            while fetches.len() < concurrency && cut <= end {
+                let span = source.backfill_span().max(1);
+                let last = end.min(cut.saturating_add(span - 1));
+                let source = &source;
+                fetches.push_back(async move { (cut, last, source.fetch_blocks(cut, last).await) });
+                cut = Self::next(last)?;
+            }
+            let Some((from, to, answer)) = fetches.next().await else {
+                // Everything requested is accepted, through `end`.
+                if stop == Some(end) {
+                    return Ok((next, head));
+                }
+                head = self.sample_head().await?;
+                end = bound(head);
+                if next > end {
+                    return Ok((next, head));
+                }
+                continue;
+            };
+            let blocks = answer?;
+            if u64::try_from(blocks.len()).ok() != Some(to - from + 1) {
+                return Err(PipelineError::InvalidRange {
+                    from,
+                    to,
+                    returned: blocks.len(),
+                });
+            }
+            for (height, block) in (from..=to).zip(blocks) {
+                self.accept(height, block).await?;
+            }
+            next = Self::next(to)?;
+        }
     }
 
     /// Samples the source's head and reports it to the sink.
@@ -813,8 +853,18 @@ mod tests {
         samples: std::sync::Mutex<VecDeque<u64>>,
         head_calls: AtomicUsize,
         block_calls: AtomicUsize,
-        /// How many heights one `fetch_blocks` returns; zero answers with none.
+        /// The heights backfill asks for in one `fetch_blocks`.
         range: u64,
+        /// The `fetch_blocks` calls backfill keeps in flight.
+        concurrency: usize,
+        /// Answer each `fetch_blocks` one block short.
+        short: bool,
+        /// Every range answers after a second, and the one starting at this height after
+        /// two, so the ranges above it answer first.
+        slow: Option<u64>,
+        /// `fetch_blocks` calls in flight now, and the most there ever were.
+        in_flight: AtomicUsize,
+        peak: AtomicUsize,
     }
 
     impl Source {
@@ -832,6 +882,11 @@ mod tests {
                     head_calls: AtomicUsize::new(0),
                     block_calls: AtomicUsize::new(0),
                     range: 1,
+                    concurrency: 1,
+                    short: false,
+                    slow: None,
+                    in_flight: AtomicUsize::new(0),
+                    peak: AtomicUsize::new(0),
                 },
             }
         }
@@ -876,14 +931,36 @@ mod tests {
             })
         }
         async fn fetch_blocks(&self, from: u64, to: u64) -> Result<Vec<FetchedBlock>, SourceError> {
-            let mut blocks = Vec::new();
-            if self.data.range == 0 {
-                return Ok(blocks);
+            let data = &self.data;
+            let now = data.in_flight.fetch_add(1, Ordering::Relaxed) + 1;
+            data.peak.fetch_max(now, Ordering::Relaxed);
+            if let Some(slow) = data.slow {
+                let seconds = if from == slow { 2 } else { 1 };
+                tokio::time::sleep(std::time::Duration::from_secs(seconds)).await;
             }
-            for height in from..=to.min(from + self.data.range - 1) {
-                blocks.push(self.fetch_block(height, None).await?);
+            let mut blocks = Vec::new();
+            let mut result = Ok(());
+            for height in from..=to {
+                match self.fetch_block(height, None).await {
+                    Ok(block) => blocks.push(block),
+                    Err(error) => {
+                        result = Err(error);
+                        break;
+                    }
+                }
+            }
+            data.in_flight.fetch_sub(1, Ordering::Relaxed);
+            result?;
+            if data.short {
+                blocks.pop();
             }
             Ok(blocks)
+        }
+        fn backfill_span(&self) -> u64 {
+            self.data.range
+        }
+        fn backfill_concurrency(&self) -> usize {
+            self.data.concurrency
         }
         async fn fetch_block(
             &self,
@@ -969,9 +1046,14 @@ mod tests {
     /// Moves the fake chain to `height` and feeds that head to the live phase, as a
     /// notification or heartbeat would.
     async fn observe(machine: &mut Machine<Source, Sink>, height: u64) {
-        machine.source.data.head = height;
+        chain(machine).data.head = height;
         let head = machine.source.head_meta();
         machine.process_head(head).await.expect("observe");
+    }
+
+    /// The fake chain, to edit between operations, when no fetch holds it.
+    fn chain(machine: &mut Machine<Source, Sink>) -> &mut Source {
+        Arc::get_mut(&mut machine.source).expect("no fetch in flight")
     }
 
     /// Collects the heights of block events the sink accepted, in order.
@@ -1107,9 +1189,8 @@ mod tests {
     async fn gap_catch_up_reads_each_missing_height_once() {
         let mut machine = Machine::new(Source::linear(3), Sink::default(), Vec::new());
         settle(&mut machine, Some(3)).await;
-        machine.source.data.head = 6;
-        machine
-            .source
+        chain(&mut machine).data.head = 6;
+        chain(&mut machine)
             .data
             .blocks
             .extend((4..=6).map(|h| (h, (hash(h), hash(h.saturating_sub(1))))));
@@ -1146,8 +1227,7 @@ mod tests {
         let mut machine = Machine::new(Source::linear(head), Sink::default(), Vec::new());
         settle(&mut machine, Some(0)).await;
         // Replace the branch above the tip's predecessor and announce the new head.
-        machine
-            .source
+        chain(&mut machine)
             .data
             .blocks
             .insert(head, (hash(head + 100), hash(head - 1)));
@@ -1175,7 +1255,10 @@ mod tests {
         let mut machine = Machine::new(Source::linear(3), Sink::default(), Vec::new());
         settle(&mut machine, Some(3)).await;
         // The window holds only the first block; its replacement descends from height 1.
-        machine.source.data.blocks.insert(3, (hash(103), hash(1)));
+        chain(&mut machine)
+            .data
+            .blocks
+            .insert(3, (hash(103), hash(1)));
         // The replacement is fetched before the first block is retracted, so a failure
         // cannot leave the window empty.
         machine.source.data.fail_once.store(true, Ordering::Relaxed);
@@ -1223,17 +1306,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_range_answered_with_no_blocks_is_rejected_before_output() {
+    async fn a_range_answered_short_is_rejected_before_output() {
         let head = MAX_UNFINALIZED_BLOCKS as u64 + 5;
         let mut source = Source::linear(head);
-        source.data.range = 0;
+        source.data.range = 4;
+        source.data.short = true;
         let mut machine = Machine::new(source, Sink::default(), Vec::new());
         assert!(matches!(
             machine.sync(Some(0), None).await,
             Err(PipelineError::InvalidRange {
                 from: 0,
-                to: 5,
-                returned: 0
+                to: 3,
+                returned: 3
             })
         ));
         assert!(machine.sink.events.is_empty());
@@ -1252,6 +1336,45 @@ mod tests {
         ));
         assert_eq!(heights(&machine), [0, 1, 2]);
         assert_eq!(machine.tip().expect("tip").height, 2);
+    }
+
+    /// Ranges are requested ahead, up to the source's concurrency, and accepted in order
+    /// even when a lower range answers after the ones above it.
+    #[tokio::test(start_paused = true)]
+    async fn concurrent_ranges_are_accepted_in_order() {
+        // The buried bound is 17: ranges of four, three in flight, the first answering last.
+        let head = MAX_UNFINALIZED_BLOCKS as u64 + 17;
+        let mut source = Source::linear(head);
+        source.data.range = 4;
+        source.data.concurrency = 3;
+        source.data.slow = Some(0);
+        let mut machine = Machine::new(source, Sink::default(), Vec::new());
+        settle(&mut machine, Some(0)).await;
+        assert_eq!(heights(&machine), (0..=head).collect::<Vec<_>>());
+        assert_eq!(machine.source.data.peak.load(Ordering::Relaxed), 3);
+        assert_eq!(
+            machine.source.data.block_calls.load(Ordering::Relaxed),
+            usize::try_from(head + 1).expect("count"),
+            "each height is fetched exactly once"
+        );
+    }
+
+    /// A failed range surfaces after every range below it is accepted, and the ranges
+    /// fetched above it are not published.
+    #[tokio::test]
+    async fn a_failed_range_in_flight_keeps_the_ranges_below_it() {
+        let head = MAX_UNFINALIZED_BLOCKS as u64 + 17;
+        let mut source = Source::linear(head);
+        source.data.range = 2;
+        source.data.concurrency = 3;
+        source.data.blocks.remove(&3);
+        let mut machine = Machine::new(source, Sink::default(), Vec::new());
+        assert!(matches!(
+            machine.sync(Some(0), None).await,
+            Err(PipelineError::Source(_))
+        ));
+        assert_eq!(heights(&machine), [0, 1]);
+        assert_eq!(machine.tip().expect("tip").height, 1);
     }
 
     #[tokio::test]
@@ -1304,8 +1427,7 @@ mod tests {
         let head = MAX_UNFINALIZED_BLOCKS as u64 + 5;
         let mut machine = Machine::new(Source::linear(head), Sink::default(), Vec::new());
         settle(&mut machine, Some(0)).await;
-        machine
-            .source
+        chain(&mut machine)
             .data
             .blocks
             .insert(head, (hash(head + 100), hash(head - 1)));
@@ -1331,8 +1453,7 @@ mod tests {
         let head = MAX_UNFINALIZED_BLOCKS as u64 + 5;
         let mut machine = Machine::new(Source::linear(head), Sink::default(), Vec::new());
         settle(&mut machine, Some(0)).await;
-        machine
-            .source
+        chain(&mut machine)
             .data
             .blocks
             .insert(head, (hash(head + 100), hash(head - 1)));
@@ -1768,7 +1889,7 @@ mod tests {
     #[tokio::test]
     async fn a_source_behind_the_stored_tip_waits_for_it() {
         let mut machine = Machine::new(Source::linear(8), Sink::default(), ledger(0..=5));
-        machine.source.data.head = 3;
+        chain(&mut machine).data.head = 3;
         settle(&mut machine, None).await;
         assert!(machine.sink.events.is_empty());
         assert_eq!(machine.tip().expect("tip").height, 5);

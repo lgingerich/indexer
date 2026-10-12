@@ -264,9 +264,11 @@ that matters most: `decode` must not depend on `ingest`.
   hash instead of re-reading the header (an empty answer still reads it, to check the
   bloom); a block or transaction dataset still fetches the body it needs. The whole
   choice is one table, `FetchPlan`, in
-  `src/ingest/source/evm.rs`. Without transactions, buried backfill fetches up to ten
-  heights in one batch — a header per height and one ranged `eth_getLogs` — and retries
-  a range the provider fails on, or that times out, in halves.
+  `src/ingest/source/evm.rs`. Without transactions, buried backfill fetches up to a
+  hundred heights in one batch — a header per height and one ranged `eth_getLogs`. A
+  range the provider fails on, or that times out, is fetched in halves, and later ranges
+  start at the size that worked, growing back after a run of successes. Backfill keeps
+  `ingest.backfill_concurrency` ranges in flight and accepts their blocks in height order.
 - **One event per dataset.** A `block` event, then for each transaction a
   `transaction` event and its `log` events. A transaction carries its receipt's fields
   with Allium's `receipt_` prefix, as `ethereum.raw.transactions` does, since there is
@@ -532,6 +534,7 @@ the field:
 | Key | Default | Meaning |
 | --- | --- | --- |
 | `ingest.start_block` | the sampled head | First height to index on an empty store. Absent starts live at the observed head; a value backfills that inclusive height forward before following live heads. A value above the sampled head is a startup error, and so is a value when the store already holds blocks: a run resumes from the store |
+| `ingest.backfill_concurrency` | `4` | Backfill fetches in flight at once. Blocks are still accepted in height order; this overlaps requests so the node is read while the stores write. Each counts against the provider's rate limit. Zero is refused |
 | `sink.duckdb.batch_records` | `500` | Most records one store commit may cover; a backlog of blocks is folded into one commit up to this, and a block is never split |
 | `sink.duckdb.path` | `indexer.duckdb` | Path to the store, relative to the settings file. Tables live in a schema named for the chain: `base.logs` |
 

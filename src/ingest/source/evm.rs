@@ -25,8 +25,9 @@
 //!   still execute separately on the node, so a reorg between them can pair a
 //!   block with another fork's receipts or logs; every `blockHash` is checked.
 //! - Without transactions, buried backfill widens that batch to a range of up to
-//!   `BATCH_LIMIT` heights — their headers and one `eth_getLogs` over the range — and
-//!   retries a range the provider fails on in halves.
+//!   `RANGE_LIMIT` heights — their headers and one `eth_getLogs` over the range. A
+//!   range the provider fails on is fetched in halves, and the size that worked is
+//!   remembered for the ranges after it (`Span`).
 //! - The batch is parsed into alloy's RPC types, then projected field by field into
 //!   the [`crate::wire::datasets`] records; nothing is kept as opaque JSON.
 //! - Parsing uses alloy's *catch-all* (`any`) types, so a chain's non-Ethereum
@@ -36,6 +37,8 @@
 //!   except the transaction type, which is kept as its raw `u8`.
 
 use std::fmt;
+use std::num::NonZeroUsize;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use alloy_consensus::Transaction as ConsensusTransaction;
 use alloy_json_rpc::RpcError;
@@ -65,9 +68,74 @@ use crate::wire::envelope::{BlockMeta, ChainId, Event};
 /// refused, so a batch larger than the limit fails the same way however often it is
 /// retried. `mainnet.base.org` and a Chainstack plan both refused every call past the
 /// 25th in one batch; ten leaves room for pacing and the requests around it. The
-/// per-transaction receipt fallback requests hashes in chunks this size, and a ranged
-/// backfill fetches at most this many heights at once: their headers, with one log query.
+/// per-transaction receipt fallback requests hashes in chunks this size.
 const BATCH_LIMIT: usize = 10;
+
+/// The most heights a ranged backfill fetches at once: their headers, with one log
+/// query, in one batch.
+///
+/// A ceiling, not a target: [`Span`] starts here and shrinks to what the provider
+/// serves. Larger than [`BATCH_LIMIT`], since a range that is refused is fetched in
+/// halves until it fits, where a receipt chunk is not. Envio's `HyperRPC` serves a
+/// hundred headers and a log query in one batch; `mainnet.base.org` and a Chainstack
+/// plan refuse it, and the span settles at what they serve.
+const RANGE_LIMIT: u64 = 100;
+
+/// Successful range fetches in a row after which [`Span`] doubles.
+///
+/// Growing probes the provider: against a fixed batch cap, roughly one fetch in this
+/// many is refused and halved again. Larger probes less often and recovers from a busy
+/// stretch more slowly.
+const GROW_AFTER: u32 = 20;
+
+/// How many heights a ranged backfill fetch covers, learned from the provider.
+///
+/// A range the provider fails on is fetched in halves, and the span drops to the half's
+/// size, so later ranges do not fail the same way first. [`GROW_AFTER`] successes in a
+/// row double it, up to [`RANGE_LIMIT`]. That keeps both causes of a refusal cheap: a
+/// provider's fixed batch cap is found once and held to within a factor of two, and a
+/// stretch of chain too busy to serve whole shrinks the span only until quieter heights
+/// let it grow back. Every fetch in flight shares it, so one refusal sizes the others.
+/// It is not kept across restarts; a new process finds it again in a few failures.
+#[derive(Debug)]
+struct Span {
+    heights: AtomicU64,
+    /// Successful fetches since the last change.
+    streak: AtomicU32,
+}
+
+impl Span {
+    const fn new() -> Self {
+        Self {
+            heights: AtomicU64::new(RANGE_LIMIT),
+            streak: AtomicU32::new(0),
+        }
+    }
+
+    /// The heights the next range should cover; at least one.
+    fn get(&self) -> u64 {
+        self.heights.load(Ordering::Relaxed)
+    }
+
+    /// Records a failed range, whose first half of `heights` is fetched next.
+    fn shrink(&self, heights: u64) {
+        self.streak.store(0, Ordering::Relaxed);
+        self.heights.fetch_min(heights.max(1), Ordering::Relaxed);
+    }
+
+    /// Records a served range, doubling the span after [`GROW_AFTER`] in a row.
+    fn served(&self) {
+        if self.streak.fetch_add(1, Ordering::Relaxed) + 1 >= GROW_AFTER {
+            self.streak.store(0, Ordering::Relaxed);
+            // Doubled in one step, so a shrink racing it is not overwritten.
+            let _ = self
+                .heights
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |heights| {
+                    Some(heights.saturating_mul(2).min(RANGE_LIMIT))
+                });
+        }
+    }
+}
 
 /// The method labels these calls are reported under, shared by the fetch path and
 /// the projection so an error names the same boundary wherever it is raised.
@@ -152,21 +220,32 @@ pub struct EvmSource<C = WsConnect> {
     heads: C,
     provider: RootProvider<AnyNetwork>,
     plan: FetchPlan,
+    span: Span,
+    concurrency: NonZeroUsize,
 }
 
 impl<C> EvmSource<C> {
     /// Builds a source for `chain` that fetches `datasets` over `http` and subscribes
     /// to heads through `heads`, which is connected afresh for each subscription.
+    /// Backfill keeps `concurrency` fetches in flight.
     ///
     /// A live notification's metadata stands in for the header only on the logs-only
     /// live path; every other dataset still reads the block body, and the header is
     /// what supplies linkage when no notification did.
-    pub fn new(chain: impl Into<ChainId>, http: RpcClient, heads: C, datasets: Datasets) -> Self {
+    pub fn new(
+        chain: impl Into<ChainId>,
+        http: RpcClient,
+        heads: C,
+        datasets: Datasets,
+        concurrency: NonZeroUsize,
+    ) -> Self {
         Self {
             chain: chain.into(),
             heads,
             provider: RootProvider::new(http),
             plan: FetchPlan::new(datasets),
+            span: Span::new(),
+            concurrency,
         }
     }
 }
@@ -833,30 +912,62 @@ impl<C: PubSubConnect + Clone> BlockSource for EvmSource<C> {
         })
     }
 
-    /// Fetches up to `BATCH_LIMIT` heights as one range when the plan is ranged, and
-    /// one height otherwise.
+    /// Fetches `from ..= to` in ranges of the learned `Span` when the plan is ranged,
+    /// and a height at a time otherwise.
     ///
     /// Logs per block vary widely, so a range a provider cannot serve is not the end: a
     /// transport failure — a refusal of the range's size, a timeout, or an error that
-    /// outlasted the retry layer — is retried for the first half of the range, rounded
-    /// up, down to one height, and only a single height's failure is returned. Each
-    /// call starts again at the full size, since the next stretch of the chain may be
-    /// quieter. A range that comes back but fails its checks is returned as is: a
+    /// outlasted the retry layer — splits the range in halves, the first rounded up,
+    /// and fetches both, down to one height; only a single height's failure is
+    /// returned. The span shrinks to the half, so the ranges after it start at a size
+    /// that works. A range that comes back but fails its checks is returned as is: a
     /// smaller range would not fix data the node got wrong.
     async fn fetch_blocks(&self, from: u64, to: u64) -> Result<Vec<FetchedBlock>, SourceError> {
+        let mut blocks = Vec::new();
         if !self.plan.ranged() {
-            return Ok(vec![self.fetch_block(from, None).await?]);
+            for height in from..=to {
+                blocks.push(self.fetch_block(height, None).await?);
+            }
+            return Ok(blocks);
         }
-        let mut last = to.min(from.saturating_add(BATCH_LIMIT as u64 - 1));
-        loop {
-            match self.fetch_range(from, last).await {
-                Err(error @ SourceError::Transport { .. }) if last > from => {
-                    warn!(from, to = last, %error, "range fetch failed; retrying its first half");
-                    last = from + (last - from) / 2;
+        // Ranges still to fetch, the lowest last, so they are fetched in height order.
+        let mut pending = vec![(from, to)];
+        while let Some((low, high)) = pending.pop() {
+            // Wider than the span, which may have shrunk since the caller cut the range:
+            // split it without first asking for what is known to fail.
+            let span = self.span.get();
+            if high - low >= span {
+                let cut = low + (span - 1);
+                pending.extend([(cut + 1, high), (low, cut)]);
+                continue;
+            }
+            match self.fetch_range(low, high).await {
+                Ok(mut fetched) => {
+                    self.span.served();
+                    blocks.append(&mut fetched);
                 }
-                result => return result,
+                Err(error @ SourceError::Transport { .. }) if high > low => {
+                    let cut = low + (high - low) / 2;
+                    warn!(from = low, to = high, %error, "range fetch failed; fetching it in halves");
+                    self.span.shrink(cut - low + 1);
+                    pending.extend([(cut + 1, high), (low, cut)]);
+                }
+                Err(error) => return Err(error),
             }
         }
+        Ok(blocks)
+    }
+
+    fn backfill_span(&self) -> u64 {
+        if self.plan.ranged() {
+            self.span.get()
+        } else {
+            1
+        }
+    }
+
+    fn backfill_concurrency(&self) -> usize {
+        self.concurrency.get()
     }
 
     async fn fetch_header(&self, height: Option<u64>) -> Result<BlockMeta, SourceError> {
@@ -1043,6 +1154,7 @@ mod tests {
             http_client(http_url.as_ref())?,
             ws_connect(ws_url.as_ref()),
             datasets,
+            std::num::NonZeroUsize::MIN,
         ))
     }
 
@@ -1273,42 +1385,77 @@ mod tests {
         }
     }
 
-    /// A range the provider refuses is retried for its first half, rounded up, down to
-    /// one height, and only a single height's failure is returned. The first attempt is
-    /// capped at the batch limit, however far the caller allows.
-    #[tokio::test]
-    async fn a_refused_range_is_retried_in_halves_down_to_one_height() {
-        for (largest, spans, served) in [
-            (2, vec![10, 5, 3, 2], Some(2)),
-            (0, vec![10, 5, 3, 2, 1], None),
-        ] {
-            let (url, server) = rpc_server(spans.len(), move |request| {
-                let mut reply = range_reply(request, &[], None);
-                if span(request) > largest {
-                    let id = &log_query(request)["id"];
-                    for response in reply.as_array_mut().expect("batch") {
-                        if response["id"] == *id {
-                            *response = json!({"jsonrpc": "2.0", "id": id, "error":
-                                {"code": -32602, "message": "query exceeds the maximum range"}});
-                        }
-                    }
+    /// Answers a range's batch, refusing its log query when the range spans more than
+    /// `largest` heights.
+    fn refusing_reply(request: &Value, largest: u64) -> Value {
+        let mut reply = range_reply(request, &[], None);
+        if span(request) > largest {
+            let id = &log_query(request)["id"];
+            for response in reply.as_array_mut().expect("batch") {
+                if response["id"] == *id {
+                    *response = json!({"jsonrpc": "2.0", "id": id, "error":
+                        {"code": -32602, "message": "query exceeds the maximum range"}});
                 }
-                reply
-            });
-            let result = logs_only(url).fetch_blocks(100, 200).await;
-            let observed = server.join().expect("server");
-            assert_eq!(observed.iter().map(span).collect::<Vec<_>>(), spans);
-            match served {
-                Some(count) => assert_eq!(result.expect("a smaller range").len(), count),
-                None => assert!(matches!(
-                    result,
-                    Err(SourceError::Transport {
-                        context: "eth_getLogs",
-                        ..
-                    })
-                )),
             }
         }
+        reply
+    }
+
+    /// A range the provider refuses is fetched in halves, the first rounded up, and every
+    /// height is returned. The span learned from the refusal sizes the halves after it,
+    /// so the second half is not refused first. The first attempt is capped at the range
+    /// limit, however far the caller allows.
+    #[tokio::test]
+    async fn a_refused_range_is_fetched_in_halves_and_the_span_kept() {
+        // 100..=224 is cut at the limit. 100..=199 is refused, then 100..=149; after that
+        // every range is cut to twenty-five before it is sent — 150..=199 and 200..=224
+        // included — so nothing else is refused.
+        let spans = vec![100, 50, 25, 25, 25, 25, 25];
+        let (url, server) = rpc_server(spans.len(), move |request| refusing_reply(request, 25));
+        let source = logs_only(url);
+        let blocks = source.fetch_blocks(100, 224).await.expect("every height");
+        let observed = server.join().expect("server");
+        assert_eq!(observed.iter().map(span).collect::<Vec<_>>(), spans);
+        let heights: Vec<u64> = blocks.iter().map(|block| block.meta.height).collect();
+        assert_eq!(heights, (100..=224).collect::<Vec<_>>());
+        assert_eq!(source.backfill_span(), 25);
+    }
+
+    /// A single height the provider still refuses fails the whole call: nothing of it is
+    /// returned.
+    #[tokio::test]
+    async fn a_refused_single_height_fails_the_range() {
+        let spans = vec![2, 1];
+        let (url, server) = rpc_server(spans.len(), move |request| refusing_reply(request, 0));
+        let result = logs_only(url).fetch_blocks(100, 101).await;
+        let observed = server.join().expect("server");
+        assert_eq!(observed.iter().map(span).collect::<Vec<_>>(), spans);
+        assert!(matches!(
+            result,
+            Err(SourceError::Transport {
+                context: "eth_getLogs",
+                ..
+            })
+        ));
+    }
+
+    /// The span grows back after enough ranges in a row are served, up to the limit.
+    #[test]
+    fn the_span_doubles_after_a_streak_and_stops_at_the_limit() {
+        let span = super::Span::new();
+        span.shrink(13);
+        span.shrink(40);
+        assert_eq!(span.get(), 13, "a shrink never grows the span");
+        for _ in 1..super::GROW_AFTER {
+            span.served();
+        }
+        assert_eq!(span.get(), 13);
+        span.served();
+        assert_eq!(span.get(), 26);
+        for _ in 0..super::GROW_AFTER * 4 {
+            span.served();
+        }
+        assert_eq!(span.get(), super::RANGE_LIMIT);
     }
 
     /// A range that comes back but breaks a range check fails as it is: a smaller range
@@ -1352,8 +1499,9 @@ mod tests {
     async fn a_transaction_dataset_backfills_one_height_at_a_time() {
         let (url, server) = rpc_server(1, |request| primary_reply(request, &block(), &receipts()));
         let source = from_urls("ethereum", url, "ws://unused", Datasets::all()).expect("source");
+        assert_eq!(source.backfill_span(), 1);
         let blocks = source
-            .fetch_blocks(18_000_000, 18_000_009)
+            .fetch_blocks(18_000_000, 18_000_000)
             .await
             .expect("fetch");
         assert_eq!(blocks.len(), 1);
