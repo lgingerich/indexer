@@ -20,6 +20,9 @@
 //! live notification carries enough metadata to reuse, and a fetched block carries
 //! the authoritative header. Adding Solana, Reth `ExEx`, or a Bitcoin source means
 //! implementing this trait, not touching the pipeline.
+//!
+//! Two EVM sources implement it: [`EvmSource`] over a node's JSON-RPC, which follows the
+//! chain, and [`HyperSyncSource`] over Envio `HyperSync`, which only backfills.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -27,11 +30,15 @@ use std::pin::Pin;
 use futures_util::Stream;
 use thiserror::Error;
 
+mod any_source;
 mod datasets;
 pub mod evm;
+pub mod hypersync;
 mod retry;
+pub use any_source::AnySource;
 pub use datasets::Datasets;
 pub use evm::EvmSource;
+pub use hypersync::HyperSyncSource;
 // The simulation builds its client the way `evm::http_client` does, over its own node.
 #[cfg(all(test, feature = "duckdb"))]
 pub(crate) use retry::{NetworkError, RetryLayer};
@@ -92,6 +99,25 @@ pub enum SourceError {
         context: String,
         /// Which invariant failed.
         detail: String,
+    },
+    /// The source answered a request with an HTTP error status that asking again will
+    /// not change, such as a refused API token.
+    #[error("{context} answered HTTP {status}: {detail}")]
+    Status {
+        /// What was being read.
+        context: &'static str,
+        /// The HTTP status code.
+        status: u16,
+        /// The response body, truncated.
+        detail: String,
+    },
+    /// The source cannot do what was asked of it.
+    #[error("{context} cannot do this: {detail}")]
+    Unsupported {
+        /// The source.
+        context: &'static str,
+        /// What it cannot do, and what to use instead.
+        detail: &'static str,
     },
     /// The node's answers disagree with each other — the chain moved mid-fetch, or a
     /// backend lags the block it announced — so, unlike [`Self::Malformed`], asking again

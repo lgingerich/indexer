@@ -12,11 +12,14 @@
 [ingest]
 # The chain id stamped on every event. Required.
 chain = "base"
-# JSON-RPC endpoint for blocks, receipts, and logs. Required; a secret. A public endpoint can
-# be written as its value; one carrying an API key is named by its variable.
+# Where blocks come from: a node's two endpoints below, or [ingest.hypersync] further
+# down instead of them. One or the other is required, never both.
+#
+# JSON-RPC endpoint for blocks, receipts, and logs; a secret. A public endpoint can be
+# written as its value; one carrying an API key is named by its variable.
 http_url = "https://base-rpc.publicnode.com"
 # http_url = { env = "INDEXER_HTTP_URL" }
-# WebSocket endpoint for heads. Required; a secret, like http_url.
+# WebSocket endpoint for heads; a secret, like http_url, and named with it.
 ws_url = "wss://base-rpc.publicnode.com"
 # ws_url = { env = "INDEXER_WS_URL" }
 
@@ -26,6 +29,15 @@ ws_url = "wss://base-rpc.publicnode.com"
 # A store that already holds blocks resumes after them, and setting this alongside one
 # is a startup error, so remove it once the first run has committed.
 # start_block = 12345678
+
+# Backfill from Envio HyperSync instead of the two endpoints above: thousands of blocks
+# per request, every dataset, decoding included. HyperSync has no live heads, so the run
+# indexes up to the reorg window below the head and exits. To follow the chain, swap
+# this table for http_url and ws_url and restart; the run resumes after the backfill.
+# A first run on an empty store needs start_block.
+# [ingest.hypersync]
+# url = "https://8453.hypersync.xyz"
+# token = { env = "INDEXER_ENVIO_HYPERSYNC_TOKEN" }
 
 # Where records go: any combination of the stores below, at most one of each. Every
 # sink lists the tables it writes, as exact names, `*` globs over names, or
