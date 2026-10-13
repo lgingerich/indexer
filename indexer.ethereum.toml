@@ -1,0 +1,39 @@
+# Ethereum: run with `target/release/indexer indexer.ethereum.toml`, one process per chain.
+#
+# Every key is documented in `src/config.rs`. The endpoints are secrets, read from the
+# environment (see `.env.example`), and every one must be set at startup. Without
+# `stop_block` the run follows live heads once it has caught up, over the WebSocket
+# endpoint; with one it exits there and never opens it, so a placeholder will do.
+
+[ingest]
+chain = "ethereum"
+http_url = { env = "INDEXER_ETHEREUM_HTTP_URL" }
+ws_url = { env = "INDEXER_ETHEREUM_WS_URL" }
+# Started at 25984373, the Metric factory's first event; the stores hold history now,
+# so a run resumes from their ledger and a `start_block` would be refused.
+backfill_concurrency = 16
+# stop_block = <height>    # index through this height and exit instead
+
+# The app's PostgreSQL (PlanetScale): decoded events and Metric's derived tables, in the
+# database schema named for the chain. Requires the `postgres` feature. The connection
+# string is a secret, since it carries the password.
+[sink.postgres]
+tables = ["contract_events", "metric_v1_swaps", "metric_v1_bin_fills", "metric_v1_liquidity", "metric_v1_pool_bins"]
+connection_string = { env = "INDEXER_POSTGRES_URL" }
+batch_records = 10000
+
+# Every raw dataset, as Delta tables on Cloudflare R2 under s3://blockchain-data/<chain>/.
+# Requires the `delta` feature. R2 takes region "auto"; the keys are an R2 API token's.
+[sink.delta]
+tables = ["blocks", "transactions", "logs", "decoded_logs"]
+uri = "s3://blockchain-data"
+
+[sink.delta.storage]
+endpoint = "https://360e3675b09bddacc6d0d09a78e3fc31.r2.cloudflarestorage.com"
+region = "auto"
+access_key_id = { env = "S3_ACCESS_KEY_ID" }
+secret_access_key = { env = "S3_SECRET_ACCESS_KEY" }
+
+# Every protocol manifest under `protocols/`; each lists its addresses per chain.
+[decode]
+protocols = "protocols"
