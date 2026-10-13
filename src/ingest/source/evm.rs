@@ -41,16 +41,18 @@ use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use alloy_consensus::Transaction as ConsensusTransaction;
+use alloy_consensus::transaction::to_eip155_value;
 use alloy_json_rpc::RpcError;
-use alloy_network::any::{AnyRpcBlock, AnyRpcTransaction, AnyTransactionReceipt};
+use alloy_network::any::{AnyRpcBlock, AnyRpcTransaction, AnyTransactionReceipt, AnyTxEnvelope};
 use alloy_network::eip2718::Typed2718 as _;
 use alloy_network::{AnyNetwork, TransactionResponse};
-use alloy_primitives::{B256, Bloom};
+use alloy_primitives::{B256, Bloom, U8, U64, U128, U256};
 use alloy_provider::{Provider, RootProvider, WsConnect};
 use alloy_pubsub::PubSubConnect;
 use alloy_rpc_client::{ClientBuilder, RpcClient};
 use alloy_rpc_types_eth::Filter;
 use alloy_rpc_types_eth::Log as RpcLog;
+use alloy_serde::OtherFields;
 use alloy_transport::{TransportError, TransportErrorKind};
 use futures_util::StreamExt;
 use serde::Deserialize;
@@ -672,15 +674,16 @@ fn split_range(
 
 /// Flattens a block header and its transaction hashes into the `blocks` dataset.
 ///
-/// Two header fields the node returns are not carried, because the dataset has no column
-/// for either and a half-present field is worse than an absent one: `mix_hash`, which
-/// post-merge is EIP-4788's `prevRandao`, and the pre-Byzantium `stateRoot` a receipt
-/// may carry instead of a `status` (alloy's `coerce_status` maps that variant to
-/// `true`, so a pre-Byzantium failure would read as a success). A consumer needing them
-/// reads the header and the receipt.
+/// A chain's own header fields — Arbitrum's `l1BlockNumber`, `sendCount`, and
+/// `sendRoot` — are not in alloy's header, so they are read from the fields the
+/// catch-all captured, and are `None` on a chain without them. One field a receipt may
+/// carry is not: the pre-Byzantium `stateRoot` in place of a `status` (alloy's
+/// `coerce_status` maps that variant to `true`, so a pre-Byzantium failure would read
+/// as a success). A consumer needing it reads the receipt.
 fn decode_header(block: &AnyRpcBlock) -> Block {
     let header = &block.0.inner.header;
     let transactions = &block.0.inner.transactions;
+    let extra = &block.0.other;
     Block {
         number: header.number,
         hash: header.hash,
@@ -705,6 +708,17 @@ fn decode_header(block: &AnyRpcBlock) -> Block {
         blob_gas_used: header.inner.blob_gas_used,
         excess_blob_gas: header.inner.excess_blob_gas,
         parent_beacon_block_root: header.inner.parent_beacon_block_root,
+        mix_hash: header.inner.mix_hash,
+        withdrawals: block
+            .0
+            .inner
+            .withdrawals
+            .as_ref()
+            .map(|withdrawals| withdrawals.to_vec()),
+        requests_hash: header.inner.requests_hash,
+        l1_block_number: quantity(extra, "l1BlockNumber"),
+        send_count: quantity(extra, "sendCount"),
+        send_root: extra.get_deserialized("sendRoot").and_then(Result::ok),
         ommers: block.0.inner.uncles.clone(),
         transaction_hashes: transactions.hashes().collect(),
     }
@@ -723,6 +737,7 @@ fn decode_transaction(
     tx_index: u64,
     meta: BlockMeta,
 ) -> Transaction {
+    let signature = signature(transaction);
     Transaction {
         hash: transaction.tx_hash(),
         nonce: ConsensusTransaction::nonce(transaction),
@@ -747,6 +762,10 @@ fn decode_transaction(
             .map(<[B256]>::to_vec),
         authorization_list: ConsensusTransaction::authorization_list(transaction)
             .map(<[_]>::to_vec),
+        r: signature.r,
+        s: signature.s,
+        v: signature.v,
+        y_parity: signature.y_parity,
         receipt_status: receipt.inner.inner.status(),
         receipt_gas_used: receipt.gas_used,
         receipt_cumulative_gas_used: receipt.inner.inner.cumulative_gas_used(),
@@ -755,11 +774,72 @@ fn decode_transaction(
         receipt_logs_bloom: receipt.inner.inner.bloom(),
         receipt_blob_gas_used: receipt.blob_gas_used,
         receipt_blob_gas_price: receipt.blob_gas_price,
+        receipt_gas_used_for_l1: quantity(&receipt.other, "gasUsedForL1"),
+        receipt_l1_block_number: quantity(&receipt.other, "l1BlockNumber"),
         log_count: receipt.logs().len() as u64,
         block_timestamp: meta.timestamp,
         block_number: meta.height,
         block_hash: meta.hash,
     }
+}
+
+/// A transaction's signature, as the node reports it.
+struct SignatureFields {
+    r: Option<U256>,
+    s: Option<U256>,
+    v: Option<u128>,
+    y_parity: Option<u8>,
+}
+
+/// Reads a transaction's signature.
+///
+/// A known envelope keeps only the parity, so a legacy transaction's `v` is rebuilt
+/// from it and the chain id as EIP-155 defines it, which is the value the node sent; a
+/// typed one's `v` is the parity itself, and only a typed one has a `yParity`. An
+/// unknown type is read from the fields the catch-all captured, each `None` when the
+/// node gave none.
+fn signature(transaction: &AnyRpcTransaction) -> SignatureFields {
+    match transaction.0.inner.inner.inner() {
+        AnyTxEnvelope::Ethereum(envelope) => {
+            let signature = envelope.signature();
+            let parity = signature.v();
+            let legacy = envelope.is_legacy();
+            SignatureFields {
+                r: Some(signature.r()),
+                s: Some(signature.s()),
+                v: Some(if legacy {
+                    to_eip155_value(parity, ConsensusTransaction::chain_id(transaction))
+                } else {
+                    u128::from(parity)
+                }),
+                y_parity: (!legacy).then_some(u8::from(parity)),
+            }
+        }
+        AnyTxEnvelope::Unknown(unknown) => {
+            let fields = &unknown.inner.fields;
+            SignatureFields {
+                r: fields.get_deserialized("r").and_then(Result::ok),
+                s: fields.get_deserialized("s").and_then(Result::ok),
+                v: fields
+                    .get_deserialized::<U128>("v")
+                    .and_then(Result::ok)
+                    .map(|v| v.to()),
+                y_parity: fields
+                    .get_deserialized::<U8>("yParity")
+                    .and_then(Result::ok)
+                    .map(|parity| parity.to()),
+            }
+        }
+    }
+}
+
+/// A chain-specific quantity the catch-all captured under `key`, when the node sent one
+/// that fits.
+fn quantity(fields: &OtherFields, key: &str) -> Option<u64> {
+    fields
+        .get_deserialized::<U64>(key)
+        .and_then(Result::ok)
+        .map(|value| value.to())
 }
 
 /// The maximum fee per gas a transaction actually carries, if it carries one.
@@ -778,7 +858,7 @@ fn known_max_fee_per_gas(transaction: &AnyRpcTransaction) -> Option<u128> {
         return transaction
             .0
             .other
-            .get_deserialized::<alloy_primitives::U128>("maxFeePerGas")
+            .get_deserialized::<U128>("maxFeePerGas")
             .and_then(Result::ok)
             .map(|fee| fee.to());
     }
@@ -1133,7 +1213,7 @@ impl<C> fmt::Display for EvmSource<C> {
 mod tests {
     use alloy_consensus::TxType;
     use alloy_network::any::AnyRpcBlock;
-    use alloy_primitives::{Address, B256};
+    use alloy_primitives::{Address, B256, U256};
     use serde_json::{Value, json};
 
     use super::{EvmSource, RpcBatch, decode_block, http_client, ws_connect};
@@ -1919,6 +1999,108 @@ mod tests {
         );
         assert_eq!(log.topic0, Some(hash(0x11).parse().expect("topic0")));
         assert!(log.topic1.is_none());
+    }
+
+    /// What a chain adds to the standard fields is kept: Ethereum's withdrawals and
+    /// requests hash, Arbitrum's L1 anchoring on the block and its receipts, and every
+    /// signature, including one on a transaction type alloy does not know.
+    #[test]
+    fn chain_fields_and_signatures_are_kept() {
+        let mut block = block();
+        block["withdrawals"] = json!([{
+            "index": "0x8b872fb", "validatorIndex": "0x2328f2",
+            "address": address(0x52), "amount": "0xd0f510",
+        }]);
+        block["requestsHash"] = json!(hash(0x0a));
+        block["l1BlockNumber"] = json!("0x16ff3c1");
+        block["sendCount"] = json!("0x2a");
+        block["sendRoot"] = json!(hash(0x0b));
+        block["transactions"]
+            .as_array_mut()
+            .expect("transactions")
+            .push(json!({
+                "type": "0x6a", "chainId": "0x1237", "nonce": "0x0",
+                "hash": hash(0x33), "blockHash": hash(0xab),
+                "blockNumber": "0x112a880", "transactionIndex": "0x2",
+                "from": address(0xa4), "to": address(0xa5), "value": "0x0",
+                "gas": "0x0", "gasPrice": "0x0", "input": "0x6bf6a42d",
+                "v": "0x0", "r": "0x0", "s": "0x0",
+            }));
+        let mut receipts = receipts();
+        receipts[0]["gasUsedForL1"] = json!("0x1f4");
+        receipts[0]["l1BlockNumber"] = json!("0x16ff3c1");
+        let mut arbitrum = receipts[1].clone();
+        arbitrum["transactionHash"] = json!(hash(0x33));
+        arbitrum["transactionIndex"] = json!("0x2");
+        arbitrum["type"] = json!("0x6a");
+        arbitrum["status"] = json!("0x1");
+        receipts.as_array_mut().expect("receipts").push(arbitrum);
+
+        let fetched = decode_block(batch(&block, &receipts)).expect("batch decodes");
+        let Event::Block(header) = &fetched.events[0] else {
+            panic!("first event must be the block marker");
+        };
+        assert_eq!(header.mix_hash, Some(B256::ZERO));
+        let withdrawals = header.withdrawals.as_ref().expect("withdrawals");
+        assert_eq!(withdrawals.len(), 1);
+        assert_eq!(withdrawals[0].validator_index, 0x0023_28f2);
+        assert_eq!(
+            header.requests_hash,
+            Some(hash(0x0a).parse().expect("hash"))
+        );
+        assert_eq!(header.l1_block_number, Some(0x016f_f3c1));
+        assert_eq!(header.send_count, Some(42));
+        assert_eq!(header.send_root, Some(hash(0x0b).parse().expect("hash")));
+
+        let transactions: Vec<_> = fetched
+            .events
+            .iter()
+            .filter_map(|event| match event {
+                Event::Transaction(transaction) => Some(transaction),
+                _ => None,
+            })
+            .collect();
+        let [typed, legacy, unknown] = transactions[..] else {
+            panic!("three transactions");
+        };
+        // A typed transaction's `v` is its parity, which it also carries as `yParity`.
+        assert_eq!(
+            typed.r,
+            Some(U256::from_be_bytes(B256::repeat_byte(0x05).0))
+        );
+        assert_eq!(
+            typed.s,
+            Some(U256::from_be_bytes(B256::repeat_byte(0x06).0))
+        );
+        assert_eq!((typed.v, typed.y_parity), (Some(1), Some(1)));
+        assert_eq!(typed.receipt_gas_used_for_l1, Some(500));
+        assert_eq!(typed.receipt_l1_block_number, Some(0x016f_f3c1));
+        // A legacy one's `v` is the EIP-155 value the node sent, and it has no `yParity`.
+        assert_eq!((legacy.v, legacy.y_parity), (Some(0x25), None));
+        assert_eq!(legacy.receipt_gas_used_for_l1, None);
+        // An unknown type's signature is read from the fields the node sent.
+        assert_eq!(unknown.transaction_type, 0x6a);
+        assert_eq!(
+            (unknown.r, unknown.s, unknown.v, unknown.y_parity),
+            (Some(U256::ZERO), Some(U256::ZERO), Some(0), None)
+        );
+    }
+
+    /// A chain without the extras leaves them null rather than zero.
+    #[test]
+    fn missing_chain_fields_are_none() {
+        let fetched = decode_block(batch(&block(), &receipts())).expect("batch decodes");
+        let Event::Block(header) = &fetched.events[0] else {
+            panic!("first event must be the block marker");
+        };
+        assert_eq!(
+            (header.withdrawals.as_ref(), header.requests_hash),
+            (None, None)
+        );
+        assert_eq!(
+            (header.l1_block_number, header.send_count, header.send_root),
+            (None, None, None)
+        );
     }
 
     #[test]

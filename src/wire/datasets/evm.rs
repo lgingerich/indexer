@@ -35,14 +35,14 @@
 //! Every field is present and typed; nothing is kept as opaque JSON, so a consumer
 //! can persist a row without decoding. Field types come from `alloy-primitives`
 //! ([`Address`], [`B256`], [`U256`], `Bytes`) and `alloy-rpc-types-eth`
-//! ([`AccessList`], `SignedAuthorization`). Integer fields carry `#[serde(with =
+//! ([`AccessList`], `SignedAuthorization`, [`Withdrawal`]). Integer fields carry `#[serde(with =
 //! "alloy_serde::quantity")]` so they render as the Ethereum JSON-RPC "quantity"
 //! form (`0x` hex) the node itself uses, not as bare JSON numbers; `U256` and the
 //! byte/address types already serialize to their canonical `0x` forms. The whole
 //! envelope is pinned by round-trip and wire-format tests in [`crate::wire::envelope`].
 
 use alloy_primitives::{Address, B64, B256, BlockHash, Bloom, Bytes, TxHash, U256};
-use alloy_rpc_types_eth::{AccessList, SignedAuthorization};
+use alloy_rpc_types_eth::{AccessList, SignedAuthorization, Withdrawal};
 use serde::{Deserialize, Serialize};
 
 use crate::wire::typed::{AbiType, TypedValue};
@@ -120,6 +120,31 @@ pub struct Block {
     pub excess_blob_gas: Option<u64>,
     /// Root of the parent beacon block; EIP-4788.
     pub parent_beacon_block_root: Option<B256>,
+    /// The header's `mixHash`: proof-of-work's mix digest, post-merge the beacon
+    /// chain's `prevRandao`, and on an Arbitrum chain the packed send count and L1
+    /// block number. `None` when the node omits it.
+    pub mix_hash: Option<B256>,
+    /// Validator withdrawals this block processes, in order; EIP-4895. `None` before
+    /// the merge and on a chain without them, empty on a block with none.
+    pub withdrawals: Option<Vec<Withdrawal>>,
+    /// Hash of the execution-layer requests; EIP-7685.
+    pub requests_hash: Option<B256>,
+    /// The L1 block an Arbitrum chain's block is anchored to.
+    #[serde(
+        default,
+        with = "alloy_serde::quantity::opt",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub l1_block_number: Option<u64>,
+    /// How many L2-to-L1 messages an Arbitrum chain has sent, through this block.
+    #[serde(
+        default,
+        with = "alloy_serde::quantity::opt",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub send_count: Option<u64>,
+    /// Root of an Arbitrum chain's outbox Merkle tree of L2-to-L1 messages.
+    pub send_root: Option<B256>,
     /// Hashes of the ommers (uncles) this block includes.
     pub ommers: Vec<BlockHash>,
     /// Hashes of this block's transactions, in index order.
@@ -229,6 +254,28 @@ pub struct Transaction {
     pub blob_versioned_hashes: Option<Vec<B256>>,
     /// Authorization list; EIP-7702.
     pub authorization_list: Option<Vec<SignedAuthorization>>,
+    /// The signature's `r`. `None` for a type the node gives no signature, such as an
+    /// OP-stack deposit.
+    pub r: Option<U256>,
+    /// The signature's `s`.
+    pub s: Option<U256>,
+    /// The signature's `v` as the node reports it: for a legacy transaction the
+    /// EIP-155 value carrying the chain id (or 27/28 before it), for a typed one the
+    /// parity.
+    #[serde(
+        default,
+        with = "alloy_serde::quantity::opt",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub v: Option<u128>,
+    /// The signature's parity, 0 or 1, for a typed transaction; a legacy one carries
+    /// it in `v` alone.
+    #[serde(
+        default,
+        with = "alloy_serde::quantity::opt",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub y_parity: Option<u8>,
     /// Success status of the transaction, from its receipt.
     pub receipt_status: bool,
     /// Gas used by this transaction alone.
@@ -258,6 +305,21 @@ pub struct Transaction {
         skip_serializing_if = "Option::is_none"
     )]
     pub receipt_blob_gas_price: Option<u128>,
+    /// Gas an Arbitrum chain charged this transaction for posting it to L1, included in
+    /// `receipt_gas_used`.
+    #[serde(
+        default,
+        with = "alloy_serde::quantity::opt",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub receipt_gas_used_for_l1: Option<u64>,
+    /// The L1 block an Arbitrum chain saw when it executed this transaction.
+    #[serde(
+        default,
+        with = "alloy_serde::quantity::opt",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub receipt_l1_block_number: Option<u64>,
     /// Number of logs emitted by this transaction.
     #[serde(with = "alloy_serde::quantity")]
     pub log_count: u64,
