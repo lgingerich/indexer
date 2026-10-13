@@ -2,7 +2,8 @@
 # per-chain settings files, and the protocol manifests. One image serves every chain;
 # the settings file is the container's argument:
 #
-#   docker run --init --env-file .env ghcr.io/lgingerich/indexer:prod-bsc indexer.bsc.toml
+#   infisical run -- bash -c 'docker run --init --env-file <(env | grep -E "^(INDEXER_|S3_)") \
+#     ghcr.io/lgingerich/indexer:prod-bsc indexer.bsc.toml'
 #
 # Secrets are never baked in: the settings files name environment variables, which the
 # host passes at run time.

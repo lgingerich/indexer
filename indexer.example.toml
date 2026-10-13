@@ -6,7 +6,7 @@
 # as the value or as `{ env = "NAME" }`, naming the environment variable that holds it.
 # The variable is read once at startup; an unset one is an error naming it. A deployment
 # names variables, so this file stays in git while the platform's secret manager injects
-# the values. For local development, either export the variables (see `.env.example`) or
+# the values. For local development, inject them with `infisical run` (see the README) or
 # write the values into a gitignored copy of this file named `*.local.toml`.
 
 [ingest]

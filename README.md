@@ -586,17 +586,30 @@ The variable is read once, as the settings load, so a deployment missing one sto
 startup naming it. A secret is never logged: settings print it as `[redacted]`, the
 startup log omits the endpoints, and RPC errors drop the URL reqwest attaches to them.
 
-In production, the settings file names the variables and the platform's secret manager
-injects them into the process — on Cloudflare Containers, the Worker that starts the
-container passes Worker secrets or Secrets Store values as its environment. The
-indexer reads only the environment, so the same file and binary run under any manager.
+Every variable lives in the Infisical project `indexer`: `prod` for the deployed
+chains, `dev` for your machine. The indexer reads only the environment, so nothing
+here talks to Infisical; the CLI injects the variables into one process:
 
-For local development, either:
+```bash
+infisical login                                      # once per machine
+infisical run -- cargo run --release -- indexer.ethereum.toml
+```
 
-- export the variables: copy `.env.example` to `.env` (gitignored) and load it with
-  `set -a && . ./.env && set +a`, or `dotenv` in a direnv `.envrc`; or
-- write the values into a gitignored local settings file — any `*.local.toml`, e.g.
-  `cargo run -- indexer.local.toml`.
+`.infisical.json` points the CLI at the project and defaults to `dev`. Point `dev`'s
+`INDEXER_POSTGRES_URL` at a local Postgres, never the production database: two
+writers to a chain duplicate rows. The variables the settings files name:
+
+| Variable | What it is |
+| --- | --- |
+| `INDEXER_<CHAIN>_HTTP_URL`, `INDEXER_<CHAIN>_WS_URL` | RPC endpoints per chain, for `indexer.<chain>.toml`. A run with `stop_block` never opens the WebSocket, so `wss://unused.invalid` will do |
+| `INDEXER_ETH_HTTP_URL`, `INDEXER_WS_URL` | The endpoints `indexer.toml` names |
+| `INDEXER_POSTGRES_URL` | The PostgreSQL store |
+| `S3_ENDPOINT`, `S3_ACCESS_KEY_ID`, `S3_SECRET_ACCESS_KEY` | The R2 lake. In `prod`, the `infra` repo writes all three |
+
+Production runs on a Hetzner server that fetches `prod` itself and restarts the
+chains when it changes; deploying and operating it is in the `infra` repo's
+`docs/production.md`. A gitignored `*.local.toml` with values written in also works
+for a quick local run.
 
 ### Protocol manifests
 
