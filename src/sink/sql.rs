@@ -34,9 +34,12 @@ pub trait Dialect {
     /// Drops `staging` after its merge, for an engine that does not drop it at commit.
     fn drop_staging(staging: &str) -> Option<String>;
 
-    /// Lists table `$1`'s columns in the session's schema, as name and type rows in
-    /// column order.
+    /// Lists every table's columns in the session's schema, as table, name, and type
+    /// rows in column order: one query for the startup check, not one a table.
     const DESCRIBE: &'static str;
+
+    /// Whether text `column` equals one element of the text-list parameter `param`.
+    fn any_of(column: &str, param: &str) -> String;
 
     /// The type a column of `kind` is reported as by [`DESCRIBE`](Self::DESCRIBE).
     #[must_use]
@@ -130,29 +133,44 @@ pub(crate) fn upsert<D: Dialect>(table: &TableDef, staging: &str) -> String {
     )
 }
 
-/// Deletes chain `$1`'s rows of block `$3`, which is at height `$2` or above, for a table
-/// whose rows belong to a block. The height bound lets `DuckDB`, which keeps no index on
-/// the hash, skip the row groups below the reorg.
-pub(crate) fn delete_block(table: &TableDef) -> Option<String> {
+/// Deletes chain `$1`'s rows of the blocks listed in `$3`, all at height `$2` or above,
+/// for a table whose rows belong to a block: one statement for every block a reorg
+/// orphans, so a remote database pays one round trip a table rather than one a block.
+/// The height bound lets `DuckDB`, which keeps no index on the hash, skip the row groups
+/// below the reorg.
+pub(crate) fn delete_blocks<D: Dialect>(table: &TableDef) -> Option<String> {
     let (hash, number) = table.block_hash.as_ref().zip(table.block_number.as_ref())?;
     Some(format!(
-        "DELETE FROM {} WHERE \"chain\" = $1 AND {} >= $2 AND {} = $3",
+        "DELETE FROM {} WHERE \"chain\" = $1 AND {} >= $2 AND {}",
         ident(&table.name),
         ident(number),
-        ident(hash)
+        D::any_of(&ident(hash), "$3")
     ))
 }
 
-/// Selects the hash of chain `$1`'s every block above height `$2`, for a table whose rows
-/// belong to a block. Read from the ledger, it names the blocks a rewind deletes through
-/// [`delete_block`], which the hash index serves; a delete by height alone would scan.
-pub(crate) fn hashes_above(table: &TableDef) -> Option<String> {
+/// Deletes chain `$1`'s rows of every block `ledger` holds above height `$2`, for a table
+/// whose rows belong to a block: one statement for the whole rewind, so a remote database
+/// pays one round trip a table rather than one a block.
+///
+/// The blocks are named by hash from the ledger, so the hash index serves the delete; a
+/// delete by height alone would scan. The height bound lets `DuckDB`, which keeps no index
+/// on the hash, skip the row groups below. Run against the ledger last: its rows are what
+/// the others are found by.
+pub(crate) fn delete_above(table: &TableDef, ledger: &TableDef) -> Option<String> {
     let (hash, number) = table.block_hash.as_ref().zip(table.block_number.as_ref())?;
+    let (ledger_hash, ledger_number) = ledger
+        .block_hash
+        .as_ref()
+        .zip(ledger.block_number.as_ref())?;
     Some(format!(
-        "SELECT {} FROM {} WHERE \"chain\" = $1 AND {} > $2",
-        ident(hash),
+        "DELETE FROM {} WHERE \"chain\" = $1 AND {} > $2 AND {} IN \
+         (SELECT {} FROM {} WHERE \"chain\" = $1 AND {} > $2)",
         ident(&table.name),
-        ident(number)
+        ident(number),
+        ident(hash),
+        ident(ledger_hash),
+        ident(&ledger.name),
+        ident(ledger_number)
     ))
 }
 

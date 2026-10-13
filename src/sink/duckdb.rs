@@ -145,8 +145,14 @@ impl DuckDbSink {
 
 impl Dialect for DuckDb {
     const INDEXES: bool = false;
-    const DESCRIBE: &'static str = "SELECT column_name, data_type FROM information_schema.columns \
-         WHERE table_schema = current_schema() AND table_name = $1 ORDER BY ordinal_position";
+    const DESCRIBE: &'static str = "SELECT table_name, column_name, data_type \
+         FROM information_schema.columns WHERE table_schema = current_schema() \
+         ORDER BY table_name, ordinal_position";
+
+    // A list parameter binds as list text, which the cast reads back exactly.
+    fn any_of(column: &str, param: &str) -> String {
+        format!("list_contains(CAST({param} AS VARCHAR[]), {column})")
+    }
 
     fn type_name(kind: ColumnType) -> String {
         match kind {
@@ -336,7 +342,7 @@ mod tests {
     use alloy_primitives::{Address, B256, TxHash, U256};
     use duckdb::{Connection, appender_params_from_iter};
 
-    use crate::sink::EnvelopeSink as _;
+    use crate::sink::{EnvelopeSink as _, Store as _};
     use crate::wire::envelope::{
         Block, BlockMeta, ChainId, Contract, Envelope, Event, Log, Reorg, Transaction,
     };
@@ -935,6 +941,64 @@ mod tests {
             hash: hash(u8::try_from(height).expect("small heights")),
             parent_hash: hash(u8::try_from(height - 1).expect("small heights")),
             timestamp: 1_700_000_000 + height,
+        }
+    }
+
+    /// A rewind deletes every block above the height from every table, the ledger
+    /// included, and leaves the blocks at or below it and other chains' rows alone.
+    #[tokio::test]
+    async fn a_rewind_deletes_every_block_above_the_height() {
+        let mut sink = sink().await;
+        for name in ["base", "ethereum"] {
+            for height in 1..=5 {
+                let meta = accepted(height);
+                for event in [
+                    Event::Block(Box::new(Block {
+                        number: height,
+                        hash: meta.hash,
+                        ..Block::default()
+                    })),
+                    Event::AcceptedBlock(meta),
+                ] {
+                    sink.publish(Envelope::new(ChainId::new(name), event))
+                        .await
+                        .expect("buffer");
+                }
+            }
+        }
+        sink.flush().await.expect("flush");
+
+        sink.rewind(3).await.expect("rewind");
+
+        let heights = |sink: &DuckDbSink, sql: &str| -> Vec<u64> {
+            sink.engine
+                .connection
+                .prepare(sql)
+                .expect("prepare")
+                .query_map([], |row| row.get(0))
+                .expect("query")
+                .collect::<Result<_, _>>()
+                .expect("rows")
+        };
+        for (table, column) in [("blocks", "number"), ("accepted_blocks", "height")] {
+            let kept = |chain: &str| {
+                heights(
+                    &sink,
+                    &format!(
+                        "SELECT {column} FROM {table} WHERE chain = '{chain}' ORDER BY {column}"
+                    ),
+                )
+            };
+            assert_eq!(
+                kept("base"),
+                [1, 2, 3],
+                "{table} keeps base through the height"
+            );
+            assert_eq!(
+                kept("ethereum"),
+                [1, 2, 3, 4, 5],
+                "{table} keeps the other chain"
+            );
         }
     }
 

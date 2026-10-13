@@ -134,9 +134,16 @@ impl PostgresSink {
 
 impl Dialect for Postgres {
     const INDEXES: bool = true;
-    const DESCRIBE: &'static str = "SELECT attname::TEXT, format_type(atttypid, atttypmod) \
-         FROM pg_attribute WHERE attrelid = to_regclass(quote_ident($1)) AND attnum > 0 \
-         AND NOT attisdropped ORDER BY attnum";
+    const DESCRIBE: &'static str = "SELECT c.relname::TEXT, a.attname::TEXT, \
+         format_type(a.atttypid, a.atttypmod) FROM pg_attribute a \
+         JOIN pg_class c ON c.oid = a.attrelid \
+         WHERE c.relnamespace = (SELECT oid FROM pg_namespace WHERE nspname = current_schema()) \
+         AND c.relkind = 'r' AND a.attnum > 0 AND NOT a.attisdropped \
+         ORDER BY c.relname, a.attnum";
+
+    fn any_of(column: &str, param: &str) -> String {
+        format!("{column} = ANY({param})")
+    }
 
     fn type_name(kind: ColumnType) -> String {
         match kind {
@@ -528,7 +535,7 @@ mod tests {
                 retracted,
                 "{label} is indexed by block exactly when a reorg deletes from it"
             );
-            assert_eq!(sql::delete_block(table).is_some(), retracted);
+            assert_eq!(sql::delete_blocks::<Postgres>(table).is_some(), retracted);
             for column in &table.columns {
                 let definition = format!(
                     "\"{}\" {}{}",
@@ -748,6 +755,84 @@ mod tests {
                 .expect("read back"),
             [accepted(1)]
         );
+
+        db(&sink)
+            .batch_execute(&format!("DROP SCHEMA \"{schema}\" CASCADE"))
+            .await
+            .expect("drop test schema");
+        drop(sink);
+        task.abort();
+    }
+
+    /// A rewind deletes every block above the height from every table, the ledger
+    /// included, in one statement each, and leaves the rest and other chains' rows alone.
+    #[tokio::test]
+    #[ignore = "requires INDEXER_TEST_POSTGRES_URL pointing to PostgreSQL 18"]
+    async fn a_rewind_deletes_every_block_above_the_height() {
+        use crate::sink::Store as _;
+        use crate::wire::datasets::evm::Block;
+        use crate::wire::envelope::BlockMeta;
+
+        let url = std::env::var("INDEXER_TEST_POSTGRES_URL").expect("test database URL");
+        let (client, connection) = tokio_postgres::connect(&url, tokio_postgres::NoTls)
+            .await
+            .expect("connect");
+        let task = tokio::spawn(connection);
+        let schema = format!("rewind_test_{}", std::process::id());
+        client
+            .batch_execute(&format!(
+                "CREATE SCHEMA \"{schema}\"; SET search_path TO \"{schema}\""
+            ))
+            .await
+            .expect("test schema");
+        // A store rewinds the chain it was opened for, which is named like its schema.
+        let mut sink = dataset_sink(client, &schema).await;
+        for name in [schema.as_str(), "ethereum"] {
+            for height in 1..=5_u64 {
+                let meta = BlockMeta {
+                    height,
+                    hash: B256::with_last_byte(u8::try_from(height).expect("small heights")),
+                    parent_hash: B256::with_last_byte(
+                        u8::try_from(height - 1).expect("small heights"),
+                    ),
+                    timestamp: 1_700_000_000 + height,
+                };
+                for event in [
+                    Event::Block(Box::new(Block {
+                        number: height,
+                        hash: meta.hash,
+                        ..Block::default()
+                    })),
+                    Event::AcceptedBlock(meta),
+                ] {
+                    sink.publish(Envelope::new(ChainId::new(name), event))
+                        .await
+                        .expect("publish");
+                }
+            }
+        }
+        sink.flush().await.expect("commit");
+
+        sink.rewind(3).await.expect("rewind");
+
+        for (table, column) in [("blocks", "number"), ("accepted_blocks", "height")] {
+            for (chain, expected) in [(schema.as_str(), 3_i64), ("ethereum", 5)] {
+                let row = db(&sink)
+                    .query_one(
+                        &format!(
+                            "SELECT count(*), max({column})::int8 FROM {table} WHERE chain = $1"
+                        ),
+                        &[&chain],
+                    )
+                    .await
+                    .expect("count");
+                assert_eq!(
+                    (row.get::<_, i64>(0), row.get::<_, i64>(1)),
+                    (expected, expected),
+                    "{table} on {chain}"
+                );
+            }
+        }
 
         db(&sink)
             .batch_execute(&format!("DROP SCHEMA \"{schema}\" CASCADE"))

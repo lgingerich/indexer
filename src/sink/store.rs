@@ -14,13 +14,14 @@
 //! stored. On failure the transaction rolls back and the whole batch stays buffered for a
 //! retry, which deletes nothing it already deleted and upserts onto itself.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::ingest::pipeline::LEDGER_WINDOW;
 use crate::sink::batch::Batch;
 use crate::sink::sql::{self, Dialect};
 use crate::sink::store_error::{EngineError, InvalidStoredValue, Operation, StoreError};
-use crate::sink::table::{Row, Schema, Table, TableDef, TableError, Value};
+use crate::sink::table::{Row, Schema, Table, TableDef, TableError, TableId, Value};
 use crate::sink::{EnvelopeSink, Restored, SinkError, Store};
 use crate::wire::envelope::{BlockMeta, ChainId, Envelope, StoredContract};
 
@@ -64,16 +65,19 @@ struct Prepared {
     merge: String,
     drop_staging: Option<String>,
     delete: Option<String>,
+    /// What a rewind runs: every block above a height, in one statement.
+    delete_above: Option<String>,
 }
 
 impl Prepared {
-    fn new<D: Dialect>(position: usize, def: &Arc<TableDef>) -> Self {
+    fn new<D: Dialect>(position: usize, def: &Arc<TableDef>, ledger: &TableDef) -> Self {
         let staging = format!("staging_{position}");
         Self {
             create_staging: D::create_staging(def, &staging),
             merge: sql::upsert::<D>(def, &staging),
             drop_staging: D::drop_staging(&staging),
-            delete: sql::delete_block(def),
+            delete: sql::delete_blocks::<D>(def),
+            delete_above: sql::delete_above(def, ledger),
             staging,
             def: Arc::clone(def),
         }
@@ -86,8 +90,6 @@ struct Reads {
     contracts: String,
     ledger: String,
     prune_ledger: String,
-    /// The hashes of the ledger's blocks above a height, which a rewind deletes.
-    ledger_above: String,
 }
 
 impl Reads {
@@ -105,10 +107,6 @@ impl Reads {
                 .limit()
                 .render()?,
             prune_ledger: sql::delete_below(ledger, "height")?,
-            ledger_above: sql::hashes_above(ledger).ok_or_else(|| TableError::UnknownColumn {
-                table: ledger.name.clone(),
-                column: "height".to_owned(),
-            })?,
         })
     }
 }
@@ -157,22 +155,29 @@ impl<E: Engine> SqlStore<E> {
             .execute("BEGIN", &[])
             .await
             .map_err(StoreError::engine(Operation::Begin, None))?;
-        for def in schema.tables() {
-            for statement in std::iter::once(sql::create_table::<E::Dialect>(def))
-                .chain(sql::create_indexes::<E::Dialect>(def))
-            {
-                engine
-                    .execute(&statement, &[])
-                    .await
-                    .map_err(StoreError::engine(Operation::Create, Some(&def.name)))?;
-            }
-        }
+        // Every table and index in one batch, so a remote database pays one round trip for
+        // the schema rather than one a statement. Each is `IF NOT EXISTS`, so a rerun
+        // creates only what is missing.
+        let create = schema
+            .tables()
+            .iter()
+            .flat_map(|def| {
+                std::iter::once(sql::create_table::<E::Dialect>(def))
+                    .chain(sql::create_indexes::<E::Dialect>(def))
+            })
+            .collect::<Vec<_>>()
+            .join(";\n");
+        engine
+            .execute(&create, &[])
+            .await
+            .map_err(StoreError::engine(Operation::Create, Some(chain)))?;
         engine
             .execute("COMMIT", &[])
             .await
             .map_err(StoreError::engine(Operation::Commit, None))?;
+        let stored = describe(&mut engine).await?;
         for def in schema.tables() {
-            check(&mut engine, def).await?;
+            check::<E::Dialect>(def, stored.get(&def.name).map_or(&[], Vec::as_slice))?;
         }
         Ok(Self {
             engine,
@@ -181,7 +186,9 @@ impl<E: Engine> SqlStore<E> {
                 .tables()
                 .iter()
                 .enumerate()
-                .map(|(position, def)| Prepared::new::<E::Dialect>(position, def))
+                .map(|(position, def)| {
+                    Prepared::new::<E::Dialect>(position, def, schema.dataset(Table::AcceptedBlock))
+                })
                 .collect(),
             reads: Reads::new(&schema)?,
             batch: Batch::new(schema),
@@ -300,34 +307,23 @@ impl<E: Engine> SqlStore<E> {
     /// Deletes every block above `height` from each table whose rows belong to one.
     ///
     /// The blocks are the ledger's: a block's rows commit with its ledger entry, so every
-    /// block above `height` with rows is named there. Each is deleted by hash, as a reorg
-    /// deletes, so the delete uses the hash index rather than scanning by height.
+    /// block above `height` with rows is named there. Each table takes one statement that
+    /// finds them in the ledger by hash, as a reorg deletes, so the delete uses the hash
+    /// index rather than scanning by height. The ledger goes last, since the others are
+    /// found through it.
     async fn delete_above(&mut self, height: u64) -> Result<(), StoreError> {
-        let chain = chain_param(&self.chain);
-        let rows = self
-            .engine
-            .query(
-                &self.reads.ledger_above,
-                &[chain.clone(), Value::Uint(height)],
-            )
-            .await
-            .map_err(StoreError::engine(Operation::Read, Some("accepted_blocks")))?;
-        let hashes = rows
-            .iter()
-            .map(|row| Ok(text("accepted_blocks.hash", column(row, 0))?.to_owned()))
-            .collect::<Result<Vec<String>, StoreError>>()?;
-        let floor = Value::Uint(height.saturating_add(1));
-        for table in &self.tables {
-            let Some(delete) = &table.delete else {
+        let params = [chain_param(&self.chain), Value::Uint(height)];
+        let ledger = TableId::Dataset(Table::AcceptedBlock);
+        let (others, last): (Vec<&Prepared>, Vec<&Prepared>) =
+            self.tables.iter().partition(|table| table.def.id != ledger);
+        for table in others.into_iter().chain(last) {
+            let Some(delete) = &table.delete_above else {
                 continue;
             };
-            for hash in &hashes {
-                let params = [chain.clone(), floor.clone(), Value::Text(hash.clone())];
-                self.engine
-                    .execute(delete, &params)
-                    .await
-                    .map_err(StoreError::engine(Operation::Delete, Some(&table.def.name)))?;
-            }
+            self.engine
+                .execute(delete, &params)
+                .await
+                .map_err(StoreError::engine(Operation::Delete, Some(&table.def.name)))?;
         }
         Ok(())
     }
@@ -339,17 +335,15 @@ impl<E: Engine> SqlStore<E> {
                 continue;
             };
             for (chain, (height, hashes)) in &self.batch.orphaned {
-                for hash in hashes {
-                    let params = [
-                        Value::Text(chain.clone()),
-                        Value::Uint(*height),
-                        Value::Text(hash.clone()),
-                    ];
-                    self.engine
-                        .execute(delete, &params)
-                        .await
-                        .map_err(StoreError::engine(Operation::Delete, Some(&table.def.name)))?;
-                }
+                let params = [
+                    Value::Text(chain.clone()),
+                    Value::Uint(*height),
+                    Value::List(hashes.iter().cloned().map(Value::Text).collect()),
+                ];
+                self.engine
+                    .execute(delete, &params)
+                    .await
+                    .map_err(StoreError::engine(Operation::Delete, Some(&table.def.name)))?;
             }
         }
         let mut grouped = self.batch.by_table();
@@ -419,27 +413,38 @@ impl<E: Engine> EnvelopeSink for SqlStore<E> {
     }
 }
 
-/// Fails when `table` as stored lacks a column, holds one it does not declare, or types
-/// one differently, so a changed definition stops the run at startup rather than at its
-/// first write.
-async fn check<E: Engine>(engine: &mut E, table: &TableDef) -> Result<(), StoreError> {
+/// Every table's stored columns in the session's schema, as name and type in column
+/// order, by table name: one query for all of them.
+async fn describe<E: Engine>(
+    engine: &mut E,
+) -> Result<HashMap<String, Vec<(String, String)>>, StoreError> {
     let rows = engine
-        .query(E::Dialect::DESCRIBE, &[Value::Text(table.name.clone())])
+        .query(E::Dialect::DESCRIBE, &[])
         .await
-        .map_err(StoreError::engine(Operation::Read, Some(&table.name)))?;
-    let mut stored = Vec::with_capacity(rows.len());
+        .map_err(StoreError::engine(Operation::Read, None))?;
+    let mut stored: HashMap<String, Vec<(String, String)>> = HashMap::new();
     for row in &rows {
-        stored.push((
-            text("column.name", column(row, 0))?,
-            text("column.type", column(row, 1))?,
-        ));
+        stored
+            .entry(text("table.name", column(row, 0))?.to_owned())
+            .or_default()
+            .push((
+                text("column.name", column(row, 1))?.to_owned(),
+                text("column.type", column(row, 2))?.to_owned(),
+            ));
     }
+    Ok(stored)
+}
+
+/// Fails when `table` as stored, its `stored` columns, lacks a column, holds one it does
+/// not declare, or types one differently, so a changed definition stops the run at
+/// startup rather than at its first write.
+fn check<D: Dialect>(table: &TableDef, stored: &[(String, String)]) -> Result<(), StoreError> {
     let drift = |difference: String| StoreError::Drift {
         table: table.name.clone(),
         difference,
     };
     for column in &table.columns {
-        let expected = E::Dialect::reported_type(column.kind);
+        let expected = D::reported_type(column.kind);
         match stored.iter().find(|(name, _)| *name == column.name) {
             None => return Err(drift(format!("it has no {} column", column.name))),
             Some((_, found)) if !found.eq_ignore_ascii_case(&expected) => {
