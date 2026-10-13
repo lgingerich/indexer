@@ -47,6 +47,12 @@ const TARGET_FILE_BYTES: NonZeroU64 = match NonZeroU64::new(128 * 1024 * 1024) {
     None => NonZeroU64::MIN,
 };
 
+/// How many output files one compaction writes at once. delta-rs defaults to one per
+/// core, each holding a decoded partition's worth of rows on its way to a
+/// [`TARGET_FILE_BYTES`] file, which beside the running writer is a peak of gigabytes.
+/// Compaction runs off the write path, so it can take longer instead.
+const COMPACTION_TASKS: usize = 1;
+
 /// A file under this is small: one a tip commit wrote, not one compaction did. A
 /// compacted partition holds at most one, the remainder of its last bin.
 const SMALL_FILE_BYTES: i64 = 32 * 1024 * 1024;
@@ -129,6 +135,7 @@ pub(super) async fn compact(
             .optimize()
             .with_filters(&filters)
             .with_target_size(TARGET_FILE_BYTES)
+            .with_max_concurrent_tasks(COMPACTION_TASKS)
             .with_writer_properties(writer.clone())
             .await?;
         *table = optimized;

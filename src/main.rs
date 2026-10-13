@@ -22,6 +22,13 @@ use tracing::error;
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::filter::LevelFilter;
 
+/// The process's allocator: mimalloc rather than the system's, so memory freed after a
+/// large, short-lived buffer goes back to the system. Under glibc's malloc a backfill
+/// that writes the lake from many threads held on to every peak until it ran out of
+/// memory (see the `mimalloc` entry in `Cargo.toml`).
+#[global_allocator]
+static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 /// The settings file used when none is named on the command line.
 const DEFAULT_SETTINGS: &str = "indexer.toml";
 
