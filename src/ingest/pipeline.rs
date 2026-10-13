@@ -46,7 +46,10 @@ use alloy_primitives::B256;
 use futures_util::StreamExt as _;
 use futures_util::stream::FuturesOrdered;
 use std::collections::VecDeque;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll, ready};
 use thiserror::Error;
 use tracing::{info, warn};
 
@@ -377,7 +380,30 @@ impl<S, K> Machine<S, K> {
     }
 }
 
-impl<S: BlockSource, K: EnvelopeSink> Machine<S, K> {
+/// A spawned task, aborted when dropped: a backfill range that will not be accepted
+/// stops reading the source rather than finishing for nothing.
+struct Spawned<T>(tokio::task::JoinHandle<T>);
+
+impl<T> Future for Spawned<T> {
+    type Output = T;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<T> {
+        match ready!(Pin::new(&mut self.0).poll(cx)) {
+            Ok(output) => Poll::Ready(output),
+            // Only a drop aborts the task, and a dropped one is never polled, so this is
+            // a panic inside it: it surfaces here, as it would have inline.
+            Err(error) => std::panic::resume_unwind(error.into_panic()),
+        }
+    }
+}
+
+impl<T> Drop for Spawned<T> {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+impl<S: BlockSource + 'static, K: EnvelopeSink> Machine<S, K> {
     /// Indexes from `start` through the sampled head, then follows live heads; or, given a
     /// `stop`, indexes through `stop` and returns.
     ///
@@ -602,8 +628,13 @@ impl<S: BlockSource, K: EnvelopeSink> Machine<S, K> {
             while fetches.len() < concurrency && cut <= end {
                 let span = source.backfill_span().max(1);
                 let last = end.min(cut.saturating_add(span - 1));
-                let source = &source;
-                fetches.push_back(async move { (cut, last, source.fetch_blocks(cut, last).await) });
+                // Its own task, so responses are read and parsed on every worker while
+                // this one accepts blocks, not only while it waits on the next range.
+                let source = Arc::clone(&source);
+                let fetch = Spawned(tokio::spawn(
+                    async move { source.fetch_blocks(cut, last).await },
+                ));
+                fetches.push_back(async move { (cut, last, fetch.await) });
                 cut = Self::next(last)?;
             }
             let Some((from, to, answer)) = fetches.next().await else {

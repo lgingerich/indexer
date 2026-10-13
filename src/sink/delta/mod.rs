@@ -84,6 +84,7 @@ use deltalake::parquet::basic::{Compression, ZstdLevel};
 use deltalake::parquet::file::properties::WriterProperties;
 use deltalake::protocol::SaveMode;
 use deltalake::{DeltaTable, DeltaTableBuilder, DeltaTableError, ensure_table_uri};
+use futures_util::future::try_join_all;
 use serde::Deserialize;
 use tokio::time::Instant;
 use tracing::{info, warn};
@@ -215,6 +216,26 @@ struct Lake {
 impl Lake {
     fn name(&self) -> &str {
         &self.def.name
+    }
+
+    /// Appends `rows` as one commit of this table's own log.
+    async fn append(&mut self, writer: &WriterProperties, rows: &[&Row]) -> Result<(), StoreError> {
+        let name = Some(self.def.name.as_str());
+        let batch = arrow::record_batch(&self.arrow, &self.def, rows)
+            .map_err(StoreError::engine(Operation::Append, name))?;
+        let mut write = self
+            .table
+            .clone()
+            .write(vec![batch])
+            .with_save_mode(SaveMode::Append)
+            .with_writer_properties(writer.clone());
+        if arrow::partitioned(&self.def).is_some() {
+            write = write.with_partition_columns([PARTITION]);
+        }
+        self.table = write
+            .await
+            .map_err(StoreError::engine(Operation::Append, name))?;
+        Ok(())
     }
 
     /// The block hash and height columns, when the rows belong to a block.
@@ -556,24 +577,7 @@ impl DeltaSink {
     }
 
     async fn append(&mut self, position: usize, rows: &[&Row]) -> Result<(), StoreError> {
-        let lake = &mut self.lakes[position];
-        let name = Some(lake.def.name.as_str());
-        let batch = arrow::record_batch(&lake.arrow, &lake.def, rows)
-            .map_err(StoreError::engine(Operation::Append, name))?;
-        let mut write = lake
-            .table
-            .clone()
-            .write(vec![batch])
-            .with_save_mode(SaveMode::Append)
-            .with_writer_properties(self.writer.clone());
-        if arrow::partitioned(&lake.def).is_some() {
-            write = write.with_partition_columns([PARTITION]);
-        }
-        let table = write
-            .await
-            .map_err(StoreError::engine(Operation::Append, name))?;
-        lake.table = table;
-        Ok(())
+        self.lakes[position].append(&self.writer, rows).await
     }
 
     /// Appends `rows` to the table at `position`, when there are any.
@@ -588,7 +592,8 @@ impl DeltaSink {
     ///
     /// 1. retractions into `reorgs`, while the ledger still names their orphans;
     /// 2. the orphans out of the ledger, then out of every other table;
-    /// 3. every table's rows;
+    /// 3. every table's rows, all at once: each table has its own log, and no rule orders
+    ///    one table's rows against another's;
     /// 4. the new blocks into the ledger, once their rows are all present.
     ///
     /// A failure part-way leaves the lake as the next open repairs it. The batch is not
@@ -628,12 +633,19 @@ impl DeltaSink {
             self.retract(*floor, hashes).await?;
         }
         let mut rows = reorgs.len() + accepted.len();
-        for position in 0..self.lakes.len() {
-            if let Some(table) = tables.remove(&self.lakes[position].def.id) {
-                rows += table.len();
-                self.append(position, &table).await?;
-            }
-        }
+        let writer = &self.writer;
+        let appends: Vec<_> = self
+            .lakes
+            .iter_mut()
+            .filter_map(|lake| Some((tables.remove(&lake.def.id)?, lake)))
+            .collect();
+        rows += appends.iter().map(|(table, _)| table.len()).sum::<usize>();
+        try_join_all(
+            appends
+                .into_iter()
+                .map(|(table, lake)| async move { lake.append(writer, &table).await }),
+        )
+        .await?;
         self.append_some(self.position(Table::AcceptedBlock), &accepted)
             .await?;
 

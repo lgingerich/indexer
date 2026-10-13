@@ -216,7 +216,7 @@ impl Pipeline {
     }
 }
 
-impl<B: BlockSource> Pipeline<B> {
+impl<B: BlockSource + 'static> Pipeline<B> {
     /// Assembles a pipeline reading `source` and decoding what `catalog` declares.
     pub(crate) fn new(
         source: B,

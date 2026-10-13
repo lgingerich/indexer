@@ -4,6 +4,11 @@
 //! learned rather than configured: back off fast, recover slowly, as TCP does. One
 //! delay is shared by every request. A transient failure doubles it, and the request is
 //! retried after it. Each success shrinks it by an eighth until it reaches zero.
+//!
+//! The delay doubles once per burst, as TCP halves its window once per round trip: a
+//! failure of a request sent before the last doubling does not double it again. Requests
+//! in flight together fail together — one dropped connection, one refused second — and
+//! counting each would take the delay to its cap from a single event.
 //! Unthrottled, requests go back to back; throttled, the delay settles near the
 //! provider's limit. After [`MAX_RETRIES`] the last error is returned as it was.
 //!
@@ -48,18 +53,40 @@ const MIN_DELAY_MS: u64 = 250;
 const MAX_DELAY_MS: u64 = 30_000;
 
 /// The pause before each request, in milliseconds, shared by every request through one
-/// layer. One number, so an atomic rather than a lock: each change is a single
-/// read-modify-write, and nothing else is ordered by it.
+/// layer, and how many times it has doubled. Atomics rather than a lock: each change is
+/// a single read-modify-write, and nothing else is ordered by them.
 #[derive(Debug, Clone, Default)]
-struct Pacing(Arc<AtomicU64>);
+struct Pacing {
+    delay_ms: Arc<AtomicU64>,
+    doublings: Arc<AtomicU64>,
+}
 
 impl Pacing {
     fn current(&self) -> u64 {
-        self.0.load(Ordering::Relaxed)
+        self.delay_ms.load(Ordering::Relaxed)
     }
 
-    /// Doubles the delay, within its bounds, and returns the new one.
-    fn slow_down(&self) -> u64 {
+    /// Marks a request about to be sent, for [`slow_down`](Self::slow_down).
+    fn sent(&self) -> u64 {
+        self.doublings.load(Ordering::Relaxed)
+    }
+
+    /// Doubles the delay, within its bounds, for a request [`sent`](Self::sent) at
+    /// `mark`, unless it has doubled since: then the failure belongs to a burst already
+    /// counted. Returns the delay either way.
+    fn slow_down(&self, mark: u64) -> u64 {
+        if self
+            .doublings
+            .compare_exchange(
+                mark,
+                mark.wrapping_add(1),
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            )
+            .is_err()
+        {
+            return self.current();
+        }
         self.adjust(|ms| ms.saturating_mul(2).clamp(MIN_DELAY_MS, MAX_DELAY_MS))
     }
 
@@ -79,7 +106,7 @@ impl Pacing {
         // The closure always answers `Some`, so this never fails; either way it carries
         // the value `change` was applied to.
         let previous = self
-            .0
+            .delay_ms
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |ms| Some(change(ms)))
             .unwrap_or_else(|ms| ms);
         change(previous)
@@ -240,6 +267,7 @@ where
                 if delay > 0 {
                     tokio::time::sleep(jitter.delay(delay)).await;
                 }
+                let mark = pacing.sent();
                 let result = inner
                     .call(request.clone())
                     .await
@@ -251,7 +279,7 @@ where
                     pacing.speed_up();
                     return result;
                 };
-                let delay = pacing.slow_down();
+                let delay = pacing.slow_down(mark);
                 if retries == MAX_RETRIES {
                     return result;
                 }
@@ -347,7 +375,7 @@ mod tests {
     use serde_json::{Value, json};
     use tower::{Layer as _, ServiceExt as _};
 
-    use super::{MAX_RETRIES, RetryLayer};
+    use super::{MAX_RETRIES, MIN_DELAY_MS, Pacing, RetryLayer};
 
     fn response(body: &str) -> ResponsePacket {
         serde_json::from_str(body).expect("response")
@@ -513,5 +541,19 @@ mod tests {
             assert!(result.is_ok(), "{method}");
             assert_eq!(calls, expected, "{method}");
         }
+    }
+
+    /// Requests that were in flight together and failed together double the delay once,
+    /// not once each; a failure of one sent after that doubling doubles it again.
+    #[test]
+    fn a_burst_of_failures_doubles_the_delay_once() {
+        let pacing = Pacing::default();
+        let mark = pacing.sent();
+        for _ in 0..16 {
+            assert_eq!(pacing.slow_down(mark), MIN_DELAY_MS);
+        }
+        let later = pacing.sent();
+        assert_eq!(pacing.slow_down(later), MIN_DELAY_MS * 2);
+        assert_eq!(pacing.slow_down(mark), MIN_DELAY_MS * 2);
     }
 }

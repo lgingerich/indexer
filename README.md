@@ -144,7 +144,7 @@ block is never split across commits:
 ingest ──▶ [ block | block | block ] ──▶ one commit
 ```
 
-Full — 32 blocks waiting and the store still flushing — the next flush waits. Ingest
+Full — 1024 blocks or about 131 thousand envelopes waiting, and the store still flushing — the next flush waits. Ingest
 stops taking heads until there is room. That wait is the backpressure; nothing is
 dropped:
 

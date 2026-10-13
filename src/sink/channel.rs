@@ -14,7 +14,8 @@
 //!
 //! # Bounded, with backpressure
 //!
-//! The channel holds a few dozen blocks (32). When it is full, [`ChannelSink::flush`] waits,
+//! The channel holds up to 1024 blocks and, whatever their count, about 131 thousand
+//! envelopes. When either is full, [`ChannelSink::flush`] waits,
 //! which stops ingest from taking the next head until storage catches up. That is
 //! deliberate: the alternative is an unbounded buffer that hides lag and loses more on a
 //! crash. Capacity times block time is how long a stall can last before ingest itself
@@ -32,7 +33,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use tokio::sync::mpsc;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 use tokio::time::Instant;
 
 use super::progress::{self, HEAD_UNKNOWN, Progress};
@@ -41,10 +42,29 @@ use crate::wire::envelope::Envelope;
 
 /// How many blocks the channel holds before the sender waits.
 ///
-/// A stall of `CAPACITY` block times is absorbed silently. Small on purpose: a deeper
-/// buffer only delays the moment the lag is felt, and everything in it is lost on a
-/// crash. Not a setting; if a deployment needs more headroom the store is too slow.
-const CAPACITY: usize = 32;
+/// A stall of `CAPACITY` block times is absorbed silently. Sized for backfill, where a
+/// lake commit takes seconds and blocks arrive at a hundred or more a second: 32 filled
+/// in a quarter second and held ingest for the rest of every commit. At the tip it
+/// delays the moment a slow store's lag is felt, and a crash loses what is in it, which
+/// the ledger refetches. Not a setting.
+const CAPACITY: usize = 1024;
+
+/// How many envelopes the channel holds before the sender waits, whatever the block
+/// count.
+///
+/// Blocks differ a hundredfold: an early Robinhood block is about a hundred envelopes, an
+/// Ethereum block over a thousand. Counted in blocks alone, [`CAPACITY`] of the large
+/// ones held gigabytes. An envelope averages about 2 KB once stored, on both, so this is
+/// about 256 MB. A block larger than this on its own still passes, alone.
+const ENVELOPES: usize = 1 << 17;
+
+/// A block on its way to storage, holding its share of the envelope budget until the
+/// drain takes it.
+#[derive(Debug)]
+struct Parcel {
+    envelopes: Vec<Envelope>,
+    _room: OwnedSemaphorePermit,
+}
 
 /// When the drain flushes: how many blocks it gathers into one commit.
 ///
@@ -80,7 +100,10 @@ impl Batching {
 /// The sending half: buffers a block's envelopes and sends them on flush.
 #[derive(Debug)]
 pub(crate) struct ChannelSink {
-    sender: mpsc::Sender<Vec<Envelope>>,
+    sender: mpsc::Sender<Parcel>,
+    /// The envelope budget. A block's share travels with it and is freed when the drain
+    /// has taken it.
+    room: Arc<Semaphore>,
     batch: Vec<Envelope>,
     /// Newest canonical head ingest has sampled. Storage reads it when a commit lands.
     head: Arc<AtomicU64>,
@@ -92,10 +115,12 @@ impl ChannelSink {
     #[must_use]
     pub(crate) fn new() -> (Self, ChannelReceiver) {
         let (sender, receiver) = mpsc::channel(CAPACITY);
+        let room = Arc::new(Semaphore::new(ENVELOPES));
         let head = Arc::new(AtomicU64::new(HEAD_UNKNOWN));
         (
             Self {
                 sender,
+                room,
                 batch: Vec::new(),
                 head: Arc::clone(&head),
             },
@@ -123,13 +148,24 @@ impl EnvelopeSink for ChannelSink {
         // regrowing from zero.
         let next = Vec::with_capacity(self.batch.len());
         let batch = std::mem::replace(&mut self.batch, next);
+        // A block over the whole budget takes all of it, and goes alone.
+        let share = u32::try_from(batch.len().min(ENVELOPES)).unwrap_or(u32::MAX);
+        // The semaphore is never closed, so this fails only if that changes; either way
+        // storage cannot take the block.
+        let room = Arc::clone(&self.room)
+            .acquire_many_owned(share)
+            .await
+            .map_err(|_| SinkError::StorageClosed)?;
         // Storage has stopped. The batch of envelopes inside `SendError` is this
         // layer's own data and nothing else can use it, so the error is translated to
         // `StorageClosed` and `Vec<Envelope>` stops appearing in the sink's error type:
         // a caller matches the variant, and the channel's concrete type stays internal
         // to this module.
         self.sender
-            .send(batch)
+            .send(Parcel {
+                envelopes: batch,
+                _room: room,
+            })
             .await
             .map_err(|_| SinkError::StorageClosed)?;
         Ok(())
@@ -143,7 +179,7 @@ impl EnvelopeSink for ChannelSink {
 /// The receiving half: what storage drains.
 #[derive(Debug)]
 pub(crate) struct ChannelReceiver {
-    receiver: mpsc::Receiver<Vec<Envelope>>,
+    receiver: mpsc::Receiver<Parcel>,
     head: Arc<AtomicU64>,
     progress: Progress,
 }
@@ -214,14 +250,16 @@ impl ChannelReceiver {
         Ok(stored)
     }
 
+    /// Hands one block's envelopes to `sink`, which buffers them against its own limits;
+    /// the block's share of the channel's budget is freed once they are handed over.
     async fn publish<K: EnvelopeSink>(
         &mut self,
         sink: &mut K,
-        block: Vec<Envelope>,
+        block: Parcel,
         pending: &mut usize,
     ) -> Result<(), SinkError> {
-        *pending += block.len();
-        for envelope in block {
+        *pending += block.envelopes.len();
+        for envelope in block.envelopes {
             self.progress.note(&envelope);
             sink.publish(envelope).await?;
         }
@@ -264,7 +302,7 @@ mod tests {
     use crate::sink::{EnvelopeSink, SinkError};
     use crate::wire::envelope::{Block, ChainId, Envelope, Event};
 
-    use super::{Batching, ChannelSink};
+    use super::{Batching, ChannelSink, ENVELOPES};
 
     /// A block at `height`, which stands in for a block's worth of envelopes. The
     /// channel carries no field of its own, so a test needs a value to tell one
@@ -355,6 +393,35 @@ mod tests {
             .expect("drain");
         assert_eq!(stored, 3);
         assert_eq!(store.flushed, [keys(0..3)]);
+    }
+
+    /// Large blocks wait on the envelope budget long before the block count is reached,
+    /// get room back as storage takes them, and one larger than the whole budget still
+    /// goes, alone.
+    #[tokio::test]
+    async fn the_envelope_budget_holds_back_large_blocks() {
+        let wait = Duration::from_millis(50);
+        let half = u64::try_from(ENVELOPES / 2 + 1).expect("fits");
+        let (mut sink, mut receiver) = ChannelSink::new();
+        send_block(&mut sink, 0..half).await;
+        assert!(
+            tokio::time::timeout(wait, send_block(&mut sink, half..2 * half))
+                .await
+                .is_err(),
+            "a second block over the budget must wait"
+        );
+        let first = receiver.receiver.recv().await.expect("the first block");
+        assert_eq!(first.envelopes.len(), ENVELOPES / 2 + 1);
+        drop(first);
+        tokio::time::timeout(wait, send_block(&mut sink, half..2 * half))
+            .await
+            .expect("room again once storage took the first");
+
+        let (mut sink, _receiver) = ChannelSink::new();
+        let whole = u64::try_from(ENVELOPES + 1).expect("fits");
+        tokio::time::timeout(wait, send_block(&mut sink, 0..whole))
+            .await
+            .expect("a block over the whole budget goes alone");
     }
 
     /// A store that fell behind commits its backlog in one flush, but never splits a
