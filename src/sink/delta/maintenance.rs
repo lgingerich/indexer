@@ -34,6 +34,7 @@ use tracing::{info, warn};
 
 use super::arrow::{PARTITION, PARTITION_BLOCKS};
 use crate::ingest::pipeline::MAX_UNFINALIZED_BLOCKS;
+use crate::metrics;
 
 /// How often the task looks for finished partitions to compact.
 const COMPACT_EVERY: Duration = Duration::from_hours(1);
@@ -92,9 +93,11 @@ async fn run(
         let vacuum = vacuumed.elapsed() >= VACUUM_EVERY;
         for (name, table) in &mut tables {
             if let Err(error) = compact(name, table, tip.load(Ordering::Acquire), &writer).await {
+                metrics::lake_maintenance_failed("compact");
                 warn!(table = %name, %error, "lake compaction failed; retrying next pass");
             }
             if vacuum && let Err(error) = self::vacuum(name, table, retention).await {
+                metrics::lake_maintenance_failed("vacuum");
                 warn!(table = %name, %error, "lake vacuum failed; retrying next pass");
             }
         }

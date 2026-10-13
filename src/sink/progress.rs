@@ -10,6 +10,8 @@ use alloy_primitives::B256;
 use tokio::time::Instant;
 use tracing::info;
 
+use crate::metrics;
+use crate::sink::route::Backend;
 use crate::wire::envelope::{ChainId, Envelope, Event};
 
 /// How far behind the sampled head still counts as caught up.
@@ -42,17 +44,21 @@ impl Progress {
         self.open.note(envelope);
     }
 
-    /// The commit landed. Logs any reorg in it, then the progress line if one is due.
+    /// `store`'s commit landed. Logs any reorg in it, records the commit's metrics, then
+    /// logs the progress line if one is due.
     pub(crate) fn committed(
         &mut self,
+        store: Backend,
         rows: u64,
-        elapsed_ms: u64,
+        elapsed: Duration,
         head: Option<u64>,
         now: Instant,
     ) {
         let stats = std::mem::take(&mut self.open);
         log_reorgs(&stats);
+        let elapsed_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
         if let Some(commit) = stats.into_commit(rows, elapsed_ms) {
+            metrics::committed(store.name(), commit.to, commit.blocks, rows, elapsed, head);
             for line in self.window.observe(commit, head, now).into_iter().flatten() {
                 line.log();
             }

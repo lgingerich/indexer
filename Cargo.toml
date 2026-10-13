@@ -70,6 +70,12 @@ futures-util = { version = "0.3.34", features = ["sink"] }
 # writes, compaction, checkpoints) are freed on other threads than allocated them grows
 # without bound; mimalloc returns freed pages to the system.
 mimalloc = { version = "0.1.52", default-features = false }
+# The metrics facade the layers record through (`crate::metrics`): its macros do nothing
+# until a recorder is installed, so a test or a run without `[metrics]` pays nothing.
+metrics = "0.24.6"
+# The Prometheus recorder and the HTTP listener it is scraped from. Only the listener:
+# the push gateway would bring rustls and a client the indexer has no use for.
+metrics-exporter-prometheus = { version = "0.18.3", default-features = false, features = ["http-listener"] }
 native-tls = { version = "0.2.18", optional = true }
 postgres-native-tls = { version = "0.5.3", optional = true }
 tokio-postgres = { version = "0.7.18", optional = true }

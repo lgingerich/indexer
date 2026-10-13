@@ -105,3 +105,9 @@ tables = ["blocks", "transactions", "logs"]
 # which is a legitimate way to run.
 # [decode]
 # protocols = "protocols"
+
+# A Prometheus endpoint: heads, per-store commit height, lag and timing, decode and RPC
+# failures. Every series is labelled with the chain; see `src/metrics.rs` for the list.
+# Absent, nothing listens and nothing is recorded.
+# [metrics]
+# listen = "0.0.0.0:9100"

@@ -3,6 +3,7 @@
 use tracing::{info, warn};
 
 use crate::decode::{DecodeError, Decoder, derive};
+use crate::metrics;
 use crate::sink::{EnvelopeSink, SinkError};
 use alloy_primitives::{Address, TxHash};
 
@@ -22,6 +23,9 @@ pub struct DecodingSink<K> {
     decoder: Decoder,
     /// The hash, sender, and recipient of the last transaction forwarded.
     transaction: Option<(TxHash, Address, Option<Address>)>,
+    /// Logs decoded since the last flush, recorded once a block rather than per log, so
+    /// the ingest task pays no metric call per envelope.
+    decoded: u64,
     inner: K,
 }
 
@@ -43,6 +47,7 @@ impl<K: EnvelopeSink> DecodingSink<K> {
         Self {
             decoder,
             transaction: None,
+            decoded: 0,
             inner,
         }
     }
@@ -54,6 +59,10 @@ impl<K: EnvelopeSink> DecodingSink<K> {
     fn decode(&mut self, chain: &ChainId, log: &Log) -> Result<Vec<Event>, SinkError> {
         match self.decoder.decode(log) {
             Ok(Some(decoding)) => {
+                self.decoded += 1;
+                if !decoding.discovered.is_empty() {
+                    metrics::contracts_discovered(decoding.discovered.len());
+                }
                 let sent = self
                     .transaction
                     .filter(|&(hash, ..)| hash == log.transaction_hash)
@@ -74,6 +83,7 @@ impl<K: EnvelopeSink> DecodingSink<K> {
             Ok(None) => Ok(Vec::new()),
             Err(error @ DecodeError::Shape) => Err(SinkError::Decode(Box::new(error))),
             Err(error) => {
+                metrics::decode_failed();
                 warn!(%chain, address = %log.address,
                     block = log.block_number, block_hash = %log.block_hash,
                     transaction = %log.transaction_hash, log_index = log.log_index,
@@ -114,6 +124,9 @@ impl<K: EnvelopeSink> EnvelopeSink for DecodingSink<K> {
     }
 
     async fn flush(&mut self) -> Result<(), SinkError> {
+        if self.decoded > 0 {
+            metrics::logs_decoded(std::mem::take(&mut self.decoded));
+        }
         self.inner.flush().await
     }
 

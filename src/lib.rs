@@ -18,7 +18,8 @@
 //! [`sink`] and [`wire`] and not on each other, so neither can reach into the
 //! other's ordering or reorg state. [`sink`] depends only on [`wire`], and [`wire`] on
 //! nothing. [`config`] sits outside the layers and names each layer's settings; a value
-//! that must not be logged is a [`secret::Secret`], which any layer may take. The layers are modules rather than crates, so that
+//! that must not be logged is a [`secret::Secret`], which any layer may take, and any
+//! layer may record into [`metrics`]. The layers are modules rather than crates, so that
 //! direction is a convention a reviewer checks rather than one the compiler enforces;
 //! each module documents the direction it may depend in.
 //!
@@ -46,6 +47,7 @@
 pub mod config;
 pub mod decode;
 pub mod ingest;
+pub mod metrics;
 /// Assembles the configured ingest, decode, and sink pipeline.
 pub mod runtime;
 pub mod secret;

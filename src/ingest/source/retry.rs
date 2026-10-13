@@ -39,6 +39,8 @@ use thiserror::Error;
 use tower::{Layer, Service};
 use tracing::warn;
 
+use crate::metrics;
+
 /// Infura's code for a refused rate, also answered to a log query whose result is too
 /// large.
 const LIMIT_EXCEEDED: i64 = -32005;
@@ -284,6 +286,7 @@ where
                     return result;
                 }
                 retries += 1;
+                metrics::rpc_retry();
                 warn!(
                     retry = retries,
                     max_retries = MAX_RETRIES,

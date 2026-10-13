@@ -236,6 +236,7 @@ src/
 ├── main.rs         the process boundary: logging, the settings path, the exit code
 ├── runtime.rs      assembles the pipeline the settings describe, and runs it
 ├── config.rs       typed settings — layer configuration, not string lookups
+├── metrics.rs      the Prometheus series every layer records, and the endpoint serving them
 ├── wire/           the wire contract: envelope, events, and dataset records. Pure data.
 ├── ingest/         block sources and the reorg-aware pipeline.
 ├── decode/         protocol manifests, the log decoder and its contract set, factory
@@ -402,17 +403,6 @@ one height at a time: its block and receipt calls are per block, and batching th
 heights is not built. The reorgable tail and live heads are fetched a height at a time
 whatever is selected. A `logs` subscription is not the log source: it has no end-of-block
 marker.
-
-### OpenTelemetry metrics
-
-Metrics are not exported yet. Nothing synchronous should run per envelope: a record in
-`DecodingSink::publish` is paid per log on the ingest task, the one that has to stay ahead
-of the chain. Height, head, and lag become observable gauges reading the atomics ingest
-already writes; blocks, rows, and commit duration record once per commit in
-`ChannelReceiver::drain`, on the storage task. Instruments are built once with fixed
-attributes (`chain`, `sink`). Attributes that vary per block — hash, address, selector —
-create a series per event and are the one way to make this expensive; `cargo bench
---bench hot_path` with the meter live is the check that indexing latency has not moved.
 
 ### Signature-only decoding
 
@@ -610,6 +600,34 @@ Production runs on a Hetzner server that fetches `prod` itself and restarts the
 chains when it changes; deploying and operating it is in the `infra` repo's
 `docs/production.md`. A gitignored `*.local.toml` with values written in also works
 for a quick local run.
+
+### Metrics
+
+A `[metrics]` table serves Prometheus metrics; every `indexer.<chain>.toml` sets one, so a
+deployed chain is scraped on port 9100 of its container. Absent, nothing listens and
+nothing is recorded.
+
+```toml
+[metrics]
+listen = "0.0.0.0:9100"
+```
+
+Every series is labelled with `chain`, and the per-store ones with `store`. The full list
+is in `src/metrics.rs`; these are the ones to alert on:
+
+| Watch | Query |
+| --- | --- |
+| A store stopped committing | `time() - indexer_store_last_commit_timestamp_seconds` |
+| A store falling behind the head | `indexer_store_lag_blocks` |
+| Records the stores are missing | `increase(indexer_decode_failures_total[10m])`, `increase(indexer_derive_failures_total[10m])` |
+| Restarts | `changes(indexer_start_time_seconds[15m])` |
+| A struggling node | `rate(indexer_rpc_retries_total[5m])`, `rate(indexer_rpc_range_splits_total[5m])` |
+
+Nothing is recorded per envelope on the ingest task, which has to stay ahead of the
+chain: decoded logs are counted per block, commits once per commit on each store's task,
+and only the failures, which are rare, are counted as they happen. Labels are fixed
+(`chain`, `store`, a derived `table`, a lake `operation`); one that varied per block or
+address would make a series per event.
 
 ### Protocol manifests
 

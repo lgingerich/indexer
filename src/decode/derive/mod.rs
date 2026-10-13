@@ -43,6 +43,7 @@ pub(super) use metric::fixtures;
 use alloy_primitives::{Address, I256, U256};
 use tracing::warn;
 
+use crate::metrics;
 use crate::sink::table::ColumnType;
 use crate::wire::envelope::{ChainId, Decoded, Derived, DerivedField, TypedValue};
 
@@ -159,6 +160,7 @@ pub(super) fn rows(
             derivation
                 .rows(decoded, sent)
                 .inspect_err(|error| {
+                    metrics::derive_failed(derivation.table);
                     warn!(%chain, table = derivation.table, address = %decoded.address,
                         block = decoded.block_number, block_hash = %decoded.block_hash,
                         transaction = %decoded.transaction_hash,

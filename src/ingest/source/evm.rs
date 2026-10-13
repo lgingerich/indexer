@@ -60,6 +60,7 @@ use tracing::warn;
 
 use super::retry::RetryLayer;
 use super::{BlockSource, Datasets, FetchedBlock, HeadStream, METHOD_NOT_FOUND, SourceError};
+use crate::metrics;
 use crate::wire::datasets::evm::{Block, Log, Transaction};
 use crate::wire::envelope::{BlockMeta, ChainId, Event};
 
@@ -1028,6 +1029,7 @@ impl<C: PubSubConnect + Clone> BlockSource for EvmSource<C> {
                 }
                 Err(error @ SourceError::Transport { .. }) if high > low => {
                     let cut = low + (high - low) / 2;
+                    metrics::rpc_range_split();
                     warn!(from = low, to = high, %error, "range fetch failed; fetching it in halves");
                     self.span.shrink(cut - low + 1);
                     pending.extend([(cut + 1, high), (low, cut)]);

@@ -40,6 +40,7 @@
 //! branch from the start height, as the first block itself was adopted.
 
 use crate::ingest::source::{BlockSource, FetchedBlock, SourceError};
+use crate::metrics;
 use crate::sink::{EnvelopeSink, SinkError};
 use crate::wire::envelope::{BlockMeta, Envelope, Event, Reorg};
 use alloy_primitives::B256;
@@ -587,6 +588,7 @@ impl<S: BlockSource + 'static, K: EnvelopeSink> Machine<S, K> {
         events.push(Event::AcceptedBlock(meta));
         self.deliver(events).await?;
         self.ring.push(meta);
+        metrics::ingested(meta.height);
         Ok(())
     }
 
@@ -668,6 +670,7 @@ impl<S: BlockSource + 'static, K: EnvelopeSink> Machine<S, K> {
     async fn sample_head(&mut self) -> Result<BlockMeta, PipelineError> {
         let head = self.source.fetch_header(None).await?;
         self.sink.observe_head(head.height);
+        metrics::chain_head(head.height);
         Ok(head)
     }
 
@@ -805,8 +808,10 @@ impl<S: BlockSource + 'static, K: EnvelopeSink> Machine<S, K> {
         let block = self.replacement(lowest).await?;
 
         self.sink.observe_head(target.height);
+        metrics::chain_head(target.height);
         let orphaned = self.ring.orphaned(ancestor);
         if !orphaned.is_empty() {
+            metrics::reorg(orphaned.len());
             self.deliver(vec![Event::Reorg(Reorg {
                 height: Self::next(ancestor)?,
                 new_head_hash: target.hash,

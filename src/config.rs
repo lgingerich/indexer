@@ -42,6 +42,9 @@
 //!
 //! [decode]
 //! protocols = "protocols"      # the protocol manifests; optional
+//!
+//! [metrics]
+//! listen = "0.0.0.0:9100"      # the Prometheus endpoint; optional
 //! ```
 
 use std::num::NonZeroUsize;
@@ -50,6 +53,7 @@ use std::path::{Path, PathBuf};
 use serde::Deserialize;
 use serde::de::{self, Unexpected};
 
+use crate::metrics::MetricsSettings;
 use crate::secret::Secret;
 use crate::sink::route::{Backend, Tables};
 
@@ -85,6 +89,10 @@ pub struct Settings {
     /// What the decode stage decodes.
     #[serde(default)]
     pub decode: DecodeSettings,
+    /// Where the Prometheus endpoint listens. Absent serves and records nothing; see
+    /// [`crate::metrics`].
+    #[serde(default)]
+    pub metrics: Option<MetricsSettings>,
     /// The directory the settings file lives in, which a relative path in it resolves
     /// against. Filled by [`Settings::from_file`]; empty for text parsed from elsewhere,
     /// which leaves a relative path as written. Not a file key, so a `dir` in the file is

@@ -37,3 +37,8 @@ secret_access_key = { env = "S3_SECRET_ACCESS_KEY" }
 # Every protocol manifest under `protocols/`; each lists its addresses per chain.
 [decode]
 protocols = "protocols"
+
+# The Prometheus endpoint (`src/metrics.rs`). Each chain's container has its own address,
+# so every chain listens on the same port; the host's collector scrapes each container.
+[metrics]
+listen = "0.0.0.0:9100"

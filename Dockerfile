@@ -29,5 +29,7 @@ COPY --from=build /usr/local/bin/indexer /app/indexer
 COPY indexer.*.toml /app/
 COPY protocols /app/protocols
 USER indexer
+# The Prometheus endpoint each settings file's `[metrics]` names.
+EXPOSE 9100
 ENV RUST_LOG=warn,indexer=info
 ENTRYPOINT ["/app/indexer"]

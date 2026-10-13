@@ -145,6 +145,9 @@ pub enum RuntimeError {
         /// `tokio`'s join error, which carries the panic payload.
         source: tokio::task::JoinError,
     },
+    /// The Prometheus endpoint could not be served: its address is taken or invalid.
+    #[error("metrics endpoint could not be served: {0}")]
+    Metrics(#[from] metrics_exporter_prometheus::BuildError),
 }
 
 impl RuntimeError {
@@ -402,7 +405,7 @@ impl<B: BlockSource + 'static> Pipeline<B> {
             tables,
         } in stores
         {
-            let (sender, receiver) = sink::channel::ChannelSink::new();
+            let (sender, receiver) = sink::channel::ChannelSink::new(backend);
             // `ponytail:` the store's writes block, so this holds one runtime worker for
             // the length of each flush. Fine on the multi-threaded runtime the binary
             // uses; a dedicated blocking thread is the upgrade if a store gets slow
@@ -503,6 +506,10 @@ pub async fn run(path: &str) -> Result<(), RuntimeError> {
         storage = ?settings.sink,
         "starting"
     );
+    if let Some(metrics) = &settings.metrics {
+        crate::metrics::serve(metrics, &settings.ingest.chain)?;
+        info!(listen = %metrics.listen, "serving metrics");
+    }
     Pipeline::from_settings(&settings)?.run(&settings).await
 }
 
@@ -682,7 +689,7 @@ tables = ["blocks", "transactions", "logs", "decoded_logs", "contract_events"]
         let mut store = DuckDbSink::connected(connection, schema(), "base")
             .await
             .expect("create tables");
-        let (blocks, receiver) = sink::channel::ChannelSink::new();
+        let (blocks, receiver) = sink::channel::ChannelSink::new(Backend::DuckDb);
         let storage =
             tokio::spawn(async move { receiver.drain(&mut store, Batching::eager(500)).await });
 

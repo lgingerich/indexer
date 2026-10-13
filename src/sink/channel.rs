@@ -37,6 +37,7 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 use tokio::time::Instant;
 
 use super::progress::{self, HEAD_UNKNOWN, Progress};
+use crate::sink::route::Backend;
 use crate::sink::{EnvelopeSink, SinkError};
 use crate::wire::envelope::Envelope;
 
@@ -111,9 +112,9 @@ pub(crate) struct ChannelSink {
 
 impl ChannelSink {
     /// Creates the channel: this sending half, which decode publishes into, and the
-    /// receiving half storage drains.
+    /// receiving half `store` drains, whose commits it reports under that name.
     #[must_use]
-    pub(crate) fn new() -> (Self, ChannelReceiver) {
+    pub(crate) fn new(store: Backend) -> (Self, ChannelReceiver) {
         let (sender, receiver) = mpsc::channel(CAPACITY);
         let room = Arc::new(Semaphore::new(ENVELOPES));
         let head = Arc::new(AtomicU64::new(HEAD_UNKNOWN));
@@ -126,6 +127,7 @@ impl ChannelSink {
             },
             ChannelReceiver {
                 receiver,
+                store,
                 head,
                 progress: Progress::default(),
             },
@@ -180,6 +182,8 @@ impl EnvelopeSink for ChannelSink {
 #[derive(Debug)]
 pub(crate) struct ChannelReceiver {
     receiver: mpsc::Receiver<Parcel>,
+    /// The store this drains into, as its commits are reported.
+    store: Backend,
     head: Arc<AtomicU64>,
     progress: Progress,
 }
@@ -275,11 +279,11 @@ impl ChannelReceiver {
     ) -> Result<u64, SinkError> {
         let started = Instant::now();
         sink.flush().await?;
-        let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        let elapsed = started.elapsed();
         let head = progress::sampled_head(self.head.load(Ordering::Acquire));
         let records = std::mem::take(pending) as u64;
         self.progress
-            .committed(records, elapsed_ms, head, Instant::now());
+            .committed(self.store, records, elapsed, head, Instant::now());
         Ok(records)
     }
 }
@@ -299,6 +303,7 @@ mod tests {
 
     use alloy_primitives::B256;
 
+    use crate::sink::route::Backend;
     use crate::sink::{EnvelopeSink, SinkError};
     use crate::wire::envelope::{Block, ChainId, Envelope, Event};
 
@@ -369,7 +374,7 @@ mod tests {
     /// in order: the flush is the block boundary.
     #[tokio::test]
     async fn a_block_crosses_whole_and_only_on_flush() {
-        let (mut sink, receiver) = ChannelSink::new();
+        let (mut sink, receiver) = ChannelSink::new(Backend::DuckDb);
         sink.publish(envelope(0)).await.expect("publish");
         sink.publish(envelope(1)).await.expect("publish");
         assert!(
@@ -383,7 +388,7 @@ mod tests {
             "an unflushed block must not reach storage"
         );
 
-        let (mut sink, receiver) = ChannelSink::new();
+        let (mut sink, receiver) = ChannelSink::new(Backend::DuckDb);
         send_block(&mut sink, 0..3).await;
         drop(sink);
         let mut store = Batches::default();
@@ -402,7 +407,7 @@ mod tests {
     async fn the_envelope_budget_holds_back_large_blocks() {
         let wait = Duration::from_millis(50);
         let half = u64::try_from(ENVELOPES / 2 + 1).expect("fits");
-        let (mut sink, mut receiver) = ChannelSink::new();
+        let (mut sink, mut receiver) = ChannelSink::new(Backend::DuckDb);
         send_block(&mut sink, 0..half).await;
         assert!(
             tokio::time::timeout(wait, send_block(&mut sink, half..2 * half))
@@ -417,7 +422,7 @@ mod tests {
             .await
             .expect("room again once storage took the first");
 
-        let (mut sink, _receiver) = ChannelSink::new();
+        let (mut sink, _receiver) = ChannelSink::new(Backend::DuckDb);
         let whole = u64::try_from(ENVELOPES + 1).expect("fits");
         tokio::time::timeout(wait, send_block(&mut sink, 0..whole))
             .await
@@ -428,7 +433,7 @@ mod tests {
     /// block: the bound is checked between blocks.
     #[tokio::test]
     async fn a_backlog_shares_a_flush_and_blocks_are_never_split() {
-        let (mut sink, receiver) = ChannelSink::new();
+        let (mut sink, receiver) = ChannelSink::new(Backend::DuckDb);
         send_block(&mut sink, 0..3).await;
         send_block(&mut sink, 3..6).await;
         send_block(&mut sink, 6..9).await;
@@ -450,7 +455,7 @@ mod tests {
     /// gathered when the channel closes is flushed too.
     #[tokio::test(start_paused = true)]
     async fn a_gathered_block_is_flushed_by_its_deadline_in_a_stall() {
-        let (mut sink, receiver) = ChannelSink::new();
+        let (mut sink, receiver) = ChannelSink::new(Backend::DuckDb);
         let batching = Batching {
             records: usize::MAX,
             bytes: usize::MAX,
@@ -477,7 +482,7 @@ mod tests {
     /// wait; a block is never split to stay under it.
     #[tokio::test]
     async fn a_store_past_its_byte_limit_flushes_early() {
-        let (mut sink, receiver) = ChannelSink::new();
+        let (mut sink, receiver) = ChannelSink::new(Backend::DuckDb);
         for height in 0..4 {
             send_block(&mut sink, height..height + 1).await;
         }
@@ -498,7 +503,7 @@ mod tests {
     /// than as unbounded growth or dropped blocks.
     #[tokio::test]
     async fn a_full_channel_blocks_the_sender() {
-        let (mut sink, _parked) = ChannelSink::new();
+        let (mut sink, _parked) = ChannelSink::new(Backend::DuckDb);
         let sent = tokio::time::timeout(Duration::from_secs(2), async {
             let mut sequence = 0;
             loop {
@@ -519,7 +524,7 @@ mod tests {
     /// directly and keeps the channel's own types out of the assertion.
     #[tokio::test]
     async fn a_stopped_store_fails_the_next_flush() {
-        let (mut sink, receiver) = ChannelSink::new();
+        let (mut sink, receiver) = ChannelSink::new(Backend::DuckDb);
         drop(receiver);
         sink.publish(envelope(0)).await.expect("publish buffers");
         let error = sink.flush().await.expect_err("nobody is reading");
@@ -543,7 +548,7 @@ mod tests {
             }
         }
 
-        let (mut sink, receiver) = ChannelSink::new();
+        let (mut sink, receiver) = ChannelSink::new(Backend::DuckDb);
         send_block(&mut sink, 0..1).await;
         let error = receiver
             .drain(&mut OutOfSpace, Batching::eager(100))
