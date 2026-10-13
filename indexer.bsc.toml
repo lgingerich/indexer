@@ -9,9 +9,8 @@
 chain = "bsc"
 http_url = { env = "INDEXER_BSC_HTTP_URL" }
 ws_url = { env = "INDEXER_BSC_WS_URL" }
-# The Metric factory's first event. Remove once the first run has committed: a store
-# with history resumes from its ledger and refuses a `start_block`.
-start_block = 122070137
+# Started at 122070137, the Metric factory's first event; the stores hold history now,
+# so a run resumes from their ledger and a `start_block` would be refused.
 backfill_concurrency = 16
 # The head when this backfill was set up: index through it and exit. Remove to follow
 # live heads, which needs a real `INDEXER_BSC_WS_URL`.

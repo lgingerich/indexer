@@ -12,7 +12,9 @@ ws_url = { env = "INDEXER_ETHEREUM_WS_URL" }
 # Started at 25984373, the Metric factory's first event; the stores hold history now,
 # so a run resumes from their ledger and a `start_block` would be refused.
 backfill_concurrency = 16
-# stop_block = <height>    # index through this height and exit instead
+# Where the backfill stopped: a run exits here. Remove to follow live heads, which needs a
+# real `INDEXER_ETHEREUM_WS_URL`.
+stop_block = 26179000
 
 # The app's PostgreSQL (PlanetScale): decoded events and Metric's derived tables, in the
 # database schema named for the chain. Requires the `postgres` feature. The connection

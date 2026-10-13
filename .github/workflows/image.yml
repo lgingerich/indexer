@@ -1,0 +1,150 @@
+name: Image
+
+# Deploys or stops production chains. The Hetzner host (see the infra repo) runs one
+# container for every `prod-<chain>` tag of this image and restarts a chain within a
+# minute of its tag moving; this workflow is what moves the tags.
+#
+# - deploy: builds the image from the chosen ref, tags it `sha-<commit>`, and points
+#   `prod-<chain>` at it for each chain given. A chain the host has never run starts.
+#   `start_block` and `stop_block` override that chain's settings file for this deploy:
+#   the image is the commit's build with one rewritten file on top.
+# - stop: points `prod-<chain>` at a no-op image that exits at once, so the chain stays
+#   down until its next deploy. A chain whose settings set `stop_block` stops by itself
+#   once it gets there; this is for stopping one that would not.
+#
+# Rolling a chain back is re-pointing its tag at an older commit's build:
+#
+#   docker buildx imagetools create -t ghcr.io/lgingerich/indexer:prod-bsc \
+#     ghcr.io/lgingerich/indexer:sha-<commit>
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        type: choice
+        options: [deploy, stop]
+        default: deploy
+      chains:
+        description: "Chains, comma-separated (e.g. bsc,robinhood). Empty with deploy builds without deploying."
+        type: string
+        required: false
+      start_block:
+        description: "Deploy, one chain only. A height sets ingest.start_block (refused once the chain has data), none removes it, empty keeps the file's."
+        type: string
+        required: false
+      stop_block:
+        description: "Deploy, one chain only. A height sets ingest.stop_block, none removes it (follow live heads), empty keeps the file's."
+        type: string
+        required: false
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Every chain named must have a settings file in the image, so a typo fails here
+      # instead of pushing a tag the host would run. Block overrides are heights of one
+      # chain, so they take exactly one.
+      - name: Resolve tags
+        id: tags
+        env:
+          ACTION: ${{ inputs.action }}
+          CHAINS: ${{ inputs.chains }}
+          START: ${{ inputs.start_block }}
+          STOP: ${{ inputs.stop_block }}
+          IMAGE: ghcr.io/${{ github.repository }}
+        run: |
+          chains=$(echo "$CHAINS" | tr ',' ' ')
+          for chain in $chains; do
+            if [ ! -f "indexer.$chain.toml" ]; then
+              echo "::error::no indexer.$chain.toml for chain '$chain'"
+              exit 1
+            fi
+          done
+          override=""
+          if [ -n "$START$STOP" ]; then
+            if [ "$ACTION" != deploy ] || [ "$(echo "$chains" | wc -w)" -ne 1 ]; then
+              echo "::error::start_block and stop_block need action deploy and exactly one chain"
+              exit 1
+            fi
+            for value in "$START" "$STOP"; do
+              case "$value" in "" | none) ;; *[!0-9]*) echo "::error::'$value' is not a height or none"; exit 1 ;; esac
+            done
+            override=$(echo "$chains" | tr -d ' ')
+          fi
+          if [ "$ACTION" = stop ] && [ -z "$chains" ]; then
+            echo "::error::stop needs at least one chain"
+            exit 1
+          fi
+          # An overridden chain's tag is pushed by the override step, not the build.
+          tags=""
+          for chain in $chains; do
+            [ "$chain" = "$override" ] || tags="$tags,$IMAGE:prod-$chain"
+          done
+          if [ "$ACTION" = deploy ]; then
+            tags="$IMAGE:sha-$GITHUB_SHA$tags"
+          else
+            tags="${tags#,}"
+          fi
+          echo "tags=$tags" >> "$GITHUB_OUTPUT"
+          echo "override=$override" >> "$GITHUB_OUTPUT"
+          echo "$ACTION: $tags${override:+,$IMAGE:prod-$override (start_block=${START:-unchanged}, stop_block=${STOP:-unchanged})}" >> "$GITHUB_STEP_SUMMARY"
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - if: inputs.action == 'deploy'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.tags.outputs.tags }}
+          # Caches the layers, which is the apt step; the Rust build itself runs cold.
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      # Rewrites the chain's settings file and layers it over the commit's build, so the
+      # override costs seconds, not a second compile. Each key is set right after
+      # `chain = `, the one line every settings file has in `[ingest]`.
+      - if: steps.tags.outputs.override != ''
+        env:
+          CHAIN: ${{ steps.tags.outputs.override }}
+          START: ${{ inputs.start_block }}
+          STOP: ${{ inputs.stop_block }}
+          IMAGE: ghcr.io/${{ github.repository }}
+        run: |
+          mkdir override
+          file="override/indexer.$CHAIN.toml"
+          cp "indexer.$CHAIN.toml" "$file"
+          if [ "$(grep -c '^chain = ' "$file")" -ne 1 ]; then
+            echo "::error::indexer.$CHAIN.toml needs exactly one 'chain = ' line"
+            exit 1
+          fi
+          if [ -n "$START" ]; then
+            sed -i '/^start_block *=/d' "$file"
+            [ "$START" = none ] || sed -i "/^chain = /a start_block = $START" "$file"
+          fi
+          if [ -n "$STOP" ]; then
+            sed -i '/^stop_block *=/d' "$file"
+            [ "$STOP" = none ] || sed -i "/^chain = /a stop_block = $STOP" "$file"
+          fi
+          { echo '```diff'; diff -u "indexer.$CHAIN.toml" "$file" || true; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          printf 'FROM %s\nCOPY indexer.%s.toml /app/\n' "$IMAGE:sha-$GITHUB_SHA" "$CHAIN" > override/Dockerfile
+          docker buildx build --push \
+            --label "indexer.start_block=${START:-unchanged}" \
+            --label "indexer.stop_block=${STOP:-unchanged}" \
+            -t "$IMAGE:prod-$CHAIN" override
+      # `true` ignores the settings file the host passes and exits 0, which the host's
+      # unit treats as a finished run, not a failure to restart.
+      - if: inputs.action == 'stop'
+        env:
+          TAGS: ${{ steps.tags.outputs.tags }}
+        run: |
+          printf 'FROM busybox:stable\nLABEL indexer.stopped=true\nENTRYPOINT ["true"]\n' > Dockerfile.stopped
+          set --
+          for tag in $(echo "$TAGS" | tr ',' ' '); do set -- "$@" -t "$tag"; done
+          docker buildx build --push -f Dockerfile.stopped "$@" .

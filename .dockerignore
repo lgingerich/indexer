@@ -1,0 +1,12 @@
+# An allowlist: the working tree also holds the build output and agent worktrees, which
+# would make the build context tens of gigabytes.
+*
+!Cargo.toml
+!Cargo.lock
+!rust-toolchain.toml
+!README.md
+!src
+!benches
+!examples
+!protocols
+!indexer.*.toml

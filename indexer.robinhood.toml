@@ -9,9 +9,8 @@
 chain = "robinhood"
 http_url = { env = "INDEXER_ROBINHOOD_HTTP_URL" }
 ws_url = { env = "INDEXER_ROBINHOOD_WS_URL" }
-# The Metric factory's first event. Remove once the first run has committed: a store
-# with history resumes from its ledger and refuses a `start_block`.
-start_block = 63835167
+# Started at 63835167, the Metric factory's first event; the stores hold history now,
+# so a run resumes from their ledger and a `start_block` would be refused.
 backfill_concurrency = 16
 # stop_block = <height>    # index through this height and exit instead
 
