@@ -590,7 +590,8 @@ mod tests {
     async fn a_second_writer_of_a_schema_is_refused() {
         let url = std::env::var("INDEXER_TEST_POSTGRES_URL").expect("test database URL");
         let settings: PostgresSettings =
-            toml::from_str(&format!("connection_string = '{url}'")).expect("settings");
+            toml::from_str(&format!("tables = ['logs']\nconnection_string = '{url}'"))
+                .expect("settings");
         let schema = format!("lock_test_{}", std::process::id());
         let first = PostgresSink::open(&settings, datasets(), &schema)
             .await
