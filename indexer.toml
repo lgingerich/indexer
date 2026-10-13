@@ -14,10 +14,8 @@ http_url = { env = "INDEXER_ETH_HTTP_URL" }
 ws_url = { env = "INDEXER_WS_URL" }
 # Started at 25984373, the Metric factory's first event on Ethereum; the stores resume
 # from their ledger now.
-stop_block = 26179000
 backfill_concurrency = 16
-# Index through this height and exit, rather than following live heads.
-
+# stop_block = <height>    # index through this height and exit instead
 
 # A remote PostgreSQL 18 database, written with transactional binary COPY and
 # upserted on (chain, dedupe_key). Requires the `postgres` feature. The connection

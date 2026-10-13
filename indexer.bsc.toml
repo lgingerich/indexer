@@ -12,9 +12,7 @@ ws_url = { env = "INDEXER_BSC_WS_URL" }
 # Started at 122070137, the Metric factory's first event; the stores hold history now,
 # so a run resumes from their ledger and a `start_block` would be refused.
 backfill_concurrency = 16
-# The head when this backfill was set up: index through it and exit. Remove to follow
-# live heads, which needs a real `INDEXER_BSC_WS_URL`.
-stop_block = 127324386
+# stop_block = <height>    # index through this height and exit instead
 
 # The app's PostgreSQL (PlanetScale): decoded events and Metric's derived tables, in the
 # database schema named for the chain. Requires the `postgres` feature. The connection
