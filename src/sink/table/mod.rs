@@ -378,13 +378,15 @@ impl TableBuilder {
         self
     }
 
-    /// Names the columns holding each row's block hash and number, and indexes the hash
-    /// under `chain`, so a reorg deletes an orphaned block's rows by index.
+    /// Names the columns holding each row's block hash and number. Indexes the hash under
+    /// `chain`, so a reorg deletes an orphaned block's rows by index, and the number under
+    /// `chain`, so a reader finds the newest block or the rows from a height on without
+    /// scanning.
     #[must_use]
     pub fn reorg_by(mut self, hash: &'static str, number: &'static str) -> Self {
         self.def.block_hash = Some(hash.into());
         self.def.block_number = Some(number.into());
-        self.index(&["chain", hash])
+        self.index(&["chain", hash]).index(&["chain", number])
     }
 
     /// Finishes the table, appending `chain` and `dedupe_key`.

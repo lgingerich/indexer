@@ -115,8 +115,9 @@ retries both; a retry of a commit that did land deletes nothing and upserts onto
 
 In `PostgreSQL`, `(chain, dedupe_key)` is each table's primary key — the replica
 identity logical replication needs to publish a delete — and `(chain, <block hash>)` is
-indexed so the delete does not scan. The index is added to an existing table at
-startup; the primary key is not, so a table created before it keeps its `UNIQUE`
+indexed so the delete does not scan. `(chain, <block number>)` is indexed too, so a
+reader finds the newest block, or the rows from a height on, without scanning. Both
+indexes are added to an existing table at startup; the primary key is not, so a table created before it keeps its `UNIQUE`
 constraint and a store meant for logical replication should be re-created. `DuckDB`
 deletes the same rows without the extra index.
 
@@ -779,7 +780,7 @@ The sink creates the same tables as DuckDB: the seven dataset tables, and the
 [event tables](#protocol-manifests). Columns the chain always
 provides are `NOT NULL`; fields it can omit stay nullable. Each table's primary key is
 `(chain, dedupe_key)`, and every table but `reorgs` is indexed on its block hash for
-[reorg deletes](#a-reorg). A flush bulk-loads with binary `COPY` into a temporary
+[reorg deletes](#a-reorg) and on its block number for reads by height. A flush bulk-loads with binary `COPY` into a temporary
 table, then upserts into the dataset table, in one transaction. Unsigned 64-bit fields
 use `NUMERIC(20,0)`, wider integers — wei amounts, prices, difficulty — `NUMERIC(78,0)`,
 times `TIMESTAMP` (UTC), hashes and addresses `0x` hex `TEXT`, booleans `BOOLEAN`, and

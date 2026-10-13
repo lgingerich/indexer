@@ -530,11 +530,22 @@ mod tests {
                 "{label} upserts on its identity and can publish a delete"
             );
             let retracted = table.id != Table::Reorg.into();
+            let indexes = sql::create_indexes::<Postgres>(table);
             assert_eq!(
-                !sql::create_indexes::<Postgres>(table).is_empty(),
+                !indexes.is_empty(),
                 retracted,
                 "{label} is indexed by block exactly when a reorg deletes from it"
             );
+            if let Some((hash, number)) = table.block_hash.as_ref().zip(table.block_number.as_ref())
+            {
+                for column in [hash, number] {
+                    let columns = format!("(\"chain\", \"{column}\")");
+                    assert!(
+                        indexes.iter().any(|index| index.ends_with(&columns)),
+                        "{label} is indexed on {columns}"
+                    );
+                }
+            }
             assert_eq!(sql::delete_blocks::<Postgres>(table).is_some(), retracted);
             for column in &table.columns {
                 let definition = format!(
