@@ -147,6 +147,33 @@ pub enum RuntimeError {
     },
 }
 
+impl RuntimeError {
+    /// Whether the settings, not the moment, are at fault: rerunning the same settings
+    /// against the same stores fails the same way, so a supervisor should stop rather
+    /// than restart. These are an unreadable settings file or manifests, a sink naming a
+    /// table the run lacks, and a start or stop height that does not fit the chain or
+    /// the stores' history.
+    ///
+    /// A height above the head is counted too, though the chain would grow past it: a
+    /// height the chain has not reached is a mistyped one far more often than an early
+    /// one. Everything else — an endpoint or store that failed, a reorg — may pass, so
+    /// it is not.
+    #[must_use]
+    pub fn is_config(&self) -> bool {
+        match self {
+            Self::Settings(_) | Self::Catalog(_) | Self::Route { .. } => true,
+            Self::Ingest(error) => matches!(
+                error,
+                PipelineError::StartWithHistory { .. }
+                    | PipelineError::StartAboveHead { .. }
+                    | PipelineError::StopAboveHead { .. }
+                    | PipelineError::StopBelowStart { .. }
+            ),
+            _ => false,
+        }
+    }
+}
+
 /// The pipeline the settings describe: the parts, built and ready.
 ///
 /// Generic over its source so a simulation runs the same assembly over an in-memory

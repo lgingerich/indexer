@@ -25,6 +25,11 @@ use tracing_subscriber::filter::LevelFilter;
 /// The settings file used when none is named on the command line.
 const DEFAULT_SETTINGS: &str = "indexer.toml";
 
+/// The exit code when the settings are at fault ([`indexer::runtime::RuntimeError::is_config`]), so a
+/// supervisor can tell "fix the settings" from "try again": `EX_CONFIG` from
+/// `sysexits.h`. Any other failure exits 1.
+const EXIT_CONFIG: u8 = 78;
+
 /// The log level when `RUST_LOG` is unset: `info` in a debug build, so the developer sees
 /// the run, and `error` in a release one, so a deployment's log volume stays the
 /// operator's call. A set `RUST_LOG` wins either way.
@@ -67,7 +72,11 @@ async fn main() -> ExitCode {
             // and its key list. The path is named here because this caller is the one
             // that has it.
             error!(%error, settings = %path, "indexer stopped");
-            ExitCode::FAILURE
+            if error.is_config() {
+                ExitCode::from(EXIT_CONFIG)
+            } else {
+                ExitCode::FAILURE
+            }
         }
     }
 }
@@ -77,7 +86,9 @@ mod tests {
     use std::str::FromStr as _;
 
     use indexer::config::Settings;
+    use indexer::ingest::PipelineError;
     use indexer::runtime::RuntimeError;
+    use indexer::sink::SinkError;
 
     /// What an operator sees when the indexer stops on a bad settings file: every layer
     /// named, the leaf cause under it — and not the raw document the parse error carries
@@ -105,5 +116,16 @@ ws_url = "wss://example.invalid"
             !shown.contains("THE DOCUMENT IS NOT THE MESSAGE"),
             "the raw document is not the message: {shown}"
         );
+    }
+
+    /// A refused start is the settings' fault and exits [`super::EXIT_CONFIG`], so a
+    /// supervisor stops instead of retrying it forever; a failed store may pass, so it
+    /// exits 1 and is retried.
+    #[test]
+    fn only_settings_faults_are_config_errors() {
+        let refused = RuntimeError::from(PipelineError::StartWithHistory { start: 2, tip: 5 });
+        assert!(refused.is_config(), "{refused}");
+        let closed = RuntimeError::from(PipelineError::Sink(SinkError::StorageClosed));
+        assert!(!closed.is_config(), "{closed}");
     }
 }
