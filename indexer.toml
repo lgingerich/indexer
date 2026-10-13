@@ -6,12 +6,16 @@
 # Every key is documented in `src/config.rs`.
 
 [ingest]
-chain = "robinhood"
+chain = "ethereum"
 # Public endpoints, so written as values. An endpoint carrying an API key names the
 # environment variable that holds it instead: http_url = { env = "INDEXER_HTTP_URL" }.
-http_url = { env = "INDEXER_HTTP_URL" }
+http_url = { env = "INDEXER_ETH_HTTP_URL" }
+# Not opened while `stop_block` is set: a bounded run never subscribes to heads.
 ws_url = { env = "INDEXER_WS_URL" }
-stop_block = 65835166
+# Started at 25984373, the Metric factory's first event on Ethereum; the stores resume
+# from their ledger now.
+stop_block = 26179000
+backfill_concurrency = 16
 # Index through this height and exit, rather than following live heads.
 
 
@@ -22,14 +26,14 @@ stop_block = 65835166
 # transactions, means ingest fetches logs alone: eth_getLogs, live for one height and
 # reusing the notification's metadata, and in backfill over up to ten heights.
 [sink.postgres]
-tables = ["contract_events"]
+tables = ["contract_events", "metric_v1_swaps", "metric_v1_bin_fills", "metric_v1_liquidity", "metric_v1_pool_bins"]
 connection_string = { env = "INDEXER_POSTGRES_URL" }
-batch_records = 500
+batch_records = 10000
 
 # Delta tables on Cloudflare R2, under s3://blockchain-data/<chain>/<table>. Requires
 # the `delta` feature. R2 takes region "auto"; the keys are an R2 API token's.
 [sink.delta]
-tables = ["logs", "decoded_logs"]
+tables = ["blocks", "transactions", "logs", "decoded_logs"]
 uri = "s3://blockchain-data"
 
 [sink.delta.storage]
