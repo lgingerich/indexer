@@ -94,14 +94,19 @@ tokio = { version = "1.53.2", features = ["test-util"] }
 name = "hot_path"
 harness = false
 
+# Built for build time over the last few percent: the indexer spends most of its time
+# waiting on the node and the stores, so fat LTO and one codegen unit bought little and
+# made the final link take many minutes.
 [profile.release]
-codegen-units = 1
 debug = 0
 debug-assertions = false
-incremental = false
+incremental = true
 opt-level = 3
-lto = true
-panic = "abort"
+lto = false
+# Unwind, not abort: delta-rs catches `object_store`'s panic on aborting an upload whose
+# completion failed, which an abort turns into the whole process dying; and a store
+# task's panic is reported as that store's error rather than ending the run unexplained.
+panic = "unwind"
 strip = "debuginfo"
 
 [profile.release-profiling]
