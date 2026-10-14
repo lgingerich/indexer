@@ -21,6 +21,10 @@ start_block = 63835167
 [ingest.hypersync]
 url = "https://4663.hypersync.xyz"
 token = { env = "INDEXER_ENVIO_HYPERSYNC_TOKEN" }
+# Ranges of `span` heights, `concurrency` in flight, each held whole until accepted, so
+# memory is about span × concurrency blocks: a few hundred MB a range: ~40 rows a block.
+span = 10000
+concurrency = 3
 
 # TEST BED: Robinhood writes the lake alone, under s3://blockchain-data/dev/, while the
 # lake's write path is tuned. Before running it for real, restore this table, point `uri`

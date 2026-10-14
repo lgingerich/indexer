@@ -542,7 +542,7 @@ the field:
 | Key | Default | Meaning |
 | --- | --- | --- |
 | `ingest.start_block` | the sampled head | First height to index on an empty store. Absent starts live at the observed head; a value backfills that inclusive height forward before following live heads. A value above the sampled head is a startup error. When the store already holds blocks a run resumes from the store: a value the stored history reaches is ignored, and one more than a block past the stored tip is a startup error |
-| `ingest.backfill_concurrency` | `4` | Backfill fetches in flight at once. Blocks are still accepted in height order; this overlaps requests so the node is read while the stores write. Each counts against the provider's rate limit. Zero is refused. Refused beside a [HyperSync backfill](#backfilling-from-hypersync), which fetches one range at a time |
+| `ingest.backfill_concurrency` | `4` | Backfill fetches in flight at once. Blocks are still accepted in height order; this overlaps requests so the node is read while the stores write. Each counts against the provider's rate limit. Zero is refused. Refused beside a [HyperSync backfill](#backfilling-from-hypersync), which takes `ingest.hypersync.concurrency` instead |
 | `sink.duckdb.batch_records` | `500` | Most records one store commit may cover; a backlog of blocks is folded into one commit up to this, and a block is never split |
 | `sink.duckdb.path` | `indexer.duckdb` | Path to the store, relative to the settings file. Tables live in a schema named for the chain: `base.logs` |
 
@@ -550,7 +550,7 @@ the field:
 
 | Key | Meaning |
 | --- | --- |
-| `ingest.hypersync` | Backfill from Envio HyperSync instead of `http_url` and `ws_url`, then exit: `url` (the chain's endpoint) and `token` (a [secret](#secrets)). See [Backfilling from HyperSync](#backfilling-from-hypersync) |
+| `ingest.hypersync` | Backfill from Envio HyperSync instead of `http_url` and `ws_url`, then exit: `url` (the chain's endpoint), `token` (a [secret](#secrets)), and optionally `span` (heights per range, default 2,000) and `concurrency` (ranges in flight, default 2). See [Backfilling from HyperSync](#backfilling-from-hypersync) |
 | `decode.protocols` | Path to the protocol manifests directory, relative to the settings file: the whole tree, a group such as `protocols/uniswap`, or one protocol. Absent means nothing is decoded; a directory with no manifest in it is a startup error |
 | `sink.duckdb.settings` | Any other DuckDB setting, passed straight through; values may be `{ env = "NAME" }` |
 
@@ -584,9 +584,13 @@ url = "https://4663.hypersync.xyz"
 token = { env = "INDEXER_ENVIO_HYPERSYNC_TOKEN" }
 ```
 
-HyperSync answers thousands of blocks per request, so the run fetches one range of
-10,000 heights at a time; `backfill_concurrency` does not apply, and naming it beside
-`[ingest.hypersync]` is a startup error. Responses are checked
+HyperSync answers thousands of blocks per request, so the run fetches ranges of `span`
+heights (default 2,000), `concurrency` of them at once (default 2), and accepts them in
+height order: the next ranges download while one is accepted. Each range in flight, or
+answered and waiting for the one below it, is held whole in memory, about `span` ×
+`concurrency` blocks with every dataset, so a chain with heavy blocks wants a smaller
+span. `backfill_concurrency` does not apply, and naming it beside `[ingest.hypersync]`
+is a startup error. Responses are checked
 as the RPC source checks a node's: every height is present and linked to its parent, and
 logs are present when a block's bloom says they are. Wherever transactions are read, the
 last one's cumulative gas must also be the block's `gas_used`, which catches a dropped

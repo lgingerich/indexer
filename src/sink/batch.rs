@@ -114,6 +114,7 @@ impl Batch {
     /// A merge must not see a key twice — both SQL engines refuse to update one conflict
     /// row twice in a statement — and "last" means last published, which only the buffer
     /// knows; a staging table's physical order does not promise it.
+    #[cfg(any(feature = "duckdb", feature = "postgres"))]
     pub(super) fn by_table(&self) -> HashMap<TableId, Vec<&Row>> {
         // Sized up front: growing a set of half a million keys rehashes it again and again.
         let mut seen = HashSet::with_capacity(self.rows.len());
@@ -126,6 +127,25 @@ impl Batch {
         }
         for rows in tables.values_mut() {
             rows.reverse();
+        }
+        tables
+    }
+
+    /// [`by_table`](Self::by_table)'s rows, owned: taken out of the batch, so whoever
+    /// writes them can free each as soon as it is written rather than all at the end.
+    #[cfg(feature = "delta")]
+    pub(super) fn take_tables(&mut self) -> HashMap<TableId, Vec<Row>> {
+        let mut keep = vec![false; self.rows.len()];
+        let mut seen = HashSet::with_capacity(self.rows.len());
+        for (position, row) in self.rows.iter().enumerate().rev() {
+            keep[position] = seen.insert((row.table().id, row.chain(), row.dedupe_key()));
+        }
+        drop(seen);
+        let mut tables: HashMap<TableId, Vec<Row>> = HashMap::new();
+        for (row, keep) in std::mem::take(&mut self.rows).into_iter().zip(keep) {
+            if keep {
+                tables.entry(row.table().id).or_default().push(row);
+            }
         }
         tables
     }

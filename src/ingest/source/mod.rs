@@ -40,7 +40,7 @@ mod retry;
 pub use any_source::AnySource;
 pub use datasets::Datasets;
 pub use evm::EvmSource;
-pub use hypersync::HyperSyncSource;
+pub use hypersync::{HyperSyncRanges, HyperSyncSource};
 // The simulation builds its client the way `evm::http_client` does, over its own node.
 #[cfg(all(test, feature = "duckdb"))]
 pub(crate) use retry::{NetworkError, RetryLayer};

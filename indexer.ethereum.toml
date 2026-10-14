@@ -21,6 +21,10 @@ start_block = 25984373
 [ingest.hypersync]
 url = "https://1.hypersync.xyz"
 token = { env = "INDEXER_ENVIO_HYPERSYNC_TOKEN" }
+# Ranges of `span` heights, `concurrency` in flight, each held whole until accepted, so
+# memory is about span × concurrency blocks: about 1 GB a range: ~2,000 rows a block.
+span = 500
+concurrency = 3
 
 # The app's PostgreSQL (PlanetScale): only what the app serves, a subset of the lake below,
 # in the database schema named for the chain. Requires the `postgres` feature. The connection

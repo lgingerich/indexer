@@ -38,6 +38,7 @@
 //! [Envio HyperSync]: https://docs.envio.dev/docs/`HyperSync`/overview
 
 use std::fmt;
+use std::num::{NonZeroU64, NonZeroUsize};
 use std::time::Duration;
 
 use alloy_primitives::{Address, B64, B256, Bloom, Bytes, TxHash, U256};
@@ -61,12 +62,6 @@ use crate::wire::envelope::{BlockMeta, ChainId};
 /// The context every error from this source names.
 const CONTEXT: &str = "hypersync";
 
-/// Heights backfill asks for in one [`BlockSource::fetch_blocks`] call. One response
-/// covers anywhere from a few dozen heights on a busy stretch to tens of thousands on a
-/// quiet one, so a range is paged through as many requests as it takes; this bounds how
-/// much one range holds in memory before it is accepted, while leaving each request room
-/// to return a full response.
-const SPAN: u64 = 10_000;
 /// How long one request may take, transfer included. The server stops a query after
 /// about five seconds of work, but its answer can be tens of megabytes.
 const REQUEST_TIMEOUT: Duration = Duration::from_mins(2);
@@ -250,6 +245,7 @@ fn columns<T: DeserializeOwned>() -> Result<&'static [&'static str], SourceError
 /// A source that backfills one EVM chain from a `HyperSync` endpoint.
 pub struct HyperSyncSource {
     chain: ChainId,
+    ranges: HyperSyncRanges,
     client: reqwest::Client,
     query_url: reqwest::Url,
     height_url: reqwest::Url,
@@ -259,9 +255,25 @@ pub struct HyperSyncSource {
     backoff: Backoff,
 }
 
+/// How backfill cuts the chain for this source: ranges of `span` heights, `concurrency`
+/// of them in flight at once (see [`BlockSource::backfill_span`]).
+///
+/// One response covers anywhere from a few dozen heights on a busy stretch to tens of
+/// thousands on a quiet one, so a range is paged through as many requests as it takes,
+/// and is held whole until it is accepted. Each range in flight, or answered and waiting
+/// for the one below it, is one more held: memory is about `span` × `concurrency` blocks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HyperSyncRanges {
+    /// Heights per range.
+    pub span: NonZeroU64,
+    /// Ranges in flight at once.
+    pub concurrency: NonZeroUsize,
+}
+
 impl HyperSyncSource {
     /// Builds a source for `chain` that reads `datasets` from the `HyperSync` endpoint at
-    /// `url` (such as `https://4663.hypersync.xyz`), authorized by `token`.
+    /// `url` (such as `https://4663.hypersync.xyz`), authorized by `token`, and backfills
+    /// in `ranges`.
     ///
     /// # Errors
     ///
@@ -272,6 +284,7 @@ impl HyperSyncSource {
         url: &str,
         token: &str,
         datasets: Datasets,
+        ranges: HyperSyncRanges,
     ) -> Result<Self, SourceError> {
         let base = reqwest::Url::parse(url).map_err(|error| {
             malformed(
@@ -289,6 +302,7 @@ impl HyperSyncSource {
         };
         Ok(Self {
             chain: chain.into(),
+            ranges,
             client: reqwest::Client::builder()
                 .timeout(REQUEST_TIMEOUT)
                 .build()?,
@@ -448,14 +462,13 @@ impl BlockSource for HyperSyncSource {
     }
 
     fn backfill_span(&self) -> u64 {
-        SPAN
+        self.ranges.span.get()
     }
 
-    /// One range at a time, whatever `ingest.backfill_concurrency` says: a range of
-    /// `SPAN` heights with every dataset is gigabytes on a busy chain, and each range in
-    /// flight, or answered and waiting for the one below it, holds one.
+    /// The ranges in flight the settings ask for, while one is accepted the next are
+    /// fetched: with one, the run stopped for every range's download, minutes at a time.
     fn backfill_concurrency(&self) -> usize {
-        1
+        self.ranges.concurrency.get()
     }
 
     async fn fetch_header(&self, height: Option<u64>) -> Result<BlockMeta, SourceError> {
@@ -1320,6 +1333,13 @@ mod tests {
     use crate::ingest::source::{BlockSource, Datasets, EvmSource, SourceError};
     use crate::wire::envelope::Event;
 
+    /// The ranges the live comparisons fetch in: one at a time, as many heights as a test
+    /// asks for at once.
+    const RANGES: super::HyperSyncRanges = super::HyperSyncRanges {
+        span: std::num::NonZeroU64::MAX,
+        concurrency: std::num::NonZeroUsize::MIN,
+    };
+
     /// `HyperSync`'s rows, converted, are the RPC source's rows for the same blocks: every
     /// dataset and field, across the transaction types each chain carries.
     ///
@@ -1384,8 +1404,8 @@ mod tests {
                 &[all, logs_only]
             };
             for &datasets in selections {
-                let hypersync =
-                    HyperSyncSource::new(chain, hypersync, &token, datasets).expect("hypersync");
+                let hypersync = HyperSyncSource::new(chain, hypersync, &token, datasets, RANGES)
+                    .expect("hypersync");
                 let rpc = EvmSource::new(
                     chain,
                     http_client(rpc).expect("rpc"),
@@ -1470,9 +1490,14 @@ mod tests {
             transactions: false,
             logs: true,
         };
-        let source =
-            HyperSyncSource::new("robinhood", "https://4663.hypersync.xyz", &token, logs_only)
-                .expect("hypersync");
+        let source = HyperSyncSource::new(
+            "robinhood",
+            "https://4663.hypersync.xyz",
+            &token,
+            logs_only,
+            RANGES,
+        )
+        .expect("hypersync");
         let blocks = source
             .fetch_blocks(1_000_000, 1_049_999)
             .await

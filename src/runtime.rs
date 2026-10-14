@@ -62,7 +62,9 @@ use crate::config::{IngestSource, Settings, SettingsError};
 use crate::decode::{Catalog, CatalogError, Decoder, DecodingSink};
 use crate::ingest::pipeline::{Machine, PipelineError};
 use crate::ingest::source::evm::{http_client, ws_connect};
-use crate::ingest::source::{AnySource, BlockSource, EvmSource, HyperSyncSource, SourceError};
+use crate::ingest::source::{
+    AnySource, BlockSource, EvmSource, HyperSyncRanges, HyperSyncSource, SourceError,
+};
 #[cfg(feature = "store")]
 use crate::sink;
 #[cfg(feature = "store")]
@@ -251,6 +253,10 @@ impl Pipeline {
                     &hypersync.url,
                     hypersync.token.expose(),
                     datasets,
+                    HyperSyncRanges {
+                        span: hypersync.span,
+                        concurrency: hypersync.concurrency,
+                    },
                 )?)
             }
         };

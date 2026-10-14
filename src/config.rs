@@ -51,7 +51,7 @@
 //! listen = "0.0.0.0:9100"      # the Prometheus endpoint; optional
 //! ```
 
-use std::num::NonZeroUsize;
+use std::num::{NonZeroU64, NonZeroUsize};
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
@@ -209,7 +209,7 @@ impl TryFrom<IngestTable> for IngestSettings {
             (None, None, Some(hypersync)) => {
                 if table.backfill_concurrency.is_some() {
                     return Err("[ingest] backfill_concurrency is for http_url and ws_url; \
-                         [ingest.hypersync] fetches one range at a time");
+                         [ingest.hypersync] takes its own concurrency");
                 }
                 IngestSource::HyperSync(hypersync)
             }
@@ -243,7 +243,15 @@ impl TryFrom<IngestTable> for IngestSettings {
 /// [ingest.hypersync]
 /// url = "https://4663.hypersync.xyz"
 /// token = { env = "INDEXER_ENVIO_HYPERSYNC_TOKEN" }
+/// span = 2000          # heights per range; optional
+/// concurrency = 3      # ranges in flight; optional
 /// ```
+///
+/// Backfill fetches ranges of `span` heights, `concurrency` of them at once, and accepts
+/// them in height order, so the next ranges download while one is accepted. Each range in
+/// flight, or answered and waiting for the one below it, is held whole in memory: about
+/// `span` × `concurrency` blocks with every dataset, so a chain with heavy blocks wants a
+/// smaller span.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HyperSyncSettings {
@@ -252,6 +260,25 @@ pub struct HyperSyncSettings {
     pub url: String,
     /// The Envio API token. Required; a [`Secret`].
     pub token: Secret,
+    /// How many heights one backfill range covers. Zero is refused; omitted is 2,000.
+    #[serde(default = "default_hypersync_span")]
+    pub span: NonZeroU64,
+    /// How many ranges backfill keeps in flight. Zero is refused; omitted is 2.
+    #[serde(default = "default_hypersync_concurrency")]
+    pub concurrency: NonZeroUsize,
+}
+
+/// 2,000 heights: on BSC, about a gigabyte held per range.
+const fn default_hypersync_span() -> NonZeroU64 {
+    match NonZeroU64::new(2_000) {
+        Some(span) => span,
+        None => NonZeroU64::MIN,
+    }
+}
+
+/// Two ranges: one is fetched while the other is accepted.
+const fn default_hypersync_concurrency() -> NonZeroUsize {
+    NonZeroUsize::MIN.saturating_add(1)
 }
 
 /// Where records go: one table per backend, each holding that backend's settings and the
@@ -566,7 +593,25 @@ tables = ["blocks"]
             panic!("expected HyperSync");
         };
         assert_eq!(source.url, "https://4663.hypersync.xyz");
+        assert_eq!(
+            (source.span.get(), source.concurrency.get()),
+            (2_000, 2),
+            "the defaults"
+        );
         assert!(!format!("{settings:?}").contains("secret-token"));
+
+        let tuned = format!("{hypersync}span = 500\nconcurrency = 4\n");
+        let settings = Settings::from_str(&ingest(&tuned)).expect("a tuned hypersync parses");
+        let super::IngestSource::HyperSync(source) = &settings.ingest.source else {
+            panic!("expected HyperSync");
+        };
+        assert_eq!((source.span.get(), source.concurrency.get()), (500, 4));
+        for zero in ["span = 0", "concurrency = 0"] {
+            assert!(
+                Settings::from_str(&ingest(&format!("{hypersync}{zero}\n"))).is_err(),
+                "{zero} is refused"
+            );
+        }
 
         let settings = Settings::from_str(&ingest(rpc)).expect("rpc alone parses");
         let super::IngestSource::Rpc {

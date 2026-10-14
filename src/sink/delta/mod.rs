@@ -112,10 +112,6 @@ const CONCURRENT_TABLES: usize = 16;
 /// on several threads at once. They are still written to the table as one commit.
 const ROWS_PER_BATCH: usize = 1 << 16;
 
-/// A committed batch at least this large is freed on a thread of its own, off the
-/// commit's path: half a million rows took a tenth of a second to drop.
-const DROP_ASIDE_ROWS: usize = 1 << 14;
-
 /// How many versions of a table pass between the checkpoints the store starts: delta-rs's
 /// own default interval.
 const CHECKPOINT_EVERY: u64 = 100;
@@ -726,35 +722,46 @@ impl DeltaSink {
     async fn write(&mut self) -> Result<(), StoreError> {
         self.refuse_replays()?;
         let started = Instant::now();
-        // Taken out so the commit can borrow its rows while it writes, and put back
-        // cleared, keeping its allocation for the next one.
+        // Taken out so the commit can take its rows while it writes, and put back cleared.
         let mut batch = std::mem::replace(&mut self.batch, Batch::new(Arc::clone(&self.schema)));
-        let mut tables = batch.by_table();
+        let orphans = self.committed_orphans(&batch);
+        let mut tables = batch.take_tables();
         let reorgs = tables
             .remove(&TableId::Dataset(Table::Reorg))
             .unwrap_or_default();
         let accepted = tables
             .remove(&TableId::Dataset(Table::AcceptedBlock))
             .unwrap_or_default();
-        let orphans = self.committed_orphans(&batch);
 
         // A retraction's steps are ordered against the ledger, so it waits for the last
         // one; a commit without one never does.
         if !reorgs.is_empty() || orphans.is_some() {
             self.settle_ledger().await?;
         }
-        self.append_some(self.position(Table::Reorg), &reorgs)
-            .await?;
+        self.append_some(
+            self.position(Table::Reorg),
+            &reorgs.iter().collect::<Vec<_>>(),
+        )
+        .await?;
         if let Some((floor, hashes)) = &orphans {
             self.retract(*floor, hashes).await?;
         }
         let mut rows = reorgs.len() + accepted.len();
-        let appends: Vec<(usize, Vec<&Row>)> = (0..self.lakes.len())
+        let appends: Vec<(usize, Vec<Row>)> = (0..self.lakes.len())
             .filter_map(|position| Some((position, tables.remove(&self.lakes[position].def.id)?)))
             .collect();
+        drop((tables, reorgs));
         rows += appends.iter().map(|(_, rows)| rows.len()).sum::<usize>();
+        let tables_written = appends.len();
         let built = Instant::now();
-        let batches = self.record_batches(&appends)?;
+        let ledger_batch = self.ledger_batch(&accepted.iter().collect::<Vec<_>>())?;
+        let first = accepted.iter().filter_map(Row::block_number).min();
+        // What the ledger's window needs of the accepted blocks, once their rows are gone.
+        let accepted: Vec<(String, u64)> = accepted
+            .iter()
+            .filter_map(|row| Some((row.block_hash()?.to_owned(), row.block_number()?)))
+            .collect();
+        let batches = self.record_batches(appends)?;
         let built = built.elapsed();
         let written = Instant::now();
         let appended = self.append_all(batches).await;
@@ -767,34 +774,30 @@ impl DeltaSink {
         let ledger = ledger.elapsed();
         appended?;
         settled?;
-        self.start_ledger(&accepted)?;
+        self.start_ledger(ledger_batch);
 
-        let first = accepted.iter().filter_map(|row| row.block_number()).min();
         let orphaned = orphans.map(|(_, hashes)| hashes).unwrap_or_default();
-        self.advance(&orphaned, &accepted);
+        self.advance(&orphaned, accepted);
         info!(
             chain = %self.chain,
             rows,
             orphaned = orphaned.len(),
             from = ?first,
             to = ?self.tip(),
-            tables = appends.len(),
+            tables = tables_written,
             build_ms = millis(built),
             write_ms = millis(written),
             ledger_wait_ms = millis(ledger),
             elapsed_ms = millis(started.elapsed()),
             "lake commit"
         );
-        if batch.rows.len() >= DROP_ASIDE_ROWS {
-            let rows = std::mem::take(&mut batch.rows);
-            std::thread::spawn(move || drop(rows));
-        }
         batch.clear();
         self.batch = batch;
         Ok(())
     }
 
-    /// Starts appending `accepted` to the ledger, on a task of its own, and returns: the
+    /// Starts appending `batch`, the accepted blocks, to the ledger, on a task of its own,
+    /// and returns: the
     /// rows of these blocks are all present, so their entries may go in any time, and the
     /// next commit's table appends overlap them, which takes a whole commit's round trips
     /// off every commit. A failure surfaces when it is next waited for.
@@ -802,14 +805,22 @@ impl DeltaSink {
     /// Safe for the reason the ledger is written last at all: until an entry lands, its
     /// block's rows are rows the ledger does not name, which a reopen deletes and ingest
     /// fetches again. Every later commit's rows are, too, until its own entry lands.
-    fn start_ledger(&mut self, accepted: &[&Row]) -> Result<(), StoreError> {
+    fn start_ledger(&mut self, batch: Option<RecordBatch>) {
+        let Some(batch) = batch else {
+            return;
+        };
+        let lake = &self.lakes[self.position(Table::AcceptedBlock)];
+        self.ledger = Some(tokio::spawn(lake.append(&self.writer, vec![batch])));
+    }
+
+    /// `accepted` as the ledger's Arrow batch, for [`start_ledger`](Self::start_ledger);
+    /// `None` when the commit accepts no block.
+    fn ledger_batch(&self, accepted: &[&Row]) -> Result<Option<RecordBatch>, StoreError> {
         if accepted.is_empty() {
-            return Ok(());
+            return Ok(None);
         }
         let lake = &self.lakes[self.position(Table::AcceptedBlock)];
-        let batch = lake.record_batch(accepted)?;
-        self.ledger = Some(tokio::spawn(lake.append(&self.writer, vec![batch])));
-        Ok(())
+        lake.record_batch(accepted).map(Some)
     }
 
     /// Waits for the ledger append [`start_ledger`](Self::start_ledger) left running, if
@@ -829,20 +840,33 @@ impl DeltaSink {
     /// Each table's rows as Arrow batches, built in parallel: a thread per table, and per
     /// [`ROWS_PER_BATCH`] rows of a large one, since one table, the logs, usually holds
     /// most of a commit's rows. Building them is the CPU half of a commit.
+    ///
+    /// Each thread owns its rows and frees them once their batch is built, so the rows
+    /// go as the batches come: a commit never holds every row and every batch at once,
+    /// which at the end of the build was its largest moment.
     fn record_batches(
         &self,
-        appends: &[(usize, Vec<&Row>)],
+        appends: Vec<(usize, Vec<Row>)>,
     ) -> Result<Vec<(usize, Vec<RecordBatch>)>, StoreError> {
+        let tables = appends.len();
         std::thread::scope(|scope| {
             // Every build starts before any is waited for.
             let mut builds = Vec::new();
             for (position, rows) in appends {
-                let lake = &self.lakes[*position];
-                for chunk in rows.chunks(ROWS_PER_BATCH) {
-                    builds.push((*position, scope.spawn(move || lake.record_batch(chunk))));
+                let lake = &self.lakes[position];
+                let mut rows = rows.into_iter();
+                loop {
+                    let chunk: Vec<Row> = rows.by_ref().take(ROWS_PER_BATCH).collect();
+                    if chunk.is_empty() {
+                        break;
+                    }
+                    builds.push((
+                        position,
+                        scope.spawn(move || lake.record_batch(&chunk.iter().collect::<Vec<_>>())),
+                    ));
                 }
             }
-            let mut batches: Vec<(usize, Vec<RecordBatch>)> = Vec::with_capacity(appends.len());
+            let mut batches: Vec<(usize, Vec<RecordBatch>)> = Vec::with_capacity(tables);
             for (position, build) in builds {
                 let batch = build
                     .join()
@@ -957,15 +981,11 @@ impl DeltaSink {
 
     /// Moves the window of blocks a reorg could still orphan past a commit: its orphans
     /// out, the blocks it accepted in, and anything below the window dropped.
-    fn advance(&mut self, orphaned: &[String], accepted: &[&Row]) {
+    fn advance(&mut self, orphaned: &[String], accepted: Vec<(String, u64)>) {
         for hash in orphaned {
             self.committed.remove(hash);
         }
-        self.committed.extend(
-            accepted
-                .iter()
-                .filter_map(|row| Some((row.block_hash()?.to_owned(), row.block_number()?))),
-        );
+        self.committed.extend(accepted);
         if let Some(tip) = self.tip() {
             let floor = tip.saturating_sub(LEDGER_WINDOW as u64);
             self.committed.retain(|_, height| *height >= floor);
