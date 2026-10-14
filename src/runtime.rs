@@ -49,6 +49,13 @@
 //! finds out at its next block, when the send to it fails, and stops the rest the same
 //! way. Either way a store's error is reported ahead of ingest's, since a dead store is
 //! the cause and a failed send the symptom.
+//!
+//! `SIGTERM` or `SIGINT` — a deploy's `docker stop`, or Ctrl-C — stops the run as
+//! asked rather than killing it: ingest stops at once, every store finishes the commit
+//! it has under way and drops what it has not started (see `crate::sink::channel`), and
+//! the process exits 0. Before ingest starts, the stores are being opened and brought
+//! to one block, which a restart repeats, so a stop there ends the run without waiting.
+//! A second signal does nothing more; the supervisor's own timeout is the backstop.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -74,6 +81,7 @@ use crate::sink::channel::Batching;
 #[cfg(feature = "store")]
 use crate::sink::resume::{Opened, ResumeError};
 use crate::sink::route::{self, Backend, RouteError, Router};
+use crate::sink::stop::Stop;
 use crate::sink::table::{Schema, TableId};
 use crate::sink::{SinkError, StdoutJsonSink};
 use crate::wire::envelope::ChainId;
@@ -290,7 +298,7 @@ impl<B: BlockSource + 'static> Pipeline<B> {
         }
     }
 
-    /// Runs until ingest or storage stops.
+    /// Runs until ingest or storage stops, or `stop` is requested.
     ///
     /// # Errors
     ///
@@ -298,7 +306,7 @@ impl<B: BlockSource + 'static> Pipeline<B> {
     /// [`RuntimeError::Resume`] when the stores cannot be brought to one block, and
     /// [`RuntimeError::Ingest`] or [`RuntimeError::Storage`] when a part fails. Each
     /// carries that part's own error, because "storage stopped" says nothing about why.
-    pub(crate) async fn run(self, settings: &Settings) -> Result<(), RuntimeError> {
+    pub(crate) async fn run(self, settings: &Settings, mut stop: Stop) -> Result<(), RuntimeError> {
         // The settings never name stdout beside a store, so a run either prints or
         // stores.
         #[cfg(feature = "store")]
@@ -307,12 +315,20 @@ impl<B: BlockSource + 'static> Pipeline<B> {
             .iter()
             .all(|(backend, _)| *backend != Backend::Stdout)
         {
-            let stores = self.open(settings).await?;
-            return Box::pin(self.run_with_stores(stores)).await;
+            let stores = tokio::select! {
+                biased;
+                () = stop.wait() => return Ok(()),
+                stores = self.open(settings) => stores?,
+            };
+            return Box::pin(self.run_with_stores(stores, stop)).await;
         }
         #[cfg(not(feature = "store"))]
         let _ = settings;
-        self.print().await
+        tokio::select! {
+            biased;
+            () = stop.wait() => Ok(()),
+            printed = self.print() => printed,
+        }
     }
 
     /// Prints the tables `[sink.stdout]` names. No store, so no tables and nothing to
@@ -399,7 +415,8 @@ impl<B: BlockSource + 'static> Pipeline<B> {
     }
 
     /// Runs against open `stores`: brings them to one block, then ingests into each the
-    /// tables routed to it, every store committing as its batching says.
+    /// tables routed to it, every store committing as its batching says, until ingest
+    /// or a store stops or `stop` is requested.
     ///
     /// # Errors
     ///
@@ -408,6 +425,7 @@ impl<B: BlockSource + 'static> Pipeline<B> {
     pub(crate) async fn run_with_stores<S: sink::Store>(
         self,
         mut stores: Vec<Opened<S>>,
+        mut stop: Stop,
     ) -> Result<(), RuntimeError> {
         let Self {
             source,
@@ -418,7 +436,11 @@ impl<B: BlockSource + 'static> Pipeline<B> {
             ..
         } = self;
         let chain = source.chain().clone();
-        let resumed = sink::resume::resume(&mut stores).await?;
+        let resumed = tokio::select! {
+            biased;
+            () = stop.wait() => return Ok(()),
+            resumed = sink::resume::resume(&mut stores) => resumed?,
+        };
         let decoder = restore(decoder, &chain, resumed.contracts);
         let ledger = ledger(&chain, resumed.ledger);
 
@@ -436,7 +458,8 @@ impl<B: BlockSource + 'static> Pipeline<B> {
             // the length of each flush. Fine on the multi-threaded runtime the binary
             // uses; a dedicated blocking thread is the upgrade if a store gets slow
             // enough to starve other tasks.
-            let drain = async move { receiver.drain(&mut store, batching).await }
+            let stopping = stop.clone();
+            let drain = async move { receiver.drain(&mut store, batching, stopping).await }
                 .instrument(info_span!("storage", store = %backend));
             drains.push((backend, tokio::spawn(drain)));
             sinks.push((sender, tables));
@@ -447,11 +470,18 @@ impl<B: BlockSource + 'static> Pipeline<B> {
             DecodingSink::new(decoder, Router::new(schema, sinks)),
             ledger,
         )
-        .run(start_block, stop_block)
-        .await;
+        .run(start_block, stop_block);
+        // Dropping ingest part-way is a crash to it: what it has not handed to storage is
+        // fetched again from the stores' ledgers on the next start.
+        let ingest = tokio::select! {
+            biased;
+            () = stop.wait() => Ok(()),
+            ingest = ingest => ingest,
+        };
 
         // Ingest's halves of the channels are gone by now, so each store drains what is
-        // queued and ends. The join order is [`finish`].
+        // queued, or on a stop finishes its commit under way, and ends. The join order is
+        // [`finish`].
         let mut stopped = Vec::with_capacity(drains.len());
         for (backend, drain) in drains {
             stopped.push((backend, drain.await));
@@ -536,7 +566,57 @@ pub async fn run(path: &str) -> Result<(), RuntimeError> {
         crate::metrics::serve(metrics, &settings.ingest.chain)?;
         info!(listen = %metrics.listen, "serving metrics");
     }
-    Pipeline::from_settings(&settings)?.run(&settings).await
+    let (request, stop) = Stop::new();
+    tokio::spawn(async move {
+        let signal = termination().await;
+        info!(
+            signal,
+            "stopping: finishing the commits under way; what is not committed is fetched again on the next start"
+        );
+        // The run may have ended already, and nothing is left to stop.
+        let _ = request.send(true);
+    });
+    let ran = Pipeline::from_settings(&settings)?
+        .run(&settings, stop.clone())
+        .await;
+    if ran.is_ok() && stop.requested() {
+        info!("stopped on request");
+    }
+    ran
+}
+
+/// Waits for the first signal that asks the process to stop: `SIGTERM`, which `docker
+/// stop` and systemd send, or `SIGINT`, from Ctrl-C. Returns its name.
+///
+/// A signal that cannot be listened for is not waited on, so a failure to install a
+/// handler leaves that signal's default — ending the process — rather than stopping the
+/// run at once.
+async fn termination() -> &'static str {
+    let interrupt = async {
+        match tokio::signal::ctrl_c().await {
+            Ok(()) => "SIGINT",
+            Err(_) => std::future::pending().await,
+        }
+    };
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        let terminate = async {
+            match signal(SignalKind::terminate()) {
+                Ok(mut terminate) => {
+                    terminate.recv().await;
+                    "SIGTERM"
+                }
+                Err(_) => std::future::pending().await,
+            }
+        };
+        tokio::select! {
+            signal = terminate => signal,
+            signal = interrupt => signal,
+        }
+    }
+    #[cfg(not(unix))]
+    interrupt.await
 }
 
 #[cfg(all(test, feature = "duckdb"))]
@@ -560,6 +640,7 @@ mod tests {
     use crate::sink::channel::Batching;
     use crate::sink::resume::Opened;
     use crate::sink::route::Backend;
+    use crate::sink::stop::Stop;
     use crate::sink::table::Schema;
     use crate::sink::{self, DuckDbSink, EnvelopeSink as _, SinkError, Store as _};
     use crate::sink::{Operation, StoreError};
@@ -716,8 +797,11 @@ tables = ["blocks", "transactions", "logs", "decoded_logs", "contract_events"]
             .await
             .expect("create tables");
         let (blocks, receiver) = sink::channel::ChannelSink::new(Backend::DuckDb);
-        let storage =
-            tokio::spawn(async move { receiver.drain(&mut store, Batching::eager(500)).await });
+        let storage = tokio::spawn(async move {
+            receiver
+                .drain(&mut store, Batching::eager(500), Stop::never())
+                .await
+        });
 
         let mut decoding = DecodingSink::new(decoder(), blocks);
         decoding
@@ -888,11 +972,10 @@ tables = ["blocks", "transactions", "logs", "decoded_logs", "contract_events"]
         let catalog =
             Catalog::load(protocols(), &ChainId::new("base")).expect("shipped protocols load");
         let result = Pipeline::new(chain, start, None, catalog)
-            .run_with_stores(vec![every_table(
-                Backend::DuckDb,
-                store,
-                Batching::eager(500),
-            )])
+            .run_with_stores(
+                vec![every_table(Backend::DuckDb, store, Batching::eager(500))],
+                Stop::never(),
+            )
             .await;
         assert!(
             matches!(
@@ -1039,13 +1122,10 @@ tables = ["blocks", "transactions", "logs", "decoded_logs", "contract_events"]
             .expect("the lake opens");
         let catalog =
             Catalog::load(protocols(), &ChainId::new("base")).expect("shipped protocols load");
-        let result = Box::pin(
-            Pipeline::new(chain, start, None, catalog).run_with_stores(vec![every_table(
-                Backend::Delta,
-                store,
-                settings.batching(),
-            )]),
-        )
+        let result = Box::pin(Pipeline::new(chain, start, None, catalog).run_with_stores(
+            vec![every_table(Backend::Delta, store, settings.batching())],
+            Stop::never(),
+        ))
         .await;
         assert!(
             matches!(
@@ -1173,8 +1253,10 @@ tables = ["blocks", "transactions", "logs", "decoded_logs", "contract_events"]
                     settings.batching(),
                 ),
             ];
-            let result =
-                Box::pin(Pipeline::new(chain, start, None, catalog).run_with_stores(stores)).await;
+            let result = Box::pin(
+                Pipeline::new(chain, start, None, catalog).run_with_stores(stores, Stop::never()),
+            )
+            .await;
             assert!(
                 matches!(
                     result,

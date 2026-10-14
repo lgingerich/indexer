@@ -29,6 +29,7 @@
 //! reorg; see `docs/multi-store-open-items.md`.
 
 use std::collections::HashSet;
+use std::time::Instant;
 
 use alloy_primitives::B256;
 use tracing::{info, warn};
@@ -135,6 +136,7 @@ pub(crate) async fn resume<S: Store>(stores: &mut [Opened<S>]) -> Result<Restore
         }
         warn!(store = %opened.backend, from = tip.height, to = common.height,
             "rewinding a store that committed past the others");
+        let started = Instant::now();
         opened
             .store
             .rewind(common.height)
@@ -144,6 +146,8 @@ pub(crate) async fn resume<S: Store>(stores: &mut [Opened<S>]) -> Result<Restore
                 height: common.height,
                 source,
             })?;
+        info!(store = %opened.backend, to = common.height, elapsed_ms = millis(started),
+            "store rewound");
         // The contracts it discovered above the block went with their blocks.
         *restored = restore(opened).await?;
     }
@@ -153,15 +157,32 @@ pub(crate) async fn resume<S: Store>(stores: &mut [Opened<S>]) -> Result<Restore
     })
 }
 
+/// Reads back what `opened` holds, and logs how long it took: a lake's read is a scan of
+/// object storage, and one of the slower parts of a start.
 async fn restore<S: Store>(opened: &mut Opened<S>) -> Result<Restored, ResumeError> {
-    opened
+    let started = Instant::now();
+    let restored = opened
         .store
         .restore()
         .await
         .map_err(|source| ResumeError::Restore {
             store: opened.backend,
             source,
-        })
+        })?;
+    info!(
+        store = %opened.backend,
+        blocks = restored.ledger.len(),
+        tip = ?restored.ledger.last().map(|block| block.height),
+        contracts = restored.contracts.len(),
+        elapsed_ms = millis(started),
+        "store read back"
+    );
+    Ok(restored)
+}
+
+/// Milliseconds since `started`, as the startup logs report them.
+fn millis(started: Instant) -> u64 {
+    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
 /// Non-empty ledgers that share no block.

@@ -400,6 +400,7 @@ impl DeltaSink {
         ] {
             require(schema.dataset(table), columns)?;
         }
+        let started = Instant::now();
         let root = settings.uri.trim_end_matches('/');
         let storage = Storage::new(root, &settings.storage)?;
         // Each open is a few requests that wait on the store, and a run has a table per
@@ -409,6 +410,7 @@ impl DeltaSink {
             .buffered(CONCURRENT_TABLES)
             .try_collect()
             .await?;
+        let opened = started.elapsed();
         let positions = lakes
             .iter()
             .enumerate()
@@ -429,8 +431,12 @@ impl DeltaSink {
             maintenance: None,
             ledger: None,
         };
+        let read = Instant::now();
         let ledger = sink.read_ledger().await?;
+        let read = read.elapsed();
+        let repaired = Instant::now();
         sink.repair(&ledger).await?;
+        let repaired = repaired.elapsed();
         sink.committed = ledger
             .iter()
             .map(|block| (hex(&block.hash), block.height))
@@ -452,7 +458,17 @@ impl DeltaSink {
                 sink.writer.clone(),
             ));
         }
-        info!(%chain, uri = root, tables = sink.lakes.len(), tip = ?sink.tip(), "delta lake opened");
+        info!(
+            %chain,
+            uri = root,
+            tables = sink.lakes.len(),
+            tip = ?sink.tip(),
+            open_ms = millis(opened),
+            ledger_ms = millis(read),
+            repair_ms = millis(repaired),
+            elapsed_ms = millis(started.elapsed()),
+            "delta lake opened"
+        );
         Ok(sink)
     }
 
@@ -551,6 +567,7 @@ impl DeltaSink {
     /// Every block table is read, so the reads overlap; a stray row is rare, and its
     /// delete runs once they are done.
     async fn repair(&mut self, ledger: &[BlockMeta]) -> Result<(), StoreError> {
+        let scanned = Instant::now();
         let named: HashSet<String> = ledger.iter().map(|block| hex(&block.hash)).collect();
         let floor = ledger.first().map(|block| block.height);
         let ledger_id = TableId::Dataset(Table::AcceptedBlock);
@@ -592,6 +609,9 @@ impl DeltaSink {
             .try_filter(|(_, stray)| std::future::ready(!stray.is_empty()))
             .try_collect()
             .await?;
+        let scanned = scanned.elapsed();
+        let deleted = Instant::now();
+        let tables = strays.len();
         for (position, stray) in strays {
             let lake = &mut self.lakes[position];
             warn!(
@@ -605,7 +625,17 @@ impl DeltaSink {
             let predicate = of_blocks(columns, &stray, floor);
             lake.delete(&self.writer, predicate).await?;
         }
-        self.repair_reorgs(ledger).await
+        let deleted = deleted.elapsed();
+        let reorgs = Instant::now();
+        self.repair_reorgs(ledger).await?;
+        info!(
+            stray_tables = tables,
+            scan_ms = millis(scanned),
+            delete_ms = millis(deleted),
+            reorgs_ms = millis(reorgs.elapsed()),
+            "lake checked for rows a stopped commit left behind"
+        );
+        Ok(())
     }
 
     /// Deletes the `reorgs` rows of retractions that never finished: ones whose orphaned

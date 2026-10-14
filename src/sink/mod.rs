@@ -17,6 +17,8 @@
 //! - `channel` — the one hop that crosses tasks: a bounded in-process channel of
 //!   blocks, from decode to storage. It is what lets a slow store stall without stalling
 //!   ingest. Commit progress is logged from `progress`, not from the channel.
+//! - `stop` — the request to stop a run, which ingest honors at once and each store's
+//!   drain between commits.
 //! - `duckdb` — an embedded `DuckDB` database.
 //! - `postgres` — a remote `PostgreSQL` 18 database with asynchronous transactional COPY.
 //! - [`table`] — the tables a store persists, declared once; `sql` renders their
@@ -59,6 +61,8 @@ pub mod route;
 #[cfg(any(feature = "duckdb", feature = "postgres"))]
 pub mod sql;
 pub mod stdout;
+/// The request to stop a run: what a `SIGTERM` becomes.
+pub(crate) mod stop;
 #[cfg(any(feature = "duckdb", feature = "postgres"))]
 pub mod store;
 #[cfg(feature = "store")]

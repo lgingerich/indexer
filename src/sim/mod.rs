@@ -48,6 +48,7 @@ use crate::sink::channel::Batching;
 use crate::sink::duckdb::DuckDb;
 use crate::sink::resume::Opened;
 use crate::sink::route::Backend;
+use crate::sink::stop::Stop;
 use crate::sink::{SinkError, SqlStore};
 
 const CHAIN: &str = "sim";
@@ -246,12 +247,15 @@ fn live(world: &Shared, path: &Path, plan: Plan, lifetime: u64, crash: Option<Du
                     source,
                 })?;
             pipeline
-                .run_with_stores(vec![Opened {
-                    backend: Backend::DuckDb,
-                    store,
-                    batching: Batching::eager(plan.batch_records),
-                    tables,
-                }])
+                .run_with_stores(
+                    vec![Opened {
+                        backend: Backend::DuckDb,
+                        store,
+                        batching: Batching::eager(plan.batch_records),
+                        tables,
+                    }],
+                    Stop::never(),
+                )
                 .await
         };
         let end = tokio::select! {
