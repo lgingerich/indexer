@@ -7,26 +7,35 @@
 
 [ingest]
 chain = "robinhood"
-http_url = { env = "INDEXER_ROBINHOOD_HTTP_URL" }
-ws_url = { env = "INDEXER_ROBINHOOD_WS_URL" }
+# Backfilling from HyperSync (README: Backfilling from HyperSync): it indexes up to
+# 4,096 blocks under the head and exits. To follow the chain after it, uncomment
+# http_url, ws_url, and backfill_concurrency, and remove [ingest.hypersync] below.
+# http_url = { env = "INDEXER_ROBINHOOD_HTTP_URL" }
+# ws_url = { env = "INDEXER_ROBINHOOD_WS_URL" }
 # The Metric factory's first event, the earliest log of any Metric contract on this
 # chain. Stores already past it resume from their ledger and ignore it.
 start_block = 63835167
-backfill_concurrency = 16
+# backfill_concurrency = 16
 # stop_block = <height>    # index through this height and exit instead
 
-# The app's PostgreSQL (PlanetScale): decoded events and Metric's derived tables, in the
-# database schema named for the chain. Requires the `postgres` feature. The connection
+[ingest.hypersync]
+url = "https://4663.hypersync.xyz"
+token = { env = "INDEXER_ENVIO_HYPERSYNC_TOKEN" }
+
+# The app's PostgreSQL (PlanetScale): only what the app serves, a subset of the lake below,
+# in the database schema named for the chain. Requires the `postgres` feature. The connection
 # string is a secret, since it carries the password.
 [sink.postgres]
 tables = ["contract_events", "metric_v1_swaps", "metric_v1_bin_fills", "metric_v1_liquidity", "metric_v1_pool_bins"]
 connection_string = { env = "INDEXER_POSTGRES_URL" }
 batch_records = 10000
 
-# Every raw dataset, as Delta tables on Cloudflare R2 under s3://blockchain-data/<chain>/.
+# Everything, as Delta tables on Cloudflare R2 under s3://blockchain-data/<chain>/: `*`
+# matches every dataset, decoded event table, and derived table, including ones added
+# later, so the lake is the complete record and PostgreSQL the subset the app serves.
 # Requires the `delta` feature. R2 takes region "auto"; the keys are an R2 API token's.
 [sink.delta]
-tables = ["blocks", "transactions", "logs", "decoded_logs"]
+tables = ["*"]
 uri = "s3://blockchain-data"
 
 [sink.delta.storage]
