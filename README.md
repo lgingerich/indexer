@@ -848,6 +848,9 @@ The connection string accepts PostgreSQL URL or keyword syntax, and is a
 [secret](#secrets) since it carries the password. TLS uses the platform certificate store;
 use `sslmode=disable` only for trusted local connections. The database must already
 exist, and the role needs permission to create a schema in it and tables in that schema.
+Both ends of the connection send TCP keepalives after 30 idle seconds, so a dead peer is
+noticed within about a minute — a killed indexer's session ends and frees the writer lock
+for its replacement — and any statement running longer than five minutes is cancelled.
 
 Tables live in a schema named for the chain — `base.logs`, `base.uniswap_v3_pool_swap` —
 created at startup if missing and set as the session's `search_path`. Processes indexing

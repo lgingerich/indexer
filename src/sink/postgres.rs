@@ -11,6 +11,7 @@
 
 use std::error::Error;
 use std::sync::Arc;
+use std::time::Duration;
 
 use alloy_primitives::U256;
 use bytes::{Buf as _, BufMut, BytesMut};
@@ -50,6 +51,14 @@ const fn default_batch_records() -> usize {
     20_000
 }
 
+/// Session settings applied on open: server-side TCP keepalives, and a statement
+/// timeout well above a commit's half second and generous for startup's table and
+/// index creation.
+const SESSION_SETTINGS: &str = "SET tcp_keepalives_idle = 30; \
+     SET tcp_keepalives_interval = 10; \
+     SET tcp_keepalives_count = 3; \
+     SET statement_timeout = '5min'";
+
 /// A store in `PostgreSQL`.
 pub type PostgresSink = SqlStore<Postgres>;
 
@@ -84,15 +93,33 @@ impl PostgresSink {
         let connector = MakeTlsConnector::new(
             native_tls::TlsConnector::new().map_err(StoreError::engine(Operation::Open, None))?,
         );
-        let (client, connection) =
-            tokio_postgres::connect(settings.connection_string.expose(), connector)
-                .await
-                .map_err(StoreError::engine(Operation::Open, None))?;
+        let mut config: tokio_postgres::Config = settings
+            .connection_string
+            .expose()
+            .parse()
+            .map_err(StoreError::engine(Operation::Open, None))?;
+        // Probe an idle connection after 30 seconds, every 10, and drop it after 3
+        // misses, so a dead server fails this process in about a minute, not two hours.
+        config
+            .keepalives_idle(Duration::from_secs(30))
+            .keepalives_interval(Duration::from_secs(10))
+            .keepalives_retries(3);
+        let (client, connection) = config
+            .connect(connector)
+            .await
+            .map_err(StoreError::engine(Operation::Open, None))?;
         let task = tokio::spawn(async move {
             if let Err(error) = connection.await {
                 tracing::error!(%error, "PostgreSQL connection stopped");
             }
         });
+        // The same probes from the server's side, so a session whose process was killed
+        // ends within a minute and releases the writer lock below. A statement stuck
+        // behind such a session's locks fails after five minutes rather than hanging.
+        client
+            .batch_execute(SESSION_SETTINGS)
+            .await
+            .map_err(StoreError::engine(Operation::Open, None))?;
         // One writer per database schema, held for the life of this connection.
         let locked: bool = client
             .query_one(
