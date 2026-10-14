@@ -35,9 +35,13 @@
 //! stores are missing.
 
 use std::net::SocketAddr;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+#[cfg(any(feature = "store", test))]
+use std::time::Duration;
+use std::time::{SystemTime, UNIX_EPOCH};
 
-use metrics::{counter, gauge, histogram};
+#[cfg(any(feature = "store", test))]
+use metrics::histogram;
+use metrics::{counter, gauge};
 use metrics_exporter_prometheus::{BuildError, Matcher, PrometheusBuilder};
 use serde::Deserialize;
 
@@ -52,10 +56,15 @@ const CHAIN_HEAD: &str = "indexer_chain_head_height";
 const INGEST_HEIGHT: &str = "indexer_ingest_height";
 const REORGS: &str = "indexer_reorgs_total";
 const REORG_ORPHANED: &str = "indexer_reorg_orphaned_blocks_total";
+#[cfg(any(feature = "store", test))]
 const STORE_HEIGHT: &str = "indexer_store_height";
+#[cfg(any(feature = "store", test))]
 const STORE_LAG: &str = "indexer_store_lag_blocks";
+#[cfg(any(feature = "store", test))]
 const STORE_LAST_COMMIT: &str = "indexer_store_last_commit_timestamp_seconds";
+#[cfg(any(feature = "store", test))]
 const STORE_BLOCKS: &str = "indexer_store_blocks_total";
+#[cfg(any(feature = "store", test))]
 const STORE_ROWS: &str = "indexer_store_rows_total";
 const STORE_COMMIT_DURATION: &str = "indexer_store_commit_duration_seconds";
 const LOGS_DECODED: &str = "indexer_logs_decoded_total";
@@ -64,6 +73,7 @@ const DERIVE_FAILURES: &str = "indexer_derive_failures_total";
 const CONTRACTS_DISCOVERED: &str = "indexer_contracts_discovered_total";
 const RPC_RETRIES: &str = "indexer_rpc_retries_total";
 const RPC_RANGE_SPLITS: &str = "indexer_rpc_range_splits_total";
+#[cfg(feature = "delta")]
 const LAKE_MAINTENANCE_FAILURES: &str = "indexer_lake_maintenance_failures_total";
 
 /// Where the Prometheus endpoint listens: the `[metrics]` table.
@@ -119,7 +129,9 @@ pub(crate) fn reorg(orphaned: usize) {
 }
 
 /// `store` committed `blocks` blocks and `rows` records, up to `height`, in `took`.
-/// `head` is the newest head ingest had sampled, if any.
+/// `head` is the newest head ingest had sampled, if any. Only a store commits, so a
+/// build without one has no caller outside the tests.
+#[cfg(any(feature = "store", test))]
 pub(crate) fn committed(
     store: &'static str,
     height: u64,
@@ -170,6 +182,7 @@ pub(crate) fn rpc_range_split() {
 }
 
 /// A lake maintenance `operation` failed and will be retried next pass.
+#[cfg(feature = "delta")]
 pub(crate) fn lake_maintenance_failed(operation: &'static str) {
     counter!(LAKE_MAINTENANCE_FAILURES, "operation" => operation).increment(1);
 }
