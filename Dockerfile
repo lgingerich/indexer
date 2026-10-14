@@ -48,10 +48,4 @@ USER indexer
 # The Prometheus endpoint each settings file's `[metrics]` names.
 EXPOSE 9100
 ENV RUST_LOG=warn,indexer=info
-# Uploads each lake file of up to 256 MiB as one PUT. delta-rs's default, 5 MiB, sends a
-# commit's larger files as multipart uploads, which add a create and a complete request in
-# sequence on every commit; the whole file is already in memory, so one PUT costs none
-# more. Read once by delta-rs, from the environment only, so it is set here, not in the
-# settings files.
-ENV DELTARS_UPLOAD_PART_SIZE=268435456
 ENTRYPOINT ["/app/indexer"]
