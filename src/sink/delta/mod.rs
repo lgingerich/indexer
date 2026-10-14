@@ -375,6 +375,10 @@ pub struct DeltaSink {
     /// else touches the ledger, before the next one starts, and by
     /// [`finish`](EnvelopeSink::finish).
     ledger: Option<JoinHandle<Result<DeltaTable, StoreError>>>,
+    /// What opening read back, for the first [`restore`](Store::restore) to hand on
+    /// rather than read again: the ledger and the contracts take tens of seconds on a
+    /// large lake. Dropped once anything is written or rewound.
+    opened: Option<Restored>,
 }
 
 impl DeltaSink {
@@ -430,17 +434,19 @@ impl DeltaSink {
             published_tip: Arc::new(AtomicU64::new(0)),
             maintenance: None,
             ledger: None,
+            opened: None,
         };
         let read = Instant::now();
         let ledger = sink.read_ledger().await?;
         let read = read.elapsed();
         let repaired = Instant::now();
-        sink.repair(&ledger).await?;
+        let contracts = sink.repair(&ledger).await?;
         let repaired = repaired.elapsed();
         sink.committed = ledger
             .iter()
             .map(|block| (hex(&block.hash), block.height))
             .collect();
+        sink.opened = Some(Restored { contracts, ledger });
         sink.publish_tip();
         if settings.maintenance {
             // Started after the repair, so it never compacts what the repair deletes.
@@ -566,12 +572,15 @@ impl DeltaSink {
     ///
     /// Every block table is read, so the reads overlap; a stray row is rare, and its
     /// delete runs once they are done.
-    async fn repair(&mut self, ledger: &[BlockMeta]) -> Result<(), StoreError> {
+    ///
+    /// Returns the contracts the lake keeps once repaired, for a restore: they are read
+    /// beside the scan, and again only if the repair deleted some of them.
+    async fn repair(&mut self, ledger: &[BlockMeta]) -> Result<Vec<StoredContract>, StoreError> {
         let scanned = Instant::now();
         let named: HashSet<String> = ledger.iter().map(|block| hex(&block.hash)).collect();
         let floor = ledger.first().map(|block| block.height);
         let ledger_id = TableId::Dataset(Table::AcceptedBlock);
-        let strays: Vec<(usize, Vec<String>)> = stream::iter(self.lakes.iter().enumerate())
+        let scan = stream::iter(self.lakes.iter().enumerate())
             .filter(|(_, lake)| std::future::ready(lake.def.id != ledger_id))
             .filter_map(|(position, lake)| {
                 std::future::ready(
@@ -607,9 +616,13 @@ impl DeltaSink {
             })
             .buffered(CONCURRENT_TABLES)
             .try_filter(|(_, stray)| std::future::ready(!stray.is_empty()))
-            .try_collect()
-            .await?;
+            .try_collect::<Vec<(usize, Vec<String>)>>();
+        let (strays, mut contracts) = tokio::try_join!(scan, self.contracts())?;
         let scanned = scanned.elapsed();
+        let contract_position = self.position(Table::Contract);
+        let contracts_repaired = strays
+            .iter()
+            .any(|(position, _)| *position == contract_position);
         let deleted = Instant::now();
         let tables = strays.len();
         for (position, stray) in strays {
@@ -625,6 +638,9 @@ impl DeltaSink {
             let predicate = of_blocks(columns, &stray, floor);
             lake.delete(&self.writer, predicate).await?;
         }
+        if contracts_repaired {
+            contracts = self.contracts().await?;
+        }
         let deleted = deleted.elapsed();
         let reorgs = Instant::now();
         self.repair_reorgs(ledger).await?;
@@ -635,7 +651,7 @@ impl DeltaSink {
             reorgs_ms = millis(reorgs.elapsed()),
             "lake checked for rows a stopped commit left behind"
         );
-        Ok(())
+        Ok(contracts)
     }
 
     /// Deletes the `reorgs` rows of retractions that never finished: ones whose orphaned
@@ -750,6 +766,7 @@ impl DeltaSink {
 
     /// Writes the batch for [`commit`](Self::commit).
     async fn write(&mut self) -> Result<(), StoreError> {
+        self.opened = None;
         self.refuse_replays()?;
         let started = Instant::now();
         // Taken out so the commit can take its rows while it writes, and put back cleared.
@@ -1038,12 +1055,15 @@ impl DeltaSink {
 /// Opening the lake already repaired it, so a restore only reads back: the ledger as the
 /// repair left it, and the contracts it kept.
 impl Store for DeltaSink {
+    /// The first restore after opening hands on what opening read, which nothing has
+    /// changed since; a later one reads both again, at once.
     async fn restore(&mut self) -> Result<Restored, StoreError> {
         self.settle_ledger().await?;
-        Ok(Restored {
-            contracts: self.contracts().await?,
-            ledger: self.read_ledger().await?,
-        })
+        if let Some(opened) = self.opened.take() {
+            return Ok(opened);
+        }
+        let (contracts, ledger) = tokio::try_join!(self.contracts(), self.read_ledger())?;
+        Ok(Restored { contracts, ledger })
     }
 
     /// Deletes in the order a retraction does: the blocks out of the ledger first, then
@@ -1056,6 +1076,7 @@ impl Store for DeltaSink {
         if self.failed {
             return Err(StoreError::Failed);
         }
+        self.opened = None;
         let rewound = match self.settle_ledger().await {
             Ok(()) => self.delete_above(height).await,
             Err(error) => Err(error),

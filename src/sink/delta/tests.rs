@@ -942,3 +942,76 @@ async fn a_checkpoint_is_written_beside_the_commits() {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
 }
+
+/// A contract created in block `height` on `branch`.
+fn contract(height: u64, branch: u8) -> Envelope {
+    Envelope::new(
+        ChainId::new(CHAIN),
+        Event::Contract(Box::new(crate::wire::envelope::Contract {
+            protocol: "uniswap_v3".to_owned(),
+            name: "UniswapV3Pool".to_owned(),
+            address: alloy_primitives::Address::from([branch.wrapping_add(0xd0); 20]),
+            factory_address: alloy_primitives::Address::from([0xfa; 20]),
+            transaction_hash: hash(height, branch.wrapping_add(100)),
+            transaction_index: 0,
+            log_index: 1,
+            block_number: height,
+            block_hash: hash(height, branch),
+            block_timestamp: 1_700_000_000 + height,
+        })),
+    )
+}
+
+/// The first restore after opening hands on what opening read, and it matches what a
+/// later read of the lake finds; once a commit lands, a restore reads it.
+#[tokio::test]
+async fn a_restore_after_opening_hands_on_what_opening_read() {
+    let dir = Dir::new();
+    let mut sink = open(&dir).await;
+    let mut first = block(1, 0);
+    first.insert(1, contract(1, 0));
+    publish(&mut sink, first).await;
+    publish(&mut sink, block(2, 0)).await;
+    drop(sink);
+
+    let mut sink = open(&dir).await;
+    let handed_on = sink.restore().await.expect("the lake restores");
+    let read = sink.restore().await.expect("the lake restores again");
+    assert_eq!(handed_on.ledger, read.ledger);
+    assert_eq!(handed_on.contracts, read.contracts);
+    assert_eq!(handed_on.contracts.len(), 1);
+    assert_eq!(
+        handed_on
+            .ledger
+            .iter()
+            .map(|block| block.height)
+            .collect::<Vec<_>>(),
+        [1, 2]
+    );
+
+    publish(&mut sink, block(3, 0)).await;
+    assert_eq!(
+        ledger(&mut sink).await.len(),
+        3,
+        "a commit is read, not handed on"
+    );
+}
+
+/// A contract a stopped commit left behind is repaired away before opening hands the
+/// contracts on: they are read again when the repair deletes some of them.
+#[tokio::test]
+async fn opening_hands_on_contracts_as_repaired() {
+    let dir = Dir::new();
+    let mut sink = open(&dir).await;
+    let mut first = block(1, 0);
+    first.insert(1, contract(1, 0));
+    publish(&mut sink, first).await;
+    // Block 2's contract, appended without its ledger entry, as a stopped commit would.
+    append_only(&mut sink, &contract(2, 0)).await;
+    drop(sink);
+
+    let mut sink = open(&dir).await;
+    let restored = sink.restore().await.expect("the lake restores");
+    assert_eq!(restored.contracts.len(), 1, "the stray contract is gone");
+    assert_eq!(restored.contracts[0].block_hash, hash(1, 0));
+}
