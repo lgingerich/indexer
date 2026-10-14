@@ -1,4 +1,4 @@
-name: Image
+name: Deploy
 
 # Deploys or stops production chains. The Hetzner host (see the infra repo) runs one
 # container for every `prod-<chain>` tag of this image and restarts a chain within a
@@ -41,7 +41,7 @@ permissions:
   packages: write
 
 jobs:
-  image:
+  deploy:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

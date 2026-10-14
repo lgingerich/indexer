@@ -5,8 +5,17 @@ on:
   push:
     branches: [main]
 
+# Debug info is most of a dependency's build output, and the cache restores all of it on
+# every run, so CI builds without it. A test panic still names its file and line.
+env:
+  CARGO_PROFILE_DEV_DEBUG: 0
+
+# Each feature set resolves the dependencies differently and so compiles its own copy of
+# them, so each runs as its own job with its own cache rather than one job carrying all
+# three. Caches are saved from `main` only: a pull request restores `main`'s and does not
+# push it out of the repository's cache space with its own.
 jobs:
-  check:
+  all-features:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -17,17 +26,44 @@ jobs:
       # The `delta` feature brings DataFusion and the AWS SDK, so a cold build is most of
       # the job's time. Cached per lockfile and toolchain.
       - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: taiki-e/install-action@nextest
       - run: cargo fmt --check
       - run: cargo clippy --all-targets --all-features -- -D warnings
       - run: cargo doc --no-deps --all-features
       - run: cargo nextest run --all-targets --all-features
-      # `--all-features` alone only ever exercises the engines' presence. The no-engine
-      # build is the one that can rot: a `duckdb`-only symbol reaching an ungated test
-      # fails to compile, and a fixture naming `[sink.duckdb]` fails to parse, so both
-      # hide until someone runs this.
+
+  # `--all-features` alone only ever exercises the engines' presence. The no-engine build
+  # is the one that can rot: a `duckdb`-only symbol reaching an ungated test fails to
+  # compile, and a fixture naming `[sink.duckdb]` fails to parse, so both hide until
+  # someone runs this.
+  no-default-features:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.95.0
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: taiki-e/install-action@nextest
       - run: cargo clippy --no-default-features --all-targets -- -D warnings
       - run: cargo nextest run --no-default-features --all-targets
-      # The lake alone is the one store build that shares nothing SQL with the others,
-      # so a SQL-only item it reaches through the shared store code shows up only here.
+
+  # The lake alone is the one store build that shares nothing SQL with the others, so a
+  # SQL-only item it reaches through the shared store code shows up only here.
+  delta:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.95.0
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo clippy --no-default-features --features delta --all-targets -- -D warnings
