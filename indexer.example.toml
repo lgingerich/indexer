@@ -30,9 +30,15 @@ ws_url = "wss://base-rpc.publicnode.com"
 # is a startup error, so remove it once the first run has committed.
 # start_block = 12345678
 
+# How many blocks under the head a fork may still reach on the chain: deeper heights are
+# backfilled straight through, and only the blocks above go one at a time through the
+# reorg-aware path. At most 4,096, the default; a chain that finalizes sooner hands a
+# backfill to its head sooner with less.
+# finality_depth = 128
+
 # Backfill from Envio HyperSync instead of the two endpoints above: thousands of blocks
 # per request, every dataset, decoding included. HyperSync has no live heads, so the run
-# indexes up to the reorg window below the head and exits. To follow the chain, swap
+# indexes up to `finality_depth` blocks below the head and exits. To follow the chain, swap
 # this table for http_url and ws_url and restart; the run resumes after the backfill.
 # A first run on an empty store needs start_block.
 # [ingest.hypersync]

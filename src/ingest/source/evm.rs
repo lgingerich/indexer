@@ -37,7 +37,7 @@
 //!   except the transaction type, which is kept as its raw `u8`.
 
 use std::fmt;
-use std::num::NonZeroUsize;
+use std::num::{NonZeroU64, NonZeroUsize};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use alloy_consensus::Transaction as ConsensusTransaction;
@@ -231,12 +231,14 @@ pub struct EvmSource<C = WsConnect> {
     plan: FetchPlan,
     span: Span,
     concurrency: NonZeroUsize,
+    finality_depth: NonZeroU64,
 }
 
 impl<C> EvmSource<C> {
     /// Builds a source for `chain` that fetches `datasets` over `http` and subscribes
     /// to heads through `heads`, which is connected afresh for each subscription.
-    /// Backfill keeps `concurrency` fetches in flight.
+    /// Backfill keeps `concurrency` fetches in flight, and treats the heights more than
+    /// `finality_depth` under the head as ones no fork reaches.
     ///
     /// A live notification's metadata stands in for the header only on the logs-only
     /// live path; every other dataset still reads the block body, and the header is
@@ -247,6 +249,7 @@ impl<C> EvmSource<C> {
         heads: C,
         datasets: Datasets,
         concurrency: NonZeroUsize,
+        finality_depth: NonZeroU64,
     ) -> Self {
         Self {
             chain: chain.into(),
@@ -255,6 +258,7 @@ impl<C> EvmSource<C> {
             plan: FetchPlan::new(datasets),
             span: Span::new(),
             concurrency,
+            finality_depth,
         }
     }
 }
@@ -1020,6 +1024,10 @@ impl<C: PubSubConnect + Clone> BlockSource for EvmSource<C> {
         self.concurrency.get()
     }
 
+    fn finality_depth(&self) -> u64 {
+        self.finality_depth.get()
+    }
+
     async fn fetch_header(&self, height: Option<u64>) -> Result<BlockMeta, SourceError> {
         const CONTEXT: &str = "eth_getBlockByNumber(header)";
         let tag = height.map_or(
@@ -1205,6 +1213,7 @@ mod tests {
             ws_connect(ws_url.as_ref()),
             datasets,
             std::num::NonZeroUsize::MIN,
+            std::num::NonZeroU64::MAX,
         ))
     }
 

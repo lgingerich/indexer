@@ -8,7 +8,7 @@
 [ingest]
 chain = "bsc"
 # Backfilling from HyperSync (README: Backfilling from HyperSync): it indexes up to
-# 4,096 blocks under the head and exits. To follow the chain after it, uncomment
+# `finality_depth` blocks under the head and exits. To follow the chain after it, uncomment
 # http_url, ws_url, and backfill_concurrency, and remove [ingest.hypersync] below.
 # http_url = { env = "INDEXER_BSC_HTTP_URL" }
 # ws_url = { env = "INDEXER_BSC_WS_URL" }
@@ -16,6 +16,10 @@ chain = "bsc"
 # chain. Stores already past it resume from their ledger and ignore it.
 start_block = 122070137
 # backfill_concurrency = 16
+# How many blocks under the head a fork may still reach. BSC's fast finality usually
+# finalizes a block within 2 or 3 more, so 128, about a minute, leaves a wide margin;
+# only the blocks above it go one at a time through the reorg-aware path.
+finality_depth = 128
 # stop_block = <height>    # index through this height and exit instead
 
 [ingest.hypersync]

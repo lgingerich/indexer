@@ -140,6 +140,15 @@ pub struct IngestSettings {
     /// A stop inside the reorg window under the head is indexed as the chain stood then:
     /// a fork that later replaces it is not retracted, since no run follows it.
     pub stop_block: Option<u64>,
+    /// `finality_depth`: how many blocks under the head a fork may still reach on this
+    /// chain. Heights deeper than it are backfilled straight through, a range at a time,
+    /// and a `HyperSync` backfill stops there; only the blocks above it go one at a time
+    /// through the reorg-aware path, so a shallower depth hands a backfill to the chain's
+    /// head sooner. It is not how deep a fork can be retracted: a run retracts up to
+    /// [`MAX_UNFINALIZED_BLOCKS`](crate::ingest::pipeline::MAX_UNFINALIZED_BLOCKS) blocks
+    /// whatever this is. Omitted is that same 4,096, which suits any chain; zero or more
+    /// is refused.
+    pub finality_depth: NonZeroU64,
 }
 
 /// The source `[ingest]` names.
@@ -184,6 +193,8 @@ struct IngestTable {
     stop_block: Option<u64>,
     #[serde(default)]
     backfill_concurrency: Option<NonZeroUsize>,
+    #[serde(default)]
+    finality_depth: Option<NonZeroU64>,
 }
 
 /// Four: enough to keep the node busy while a store commits, few enough that a
@@ -223,11 +234,22 @@ impl TryFrom<IngestTable> for IngestSettings {
             }
             _ => return Err("[ingest] http_url and ws_url are named together"),
         };
+        let deepest = crate::ingest::pipeline::MAX_UNFINALIZED_BLOCKS as u64;
+        let finality_depth = match table.finality_depth {
+            Some(depth) if depth.get() > deepest => {
+                return Err(
+                    "[ingest] finality_depth is at most 4,096, the deepest fork a run retracts",
+                );
+            }
+            Some(depth) => depth,
+            None => NonZeroU64::new(deepest).unwrap_or(NonZeroU64::MIN),
+        };
         Ok(Self {
             chain: table.chain,
             source,
             start_block: table.start_block,
             stop_block: table.stop_block,
+            finality_depth,
         })
     }
 }
@@ -598,6 +620,19 @@ tables = ["blocks"]
             (2_000, 2),
             "the defaults"
         );
+        assert_eq!(
+            settings.ingest.finality_depth.get(),
+            4_096,
+            "the default depth"
+        );
+        for (depth, parses) in [("128", true), ("4096", true), ("0", false), ("4097", false)] {
+            let keys = format!("finality_depth = {depth}\n{rpc}");
+            assert_eq!(
+                Settings::from_str(&ingest(&keys)).is_ok(),
+                parses,
+                "finality_depth = {depth}"
+            );
+        }
         assert!(!format!("{settings:?}").contains("secret-token"));
 
         let tuned = format!("{hypersync}span = 500\nconcurrency = 4\n");

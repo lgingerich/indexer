@@ -13,10 +13,14 @@ ws_url = { env = "INDEXER_ETHEREUM_WS_URL" }
 # chain. Stores already past it resume from their ledger and ignore it.
 start_block = 25984373
 backfill_concurrency = 16
+# How many blocks under the head a fork may still reach. Ethereum finalizes every two
+# epochs, so its finalized block is normally 64 to 95 blocks behind the head; 128 leaves
+# a margin. Only the blocks above it go one at a time through the reorg-aware path.
+finality_depth = 128
 # stop_block = <height>    # index through this height and exit instead
 
-# Instead of http_url and ws_url, a HyperSync backfill that exits 4,096 blocks under the
-# head (README: Backfilling from HyperSync). Ranges of `span` heights, `concurrency` in
+# Instead of http_url and ws_url, a HyperSync backfill that exits `finality_depth` blocks
+# under the head (README: Backfilling from HyperSync). Ranges of `span` heights, `concurrency` in
 # flight, each held whole until accepted, so memory is about span × concurrency blocks.
 # [ingest.hypersync]
 # url = "https://1.hypersync.xyz"

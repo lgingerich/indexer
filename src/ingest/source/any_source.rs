@@ -55,6 +55,10 @@ impl BlockSource for AnySource {
         each!(self, source => source.backfill_concurrency())
     }
 
+    fn finality_depth(&self) -> u64 {
+        each!(self, source => source.finality_depth())
+    }
+
     async fn fetch_header(&self, height: Option<u64>) -> Result<BlockMeta, SourceError> {
         each!(self, source => source.fetch_header(height).await)
     }

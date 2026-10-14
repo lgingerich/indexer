@@ -253,6 +253,7 @@ impl Pipeline {
                 ws_connect(ws_url.expose()),
                 datasets,
                 *backfill_concurrency,
+                settings.ingest.finality_depth,
             )),
             IngestSource::HyperSync(hypersync) => {
                 info!(url = %hypersync.url, "backfilling from HyperSync; the run stops at the reorg window");
@@ -265,6 +266,7 @@ impl Pipeline {
                         span: hypersync.span,
                         concurrency: hypersync.concurrency,
                     },
+                    settings.ingest.finality_depth,
                 )?)
             }
         };

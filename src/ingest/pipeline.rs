@@ -314,6 +314,15 @@ pub struct Machine<S, K> {
     ring: UndoRing,
 }
 
+impl<S: BlockSource, K> Machine<S, K> {
+    /// The source's finality depth, never deeper than a run can retract.
+    fn finality_depth(&self) -> u64 {
+        self.source
+            .finality_depth()
+            .clamp(1, MAX_UNFINALIZED_BLOCKS as u64)
+    }
+}
+
 impl<S, K> Machine<S, K> {
     /// Builds a driver whose undo window starts as `ledger`: the accepted identities a
     /// store read back, oldest first.
@@ -384,9 +393,10 @@ impl<S, K> Machine<S, K> {
             .ok_or(PipelineError::HeightOverflow { height })
     }
 
-    /// The highest height a fork cannot reach while `head` is the head.
-    fn buried(head: BlockMeta) -> u64 {
-        head.height.saturating_sub(MAX_UNFINALIZED_BLOCKS as u64)
+    /// The highest height a fork cannot reach while `head` is the head, `depth` blocks
+    /// under it (see [`Self::finality_depth`]).
+    fn buried(head: BlockMeta, depth: u64) -> u64 {
+        head.height.saturating_sub(depth)
     }
 }
 
@@ -616,7 +626,7 @@ impl<S: BlockSource + 'static, K: EnvelopeSink> Machine<S, K> {
                 head: head.height,
             });
         }
-        let buried = Self::buried(head);
+        let buried = Self::buried(head, self.finality_depth());
         let buried = stop.map_or(buried, |stop| stop.min(buried));
         info!(chain = %self.source.chain(), through = buried,
             "this source does not follow the chain: indexing the buried heights, then \
@@ -704,8 +714,13 @@ impl<S: BlockSource + 'static, K: EnvelopeSink> Machine<S, K> {
         mut head: BlockMeta,
         stop: Option<u64>,
     ) -> Result<(u64, BlockMeta), PipelineError> {
-        let bound =
-            |head| stop.map_or_else(|| Self::buried(head), |stop| Self::buried(head).min(stop));
+        let depth = self.finality_depth();
+        let bound = |head| {
+            stop.map_or_else(
+                || Self::buried(head, depth),
+                |stop| Self::buried(head, depth).min(stop),
+            )
+        };
         let mut end = bound(head);
         if next > end {
             return Ok((next, head));
@@ -804,21 +819,44 @@ impl<S: BlockSource + 'static, K: EnvelopeSink> Machine<S, K> {
     /// Only a fetch at the target height may reuse the notification metadata, because
     /// that is the only height it describes. A link failure at the next height means
     /// the branch diverged, so the target is re-read and reconciled.
+    ///
+    /// The heights after the next are fetched ahead, up to the source's
+    /// [`backfill_concurrency`](BlockSource::backfill_concurrency) in flight, each on its
+    /// own task, and accepted one at a time in height order with the same link check: a
+    /// block costs a round trip, and the reorg window under the head is thousands of them
+    /// when a backfill hands over. A divergence drops whatever was fetched ahead, which
+    /// stops those fetches, before the reorg is reconciled.
     async fn catch_up(
         &mut self,
         mut tip: BlockMeta,
         target: BlockMeta,
     ) -> Result<(), PipelineError> {
+        let ahead = self.source.backfill_concurrency().max(1);
+        let mut fetches = FuturesOrdered::new();
+        // The first height not yet requested.
+        let mut cut = Self::next(tip.height)?;
         while tip.height < target.height {
-            let next = Self::next(tip.height)?;
-            let fetch_head = (next == target.height).then_some(&target);
-            let block = self.source.fetch_block(next, fetch_head).await?;
+            while fetches.len() < ahead && cut <= target.height {
+                let height = cut;
+                let source = Arc::clone(&self.source);
+                let fetch = Spawned(tokio::spawn(async move {
+                    let head = (height == target.height).then_some(&target);
+                    source.fetch_block(height, head).await
+                }));
+                fetches.push_back(async move { (height, fetch.await) });
+                cut = Self::next(height)?;
+            }
+            let Some((next, block)) = fetches.next().await else {
+                break;
+            };
+            let block = block?;
             let meta = Self::marker(block.meta, next)?;
             if Self::validate_link(tip, meta).is_ok() {
                 self.commit(meta, block.events).await?;
                 tip = meta;
                 continue;
             }
+            drop(fetches);
             // Re-read the announced target by height; it must still match before any
             // retraction is emitted.
             if self.header(target.height).await? != target {
@@ -992,6 +1030,13 @@ mod tests {
         peak: AtomicUsize,
         /// Whether the source follows heads, or only backfills.
         follows: bool,
+        /// The source's finality depth.
+        finality: u64,
+        /// Whether each `fetch_block` waits a moment, so fetches made ahead overlap.
+        slow_blocks: bool,
+        /// `fetch_block` calls in flight now, and the most there ever were.
+        blocks_in_flight: AtomicUsize,
+        blocks_peak: AtomicUsize,
     }
 
     impl Source {
@@ -1015,6 +1060,10 @@ mod tests {
                     in_flight: AtomicUsize::new(0),
                     peak: AtomicUsize::new(0),
                     follows: true,
+                    finality: MAX_UNFINALIZED_BLOCKS as u64,
+                    slow_blocks: false,
+                    blocks_in_flight: AtomicUsize::new(0),
+                    blocks_peak: AtomicUsize::new(0),
                 },
             }
         }
@@ -1100,6 +1149,9 @@ mod tests {
         fn backfill_concurrency(&self) -> usize {
             self.data.concurrency
         }
+        fn finality_depth(&self) -> u64 {
+            self.data.finality
+        }
         async fn fetch_block(
             &self,
             height: u64,
@@ -1107,6 +1159,12 @@ mod tests {
         ) -> Result<FetchedBlock, SourceError> {
             let data = &self.data;
             data.block_calls.fetch_add(1, Ordering::Relaxed);
+            if data.slow_blocks {
+                let now = data.blocks_in_flight.fetch_add(1, Ordering::Relaxed) + 1;
+                data.blocks_peak.fetch_max(now, Ordering::Relaxed);
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                data.blocks_in_flight.fetch_sub(1, Ordering::Relaxed);
+            }
             if data.fail_once.swap(false, Ordering::Relaxed) {
                 return Err(SourceError::Malformed {
                     context: "test".into(),
@@ -1345,6 +1403,55 @@ mod tests {
                 .iter()
                 .any(|event| matches!(event, Event::Reorg(_)))
         );
+    }
+
+    /// A gap is fetched ahead, several heights in flight at once, and still accepted one
+    /// at a time in height order, each height read once.
+    #[tokio::test]
+    async fn a_gap_is_fetched_ahead_and_accepted_in_order() {
+        let mut machine = Machine::new(Source::linear(3), Sink::default(), Vec::new());
+        settle(&mut machine, Some(3)).await;
+        let source = chain(&mut machine);
+        source.data.concurrency = 4;
+        source.data.slow_blocks = true;
+        source
+            .data
+            .blocks
+            .extend((4..=40).map(|h| (h, (hash(h), hash(h - 1)))));
+        let calls = source.data.block_calls.load(Ordering::Relaxed);
+        observe(&mut machine, 40).await;
+        assert_eq!(heights(&machine), (3..=40).collect::<Vec<_>>());
+        let data = &machine.source.data;
+        assert_eq!(data.block_calls.load(Ordering::Relaxed) - calls, 37);
+        let peak = data.blocks_peak.load(Ordering::Relaxed);
+        assert!((2..=4).contains(&peak), "{peak} fetches overlapped");
+        assert!(reorgs(&machine).is_empty());
+    }
+
+    /// A fork that orphans the tip while heights are fetched ahead drops those fetches,
+    /// retracts the tip once, and replays the new branch in order.
+    #[tokio::test]
+    async fn a_fork_under_fetches_made_ahead_is_reconciled() {
+        let head = MAX_UNFINALIZED_BLOCKS as u64 + 5;
+        let mut machine = Machine::new(Source::linear(head), Sink::default(), Vec::new());
+        settle(&mut machine, Some(0)).await;
+        let tip = machine.tip().expect("tip").height;
+        let source = chain(&mut machine);
+        source.data.concurrency = 4;
+        source.data.slow_blocks = true;
+        // The tip is replaced, and the new branch runs ten blocks past it.
+        fork(source, tip, tip + 10);
+        observe(&mut machine, tip + 10).await;
+        let markers = reorgs(&machine);
+        assert_eq!(markers.len(), 1);
+        assert_eq!(markers[0].orphaned_hashes, [hash(tip)]);
+        assert_eq!(machine.tip().expect("tip").hash, hash(tip + 110));
+        let replayed: Vec<u64> = heights(&machine)
+            .into_iter()
+            .skip_while(|&height| height != tip)
+            .skip(1)
+            .collect();
+        assert_eq!(replayed, (tip..=tip + 10).collect::<Vec<_>>());
     }
 
     #[tokio::test]
@@ -1942,6 +2049,25 @@ mod tests {
     async fn a_backfill_stops_at_the_reorg_window() {
         let head = MAX_UNFINALIZED_BLOCKS as u64 + 5;
         let mut machine = Machine::new(Source::backfilling(head), Sink::default(), Vec::new());
+        machine.sync(Some(2), None).await.expect("backfill");
+        assert_eq!(heights(&machine), (2..=5).collect::<Vec<_>>());
+    }
+
+    /// A chain that finalizes sooner hands its backfill over sooner: the run stops its
+    /// finality depth under the head, not the whole undo window under it, and a depth
+    /// deeper than a run can retract is held to the undo window.
+    #[tokio::test]
+    async fn a_backfill_stops_at_the_chains_finality_depth() {
+        let mut source = Source::backfilling(100);
+        source.data.finality = 10;
+        let mut machine = Machine::new(source, Sink::default(), Vec::new());
+        machine.sync(Some(2), None).await.expect("backfill");
+        assert_eq!(heights(&machine), (2..=90).collect::<Vec<_>>());
+
+        let head = MAX_UNFINALIZED_BLOCKS as u64 + 5;
+        let mut source = Source::backfilling(head);
+        source.data.finality = u64::MAX;
+        let mut machine = Machine::new(source, Sink::default(), Vec::new());
         machine.sync(Some(2), None).await.expect("backfill");
         assert_eq!(heights(&machine), (2..=5).collect::<Vec<_>>());
     }

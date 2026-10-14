@@ -224,7 +224,15 @@ fn live(world: &Shared, path: &Path, plan: Plan, lifetime: u64, crash: Option<Du
         let heads = SimHeads {
             world: Arc::clone(world),
         };
-        let source = EvmSource::new(CHAIN, http, heads, plan.datasets, CONCURRENCY);
+        let source = EvmSource::new(
+            CHAIN,
+            http,
+            heads,
+            plan.datasets,
+            CONCURRENCY,
+            // Deeper than a run can retract, so the whole undo window is the tail.
+            std::num::NonZeroU64::MAX,
+        );
         let pipeline = Pipeline::new(source, start, None, catalog);
 
         // The chain grows while faults run, and holds still for the final catch-up.

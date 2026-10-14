@@ -246,6 +246,7 @@ fn columns<T: DeserializeOwned>() -> Result<&'static [&'static str], SourceError
 pub struct HyperSyncSource {
     chain: ChainId,
     ranges: HyperSyncRanges,
+    finality_depth: NonZeroU64,
     client: reqwest::Client,
     query_url: reqwest::Url,
     height_url: reqwest::Url,
@@ -273,7 +274,7 @@ pub struct HyperSyncRanges {
 impl HyperSyncSource {
     /// Builds a source for `chain` that reads `datasets` from the `HyperSync` endpoint at
     /// `url` (such as `https://4663.hypersync.xyz`), authorized by `token`, and backfills
-    /// in `ranges`.
+    /// in `ranges` through the heights more than `finality_depth` under the head.
     ///
     /// # Errors
     ///
@@ -285,6 +286,7 @@ impl HyperSyncSource {
         token: &str,
         datasets: Datasets,
         ranges: HyperSyncRanges,
+        finality_depth: NonZeroU64,
     ) -> Result<Self, SourceError> {
         let base = reqwest::Url::parse(url).map_err(|error| {
             malformed(
@@ -303,6 +305,7 @@ impl HyperSyncSource {
         Ok(Self {
             chain: chain.into(),
             ranges,
+            finality_depth,
             client: reqwest::Client::builder()
                 .timeout(REQUEST_TIMEOUT)
                 .build()?,
@@ -469,6 +472,12 @@ impl BlockSource for HyperSyncSource {
     /// fetched: with one, the run stopped for every range's download, minutes at a time.
     fn backfill_concurrency(&self) -> usize {
         self.ranges.concurrency.get()
+    }
+
+    /// How far under the head the backfill stops, where the run on an RPC source that
+    /// follows the chain takes over.
+    fn finality_depth(&self) -> u64 {
+        self.finality_depth.get()
     }
 
     async fn fetch_header(&self, height: Option<u64>) -> Result<BlockMeta, SourceError> {
@@ -1340,6 +1349,9 @@ mod tests {
         concurrency: std::num::NonZeroUsize::MIN,
     };
 
+    /// The default finality depth: the comparisons fetch fixed heights, so it is unused.
+    const DEPTH: std::num::NonZeroU64 = std::num::NonZeroU64::MIN;
+
     /// `HyperSync`'s rows, converted, are the RPC source's rows for the same blocks: every
     /// dataset and field, across the transaction types each chain carries.
     ///
@@ -1404,14 +1416,16 @@ mod tests {
                 &[all, logs_only]
             };
             for &datasets in selections {
-                let hypersync = HyperSyncSource::new(chain, hypersync, &token, datasets, RANGES)
-                    .expect("hypersync");
+                let hypersync =
+                    HyperSyncSource::new(chain, hypersync, &token, datasets, RANGES, DEPTH)
+                        .expect("hypersync");
                 let rpc = EvmSource::new(
                     chain,
                     http_client(rpc).expect("rpc"),
                     ws_connect(rpc),
                     datasets,
                     std::num::NonZeroUsize::MIN,
+                    std::num::NonZeroU64::MAX,
                 );
                 for &height in heights {
                     let expected = rpc.fetch_block(height, None).await.expect("rpc block");
@@ -1496,6 +1510,7 @@ mod tests {
             &token,
             logs_only,
             RANGES,
+            DEPTH,
         )
         .expect("hypersync");
         let blocks = source

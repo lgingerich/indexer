@@ -216,6 +216,15 @@ pub trait BlockSource: Send + Sync {
         1
     }
 
+    /// How many blocks under the head a fork may still reach on this source's chain: the
+    /// buried heights, below it, are backfilled straight through, and only those above
+    /// it go block by block through the reorg-aware path. At most
+    /// [`MAX_UNFINALIZED_BLOCKS`](crate::ingest::pipeline::MAX_UNFINALIZED_BLOCKS), the
+    /// deepest fork a run can retract, which is the default.
+    fn finality_depth(&self) -> u64 {
+        crate::ingest::pipeline::MAX_UNFINALIZED_BLOCKS as u64
+    }
+
     /// How many [`Self::fetch_blocks`] calls backfill keeps in flight at once.
     ///
     /// Blocks are accepted in height order whatever this is; it only overlaps requests.

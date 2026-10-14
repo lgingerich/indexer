@@ -543,6 +543,7 @@ the field:
 | --- | --- | --- |
 | `ingest.start_block` | the sampled head | First height to index on an empty store. Absent starts live at the observed head; a value backfills that inclusive height forward before following live heads. A value above the sampled head is a startup error. When the store already holds blocks a run resumes from the store: a value the stored history reaches is ignored, and one more than a block past the stored tip is a startup error |
 | `ingest.backfill_concurrency` | `4` | Backfill fetches in flight at once. Blocks are still accepted in height order; this overlaps requests so the node is read while the stores write. Each counts against the provider's rate limit. Zero is refused. Refused beside a [HyperSync backfill](#backfilling-from-hypersync), which takes `ingest.hypersync.concurrency` instead |
+| `ingest.finality_depth` | `4096` | How many blocks under the head a fork may still reach on the chain. Deeper heights are backfilled straight through and a [HyperSync backfill](#backfilling-from-hypersync) stops there; only the blocks above it go one at a time through the reorg-aware path, so a shallower depth hands a backfill to the head sooner. Not how deep a fork is retracted, which is always up to 4,096 blocks. At most 4,096; zero is refused |
 | `sink.duckdb.batch_records` | `500` | Most records one store commit may cover; a backlog of blocks is folded into one commit up to this, and a block is never split |
 | `sink.duckdb.path` | `indexer.duckdb` | Path to the store, relative to the settings file. Tables live in a schema named for the chain: `base.logs` |
 
@@ -570,7 +571,7 @@ once is an error rather than picking one.
 history thousands of blocks per request, where an RPC node answers one call per height.
 A run with `[ingest.hypersync]` in place of `http_url` and `ws_url` reads every dataset
 from it — blocks, transactions with their receipts, and logs, so decoding works
-unchanged — up to the reorg window below the head it samples at startup, and exits. HyperSync has no live
+unchanged — up to `ingest.finality_depth` blocks below the head it samples at startup, and exits. HyperSync has no live
 heads, so following the chain is a second run: swap the table back for the two
 endpoints and restart, and the run resumes after the last block the backfill committed.
 

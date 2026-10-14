@@ -8,7 +8,7 @@
 [ingest]
 chain = "robinhood"
 # Backfilling from HyperSync (README: Backfilling from HyperSync): it indexes up to
-# 4,096 blocks under the head and exits. To follow the chain after it, uncomment
+# `finality_depth` blocks under the head and exits. To follow the chain after it, uncomment
 # http_url, ws_url, and backfill_concurrency, and remove [ingest.hypersync] below.
 # http_url = { env = "INDEXER_ROBINHOOD_HTTP_URL" }
 # ws_url = { env = "INDEXER_ROBINHOOD_WS_URL" }
@@ -16,6 +16,8 @@ chain = "robinhood"
 # chain. Stores already past it resume from their ledger and ignore it.
 start_block = 63835167
 # backfill_concurrency = 16
+# No `finality_depth`: an Orbit chain's blocks are final once their batch is final on
+# Ethereum, deeper than a run retracts, so it keeps the default, 4,096 blocks.
 # stop_block = <height>    # index through this height and exit instead
 
 [ingest.hypersync]
