@@ -8,14 +8,30 @@
 # Secrets are never baked in: the settings files name environment variables, which the
 # host passes at run time.
 
-FROM rust:1.95-bookworm AS build
+# The dependencies are built in a layer of their own with cargo-chef, so a commit that
+# leaves `Cargo.lock` and the manifests alone reuses it from the registry build cache and
+# compiles only this crate. Everything stays in layers rather than cache mounts: the
+# build cache exports layers, and a mount starts empty on every CI runner.
+#
+# The toolchain file comes first, so every stage compiles with the pinned toolchain and
+# the dependency layer matches the final build's compiler.
+FROM rust:1.95-bookworm AS chef
 WORKDIR /src
+COPY rust-toolchain.toml .
+RUN cargo install cargo-chef --locked --version 0.1.78
+
+# The recipe is the manifests and lockfile with the sources stripped out, so it changes
+# only when the dependencies do.
+FROM chef AS plan
 COPY . .
-# The cache mounts only speed up local rebuilds; the binary is copied out of the cached
-# target directory in the same step, since a mount does not outlive its step.
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,target=/src/target \
-    cargo build --release --locked --bin indexer --features postgres,delta \
+RUN cargo chef prepare --recipe-path recipe.json
+
+FROM chef AS build
+COPY --from=plan /src/recipe.json recipe.json
+RUN cargo chef cook --release --locked --bin indexer --features postgres,delta \
+    --recipe-path recipe.json
+COPY . .
+RUN cargo build --release --locked --bin indexer --features postgres,delta \
     && cp target/release/indexer /usr/local/bin/indexer
 
 FROM debian:bookworm-slim

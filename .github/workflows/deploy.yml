@@ -5,7 +5,8 @@ name: Deploy
 # minute of its tag moving; this workflow is what moves the tags.
 #
 # - deploy: builds the image from the chosen ref, tags it `sha-<commit>`, and points
-#   `prod-<chain>` at it for each chain given. A chain the host has never run starts.
+#   `prod-<chain>` at it for each chain given; a commit already built is re-tagged, not
+#   rebuilt. A chain the host has never run starts.
 #   `start_block` and `stop_block` override that chain's settings file for this deploy:
 #   the image is the commit's build with one rewritten file on top.
 # - stop: points `prod-<chain>` at a no-op image that exits at once, so the chain stays
@@ -98,15 +99,37 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+      # The image is a function of the commit, so a commit already built is never built
+      # again: its chains are pointed at the same `sha-<commit>` image, which also keeps
+      # every chain deployed from one commit on identical bytes.
       - if: inputs.action == 'deploy'
+        id: built
+        env:
+          IMAGE: ghcr.io/${{ github.repository }}
+        run: |
+          if docker buildx imagetools inspect "$IMAGE:sha-$GITHUB_SHA" > /dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "reused the existing build of $GITHUB_SHA" >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - if: inputs.action == 'deploy' && steps.built.outputs.exists != 'true'
         uses: docker/build-push-action@v6
         with:
           context: .
           push: true
           tags: ${{ steps.tags.outputs.tags }}
-          # Caches the layers, which is the apt step; the Rust build itself runs cold.
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          # In the registry rather than the Actions cache: the dependency layer is
+          # gigabytes, and the Actions cache's 10 GB is CI's.
+          cache-from: type=registry,ref=ghcr.io/${{ github.repository }}:buildcache
+          cache-to: type=registry,ref=ghcr.io/${{ github.repository }}:buildcache,mode=max
+      - if: steps.built.outputs.exists == 'true'
+        env:
+          TAGS: ${{ steps.tags.outputs.tags }}
+          IMAGE: ghcr.io/${{ github.repository }}
+        run: |
+          for tag in $(echo "$TAGS" | tr ',' ' '); do
+            [ "$tag" = "$IMAGE:sha-$GITHUB_SHA" ] && continue
+            docker buildx imagetools create -t "$tag" "$IMAGE:sha-$GITHUB_SHA"
+          done
       # Rewrites the chain's settings file and layers it over the commit's build, so the
       # override costs seconds, not a second compile. Each key is set right after
       # `chain = `, the one line every settings file has in `[ingest]`.
