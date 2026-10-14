@@ -36,7 +36,8 @@
 //! - **Where ingest starts.** Every store's ledger of accepted blocks is read back before
 //!   ingest starts, every store is brought to the newest block they all hold (see
 //!   `crate::sink::resume`), and a run resumes after it; see `crate::ingest::pipeline`.
-//!   Empty ledgers start at `ingest.start_block` or the head, and `[sink.stdout]`, which
+//!   Empty ledgers start at `ingest.start_block` or the head; a `start_block` the stored
+//!   history already reaches is ignored. `[sink.stdout]`, which
 //!   has no store, always starts fresh. A run with `ingest.stop_block` ends there.
 //!
 //! # Shutdown
@@ -167,7 +168,7 @@ impl RuntimeError {
             Self::Settings(_) | Self::Catalog(_) | Self::Route { .. } => true,
             Self::Ingest(error) => matches!(
                 error,
-                PipelineError::StartWithHistory { .. }
+                PipelineError::StartAboveHistory { .. }
                     | PipelineError::StartAboveHead { .. }
                     | PipelineError::StopAboveHead { .. }
                     | PipelineError::StopBelowStart { .. }
@@ -973,9 +974,9 @@ tables = ["blocks", "transactions", "logs", "decoded_logs", "contract_events"]
         assert_eq!(canonical[6].hash, block_hash(0xb0, 7));
     }
 
-    /// A start height and a stored ledger contradict each other, so the run refuses.
+    /// A start height above a stored ledger's tip would leave a gap, so the run refuses.
     #[tokio::test]
-    async fn a_start_height_with_a_stored_ledger_is_refused() {
+    async fn a_start_height_above_a_stored_ledger_is_refused() {
         let connection = duckdb::Connection::open_in_memory().expect("open in-memory DuckDB");
         run_once(&connection, FakeChain::new(3, 0xa0), Some(1)).await;
         let mut store =
@@ -986,8 +987,8 @@ tables = ["blocks", "transactions", "logs", "decoded_logs", "contract_events"]
         let restored = ledger(&chain, store.restore().await.expect("restore").ledger);
         let machine = Machine::new(FakeChain::new(5, 0xa0), store, restored);
         assert!(matches!(
-            machine.run(Some(1), None).await,
-            Err(PipelineError::StartWithHistory { start: 1, tip: 3 })
+            machine.run(Some(5), None).await,
+            Err(PipelineError::StartAboveHistory { start: 5, tip: 3 })
         ));
     }
 

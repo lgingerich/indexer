@@ -9,8 +9,9 @@
 chain = "ethereum"
 http_url = { env = "INDEXER_ETHEREUM_HTTP_URL" }
 ws_url = { env = "INDEXER_ETHEREUM_WS_URL" }
-# Started at 25984373, the Metric factory's first event; the stores hold history now,
-# so a run resumes from their ledger and a `start_block` would be refused.
+# The Metric factory's first event, the earliest log of any Metric contract on this
+# chain. Stores already past it resume from their ledger and ignore it.
+start_block = 25984373
 backfill_concurrency = 16
 # stop_block = <height>    # index through this height and exit instead
 

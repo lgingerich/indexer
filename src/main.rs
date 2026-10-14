@@ -130,7 +130,7 @@ ws_url = "wss://example.invalid"
     /// exits 1 and is retried.
     #[test]
     fn only_settings_faults_are_config_errors() {
-        let refused = RuntimeError::from(PipelineError::StartWithHistory { start: 2, tip: 5 });
+        let refused = RuntimeError::from(PipelineError::StartAboveHistory { start: 7, tip: 5 });
         assert!(refused.is_config(), "{refused}");
         let closed = RuntimeError::from(PipelineError::Sink(SinkError::StorageClosed));
         assert!(!closed.is_config(), "{closed}");

@@ -105,15 +105,17 @@ pub enum PipelineError {
         /// Sampled head height.
         head: u64,
     },
-    /// A start height was requested, but the store already holds accepted history.
+    /// A start height was requested above the block after the store's tip.
     ///
-    /// Resuming from the store and starting elsewhere would leave a gap or orphaned rows,
-    /// so the run refuses to guess which was meant.
+    /// Resuming from the store would index heights below the start, and starting there
+    /// would leave a gap above the tip, so the run refuses to guess which was meant. A
+    /// start at or below the next height is covered by the stored history and resumes.
     #[error(
-        "a start at height {start} was requested, but the store already holds blocks through \
-         {tip}; remove ingest.start_block to resume from the store"
+        "a start at height {start} was requested, but the store holds blocks only through \
+         {tip}; starting there would leave a gap, so remove ingest.start_block to resume \
+         from the store"
     )]
-    StartWithHistory {
+    StartAboveHistory {
         /// Requested start height.
         start: u64,
         /// The restored tip's height.
@@ -409,7 +411,8 @@ impl<S: BlockSource + 'static, K: EnvelopeSink> Machine<S, K> {
     /// `stop`, indexes through `stop` and returns.
     ///
     /// `start` is a fresh run's first height; `None` starts at the sampled head. A machine
-    /// built with a ledger resumes after its tip instead, and refuses a `start`. A `stop`
+    /// built with a ledger resumes after its tip instead: a `start` the stored history
+    /// already reaches is ignored, and one above the tip's successor is refused. A `stop`
     /// must be at or below the sampled head and at or above where the run starts; a
     /// ledger whose tip is already at or past it returns at once.
     /// Backfill indexes only buried heights, which cannot reorg; once it reaches the
@@ -421,7 +424,7 @@ impl<S: BlockSource + 'static, K: EnvelopeSink> Machine<S, K> {
     /// # Errors
     /// Consumes this instance. An error or cancellation drops its source, sink, and
     /// history, so partially delivered output cannot be followed by reuse.
-    /// Returns [`PipelineError::StartWithHistory`] for a `start` given with a ledger,
+    /// Returns [`PipelineError::StartAboveHistory`] for a `start` past a ledger's tip,
     /// [`PipelineError::StartAboveHead`] for one above the sampled head,
     /// [`PipelineError::StopAboveHead`] and [`PipelineError::StopBelowStart`] for a `stop`
     /// outside those bounds, [`PipelineError::SubscriptionClosed`] when the subscription
@@ -478,10 +481,17 @@ impl<S: BlockSource + 'static, K: EnvelopeSink> Machine<S, K> {
     async fn sync(&mut self, start: Option<u64>, stop: Option<u64>) -> Result<(), PipelineError> {
         let restored = self.ring.tip();
         if let (Some(start), Some(tip)) = (start, restored) {
-            return Err(PipelineError::StartWithHistory {
+            if start > tip.height.saturating_add(1) {
+                return Err(PipelineError::StartAboveHistory {
+                    start,
+                    tip: tip.height,
+                });
+            }
+            info!(
                 start,
-                tip: tip.height,
-            });
+                tip = tip.height,
+                "the store already holds blocks past the start; resuming from the stored tip"
+            );
         }
         if let (Some(tip), Some(stop)) = (restored, stop)
             && tip.height >= stop
@@ -1932,12 +1942,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_start_height_with_stored_history_is_refused_before_any_read() {
+    async fn a_start_height_above_stored_history_is_refused_before_any_read() {
         let machine = Machine::new(Source::linear(8), Sink::default(), ledger(0..=5));
         assert!(matches!(
-            machine.run(Some(2), None).await,
-            Err(PipelineError::StartWithHistory { start: 2, tip: 5 })
+            machine.run(Some(7), None).await,
+            Err(PipelineError::StartAboveHistory { start: 7, tip: 5 })
         ));
+    }
+
+    /// A start the stored history already reaches, or the block right after it, is
+    /// ignored: the run resumes from the stored tip.
+    #[tokio::test]
+    async fn a_start_height_within_stored_history_resumes_from_the_tip() {
+        for start in [2, 5, 6] {
+            let mut machine = Machine::new(Source::linear(8), Sink::default(), ledger(0..=5));
+            machine.sync(Some(start), Some(8)).await.expect("sync");
+            assert_eq!(heights(&machine), [6, 7, 8], "start {start}");
+        }
     }
 
     #[test]

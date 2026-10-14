@@ -17,14 +17,15 @@ runtime::Pipeline { source, start_block }
 - `ledger` is the accepted blocks the stores read back, oldest first, after
   `sink::resume` brought every store to the newest block they all hold. It is empty for
   a fresh run, and always empty for `[sink.stdout]`.
-- `start_block` is a fresh run's first height; `None` starts at the head. Giving one
-  together with a non-empty ledger is refused.
+- `start_block` is a fresh run's first height; `None` starts at the head. With a
+  non-empty ledger it is ignored when the ledger reaches it, and refused when it is more
+  than one block past the ledger's tip.
 
 ## Startup: `sync`
 
 ```
 sync(start)
-  ├─ start + ledger? ─────────────────► Err(StartWithHistory)
+  ├─ start > ledger tip + 1? ─────────► Err(StartAboveHistory)   (else the start is ignored)
   ├─ head = sample_head()
   ├─ next =
   │    ├─ ledger:  head < tip? ───────► process_head(head); return   (source is behind the store)

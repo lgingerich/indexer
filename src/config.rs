@@ -124,8 +124,8 @@ pub struct IngestSettings {
     /// which skips earlier history; a value indexes that height and every one after it
     /// before following live heads. A value above the sampled head is a startup error
     /// rather than a silent clamp. A store that already holds accepted blocks resumes
-    /// after them instead, and a value set alongside one is a startup error: remove it
-    /// once the first run has committed.
+    /// after them instead: a value at or below the block after the stored tip is
+    /// ignored, and one above it is a startup error, since it would leave a gap.
     #[serde(default)]
     pub start_block: Option<u64>,
     /// The last height to index. Omitted follows live heads without end; a value indexes

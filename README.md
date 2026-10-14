@@ -206,9 +206,11 @@ How each crash point resolves:
 | B committed, progress only in memory | The ledger includes B | Resumes after B |
 | A `PostgreSQL` commit's outcome is unknown | Whatever committed | Reads it; replaying a committed row upserts onto itself |
 
-`ingest.start_block` applies to an empty store only. Set alongside a non-empty ledger it
-is a startup error rather than a choice between the two, since starting elsewhere would
-recreate the gaps resume closes. `[sink.stdout]` has no store, so it always starts fresh.
+`ingest.start_block` applies to an empty store only. Set alongside a non-empty ledger that
+already reaches it (the tip is at or past `start_block - 1`), it is ignored and the run
+resumes from the stored tip, so the setting can stay in place across restarts. A
+`start_block` above that is a startup error rather than a choice between the two, since
+starting there would leave a gap above the tip. `[sink.stdout]` has no store, so it always starts fresh.
 
 With several stores, each commits on its own schedule — the lake every half minute, a
 database every block — so a restart can find them at different heights, or on different
@@ -538,7 +540,7 @@ the field:
 
 | Key | Default | Meaning |
 | --- | --- | --- |
-| `ingest.start_block` | the sampled head | First height to index on an empty store. Absent starts live at the observed head; a value backfills that inclusive height forward before following live heads. A value above the sampled head is a startup error, and so is a value when the store already holds blocks: a run resumes from the store |
+| `ingest.start_block` | the sampled head | First height to index on an empty store. Absent starts live at the observed head; a value backfills that inclusive height forward before following live heads. A value above the sampled head is a startup error. When the store already holds blocks a run resumes from the store: a value the stored history reaches is ignored, and one more than a block past the stored tip is a startup error |
 | `ingest.backfill_concurrency` | `4` | Backfill fetches in flight at once. Blocks are still accepted in height order; this overlaps requests so the node is read while the stores write. Each counts against the provider's rate limit. Zero is refused |
 | `sink.duckdb.batch_records` | `500` | Most records one store commit may cover; a backlog of blocks is folded into one commit up to this, and a block is never split |
 | `sink.duckdb.path` | `indexer.duckdb` | Path to the store, relative to the settings file. Tables live in a schema named for the chain: `base.logs` |
