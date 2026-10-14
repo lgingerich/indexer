@@ -295,7 +295,7 @@ async fn append_only(sink: &mut DeltaSink, envelope: &Envelope) {
         .row(&ChainId::new(CHAIN), &envelope.event)
         .expect("a row");
     let position = sink.positions[&row.table().id];
-    sink.append(position, &[&row]).await.expect("appended");
+    sink.append_some(position, &[&row]).await.expect("appended");
 }
 
 /// A commit that stopped after recording a retraction but before taking its orphans out
@@ -337,7 +337,9 @@ async fn a_retraction_out_of_the_ledger_keeps_its_record() {
     }
     append_only(&mut sink, &reorg(3..=3, 1)).await;
     let position = sink.positions[&TableId::Dataset(Table::AcceptedBlock)];
-    sink.delete(position, in_texts("hash", &[hex(hash(3, 0))]))
+    let writer = sink.writer.clone();
+    sink.lakes[position]
+        .delete(&writer, in_texts("hash", &[hex(hash(3, 0))]))
         .await
         .expect("deleted");
     drop(sink);
@@ -373,7 +375,7 @@ async fn opening_repairs_rows_a_stopped_commit_left_behind() {
             .iter()
             .filter(|row| row.table().id == TableId::Dataset(table))
             .collect();
-        sink.append(position, &rows).await.expect("appended");
+        sink.append_some(position, &rows).await.expect("appended");
     }
     drop(sink);
 
@@ -394,7 +396,7 @@ async fn opening_with_no_ledger_keeps_no_block_rows() {
     let row = schema
         .row(&chain, &block(1, 0)[0].event)
         .expect("a block row");
-    sink.append(position, &[&row]).await.expect("appended");
+    sink.append_some(position, &[&row]).await.expect("appended");
     drop(sink);
 
     let mut sink = open(&dir).await;
@@ -576,7 +578,9 @@ async fn opening_finishes_a_retraction_stopped_between_tables() {
     append_only(&mut sink, &reorg(3..=3, 1)).await;
     for (table, column) in [(Table::AcceptedBlock, "hash"), (Table::Block, "hash")] {
         let position = sink.positions[&TableId::Dataset(table)];
-        sink.delete(position, in_texts(column, &[hex(hash(3, 0))]))
+        let writer = sink.writer.clone();
+        sink.lakes[position]
+            .delete(&writer, in_texts(column, &[hex(hash(3, 0))]))
             .await
             .expect("deleted");
     }
@@ -852,4 +856,37 @@ async fn log_cleanup_keeps_what_a_checkpoint_does_not_replace() {
         blocks(&sink).await,
         expected(&[(1, 0), (2, 0), (3, 0), (4, 0)])
     );
+}
+
+/// A table with more rows than one Arrow batch holds is built in several, on several
+/// threads, and still commits every row once.
+#[tokio::test]
+async fn a_table_larger_than_one_batch_commits_every_row() {
+    let dir = Dir::new();
+    let mut sink = open(&dir).await;
+    let logs = super::ROWS_PER_BATCH * 2 + 7;
+    let mut envelopes = block(1, 0);
+    let ledger_entry = envelopes.pop().expect("the ledger entry");
+    let transaction = hash(1, 100);
+    for index in 1..logs {
+        envelopes.push(Envelope::new(
+            ChainId::new(CHAIN),
+            Event::Log(Box::new(Log {
+                log_index: u64::try_from(index).expect("an index"),
+                transaction_hash: transaction,
+                block_number: 1,
+                block_hash: hash(1, 0),
+                block_timestamp: 1_700_000_001,
+                ..Log::default()
+            })),
+        ));
+    }
+    envelopes.push(ledger_entry);
+    publish(&mut sink, envelopes).await;
+
+    assert_eq!(stored(&sink, Table::Log, "dedupe_key").await.len(), logs);
+    drop(sink);
+    let mut sink = open(&dir).await;
+    assert_eq!(stored(&sink, Table::Log, "dedupe_key").await.len(), logs);
+    assert_eq!(ledger(&mut sink).await.len(), 1);
 }

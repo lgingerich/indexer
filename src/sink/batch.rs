@@ -115,7 +115,8 @@ impl Batch {
     /// row twice in a statement — and "last" means last published, which only the buffer
     /// knows; a staging table's physical order does not promise it.
     pub(super) fn by_table(&self) -> HashMap<TableId, Vec<&Row>> {
-        let mut seen = HashSet::new();
+        // Sized up front: growing a set of half a million keys rehashes it again and again.
+        let mut seen = HashSet::with_capacity(self.rows.len());
         let mut tables: HashMap<TableId, Vec<&Row>> = HashMap::new();
         for row in self.rows.iter().rev() {
             let id = row.table().id;

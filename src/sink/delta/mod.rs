@@ -85,7 +85,7 @@ use deltalake::parquet::basic::{Compression, ZstdLevel};
 use deltalake::parquet::file::properties::WriterProperties;
 use deltalake::protocol::SaveMode;
 use deltalake::{DeltaTable, DeltaTableBuilder, DeltaTableError, ensure_table_uri};
-use futures_util::future::try_join_all;
+use futures_util::stream::{self, StreamExt as _, TryStreamExt as _};
 use serde::Deserialize;
 use tokio::time::Instant;
 use tracing::{info, warn};
@@ -102,6 +102,18 @@ use crate::wire::envelope::{BlockMeta, ChainId, Envelope, StoredContract};
 
 use self::arrow::{PARTITION, UINT_PRECISION};
 use self::maintenance::Maintenance;
+
+/// How many tables an open, a repair, or a delete across the lake works on at once:
+/// enough to hide the store's latency, few enough not to flood it with requests.
+const CONCURRENT_TABLES: usize = 16;
+
+/// The most rows one Arrow batch of a commit holds, so a large table's batches are built
+/// on several threads at once. They are still written to the table as one commit.
+const ROWS_PER_BATCH: usize = 1 << 16;
+
+/// A committed batch at least this large is freed on a thread of its own, off the
+/// commit's path: half a million rows took a tenth of a second to drop.
+const DROP_ASIDE_ROWS: usize = 1 << 14;
 
 /// The `contracts` columns a restore reads back.
 const CONTRACT_COLUMNS: [&str; 4] = ["protocol", "name", "address", "block_hash"];
@@ -219,24 +231,54 @@ impl Lake {
         &self.def.name
     }
 
-    /// Appends `rows` as one commit of this table's own log.
-    async fn append(&mut self, writer: &WriterProperties, rows: &[&Row]) -> Result<(), StoreError> {
-        let name = Some(self.def.name.as_str());
-        let batch = arrow::record_batch(&self.arrow, &self.def, rows)
-            .map_err(StoreError::engine(Operation::Append, name))?;
+    /// `rows` as this table's Arrow batch: the CPU half of an append.
+    fn record_batch(&self, rows: &[&Row]) -> Result<RecordBatch, StoreError> {
+        arrow::record_batch(&self.arrow, &self.def, rows)
+            .map_err(StoreError::engine(Operation::Append, Some(self.name())))
+    }
+
+    /// Appends `batches` as one commit of this table's own log, resolving to the table as of
+    /// that commit. It owns what it needs, so it can run on a task of its own, where its
+    /// Parquet encoding takes a core of its own too.
+    fn append(
+        &self,
+        writer: &WriterProperties,
+        batches: Vec<RecordBatch>,
+    ) -> impl Future<Output = Result<DeltaTable, StoreError>> + Send + 'static {
+        let def = Arc::clone(&self.def);
         let mut write = self
             .table
             .clone()
-            .write(vec![batch])
+            .write(batches)
             .with_save_mode(SaveMode::Append)
             .with_writer_properties(writer.clone())
             .with_commit_properties(commit_properties());
         if arrow::partitioned(&self.def).is_some() {
             write = write.with_partition_columns([PARTITION]);
         }
-        self.table = write
+        async move {
+            write
+                .await
+                .map_err(StoreError::engine(Operation::Append, Some(&def.name)))
+        }
+    }
+
+    /// Deletes the rows `predicate` matches, as one commit of this table's own log.
+    async fn delete(
+        &mut self,
+        writer: &WriterProperties,
+        predicate: Expr,
+    ) -> Result<(), StoreError> {
+        let (table, _) = self
+            .table
+            .clone()
+            .delete()
+            .with_predicate(predicate)
+            .with_writer_properties(writer.clone())
+            .with_commit_properties(commit_properties())
             .await
-            .map_err(StoreError::engine(Operation::Append, name))?;
+            .map_err(StoreError::engine(Operation::Delete, Some(&self.def.name)))?;
+        self.table = table;
         Ok(())
     }
 
@@ -328,10 +370,13 @@ impl DeltaSink {
         }
         let root = settings.uri.trim_end_matches('/');
         let storage = Storage::new(root, &settings.storage)?;
-        let mut lakes = Vec::with_capacity(schema.tables().len());
-        for def in schema.tables() {
-            lakes.push(open_table(&storage, &format!("{root}/{chain}/{}", def.name), def).await?);
-        }
+        // Each open is a few requests that wait on the store, and a run has a table per
+        // event, so they overlap: one after another, a hundred tables took minutes.
+        let lakes: Vec<Lake> = stream::iter(schema.tables())
+            .map(|def| open_table(&storage, format!("{root}/{chain}/{}", def.name), def))
+            .buffered(CONCURRENT_TABLES)
+            .try_collect()
+            .await?;
         let positions = lakes
             .iter()
             .enumerate()
@@ -469,48 +514,63 @@ impl DeltaSink {
     /// Deletes the rows of blocks `ledger` does not name, at or above its oldest height:
     /// what a commit that stopped part-way appended before its ledger entry. With no
     /// ledger at all, every block row is such a row.
+    ///
+    /// Every block table is read, so the reads overlap; a stray row is rare, and its
+    /// delete runs once they are done.
     async fn repair(&mut self, ledger: &[BlockMeta]) -> Result<(), StoreError> {
         let named: HashSet<String> = ledger.iter().map(|block| hex(&block.hash)).collect();
         let floor = ledger.first().map(|block| block.height);
         let ledger_id = TableId::Dataset(Table::AcceptedBlock);
-        for position in 0..self.lakes.len() {
-            let lake = &self.lakes[position];
-            let Some((hash, number)) = lake.block_columns() else {
-                continue;
-            };
-            if lake.def.id == ledger_id {
-                continue;
-            }
-            let batches = lake
-                .read(|frame| {
-                    let frame = match floor {
-                        Some(floor) => frame.filter(at_or_above(number, floor))?,
-                        None => frame,
-                    };
-                    frame.select(texts_of(&[hash]))?.distinct()
-                })
-                .await?;
-            let mut stray = Vec::new();
-            for batch in &batches {
-                let hashes = texts(batch, 0, "block_hash")?;
-                stray.extend(
-                    hashes
-                        .iter()
-                        .flatten()
-                        .filter(|block| !named.contains(*block))
-                        .map(str::to_owned),
-                );
-            }
-            if stray.is_empty() {
-                continue;
-            }
+        let strays: Vec<(usize, Vec<String>)> = stream::iter(self.lakes.iter().enumerate())
+            .filter(|(_, lake)| std::future::ready(lake.def.id != ledger_id))
+            .filter_map(|(position, lake)| {
+                std::future::ready(
+                    lake.block_columns()
+                        .map(|columns| (position, lake, columns)),
+                )
+            })
+            .map(|(position, lake, (hash, number))| {
+                let named = &named;
+                async move {
+                    let batches = lake
+                        .read(|frame| {
+                            let frame = match floor {
+                                Some(floor) => frame.filter(at_or_above(number, floor))?,
+                                None => frame,
+                            };
+                            frame.select(texts_of(&[hash]))?.distinct()
+                        })
+                        .await?;
+                    let mut stray = Vec::new();
+                    for batch in &batches {
+                        let hashes = texts(batch, 0, "block_hash")?;
+                        stray.extend(
+                            hashes
+                                .iter()
+                                .flatten()
+                                .filter(|block| !named.contains(*block))
+                                .map(str::to_owned),
+                        );
+                    }
+                    Ok::<_, StoreError>((position, stray))
+                }
+            })
+            .buffered(CONCURRENT_TABLES)
+            .try_filter(|(_, stray)| std::future::ready(!stray.is_empty()))
+            .try_collect()
+            .await?;
+        for (position, stray) in strays {
+            let lake = &mut self.lakes[position];
             warn!(
                 table = lake.name(),
                 blocks = stray.len(),
                 "deleting rows a stopped commit left behind"
             );
-            self.delete(position, of_blocks((hash, number), &stray, floor))
-                .await?;
+            let Some(columns) = lake.block_columns() else {
+                continue;
+            };
+            let predicate = of_blocks(columns, &stray, floor);
+            lake.delete(&self.writer, predicate).await?;
         }
         self.repair_reorgs(ledger).await
     }
@@ -560,35 +620,44 @@ impl DeltaSink {
             rows = unfinished.len(),
             "deleting retractions a stopped commit left unfinished"
         );
-        self.delete(position, in_texts(dedupe_key, &unfinished))
+        self.lakes[position]
+            .delete(&self.writer, in_texts(dedupe_key, &unfinished))
             .await
     }
 
-    async fn delete(&mut self, position: usize, predicate: Expr) -> Result<(), StoreError> {
-        let lake = &mut self.lakes[position];
-        let (table, _) = lake
-            .table
-            .clone()
-            .delete()
-            .with_predicate(predicate)
-            .with_writer_properties(self.writer.clone())
-            .with_commit_properties(commit_properties())
-            .await
-            .map_err(StoreError::engine(Operation::Delete, Some(&lake.def.name)))?;
-        lake.table = table;
-        Ok(())
-    }
-
-    async fn append(&mut self, position: usize, rows: &[&Row]) -> Result<(), StoreError> {
-        self.lakes[position].append(&self.writer, rows).await
-    }
-
-    /// Appends `rows` to the table at `position`, when there are any.
+    /// Appends `rows` to the table at `position`, when there are any, and waits for it.
     async fn append_some(&mut self, position: usize, rows: &[&Row]) -> Result<(), StoreError> {
         if rows.is_empty() {
             return Ok(());
         }
-        self.append(position, rows).await
+        let lake = &mut self.lakes[position];
+        let batch = lake.record_batch(rows)?;
+        lake.table = lake.append(&self.writer, vec![batch]).await?;
+        Ok(())
+    }
+
+    /// Deletes from every table but the ledger, with `predicate` naming each table's rows,
+    /// [`CONCURRENT_TABLES`] at a time. A retraction and a rewind take the blocks out of
+    /// the ledger first, so the order among the rest does not matter.
+    async fn delete_from_the_rest(
+        &mut self,
+        predicate: impl Fn(&Lake) -> Option<Expr>,
+    ) -> Result<(), StoreError> {
+        let ledger_id = TableId::Dataset(Table::AcceptedBlock);
+        let writer = &self.writer;
+        let mut deletes = Vec::new();
+        for lake in &mut self.lakes {
+            if lake.def.id == ledger_id {
+                continue;
+            }
+            if let Some(predicate) = predicate(lake) {
+                deletes.push(lake.delete(writer, predicate));
+            }
+        }
+        stream::iter(deletes)
+            .buffer_unordered(CONCURRENT_TABLES)
+            .try_collect::<()>()
+            .await
     }
 
     /// Writes the batch in the ledger's order, one step per rule in the module docs:
@@ -636,21 +705,20 @@ impl DeltaSink {
             self.retract(*floor, hashes).await?;
         }
         let mut rows = reorgs.len() + accepted.len();
-        let writer = &self.writer;
-        let appends: Vec<_> = self
-            .lakes
-            .iter_mut()
-            .filter_map(|lake| Some((tables.remove(&lake.def.id)?, lake)))
+        let appends: Vec<(usize, Vec<&Row>)> = (0..self.lakes.len())
+            .filter_map(|position| Some((position, tables.remove(&self.lakes[position].def.id)?)))
             .collect();
-        rows += appends.iter().map(|(table, _)| table.len()).sum::<usize>();
-        try_join_all(
-            appends
-                .into_iter()
-                .map(|(table, lake)| async move { lake.append(writer, &table).await }),
-        )
-        .await?;
+        rows += appends.iter().map(|(_, rows)| rows.len()).sum::<usize>();
+        let built = Instant::now();
+        let batches = self.record_batches(&appends)?;
+        let built = built.elapsed();
+        let written = Instant::now();
+        self.append_all(batches).await?;
+        let written = written.elapsed();
+        let ledger = Instant::now();
         self.append_some(self.position(Table::AcceptedBlock), &accepted)
             .await?;
+        let ledger = ledger.elapsed();
 
         let first = accepted.iter().filter_map(|row| row.block_number()).min();
         let orphaned = orphans.map(|(_, hashes)| hashes).unwrap_or_default();
@@ -661,12 +729,80 @@ impl DeltaSink {
             orphaned = orphaned.len(),
             from = ?first,
             to = ?self.tip(),
-            elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            tables = appends.len(),
+            build_ms = millis(built),
+            write_ms = millis(written),
+            ledger_ms = millis(ledger),
+            elapsed_ms = millis(started.elapsed()),
             "lake commit"
         );
+        if batch.rows.len() >= DROP_ASIDE_ROWS {
+            let rows = std::mem::take(&mut batch.rows);
+            std::thread::spawn(move || drop(rows));
+        }
         batch.clear();
         self.batch = batch;
         Ok(())
+    }
+
+    /// Each table's rows as Arrow batches, built in parallel: a thread per table, and per
+    /// [`ROWS_PER_BATCH`] rows of a large one, since one table, the logs, usually holds
+    /// most of a commit's rows. Building them is the CPU half of a commit.
+    fn record_batches(
+        &self,
+        appends: &[(usize, Vec<&Row>)],
+    ) -> Result<Vec<(usize, Vec<RecordBatch>)>, StoreError> {
+        std::thread::scope(|scope| {
+            // Every build starts before any is waited for.
+            let mut builds = Vec::new();
+            for (position, rows) in appends {
+                let lake = &self.lakes[*position];
+                for chunk in rows.chunks(ROWS_PER_BATCH) {
+                    builds.push((*position, scope.spawn(move || lake.record_batch(chunk))));
+                }
+            }
+            let mut batches: Vec<(usize, Vec<RecordBatch>)> = Vec::with_capacity(appends.len());
+            for (position, build) in builds {
+                let batch = build
+                    .join()
+                    .unwrap_or_else(|panic| std::panic::resume_unwind(panic))?;
+                match batches.last_mut() {
+                    Some((last, table)) if *last == position => table.push(batch),
+                    _ => batches.push((position, vec![batch])),
+                }
+            }
+            Ok(batches)
+        })
+    }
+
+    /// Appends each table's batch as a commit of its own log, every table on its own task
+    /// so their Parquet encoding spreads over the cores. Each table has its own log and no
+    /// rule orders one table's rows against another's, so they go at once.
+    ///
+    /// Every append is waited for, failed or not, before the first failure is returned:
+    /// none is left running to commit after the store has given up.
+    async fn append_all(
+        &mut self,
+        batches: Vec<(usize, Vec<RecordBatch>)>,
+    ) -> Result<(), StoreError> {
+        let tasks: Vec<_> = batches
+            .into_iter()
+            .map(|(position, batches)| {
+                let append = self.lakes[position].append(&self.writer, batches);
+                (position, tokio::spawn(append))
+            })
+            .collect();
+        let mut failure = None;
+        for (position, task) in tasks {
+            match task.await {
+                Ok(Ok(table)) => self.lakes[position].table = table,
+                Ok(Err(error)) => {
+                    failure.get_or_insert(error);
+                }
+                Err(join) => std::panic::resume_unwind(join.into_panic()),
+            }
+        }
+        failure.map_or(Ok(()), Err)
     }
 
     /// Refuses a batch that accepts a block already committed, unless the batch orphans
@@ -713,28 +849,29 @@ impl DeltaSink {
     /// Deletes the orphaned blocks `hashes`, none below `floor`: out of the ledger first,
     /// so it never names a block whose rows are going, then out of every other table.
     async fn retract(&mut self, floor: u64, hashes: &[String]) -> Result<(), StoreError> {
-        let ledger = self.position(Table::AcceptedBlock);
-        let others = (0..self.lakes.len()).filter(|&position| position != ledger);
-        for position in std::iter::once(ledger).chain(others) {
-            if let Some(columns) = self.lakes[position].block_columns() {
-                let predicate = of_blocks(columns, hashes, Some(floor));
-                self.delete(position, predicate).await?;
-            }
-        }
-        Ok(())
+        let of = |lake: &Lake| Some(of_blocks(lake.block_columns()?, hashes, Some(floor)));
+        self.delete_from_the_ledger_then_the_rest(of).await
     }
 
     /// Deletes every block above `height`, for [`rewind`](Store::rewind).
     async fn delete_above(&mut self, height: u64) -> Result<(), StoreError> {
-        let ledger = self.position(Table::AcceptedBlock);
-        let others = (0..self.lakes.len()).filter(|&position| position != ledger);
-        for position in std::iter::once(ledger).chain(others) {
-            if let Some((_, number)) = self.lakes[position].block_columns() {
-                let predicate = at_or_above(number, height.saturating_add(1));
-                self.delete(position, predicate).await?;
-            }
+        let above = |lake: &Lake| {
+            let (_, number) = lake.block_columns()?;
+            Some(at_or_above(number, height.saturating_add(1)))
+        };
+        self.delete_from_the_ledger_then_the_rest(above).await
+    }
+
+    /// Deletes what `predicate` names from the ledger, then from every other table.
+    async fn delete_from_the_ledger_then_the_rest(
+        &mut self,
+        predicate: impl Fn(&Lake) -> Option<Expr>,
+    ) -> Result<(), StoreError> {
+        let ledger = &mut self.lakes[self.positions[&TableId::Dataset(Table::AcceptedBlock)]];
+        if let Some(predicate) = predicate(ledger) {
+            ledger.delete(&self.writer, predicate).await?;
         }
-        Ok(())
+        self.delete_from_the_rest(predicate).await
     }
 
     /// Moves the window of blocks a reorg could still orphan past a commit: its orphans
@@ -876,7 +1013,11 @@ fn commit_properties() -> CommitProperties {
 
 /// Opens the table of `def` at `uri`, creating it when it does not exist, and checks an
 /// existing one against its definition.
-async fn open_table(storage: &Storage, uri: &str, def: &Arc<TableDef>) -> Result<Lake, StoreError> {
+async fn open_table(
+    storage: &Storage,
+    uri: String,
+    def: &Arc<TableDef>,
+) -> Result<Lake, StoreError> {
     let name = def.name.as_str();
     if def.position(PARTITION).is_some() {
         return Err(StoreError::Reserved {
@@ -887,7 +1028,7 @@ async fn open_table(storage: &Storage, uri: &str, def: &Arc<TableDef>) -> Result
     let expected =
         arrow::delta_schema(def).map_err(StoreError::engine(Operation::Create, Some(name)))?;
     let mut table = storage
-        .table(uri)
+        .table(&uri)
         .await
         .map_err(StoreError::engine(Operation::Open, Some(name)))?;
     if table.version().is_none() {
@@ -992,6 +1133,11 @@ fn uint(value: u64) -> Expr {
 }
 
 /// A hash as the lake stores it: lowercase `0x` hex.
+/// A duration in whole milliseconds, for a log field.
+fn millis(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
 fn hex(hash: &B256) -> String {
     format!("{hash:#x}")
 }
