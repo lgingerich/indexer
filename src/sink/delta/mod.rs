@@ -79,6 +79,7 @@ use deltalake::datafusion::dataframe::DataFrame;
 use deltalake::datafusion::error::DataFusionError;
 use deltalake::datafusion::prelude::{Expr, SessionContext, cast, ident, lit};
 use deltalake::datafusion::scalar::ScalarValue;
+use deltalake::kernel::transaction::CommitProperties;
 use deltalake::logstore::{ObjectStoreRef, store_for};
 use deltalake::parquet::basic::{Compression, ZstdLevel};
 use deltalake::parquet::file::properties::WriterProperties;
@@ -228,7 +229,8 @@ impl Lake {
             .clone()
             .write(vec![batch])
             .with_save_mode(SaveMode::Append)
-            .with_writer_properties(writer.clone());
+            .with_writer_properties(writer.clone())
+            .with_commit_properties(commit_properties());
         if arrow::partitioned(&self.def).is_some() {
             write = write.with_partition_columns([PARTITION]);
         }
@@ -570,6 +572,7 @@ impl DeltaSink {
             .delete()
             .with_predicate(predicate)
             .with_writer_properties(self.writer.clone())
+            .with_commit_properties(commit_properties())
             .await
             .map_err(StoreError::engine(Operation::Delete, Some(&lake.def.name)))?;
         lake.table = table;
@@ -857,6 +860,18 @@ impl Storage {
             Err(error) => Err(error),
         }
     }
+}
+
+/// How every commit to the lake is made, by the store and by `maintenance` alike: without
+/// delta-rs's cleanup of expired log entries.
+///
+/// delta-rs otherwise runs that cleanup after every commit, and it lists the table's whole
+/// `_delta_log` to do it, a list request per thousand entries. A table committed to at the
+/// tip gains thousands of entries a day and keeps a month of them, so each commit would
+/// cost tens of requests, and more every day. `maintenance` cleans each log once a day
+/// instead.
+fn commit_properties() -> CommitProperties {
+    CommitProperties::default().with_cleanup_expired_logs(Some(false))
 }
 
 /// Opens the table of `def` at `uri`, creating it when it does not exist, and checks an

@@ -806,3 +806,50 @@ async fn the_writer_commits_past_a_compaction_it_did_not_see() {
     );
     assert_eq!(files_by_partition(&sink, Table::Block)["0"], 1);
 }
+
+/// Log cleanup deletes the transaction log's entries a checkpoint replaces, and keeps
+/// the checkpoint and every entry after it, so the table still opens with every row.
+#[tokio::test]
+async fn log_cleanup_keeps_what_a_checkpoint_does_not_replace() {
+    let dir = Dir::new();
+    let mut sink = open(&dir).await;
+    for height in [1, 2, 3] {
+        publish(&mut sink, block(height, 0)).await;
+    }
+    let position = sink.positions[&TableId::Dataset(Table::Block)];
+    deltalake::checkpoints::create_checkpoint(&sink.lakes[position].table, None)
+        .await
+        .expect("a checkpoint");
+    let checkpoint = sink.lakes[position].table.version().expect("a version");
+    publish(&mut sink, block(4, 0)).await;
+
+    let entries = || {
+        let mut versions: Vec<u64> = std::fs::read_dir(dir.table("blocks/_delta_log"))
+            .expect("the log directory")
+            .filter_map(|entry| {
+                let name = entry.ok()?.file_name().into_string().ok()?;
+                name.strip_suffix(".json")?.parse().ok()
+            })
+            .collect();
+        versions.sort_unstable();
+        versions
+    };
+    assert_eq!(entries(), (0..=checkpoint + 1).collect::<Vec<_>>());
+
+    let mut table = sink.lakes[position].table.clone();
+    let cleaned = maintenance::clean_log("blocks", &mut table, std::time::Duration::ZERO)
+        .await
+        .expect("cleans");
+    assert_eq!(
+        cleaned,
+        usize::try_from(checkpoint).expect("a small version")
+    );
+    assert_eq!(entries(), vec![checkpoint, checkpoint + 1]);
+    drop(sink);
+
+    let sink = open(&dir).await;
+    assert_eq!(
+        blocks(&sink).await,
+        expected(&[(1, 0), (2, 0), (3, 0), (4, 0)])
+    );
+}

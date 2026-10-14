@@ -39,9 +39,15 @@ tables = ["*"]
 uri = "s3://blockchain-data"
 # While catching up, a commit is made each time this many bytes of rows are buffered,
 # and each commit costs a round trip per table it touches, so a larger buffer means
-# fewer, larger commits. At the tip the 30 s commit interval comes first. A commit
+# fewer, larger commits. At the tip the commit interval below comes first. A commit
 # briefly holds twice this in memory.
 max_buffer_bytes = 1073741824
+# At the tip a commit is made once the oldest buffered block has waited this long. Each
+# commit writes a file and a log entry per table it touches, so a longer wait means
+# fewer requests and larger files, at the cost of the lake trailing the chain by up to
+# this much (PostgreSQL commits every block regardless), and of a restart refetching
+# up to this much of the chain into every store.
+commit_interval_secs = 150
 
 [sink.delta.storage]
 endpoint = { env = "S3_ENDPOINT" }

@@ -13,6 +13,10 @@
 //! - **Vacuum.** Files no commit references, and that have not been referenced for
 //!   [`vacuum_retention_hours`](super::DeltaSettings::vacuum_retention_hours), are
 //!   deleted. The retention is how long a reader may still be reading an older version.
+//! - **Log cleanup.** Entries of the transaction log older than the same retention, and
+//!   older than a checkpoint that replaces them, are deleted, once a day. delta-rs would
+//!   otherwise do it after every commit, listing the whole log each time (see
+//!   [`commit_properties`](super::commit_properties)).
 //!
 //! It is a second writer to the same tables, which the lake's one-writer rule allows
 //! because the two never touch the same file: the writer appends to the newest partition
@@ -24,8 +28,9 @@ use std::collections::BTreeMap;
 use std::num::NonZeroU64;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
+use deltalake::checkpoints::cleanup_expired_logs_for;
 use deltalake::parquet::file::properties::WriterProperties;
 use deltalake::{DeltaTable, DeltaTableError, FilterOp, FilterValue};
 use tokio::task::JoinHandle;
@@ -33,13 +38,14 @@ use tokio::time::{Instant, MissedTickBehavior};
 use tracing::{info, warn};
 
 use super::arrow::{PARTITION, PARTITION_BLOCKS};
+use super::commit_properties;
 use crate::ingest::pipeline::MAX_UNFINALIZED_BLOCKS;
 use crate::metrics;
 
 /// How often the task looks for finished partitions to compact.
 const COMPACT_EVERY: Duration = Duration::from_hours(1);
 
-/// How often the task vacuums every table.
+/// How often the task vacuums every table and cleans its log.
 const VACUUM_EVERY: Duration = Duration::from_hours(24);
 
 /// The file size compaction writes towards.
@@ -100,6 +106,10 @@ async fn run(
                 metrics::lake_maintenance_failed("vacuum");
                 warn!(table = %name, %error, "lake vacuum failed; retrying next pass");
             }
+            if vacuum && let Err(error) = clean_log(name, table, retention).await {
+                metrics::lake_maintenance_failed("log_cleanup");
+                warn!(table = %name, %error, "lake log cleanup failed; retrying next pass");
+            }
         }
         if vacuum {
             vacuumed = Instant::now();
@@ -140,6 +150,7 @@ pub(super) async fn compact(
             .with_target_size(TARGET_FILE_BYTES)
             .with_max_concurrent_tasks(COMPACTION_TASKS)
             .with_writer_properties(writer.clone())
+            .with_commit_properties(commit_properties())
             .await?;
         *table = optimized;
         compacted += 1;
@@ -182,6 +193,7 @@ pub(super) async fn vacuum(
         .with_retention_period(retention)
         // The settings' retention is the one that counts, not the table's default.
         .with_enforce_retention_duration(false)
+        .with_commit_properties(commit_properties())
         .await?;
     *table = vacuumed;
     if !metrics.files_deleted.is_empty() {
@@ -192,4 +204,31 @@ pub(super) async fn vacuum(
         );
     }
     Ok(metrics.files_deleted.len())
+}
+
+/// Deletes the entries of the table `name`'s transaction log older than `retention`,
+/// returning how many. Only entries a checkpoint already replaces go, so every version
+/// newer than the oldest checkpoint kept can still be read; the files of older ones are
+/// vacuumed after the same `retention` anyway.
+pub(super) async fn clean_log(
+    name: &str,
+    table: &mut DeltaTable,
+    retention: Duration,
+) -> Result<usize, DeltaTableError> {
+    table.update_state().await?;
+    let Some(version) = table.version() else {
+        return Ok(0);
+    };
+    let cutoff = SystemTime::now()
+        .checked_sub(retention)
+        .and_then(|cutoff| cutoff.duration_since(SystemTime::UNIX_EPOCH).ok())
+        .map_or(0, |cutoff| {
+            i64::try_from(cutoff.as_millis()).unwrap_or(i64::MAX)
+        });
+    let cleaned =
+        cleanup_expired_logs_for(version, table.log_store().as_ref(), cutoff, None).await?;
+    if cleaned > 0 {
+        info!(table = name, entries = cleaned, "lake log cleaned");
+    }
+    Ok(cleaned)
 }
