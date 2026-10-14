@@ -542,7 +542,7 @@ the field:
 | Key | Default | Meaning |
 | --- | --- | --- |
 | `ingest.start_block` | the sampled head | First height to index on an empty store. Absent starts live at the observed head; a value backfills that inclusive height forward before following live heads. A value above the sampled head is a startup error. When the store already holds blocks a run resumes from the store: a value the stored history reaches is ignored, and one more than a block past the stored tip is a startup error |
-| `ingest.backfill_concurrency` | `4` | Backfill fetches in flight at once. Blocks are still accepted in height order; this overlaps requests so the node is read while the stores write. Each counts against the provider's rate limit. Zero is refused. A [HyperSync backfill](#backfilling-from-hypersync) ignores it |
+| `ingest.backfill_concurrency` | `4` | Backfill fetches in flight at once. Blocks are still accepted in height order; this overlaps requests so the node is read while the stores write. Each counts against the provider's rate limit. Zero is refused. Refused beside a [HyperSync backfill](#backfilling-from-hypersync), which fetches one range at a time |
 | `sink.duckdb.batch_records` | `500` | Most records one store commit may cover; a backlog of blocks is folded into one commit up to this, and a block is never split |
 | `sink.duckdb.path` | `indexer.duckdb` | Path to the store, relative to the settings file. Tables live in a schema named for the chain: `base.logs` |
 
@@ -570,7 +570,7 @@ once is an error rather than picking one.
 history thousands of blocks per request, where an RPC node answers one call per height.
 A run with `[ingest.hypersync]` in place of `http_url` and `ws_url` reads every dataset
 from it — blocks, transactions with their receipts, and logs, so decoding works
-unchanged — up to the reorg window below the head, and exits. HyperSync has no live
+unchanged — up to the reorg window below the head it samples at startup, and exits. HyperSync has no live
 heads, so following the chain is a second run: swap the table back for the two
 endpoints and restart, and the run resumes after the last block the backfill committed.
 
@@ -585,7 +585,8 @@ token = { env = "INDEXER_ENVIO_HYPERSYNC_TOKEN" }
 ```
 
 HyperSync answers thousands of blocks per request, so the run fetches one range of
-10,000 heights at a time; `backfill_concurrency` does not apply. Responses are checked
+10,000 heights at a time; `backfill_concurrency` does not apply, and naming it beside
+`[ingest.hypersync]` is a startup error. Responses are checked
 as the RPC source checks a node's: every height is present and linked to its parent, and
 logs are present when a block's bloom says they are. Wherever transactions are read, the
 last one's cumulative gas must also be the block's `gas_used`, which catches a dropped

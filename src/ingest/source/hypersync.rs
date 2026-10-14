@@ -28,10 +28,12 @@
 //! parent. Within a block, transactions must be in index order with no gap, and logs in
 //! `log_index` order, each naming the block it was returned for. Two guards catch a
 //! backend that answers short. Logs are required when the header's `logsBloom` is set,
-//! as the RPC source requires them. And wherever transactions are read, the last one's
-//! cumulative gas must be the block's `gas_used`: the RPC source counts a receipt per
-//! transaction instead, which cannot fail here, where each row is a transaction joined to
-//! its receipt, so this is the check that a trailing transaction was not dropped.
+//! by the same check the RPC source runs; that check, the ordering checks, and the event
+//! order live in the `assemble` module both sources share. And wherever transactions are
+//! read, the last one's cumulative gas must be the block's `gas_used`: the RPC source
+//! counts a receipt per transaction instead, which cannot fail here, where each row is a
+//! transaction joined to its receipt, so this is the check that a trailing transaction
+//! was not dropped.
 //!
 //! [Envio HyperSync]: https://docs.envio.dev/docs/`HyperSync`/overview
 
@@ -46,12 +48,15 @@ use futures_util::stream;
 use serde::de::{self, DeserializeOwned};
 use serde::{Deserialize, Deserializer, Serialize};
 
+use super::assemble::{
+    BlockRows, check_height, check_log_order, check_logs_present, check_no_leftovers,
+};
 use super::retry::{Backoff, os_seed, transient_status};
 use super::{
     BlockSource, Datasets, FetchedBlock, HeadStream, SourceError, inconsistent, malformed,
 };
 use crate::wire::datasets::evm::{Block, Log, Transaction};
-use crate::wire::envelope::{BlockMeta, ChainId, Event};
+use crate::wire::envelope::{BlockMeta, ChainId};
 
 /// The context every error from this source names.
 const CONTEXT: &str = "hypersync";
@@ -119,64 +124,84 @@ struct Plan {
     datasets: Datasets,
     /// The columns queried for them.
     fields: FieldSelection,
+    /// Whether the query reads transactions, which are then checked for a gap and
+    /// against the block's gas.
+    reads_transactions: bool,
+    /// Whether the query reads logs, which are then checked against the block's bloom.
+    reads_logs: bool,
 }
 
 impl Plan {
-    fn new(datasets: Datasets) -> Self {
+    /// # Errors
+    ///
+    /// Returns [`SourceError::Malformed`] when a row's columns cannot be read from its
+    /// struct; see [`columns`].
+    fn new(datasets: Datasets) -> Result<Self, SourceError> {
         let Datasets {
             blocks,
             transactions,
             logs,
         } = datasets;
+        let reads_transactions = transactions || blocks;
+        let reads_logs = logs || transactions;
         let fields = FieldSelection {
             block: if blocks {
-                columns::<RawBlock>()
+                columns::<RawBlock>()?
             } else {
                 IDENTITY_FIELDS
             },
             transaction: if transactions {
-                columns::<RawTransaction>()
-            } else if blocks {
+                columns::<RawTransaction>()?
+            } else if reads_transactions {
                 TRANSACTION_POSITION_FIELDS
             } else {
                 &[]
             },
             log: if logs {
-                columns::<RawLog>()
-            } else if transactions {
+                columns::<RawLog>()?
+            } else if reads_logs {
                 LOG_POSITION_FIELDS
             } else {
                 &[]
             },
         };
-        Self { datasets, fields }
-    }
-
-    /// A header read: each block's identity, and no rows.
-    fn headers() -> Self {
-        Self::new(Datasets {
-            blocks: false,
-            transactions: false,
-            logs: false,
+        Ok(Self {
+            datasets,
+            fields,
+            reads_transactions,
+            reads_logs,
         })
     }
 
-    /// Whether the query reads transactions, which are then checked for a gap and
-    /// against the block's gas.
-    const fn reads_transactions(self) -> bool {
-        !self.fields.transaction.is_empty()
-    }
-
-    /// Whether the query reads logs, which are then checked against the block's bloom.
-    const fn reads_logs(self) -> bool {
-        !self.fields.log.is_empty()
+    /// A header read: each block's identity, and no rows.
+    const fn headers() -> Self {
+        Self {
+            datasets: Datasets {
+                blocks: false,
+                transactions: false,
+                logs: false,
+            },
+            fields: FieldSelection {
+                block: IDENTITY_FIELDS,
+                transaction: &[],
+                log: &[],
+            },
+            reads_transactions: false,
+            reads_logs: false,
+        }
     }
 }
 
 /// The fields `T` deserializes, read from its derived `Deserialize`: a row's struct is
 /// the one list of the columns a full selection asks for, so a field added to it is
 /// selected, and none is selected that it lacks.
-fn columns<T: DeserializeOwned>() -> &'static [&'static str] {
+///
+/// # Errors
+///
+/// Returns [`SourceError::Malformed`] when `T` does not deserialize as a plain struct
+/// with fields, so a change to a row's shape fails the source's construction rather
+/// than selecting no columns.
+fn columns<T: DeserializeOwned>() -> Result<&'static [&'static str], SourceError> {
     /// Answers nothing, and records the field names a struct asks it for.
     struct Columns<'a>(&'a mut &'static [&'static str]);
 
@@ -210,7 +235,16 @@ fn columns<T: DeserializeOwned>() -> &'static [&'static str] {
     let mut fields: &'static [&'static str] = &[];
     // Always an error: the deserializer only records what it is asked for.
     drop(T::deserialize(Columns(&mut fields)));
-    fields
+    if fields.is_empty() {
+        return Err(malformed(
+            "HyperSync columns",
+            format!(
+                "{} does not deserialize as a struct with fields",
+                std::any::type_name::<T>()
+            ),
+        ));
+    }
+    Ok(fields)
 }
 
 /// A source that backfills one EVM chain from a `HyperSync` endpoint.
@@ -231,7 +265,8 @@ impl HyperSyncSource {
     ///
     /// # Errors
     ///
-    /// Returns a typed error when `url` is not a URL or the HTTP client cannot be built.
+    /// Returns a typed error when `url` is not a URL, the HTTP client cannot be built, or
+    /// a row's columns cannot be read from its struct.
     pub fn new(
         chain: impl Into<ChainId>,
         url: &str,
@@ -260,7 +295,7 @@ impl HyperSyncSource {
             query_url: endpoint("query")?,
             height_url: endpoint("height")?,
             token: token.to_owned(),
-            plan: Plan::new(datasets),
+            plan: Plan::new(datasets)?,
             backoff: Backoff::new(os_seed()),
         })
     }
@@ -273,8 +308,8 @@ impl HyperSyncSource {
             to_block: to.saturating_add(1),
             include_all_blocks: true,
             join_mode: "JoinNothing",
-            transactions: plan.reads_transactions().then_some([All {}]),
-            logs: plan.reads_logs().then_some([All {}]),
+            transactions: plan.reads_transactions.then_some([All {}]),
+            logs: plan.reads_logs.then_some([All {}]),
             field_selection: plan.fields,
         };
         self.send(|client| client.post(self.query_url.clone()).json(&query))
@@ -289,18 +324,10 @@ impl HyperSyncSource {
         &self,
         request: impl Fn(&reqwest::Client) -> reqwest::RequestBuilder,
     ) -> Result<T, SourceError> {
-        let mut retries = 0;
-        loop {
-            let mark = self.backoff.ready().await;
-            let result = self.attempt(&request).await;
-            let Some(cause) = transient(&result) else {
-                self.backoff.settled();
-                return result;
-            };
-            if !self.backoff.retry(mark, &mut retries, &cause, CONTEXT) {
-                return result;
-            }
-        }
+        let request = &request;
+        self.backoff
+            .run(CONTEXT, || self.attempt(request), transient)
+            .await
     }
 
     /// One try at a request.
@@ -821,9 +848,7 @@ impl RawLog {
 ///
 /// Rows come back sorted by block, then by index; each block takes the next run of rows
 /// carrying its number, and a row left over at the end, or out of order, is an error.
-/// Events are ordered as the RPC source orders them: the block row, then each
-/// transaction followed by its logs, or the logs alone when transactions are not
-/// selected.
+/// Events are ordered as every source orders them; see [`BlockRows::into_events`].
 fn assemble(
     from: u64,
     to: u64,
@@ -865,25 +890,16 @@ fn assemble(
     let mut fetched = Vec::with_capacity(blocks.len());
     for (height, block) in (from..=last).zip(blocks) {
         let meta = block.meta()?;
-        if meta.height != height {
-            return Err(malformed(
-                CONTEXT,
-                format!("requested block {height}, received {}", meta.height),
-            ));
-        }
+        check_height(CONTEXT, height, meta.height)?;
         let own_transactions = take_block(&mut transactions, meta, |row| {
             (row.block_number, row.block_hash)
         })?;
         let own_logs = take_block(&mut logs, meta, |row| (row.block_number, row.block_hash))?;
-        let events = project(block, meta, own_transactions, own_logs, plan)?;
+        let events = project(block, meta, own_transactions, own_logs, plan)?.into_events();
         fetched.push(FetchedBlock { meta, events });
     }
-    if transactions.next().is_some() || logs.next().is_some() {
-        return Err(malformed(
-            CONTEXT,
-            format!("rows outside the blocks {from}..={last}, or out of order"),
-        ));
-    }
+    let leftover = transactions.next().is_some() || logs.next().is_some();
+    check_no_leftovers(CONTEXT, from, last, leftover)?;
     Ok(fetched)
 }
 
@@ -913,32 +929,26 @@ fn take_block<T>(
     Ok(own)
 }
 
-/// A block's logs in `log_index` order, each with its transaction's index.
-type Placed = Vec<(u64, u64, RawLog)>;
+/// A log row with its two indexes read.
+struct PlacedLog {
+    log_index: u64,
+    transaction_index: u64,
+    row: RawLog,
+}
 
-/// Orders a block's logs by `log_index`, refusing a misordered or duplicate one.
-fn place_logs(logs: Vec<RawLog>, meta: BlockMeta) -> Result<Placed, SourceError> {
-    let mut placed: Placed = Vec::with_capacity(logs.len());
-    for log in logs {
-        let log_index = log.log_index.to_u64("log_index")?;
-        if placed
-            .last()
-            .is_some_and(|(previous, _, _)| *previous >= log_index)
-        {
-            return Err(malformed(
-                CONTEXT,
-                format!(
-                    "logs of block {} are not in ascending logIndex order",
-                    meta.height
-                ),
-            ));
-        }
-        placed.push((
-            log_index,
-            log.transaction_index.to_u64("transaction_index")?,
-            log,
-        ));
-    }
+/// Reads a block's logs' indexes, refusing logs out of `log_index` order.
+fn place_logs(logs: Vec<RawLog>, meta: BlockMeta) -> Result<Vec<PlacedLog>, SourceError> {
+    let placed = logs
+        .into_iter()
+        .map(|row| {
+            Ok(PlacedLog {
+                log_index: row.log_index.to_u64("log_index")?,
+                transaction_index: row.transaction_index.to_u64("transaction_index")?,
+                row,
+            })
+        })
+        .collect::<Result<Vec<_>, SourceError>>()?;
+    check_log_order(CONTEXT, meta.height, placed.iter().map(|log| log.log_index))?;
     Ok(placed)
 }
 
@@ -949,17 +959,11 @@ fn check_block(
     block: &RawBlock,
     meta: BlockMeta,
     transactions: &[RawTransaction],
-    placed: &Placed,
+    placed: &[PlacedLog],
     plan: Plan,
 ) -> Result<(), SourceError> {
-    if plan.reads_logs() && placed.is_empty() && block.logs_bloom != Bloom::ZERO {
-        return Err(inconsistent(
-            CONTEXT,
-            format!(
-                "no logs returned for block {}, whose logsBloom is set",
-                meta.height
-            ),
-        ));
+    if plan.reads_logs {
+        check_logs_present(CONTEXT, meta.height, !placed.is_empty(), &block.logs_bloom)?;
     }
     for (position, transaction) in transactions.iter().enumerate() {
         if transaction.transaction_index.to_u64("transaction_index")? != position as u64 {
@@ -972,7 +976,7 @@ fn check_block(
             ));
         }
     }
-    if plan.reads_transactions() {
+    if plan.reads_transactions {
         let cumulative = match transactions.last() {
             Some(last) => required(last.cumulative_gas_used, "cumulative_gas_used")?
                 .to_u64("cumulative_gas_used")?,
@@ -989,60 +993,56 @@ fn check_block(
             ));
         }
     }
-    if plan.reads_transactions()
-        && let Some((_, index, _)) = placed
+    if plan.reads_transactions
+        && let Some(log) = placed
             .iter()
-            .find(|(_, index, _)| *index >= transactions.len() as u64)
+            .find(|log| log.transaction_index >= transactions.len() as u64)
     {
         return Err(malformed(
             CONTEXT,
             format!(
-                "a log of block {} names transaction {index}, which it does not have",
-                meta.height
+                "a log of block {} names transaction {}, which it does not have",
+                meta.height, log.transaction_index
             ),
         ));
     }
     Ok(())
 }
 
-/// One block's events, from its header and the rows that carry its number.
+/// One block's rows, from its header and the rows that carry its number.
 fn project(
     block: RawBlock,
     meta: BlockMeta,
     transactions: Vec<RawTransaction>,
     logs: Vec<RawLog>,
     plan: Plan,
-) -> Result<Vec<Event>, SourceError> {
+) -> Result<BlockRows, SourceError> {
     let placed = place_logs(logs, meta)?;
     check_block(&block, meta, &transactions, &placed, plan)?;
     let datasets = plan.datasets;
 
-    let mut events = Vec::new();
+    let mut rows = BlockRows::default();
     if datasets.blocks {
         let hashes = transactions
             .iter()
             .map(|transaction| transaction.hash)
             .collect();
-        events.push(Event::Block(Box::new(block.into_block(meta, hashes)?)));
+        rows.block = Some(block.into_block(meta, hashes)?);
     }
     if datasets.transactions {
         let mut placed = placed.into_iter().peekable();
         for (position, transaction) in transactions.into_iter().enumerate() {
             let index = position as u64;
+            let mut count = 0;
             let mut own = Vec::new();
-            while let Some((log_index, _, log)) = placed.next_if(|(_, tx, _)| *tx == index) {
-                own.push((log_index, log));
-            }
-            events.push(Event::Transaction(Box::new(transaction.into_transaction(
-                meta,
-                index,
-                own.len() as u64,
-            )?)));
-            if datasets.logs {
-                for (log_index, log) in own {
-                    events.push(Event::Log(Box::new(log.into_log(meta, index, log_index)?)));
+            while let Some(log) = placed.next_if(|log| log.transaction_index == index) {
+                count += 1;
+                if datasets.logs {
+                    own.push(log.row.into_log(meta, index, log.log_index)?);
                 }
             }
+            rows.transactions
+                .push((transaction.into_transaction(meta, index, count)?, own));
         }
         if placed.next().is_some() {
             return Err(malformed(
@@ -1054,15 +1054,14 @@ fn project(
             ));
         }
     } else if datasets.logs {
-        for (log_index, transaction_index, log) in placed {
-            events.push(Event::Log(Box::new(log.into_log(
-                meta,
-                transaction_index,
-                log_index,
-            )?)));
+        for log in placed {
+            rows.logs.push(
+                log.row
+                    .into_log(meta, log.transaction_index, log.log_index)?,
+            );
         }
     }
-    Ok(events)
+    Ok(rows)
 }
 
 /// An unsigned integer as `HyperSync` writes it: a JSON number, or `0x` hex that may carry
@@ -1609,7 +1608,8 @@ mod tests {
             &[block(10, true, 0), block(11, false, 0), block(12, true, 0)],
             &[log(10, 0, 0), log(10, 1, 1), log(12, 0, 0)],
         );
-        let blocks = assemble(10, 20, response, Plan::new(logs_only())).expect("assembles");
+        let blocks =
+            assemble(10, 20, response, Plan::new(logs_only()).expect("plan")).expect("assembles");
         let shape: Vec<_> = blocks
             .iter()
             .map(|block| (block.meta.height, block.events.len()))
@@ -1634,7 +1634,7 @@ mod tests {
     fn a_short_or_mismatched_response_is_refused() {
         let skipped = respond(12, &[block(10, false, 0)], &[]);
         assert!(
-            assemble(10, 20, skipped, Plan::new(logs_only())).is_err(),
+            assemble(10, 20, skipped, Plan::new(logs_only()).expect("plan")).is_err(),
             "a skipped height"
         );
 
@@ -1642,25 +1642,25 @@ mod tests {
         foreign["block_hash"] = hash(99).into();
         let foreign = respond(11, &[block(10, true, 0)], &[foreign]);
         assert!(matches!(
-            assemble(10, 20, foreign, Plan::new(logs_only())),
+            assemble(10, 20, foreign, Plan::new(logs_only()).expect("plan")),
             Err(SourceError::Inconsistent { .. })
         ));
 
         let bloomed = respond(11, &[block(10, true, 0)], &[]);
         assert!(matches!(
-            assemble(10, 20, bloomed, Plan::new(logs_only())),
+            assemble(10, 20, bloomed, Plan::new(logs_only()).expect("plan")),
             Err(SourceError::Inconsistent { .. })
         ));
 
         let misordered = respond(11, &[block(10, true, 0)], &[log(10, 0, 1), log(10, 0, 0)]);
         assert!(
-            assemble(10, 20, misordered, Plan::new(logs_only())).is_err(),
+            assemble(10, 20, misordered, Plan::new(logs_only()).expect("plan")).is_err(),
             "misordered logs"
         );
 
         let past = respond(12, &[block(10, false, 0), block(11, false, 0)], &[]);
         assert!(
-            assemble(10, 10, past, Plan::new(logs_only())).is_err(),
+            assemble(10, 10, past, Plan::new(logs_only()).expect("plan")).is_err(),
             "past the end"
         );
     }
@@ -1696,11 +1696,21 @@ mod tests {
             .expect("response")
         };
         let whole = [transaction(0, 21_000), transaction(1, 42_000)];
-        let blocks =
-            assemble(10, 10, response(&whole), Plan::new(transactions)).expect("assembles");
+        let blocks = assemble(
+            10,
+            10,
+            response(&whole),
+            Plan::new(transactions).expect("plan"),
+        )
+        .expect("assembles");
         assert_eq!(blocks[0].events.len(), 2);
         assert!(matches!(
-            assemble(10, 10, response(&whole[..1]), Plan::new(transactions)),
+            assemble(
+                10,
+                10,
+                response(&whole[..1]),
+                Plan::new(transactions).expect("plan")
+            ),
             Err(SourceError::Inconsistent { .. })
         ));
 
@@ -1721,19 +1731,24 @@ mod tests {
             logs: false,
         };
         assert!(matches!(
-            assemble(10, 10, response(&positions[..1]), Plan::new(blocks_only)),
+            assemble(
+                10,
+                10,
+                response(&positions[..1]),
+                Plan::new(blocks_only).expect("plan")
+            ),
             Err(SourceError::Inconsistent { .. })
         ));
     }
 
     /// A full selection asks for every field of a row's struct, by its wire name, and the
-    /// partial ones only for fields the structs have.
+    /// partial ones only for fields the structs have. A type that is not a struct with
+    /// fields is refused, rather than selecting nothing.
     #[test]
     fn a_full_selection_is_every_field_of_the_row() {
-        let blocks = columns::<RawBlock>();
-        let transactions = columns::<RawTransaction>();
-        let logs = columns::<RawLog>();
-        assert_eq!((blocks.len(), transactions.len(), logs.len()), (28, 34, 12));
+        let blocks = columns::<RawBlock>().expect("blocks");
+        let transactions = columns::<RawTransaction>().expect("transactions");
+        let logs = columns::<RawLog>().expect("logs");
         assert!(
             transactions.contains(&"type"),
             "the renamed field's wire name"
@@ -1747,6 +1762,10 @@ mod tests {
                 assert!(full.contains(field), "{field}");
             }
         }
+        assert!(matches!(
+            columns::<u64>(),
+            Err(SourceError::Malformed { .. })
+        ));
     }
 
     #[test]
@@ -1755,6 +1774,6 @@ mod tests {
             "data": [], "next_block": 10, "archive_height": 9
         }))
         .expect("response");
-        assert!(assemble(10, 20, response, Plan::new(Datasets::all())).is_err());
+        assert!(assemble(10, 20, response, Plan::new(Datasets::all()).expect("plan")).is_err());
     }
 }
