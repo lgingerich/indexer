@@ -24,6 +24,7 @@
 //! Two EVM sources implement it: [`EvmSource`] over a node's JSON-RPC, which follows the
 //! chain, and [`HyperSyncSource`] over Envio `HyperSync`, which only backfills.
 
+use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
 
@@ -71,7 +72,7 @@ pub const METHOD_NOT_FOUND: i64 = -32601;
 /// Failure while constructing or talking to a chain data source.
 #[derive(Debug, Error)]
 pub enum SourceError {
-    /// HTTP client construction failed.
+    /// The HTTP client failed: it could not be built, or a request did not complete.
     #[error("http client failure: {0}")]
     Http(#[from] reqwest::Error),
     /// Alloy's typed RPC, decoding, or transport error at the named boundary.
@@ -100,8 +101,8 @@ pub enum SourceError {
         /// Which invariant failed.
         detail: String,
     },
-    /// The source answered a request with an HTTP error status that asking again will
-    /// not change, such as a refused API token.
+    /// The source answered a request with an HTTP error status: one asking again will
+    /// not change, such as a refused API token, or a transient one every retry got.
     #[error("{context} answered HTTP {status}: {detail}")]
     Status {
         /// What was being read.
@@ -110,14 +111,6 @@ pub enum SourceError {
         status: u16,
         /// The response body, truncated.
         detail: String,
-    },
-    /// The source cannot do what was asked of it.
-    #[error("{context} cannot do this: {detail}")]
-    Unsupported {
-        /// The source.
-        context: &'static str,
-        /// What it cannot do, and what to use instead.
-        detail: &'static str,
     },
     /// The node's answers disagree with each other — the chain moved mid-fetch, or a
     /// backend lags the block it announced — so, unlike [`Self::Malformed`], asking again
@@ -131,10 +124,39 @@ pub enum SourceError {
     },
 }
 
+/// A source invariant failed: the response at `context` cannot be right, so asking again
+/// would fail the same way.
+pub(crate) fn malformed(context: &str, detail: impl fmt::Display) -> SourceError {
+    SourceError::Malformed {
+        context: context.to_owned(),
+        detail: detail.to_string(),
+    }
+}
+
+/// The source's answers at `context` disagree with each other, so asking again can
+/// succeed.
+pub(crate) fn inconsistent(context: &str, detail: impl fmt::Display) -> SourceError {
+    SourceError::Inconsistent {
+        context: context.to_owned(),
+        detail: detail.to_string(),
+    }
+}
+
 /// A chain data source: one live subscription plus on-demand block fetches.
 pub trait BlockSource: Send + Sync {
     /// The chain this source reads.
     fn chain(&self) -> &ChainId;
+
+    /// Whether the source can follow the chain: announce heads through
+    /// [`Self::subscribe_heads`], and answer at the tip, where a fork can still reach.
+    ///
+    /// A source that cannot only backfills: a run on it indexes the buried heights and
+    /// stops, and leaves the rest to a run on one that can. It also refuses to resume
+    /// past a stored tip it disagrees with, since it has no view of the fork that would
+    /// retract it.
+    fn follows_heads(&self) -> bool {
+        true
+    }
 
     /// Opens the live head subscription.
     ///

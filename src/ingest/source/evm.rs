@@ -58,8 +58,11 @@ use futures_util::StreamExt;
 use serde::Deserialize;
 use tracing::warn;
 
-use super::retry::RetryLayer;
-use super::{BlockSource, Datasets, FetchedBlock, HeadStream, METHOD_NOT_FOUND, SourceError};
+use super::retry::{RetryLayer, os_seed};
+use super::{
+    BlockSource, Datasets, FetchedBlock, HeadStream, METHOD_NOT_FOUND, SourceError, inconsistent,
+    malformed,
+};
 use crate::metrics;
 use crate::wire::datasets::evm::{Block, Log, Transaction};
 use crate::wire::envelope::{BlockMeta, ChainId, Event};
@@ -269,10 +272,8 @@ pub fn http_client(url: &str) -> Result<RpcClient, SourceError> {
         context: "HTTP endpoint",
         source: TransportErrorKind::custom(source),
     })?;
-    // Jitter only has to differ between processes, so the OS-keyed hasher seeds it.
-    let seed = std::hash::BuildHasher::hash_one(&std::hash::RandomState::new(), ());
     Ok(ClientBuilder::default()
-        .layer(RetryLayer::new(seed))
+        .layer(RetryLayer::new(os_seed()))
         .http_with_client(client, url))
 }
 
@@ -324,20 +325,6 @@ impl From<&AnyRpcBlock> for BlockMeta {
             parent_hash: header.inner.parent_hash,
             timestamp: header.inner.timestamp,
         }
-    }
-}
-
-fn malformed(context: &str, detail: impl fmt::Display) -> SourceError {
-    SourceError::Malformed {
-        context: context.to_owned(),
-        detail: detail.to_string(),
-    }
-}
-
-fn inconsistent(context: &str, detail: impl fmt::Display) -> SourceError {
-    SourceError::Inconsistent {
-        context: context.to_owned(),
-        detail: detail.to_string(),
     }
 }
 
