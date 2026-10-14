@@ -26,17 +26,13 @@ token = { env = "INDEXER_ENVIO_HYPERSYNC_TOKEN" }
 span = 10000
 concurrency = 3
 
-# TEST BED: Robinhood writes the lake alone, under s3://blockchain-data/dev/, while the
-# lake's write path is tuned. Before running it for real, restore this table, point `uri`
-# below back at s3://blockchain-data, and start from empty stores.
-#
 # The app's PostgreSQL (PlanetScale): only what the app serves, a subset of the lake below,
 # in the database schema named for the chain. Requires the `postgres` feature. The connection
 # string is a secret, since it carries the password.
-# [sink.postgres]
-# tables = ["contract_events", "metric_v1_swaps", "metric_v1_bin_fills", "metric_v1_liquidity", "metric_v1_pool_bins"]
-# connection_string = { env = "INDEXER_POSTGRES_URL" }
-# batch_records = 10000
+[sink.postgres]
+tables = ["contract_events", "metric_v1_swaps", "metric_v1_bin_fills", "metric_v1_liquidity", "metric_v1_pool_bins"]
+connection_string = { env = "INDEXER_POSTGRES_URL" }
+batch_records = 10000
 
 # Everything, as Delta tables on Cloudflare R2 under s3://blockchain-data/<chain>/: `*`
 # matches every dataset, decoded event table, and derived table, including ones added
@@ -44,7 +40,7 @@ concurrency = 3
 # Requires the `delta` feature. R2 takes region "auto"; the keys are an R2 API token's.
 [sink.delta]
 tables = ["*"]
-uri = "s3://blockchain-data/dev"   # TEST BED; production is s3://blockchain-data
+uri = "s3://blockchain-data"
 # While catching up, a commit is made each time this many bytes of rows are buffered,
 # and each commit costs a round trip per table it touches, so a larger buffer means
 # fewer, larger commits. At the tip the commit interval below comes first. A commit
