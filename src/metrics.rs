@@ -26,7 +26,7 @@
 //! | `indexer_decode_failures_total` | counter | Logs from a known contract that did not decode |
 //! | `indexer_derive_failures_total` | counter | Decoded records a derived `table` could not use |
 //! | `indexer_contracts_discovered_total` | counter | Contracts found through a factory's event |
-//! | `indexer_rpc_retries_total` | counter | RPC requests retried after a transient failure |
+//! | `indexer_rpc_retries_total` | counter | Source requests retried after a transient failure, by `source`: `rpc` or `hypersync` |
 //! | `indexer_rpc_range_splits_total` | counter | Backfill ranges split after a failed fetch |
 //! | `indexer_lake_maintenance_failures_total` | counter | Failed Delta `operation`s: compact or vacuum |
 //!
@@ -158,9 +158,10 @@ pub(crate) fn contracts_discovered(count: usize) {
     counter!(CONTRACTS_DISCOVERED).increment(count as u64);
 }
 
-/// An RPC request failed transiently and is being retried.
-pub(crate) fn rpc_retry() {
-    counter!(RPC_RETRIES).increment(1);
+/// A request to `source`, the RPC node or `HyperSync`, failed transiently and is being
+/// retried.
+pub(crate) fn source_retry(source: &'static str) {
+    counter!(RPC_RETRIES, "source" => source).increment(1);
 }
 
 /// A backfill range failed to fetch and is being fetched in halves.

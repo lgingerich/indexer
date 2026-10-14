@@ -46,7 +46,7 @@ use alloy_json_rpc::RpcError;
 use alloy_network::any::{AnyRpcBlock, AnyRpcTransaction, AnyTransactionReceipt, AnyTxEnvelope};
 use alloy_network::eip2718::Typed2718 as _;
 use alloy_network::{AnyNetwork, TransactionResponse};
-use alloy_primitives::{B256, Bloom, U8, U64, U128, U256};
+use alloy_primitives::{B256, U8, U64, U128, U256};
 use alloy_provider::{Provider, RootProvider, WsConnect};
 use alloy_pubsub::PubSubConnect;
 use alloy_rpc_client::{ClientBuilder, RpcClient};
@@ -58,6 +58,9 @@ use futures_util::StreamExt;
 use serde::Deserialize;
 use tracing::warn;
 
+use super::assemble::{
+    BlockRows, check_height, check_log_order, check_logs_present, check_no_leftovers,
+};
 use super::retry::{RetryLayer, os_seed};
 use super::{
     BlockSource, Datasets, FetchedBlock, HeadStream, METHOD_NOT_FOUND, SourceError, inconsistent,
@@ -445,7 +448,7 @@ fn project(
         return Err(malformed(LOGS, "logs were not fetched"));
     }
 
-    let mut events = Vec::new();
+    let mut rows = BlockRows::default();
     if let Some(block) = block {
         let header = &block.0.inner.header;
         if header.number != meta.height || header.hash != meta.hash {
@@ -455,30 +458,29 @@ fn project(
             ));
         }
         if plan.block_row {
-            events.push(Event::Block(Box::new(decode_header(block))));
+            rows.block = Some(decode_header(block));
         }
-        append_body(&mut events, block, receipts, plan, meta)?;
+        append_body(&mut rows, block, receipts, plan, meta)?;
     }
     if let Some(logs) = logs {
-        if logs.is_empty()
-            && let Some(block) = block
-            && block.0.inner.header.inner.logs_bloom != Bloom::ZERO
-        {
-            return Err(inconsistent(
+        if let Some(block) = block {
+            check_logs_present(
                 LOGS,
-                "no logs returned for a block whose logsBloom is set",
-            ));
+                meta.height,
+                !logs.is_empty(),
+                &block.0.inner.header.inner.logs_bloom,
+            )?;
         }
         for log in logs {
-            events.push(Event::Log(Box::new(get_logs_record(
+            rows.logs.push(get_logs_record(
                 log,
                 meta.height,
                 meta.hash,
                 meta.timestamp,
-            )?)));
+            )?);
         }
     }
-    Ok(events)
+    Ok(rows.into_events())
 }
 
 /// Appends the transaction and log rows a fetched body and its receipts carry.
@@ -486,7 +488,7 @@ fn project(
 /// Both come from the receipts, which are fetched only alongside transactions, so a
 /// body read for the block row alone appends nothing here.
 fn append_body(
-    events: &mut Vec<Event>,
+    rows: &mut BlockRows,
     block: &AnyRpcBlock,
     receipts: Option<&[AnyTransactionReceipt]>,
     plan: FetchPlan,
@@ -535,26 +537,25 @@ fn append_body(
                 ),
             ));
         }
-        events.push(Event::Transaction(Box::new(decode_transaction(
-            transaction,
-            receipt,
-            tx_index,
-            meta,
-        ))));
+        let mut own = Vec::new();
         if plan.logs == LogSource::Receipts {
             for log in receipt.logs() {
                 // Logs nested in this receipt, as opposed to a separate `eth_getLogs`
                 // query; the label names the boundary an error at this site reports.
-                events.push(Event::Log(Box::new(log_record(
+                own.push(log_record(
                     log,
                     tx_index,
                     meta.height,
                     meta.hash,
                     meta.timestamp,
                     RECEIPTS,
-                )?)));
+                )?);
             }
         }
+        rows.transactions.push((
+            decode_transaction(transaction, receipt, tx_index, meta),
+            own,
+        ));
     }
     Ok(())
 }
@@ -615,12 +616,7 @@ fn split_range(
     let mut blocks = Vec::with_capacity(headers.len());
     for (height, header) in (from..).zip(headers) {
         let meta = BlockMeta::from(header);
-        if meta.height != height {
-            return Err(malformed(
-                BLOCK,
-                format!("requested block {height}, received {}", meta.height),
-            ));
-        }
+        check_height(BLOCK, height, meta.height)?;
         // In order, this height's logs are the next run carrying its number.
         let own = match rest {
             Some(logs) => {
@@ -629,15 +625,7 @@ fn split_range(
                     .take_while(|log| log.block_number == Some(height))
                     .count();
                 let (own, after) = logs.split_at(count);
-                if own
-                    .windows(2)
-                    .any(|pair| pair[0].log_index >= pair[1].log_index)
-                {
-                    return Err(malformed(
-                        LOGS,
-                        format!("logs of block {height} are not in ascending logIndex order"),
-                    ));
-                }
+                check_log_order(LOGS, height, own.iter().map(|log| log.log_index))?;
                 rest = Some(after);
                 Some(own)
             }
@@ -648,15 +636,8 @@ fn split_range(
             events: project(meta, Some(header), None, own, plan)?,
         });
     }
-    if let Some(log) = rest.and_then(<[RpcLog]>::first) {
-        return Err(malformed(
-            LOGS,
-            format!(
-                "log at block {:?} is outside the range or out of order",
-                log.block_number
-            ),
-        ));
-    }
+    let last = (from + headers.len() as u64).saturating_sub(1);
+    check_no_leftovers(LOGS, from, last, rest.is_some_and(|rest| !rest.is_empty()))?;
     Ok(blocks)
 }
 

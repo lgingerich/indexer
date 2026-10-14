@@ -210,8 +210,7 @@ impl Pipeline {
     /// # Errors
     ///
     /// Returns [`RuntimeError::Catalog`] when the manifests cannot be loaded,
-    /// [`RuntimeError::Route`] when a sink's `tables` do not resolve,
-    /// [`RuntimeError::Settings`] when `[ingest]` does not name one source, and
+    /// [`RuntimeError::Route`] when a sink's `tables` do not resolve, and
     /// [`RuntimeError::Source`] when the HTTP client cannot be built.
     pub(crate) fn from_settings(settings: &Settings) -> Result<Self, RuntimeError> {
         let catalog = settings
@@ -233,13 +232,17 @@ impl Pipeline {
         let datasets = route::datasets(routes.iter().map(|(_, tables)| tables));
         info!(%datasets, "fetching what the sinks write");
         let chain = settings.ingest.chain.as_str();
-        let source = match settings.ingest.source()? {
-            IngestSource::Rpc { http_url, ws_url } => AnySource::Rpc(EvmSource::new(
+        let source = match &settings.ingest.source {
+            IngestSource::Rpc {
+                http_url,
+                ws_url,
+                backfill_concurrency,
+            } => AnySource::Rpc(EvmSource::new(
                 chain,
                 http_client(http_url.expose())?,
                 ws_connect(ws_url.expose()),
                 datasets,
-                settings.ingest.backfill_concurrency,
+                *backfill_concurrency,
             )),
             IngestSource::HyperSync(hypersync) => {
                 info!(url = %hypersync.url, "backfilling from HyperSync; the run stops at the reorg window");
@@ -433,12 +436,13 @@ impl<B: BlockSource + 'static> Pipeline<B> {
             sinks.push((sender, tables));
         }
 
-        let machine = Machine::new(
+        let ingest = Machine::new(
             source,
             DecodingSink::new(decoder, Router::new(schema, sinks)),
             ledger,
-        );
-        let ingest = machine.run(start_block, stop_block).await;
+        )
+        .run(start_block, stop_block)
+        .await;
 
         // Ingest's halves of the channels are gone by now, so each store drains what is
         // queued and ends. The join order is [`finish`].

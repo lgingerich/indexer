@@ -111,27 +111,18 @@ pub struct Settings {
 /// a node's JSON-RPC that follows the chain, or `[ingest.hypersync]`, which backfills the
 /// buried heights and stops (see [`HyperSyncSettings`]). A source cannot default — a
 /// default would silently index nothing — so naming neither, half of the pair, or both
-/// is a startup error; see [`IngestSettings::source`].
+/// is a parse error, as is a key that only the other source reads. Each key's meaning is
+/// documented where it lands: here, or on [`IngestSource`].
 #[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(try_from = "IngestTable")]
 pub struct IngestSettings {
     /// The chain id stamped on every event. Required, and non-empty.
-    #[serde(deserialize_with = "non_empty")]
     pub chain: String,
-    /// The JSON-RPC endpoint used for blocks, receipts, and logs. A [`Secret`], since
-    /// a provider's URL usually carries its API key. Named with `ws_url`, or not at all.
+    /// The one source the table names.
     ///
-    /// What ingest fetches is not set here: it is what the sinks' `tables` need (see
-    /// [`crate::sink::route::datasets`]).
-    #[serde(default)]
-    pub http_url: Option<Secret>,
-    /// The WebSocket endpoint used for heads. A [`Secret`], like `http_url`, and named
-    /// with it.
-    #[serde(default)]
-    pub ws_url: Option<Secret>,
-    /// Backfill from Envio `HyperSync` instead of an RPC node, and stop.
-    #[serde(default)]
-    pub hypersync: Option<HyperSyncSettings>,
+    /// What ingest fetches from it is not set here: it is what the sinks' `tables` need
+    /// (see [`crate::sink::route::datasets`]).
+    pub source: IngestSource,
     /// The first height to index on an empty store. Omitted starts at the observed head,
     /// which skips earlier history; a value indexes that height and every one after it
     /// before following live heads. A value above the sampled head is a startup error
@@ -140,7 +131,6 @@ pub struct IngestSettings {
     /// ignored, and one above it is a startup error, since it would leave a gap.
     /// A `HyperSync` backfill on an empty store needs it, since a backfill that starts at
     /// the head has nothing to do.
-    #[serde(default)]
     pub start_block: Option<u64>,
     /// The last height to index. Omitted follows live heads without end; a value indexes
     /// through that height and exits instead of following the chain. A value above the
@@ -149,15 +139,51 @@ pub struct IngestSettings {
     ///
     /// A stop inside the reorg window under the head is indexed as the chain stood then:
     /// a fork that later replaces it is not retracted, since no run follows it.
-    #[serde(default)]
     pub stop_block: Option<u64>,
-    /// How many backfill fetches are in flight at once. Blocks are still accepted one at a
-    /// time, in height order; this only overlaps the requests, so the node is read while
-    /// the stores write. Zero is refused. Each fetch counts against the provider's rate
-    /// limit, so a provider that throttles hard wants this low. A `HyperSync` backfill
-    /// ignores it and fetches one range at a time, since each range is far larger.
-    #[serde(default = "default_backfill_concurrency")]
-    pub backfill_concurrency: NonZeroUsize,
+}
+
+/// The source `[ingest]` names.
+#[derive(Debug)]
+pub enum IngestSource {
+    /// A node's JSON-RPC for blocks, and its WebSocket for heads.
+    Rpc {
+        /// `http_url`: the JSON-RPC endpoint used for blocks, receipts, and logs. A
+        /// [`Secret`], since a provider's URL usually carries its API key.
+        http_url: Secret,
+        /// `ws_url`: the WebSocket endpoint used for heads. A [`Secret`], like
+        /// `http_url`.
+        ws_url: Secret,
+        /// `backfill_concurrency`: how many backfill fetches are in flight at once.
+        /// Blocks are still accepted one at a time, in height order; this only overlaps
+        /// the requests, so the node is read while the stores write. Zero is refused, and
+        /// omitted is four. Each fetch counts against the provider's rate limit, so a
+        /// provider that throttles hard wants this low.
+        backfill_concurrency: NonZeroUsize,
+    },
+    /// `[ingest.hypersync]`: Envio `HyperSync`, for a backfill that stops at the reorg
+    /// window. It fetches one range at a time, since each range is far larger than an
+    /// RPC node's, so it takes no `backfill_concurrency`.
+    HyperSync(HyperSyncSettings),
+}
+
+/// `[ingest]` as written, which [`IngestSettings`] is resolved from.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct IngestTable {
+    #[serde(deserialize_with = "non_empty")]
+    chain: String,
+    #[serde(default)]
+    http_url: Option<Secret>,
+    #[serde(default)]
+    ws_url: Option<Secret>,
+    #[serde(default)]
+    hypersync: Option<HyperSyncSettings>,
+    #[serde(default)]
+    start_block: Option<u64>,
+    #[serde(default)]
+    stop_block: Option<u64>,
+    #[serde(default)]
+    backfill_concurrency: Option<NonZeroUsize>,
 }
 
 /// Four: enough to keep the node busy while a store commits, few enough that a
@@ -166,41 +192,43 @@ const fn default_backfill_concurrency() -> NonZeroUsize {
     NonZeroUsize::MIN.saturating_add(3)
 }
 
-/// The source `[ingest]` names, as [`IngestSettings::source`] resolves it.
-#[derive(Debug, Clone, Copy)]
-pub enum IngestSource<'a> {
-    /// A node's JSON-RPC for blocks, and its WebSocket for heads.
-    Rpc {
-        /// The JSON-RPC endpoint.
-        http_url: &'a Secret,
-        /// The WebSocket endpoint.
-        ws_url: &'a Secret,
-    },
-    /// Envio `HyperSync`, for a backfill that stops at the reorg window.
-    HyperSync(&'a HyperSyncSettings),
-}
+impl TryFrom<IngestTable> for IngestSettings {
+    type Error = &'static str;
 
-impl IngestSettings {
-    /// The one source these settings name.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`SettingsError::IngestSource`] when they name neither an RPC node nor
-    /// `HyperSync`, only one of the RPC node's two endpoints, or both sources.
-    pub fn source(&self) -> Result<IngestSource<'_>, SettingsError> {
-        match (&self.http_url, &self.ws_url, &self.hypersync) {
-            (Some(http_url), Some(ws_url), None) => Ok(IngestSource::Rpc { http_url, ws_url }),
-            (None, None, Some(hypersync)) => Ok(IngestSource::HyperSync(hypersync)),
-            (None, None, None) => Err(SettingsError::IngestSource(
-                "name http_url and ws_url, or [ingest.hypersync]",
-            )),
-            (_, _, Some(_)) => Err(SettingsError::IngestSource(
-                "[ingest.hypersync] replaces http_url and ws_url; name one or the other",
-            )),
-            _ => Err(SettingsError::IngestSource(
-                "http_url and ws_url are named together",
-            )),
-        }
+    /// Resolves the one source the table names, refusing neither, half of the RPC pair,
+    /// both, or `backfill_concurrency` beside `HyperSync`.
+    fn try_from(table: IngestTable) -> Result<Self, Self::Error> {
+        let source = match (table.http_url, table.ws_url, table.hypersync) {
+            (Some(http_url), Some(ws_url), None) => IngestSource::Rpc {
+                http_url,
+                ws_url,
+                backfill_concurrency: table
+                    .backfill_concurrency
+                    .unwrap_or_else(default_backfill_concurrency),
+            },
+            (None, None, Some(hypersync)) => {
+                if table.backfill_concurrency.is_some() {
+                    return Err("[ingest] backfill_concurrency is for http_url and ws_url; \
+                         [ingest.hypersync] fetches one range at a time");
+                }
+                IngestSource::HyperSync(hypersync)
+            }
+            (None, None, None) => {
+                return Err("[ingest] name http_url and ws_url, or [ingest.hypersync]");
+            }
+            (_, _, Some(_)) => {
+                return Err(
+                    "[ingest.hypersync] replaces http_url and ws_url; name one or the other",
+                );
+            }
+            _ => return Err("[ingest] http_url and ws_url are named together"),
+        };
+        Ok(Self {
+            chain: table.chain,
+            source,
+            start_block: table.start_block,
+            stop_block: table.stop_block,
+        })
     }
 }
 
@@ -355,9 +383,6 @@ pub enum SettingsError {
     /// `[sink.stdout]` is named beside a store.
     #[error("invalid settings: [sink.stdout] cannot be named beside a store")]
     StdoutBesideStore,
-    /// `[ingest]` names no source, half of one, or two.
-    #[error("invalid settings: [ingest] {0}")]
-    IngestSource(&'static str),
 }
 
 impl std::str::FromStr for Settings {
@@ -375,7 +400,6 @@ impl std::str::FromStr for Settings {
     fn from_str(text: &str) -> Result<Self, SettingsError> {
         let settings: Self =
             toml::from_str(text).map_err(|source| SettingsError::Parse { source })?;
-        settings.ingest.source()?;
         settings.sink.check()?;
         Ok(settings)
     }
@@ -387,8 +411,8 @@ impl Settings {
     /// # Errors
     ///
     /// Returns [`SettingsError::Read`] when the file cannot be read,
-    /// [`SettingsError::Parse`] when it does not parse or a required value is absent,
-    /// [`SettingsError::IngestSource`] when `[ingest]` does not name one source, and
+    /// [`SettingsError::Parse`] when it does not parse, a required value is absent, or
+    /// `[ingest]` does not name one source, and
     /// [`SettingsError::NoSink`] or [`SettingsError::StdoutBesideStore`] when its sinks
     /// cannot run. A
     /// malformed file reports its line and column; an unknown field is an error rather
@@ -525,36 +549,57 @@ tables = ["blocks"]
         assert!(Settings::from_str(&unknown).is_err());
     }
 
-    /// `[ingest]` names one source: both RPC endpoints, or `HyperSync`.
+    /// `[ingest]` names one source: both RPC endpoints, or `HyperSync`, and only the keys
+    /// that source reads.
     #[test]
     fn ingest_names_one_source() {
-        let hypersync = minimal().replace(
-            "http_url = \"https://example.invalid\"\nws_url = \"wss://example.invalid\"\n",
-            "\n[ingest.hypersync]\nurl = \"https://4663.hypersync.xyz\"\ntoken = \"secret-token\"\n",
-        );
-        let settings = Settings::from_str(&hypersync).expect("hypersync alone parses");
-        let Ok(super::IngestSource::HyperSync(source)) = settings.ingest.source() else {
+        /// `[ingest]` with `keys` after its chain, and a sink.
+        fn ingest(keys: &str) -> String {
+            format!("[ingest]\nchain = \"base\"\n{keys}\n[sink.stdout]\ntables = [\"blocks\"]\n")
+        }
+        let rpc = "http_url = \"https://example.invalid\"\nws_url = \"wss://example.invalid\"\n";
+        let hypersync =
+            "[ingest.hypersync]\nurl = \"https://4663.hypersync.xyz\"\ntoken = \"secret-token\"\n";
+
+        let settings = Settings::from_str(&ingest(hypersync)).expect("hypersync alone parses");
+        let super::IngestSource::HyperSync(source) = &settings.ingest.source else {
             panic!("expected HyperSync");
         };
         assert_eq!(source.url, "https://4663.hypersync.xyz");
         assert!(!format!("{settings:?}").contains("secret-token"));
 
-        let both = format!(
-            "{}\n[ingest.hypersync]\nurl = \"https://4663.hypersync.xyz\"\ntoken = \"t\"\n",
-            minimal().replace("[sink.stdout]\ntables = [\"blocks\"]\n", "")
-        ) + "\n[sink.stdout]\ntables = [\"blocks\"]\n";
-        let neither = minimal().replace(
-            "http_url = \"https://example.invalid\"\nws_url = \"wss://example.invalid\"\n",
-            "",
-        );
-        let half = minimal().replace("ws_url = \"wss://example.invalid\"\n", "");
-        for (case, text) in [("both", both), ("neither", neither), ("half", half)] {
+        let settings = Settings::from_str(&ingest(rpc)).expect("rpc alone parses");
+        let super::IngestSource::Rpc {
+            backfill_concurrency,
+            ..
+        } = settings.ingest.source
+        else {
+            panic!("expected RPC");
+        };
+        assert_eq!(backfill_concurrency.get(), 4, "the default");
+
+        for (case, keys, refusal) in [
+            (
+                "both",
+                format!("{rpc}{hypersync}"),
+                "replaces http_url and ws_url",
+            ),
+            ("neither", String::new(), "name http_url and ws_url"),
+            (
+                "half",
+                "http_url = \"https://example.invalid\"\n".to_owned(),
+                "named together",
+            ),
+            (
+                "concurrency beside hypersync",
+                format!("backfill_concurrency = 2\n{hypersync}"),
+                "backfill_concurrency is for http_url",
+            ),
+        ] {
+            let error = Settings::from_str(&ingest(&keys)).expect_err(case);
             assert!(
-                matches!(
-                    Settings::from_str(&text),
-                    Err(SettingsError::IngestSource(_))
-                ),
-                "{case}"
+                matches!(error, SettingsError::Parse { .. }) && error.to_string().contains(refusal),
+                "{case}: {error}"
             );
         }
     }
@@ -617,7 +662,10 @@ tables = ["blocks"]
         )
         .expect("both forms parse");
 
-        let Ok(super::IngestSource::Rpc { http_url, ws_url }) = settings.ingest.source() else {
+        let super::IngestSource::Rpc {
+            http_url, ws_url, ..
+        } = &settings.ingest.source
+        else {
             panic!("expected an RPC source");
         };
         assert_eq!(http_url.expose(), "https://example.invalid/v2/literal-key");

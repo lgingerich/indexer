@@ -32,6 +32,7 @@ use futures_util::Stream;
 use thiserror::Error;
 
 mod any_source;
+mod assemble;
 mod datasets;
 pub mod evm;
 pub mod hypersync;

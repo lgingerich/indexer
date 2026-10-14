@@ -199,7 +199,7 @@ impl NetworkError {
     }
 }
 
-/// One source's shared delay and jitter, and the bookkeeping of each retry: what
+/// One source's shared delay and jitter, and the loop every request is retried in: what
 /// [`RetryLayer`] wraps a JSON-RPC transport in, and what the `HyperSync` source sends
 /// its requests through. See the [module docs](self).
 #[derive(Debug, Clone)]
@@ -218,40 +218,43 @@ impl Backoff {
         }
     }
 
-    /// Waits out the shared delay, then marks a request about to be sent, for
-    /// [`retry`](Self::retry).
-    pub(crate) async fn ready(&self) -> u64 {
-        let delay = self.pacing.current();
-        if delay > 0 {
-            tokio::time::sleep(self.jitter.delay(delay)).await;
+    /// Sends a request through `attempt` until it settles: after the shared delay each
+    /// time, and again while `transient` names a cause, up to [`MAX_RETRIES`] retries.
+    /// The last answer is returned as it was. `source` names who is retrying, in the log
+    /// and the retry metric.
+    pub(crate) async fn run<T, F: Future<Output = T>>(
+        &self,
+        source: &'static str,
+        mut attempt: impl FnMut() -> F,
+        transient: impl Fn(&T) -> Option<String>,
+    ) -> T {
+        let mut retries = 0;
+        loop {
+            let delay = self.pacing.current();
+            if delay > 0 {
+                tokio::time::sleep(self.jitter.delay(delay)).await;
+            }
+            let mark = self.pacing.sent();
+            let result = attempt().await;
+            let Some(cause) = transient(&result) else {
+                self.pacing.speed_up();
+                return result;
+            };
+            let delay = self.pacing.slow_down(mark);
+            if retries == MAX_RETRIES {
+                return result;
+            }
+            retries += 1;
+            metrics::source_retry(source);
+            warn!(
+                source,
+                retry = retries,
+                max_retries = MAX_RETRIES,
+                delay_ms = delay,
+                %cause,
+                "request failed transiently; backing off"
+            );
         }
-        self.pacing.sent()
-    }
-
-    /// Records a request that succeeded, or failed for good: the delay shrinks.
-    pub(crate) fn settled(&self) {
-        self.pacing.speed_up();
-    }
-
-    /// Records a transient failure, for `cause`, of a request [`ready`](Self::ready) at
-    /// `mark` after `retries` retries, and whether to send it again. After
-    /// [`MAX_RETRIES`] it is not, and the caller returns the last error as it was.
-    pub(crate) fn retry(&self, mark: u64, retries: &mut u32, cause: &str, source: &str) -> bool {
-        let delay = self.pacing.slow_down(mark);
-        if *retries == MAX_RETRIES {
-            return false;
-        }
-        *retries += 1;
-        metrics::rpc_retry();
-        warn!(
-            source,
-            retry = *retries,
-            max_retries = MAX_RETRIES,
-            delay_ms = delay,
-            %cause,
-            "request failed transiently; backing off"
-        );
-        true
     }
 }
 
@@ -324,28 +327,41 @@ where
         // Tower's contract: the service polled ready takes the call, so keep it for this
         // request and leave a fresh clone behind.
         let clone = self.inner.clone();
-        let mut inner = std::mem::replace(&mut self.inner, clone);
+        let mut polled = Some(std::mem::replace(&mut self.inner, clone));
+        // Each retry sends through a clone of its own, polled ready first.
+        let retries = self.inner.clone();
         let backoff = self.backoff.clone();
         Box::pin(async move {
-            let mut retries = 0;
-            loop {
-                let mark = backoff.ready().await;
-                let result = inner
-                    .call(request.clone())
-                    .await
-                    .map_err(NetworkError::from_transport);
-                if timed_out(&result) && request.requests().iter().any(spans_heights) {
-                    return result;
-                }
-                let Some(cause) = transient(&request, &result) else {
-                    backoff.settled();
-                    return result;
-                };
-                if !backoff.retry(mark, &mut retries, &cause, "rpc") {
-                    return result;
-                }
-                std::future::poll_fn(|cx| inner.poll_ready(cx)).await?;
-            }
+            let request = &request;
+            let ranged = request.requests().iter().any(spans_heights);
+            backoff
+                .run(
+                    "rpc",
+                    move || {
+                        let (mut inner, ready) = match polled.take() {
+                            Some(inner) => (inner, true),
+                            None => (retries.clone(), false),
+                        };
+                        let request = request.clone();
+                        async move {
+                            if !ready {
+                                std::future::poll_fn(|cx| inner.poll_ready(cx)).await?;
+                            }
+                            inner
+                                .call(request)
+                                .await
+                                .map_err(NetworkError::from_transport)
+                        }
+                    },
+                    |result| {
+                        // A ranged log query that timed out goes back to be split.
+                        if ranged && timed_out(result) {
+                            return None;
+                        }
+                        transient(request, result)
+                    },
+                )
+                .await
         })
     }
 }
