@@ -84,9 +84,10 @@ use deltalake::logstore::{ObjectStoreRef, store_for};
 use deltalake::parquet::basic::{Compression, ZstdLevel};
 use deltalake::parquet::file::properties::WriterProperties;
 use deltalake::protocol::SaveMode;
-use deltalake::{DeltaTable, DeltaTableBuilder, DeltaTableError, ensure_table_uri};
+use deltalake::{DeltaTable, DeltaTableBuilder, DeltaTableError, checkpoints, ensure_table_uri};
 use futures_util::stream::{self, StreamExt as _, TryStreamExt as _};
 use serde::Deserialize;
+use tokio::task::JoinHandle;
 use tokio::time::Instant;
 use tracing::{info, warn};
 
@@ -114,6 +115,10 @@ const ROWS_PER_BATCH: usize = 1 << 16;
 /// A committed batch at least this large is freed on a thread of its own, off the
 /// commit's path: half a million rows took a tenth of a second to drop.
 const DROP_ASIDE_ROWS: usize = 1 << 14;
+
+/// How many versions of a table pass between the checkpoints the store starts: delta-rs's
+/// own default interval.
+const CHECKPOINT_EVERY: u64 = 100;
 
 /// The `contracts` columns a restore reads back.
 const CONTRACT_COLUMNS: [&str; 4] = ["protocol", "name", "address", "block_hash"];
@@ -224,11 +229,37 @@ struct Lake {
     def: Arc<TableDef>,
     arrow: Arc<ArrowSchema>,
     table: DeltaTable,
+    /// The newest version a checkpoint was started for, or the version the table opened
+    /// at: the next is due [`CHECKPOINT_EVERY`] versions later.
+    checkpointed: u64,
 }
 
 impl Lake {
     fn name(&self) -> &str {
         &self.def.name
+    }
+
+    /// Takes `table`, the table as of a commit this process made, and starts a checkpoint
+    /// in the background once [`CHECKPOINT_EVERY`] versions have passed since the last.
+    ///
+    /// delta-rs would write it inside the commit that reaches the interval, rebuilding the
+    /// table's state from storage first, which held that commit up for ten seconds and
+    /// more. A checkpoint only shortens how much log a later open reads; any version it
+    /// is written for is as good, so it runs beside the writer, and a failed one is
+    /// logged and left to the next.
+    fn committed(&mut self, table: DeltaTable) {
+        let version = table.version().unwrap_or_default();
+        if version.saturating_sub(self.checkpointed) >= CHECKPOINT_EVERY {
+            self.checkpointed = version;
+            let name = self.def.name.clone();
+            let snapshot = table.clone();
+            tokio::spawn(async move {
+                if let Err(error) = checkpoints::create_checkpoint(&snapshot, None).await {
+                    warn!(table = %name, version, %error, "lake checkpoint failed; the next is due later");
+                }
+            });
+        }
+        self.table = table;
     }
 
     /// `rows` as this table's Arrow batch: the CPU half of an append.
@@ -278,7 +309,7 @@ impl Lake {
             .with_commit_properties(commit_properties())
             .await
             .map_err(StoreError::engine(Operation::Delete, Some(&self.def.name)))?;
-        self.table = table;
+        self.committed(table);
         Ok(())
     }
 
@@ -343,6 +374,11 @@ pub struct DeltaSink {
     /// The background compaction and vacuum, when the settings ask for it. Held, never
     /// read: dropping the store stops the task.
     maintenance: Option<Maintenance>,
+    /// The last commit's ledger append, still running: it overlaps the next commit's
+    /// table appends (see [`write`](Self::write)), and is waited for before anything
+    /// else touches the ledger, before the next one starts, and by
+    /// [`finish`](EnvelopeSink::finish).
+    ledger: Option<JoinHandle<Result<DeltaTable, StoreError>>>,
 }
 
 impl DeltaSink {
@@ -395,6 +431,7 @@ impl DeltaSink {
                 .build(),
             published_tip: Arc::new(AtomicU64::new(0)),
             maintenance: None,
+            ledger: None,
         };
         let ledger = sink.read_ledger().await?;
         sink.repair(&ledger).await?;
@@ -632,7 +669,8 @@ impl DeltaSink {
         }
         let lake = &mut self.lakes[position];
         let batch = lake.record_batch(rows)?;
-        lake.table = lake.append(&self.writer, vec![batch]).await?;
+        let table = lake.append(&self.writer, vec![batch]).await?;
+        lake.committed(table);
         Ok(())
     }
 
@@ -666,7 +704,8 @@ impl DeltaSink {
     /// 2. the orphans out of the ledger, then out of every other table;
     /// 3. every table's rows, all at once: each table has its own log, and no rule orders
     ///    one table's rows against another's;
-    /// 4. the new blocks into the ledger, once their rows are all present.
+    /// 4. the new blocks into the ledger, once their rows are all present, running on
+    ///    while the next commit's rows are appended (see [`start_ledger`](Self::start_ledger)).
     ///
     /// A failure part-way leaves the lake as the next open repairs it. The batch is not
     /// kept for a retry: the store refuses every later write with
@@ -699,6 +738,11 @@ impl DeltaSink {
             .unwrap_or_default();
         let orphans = self.committed_orphans(&batch);
 
+        // A retraction's steps are ordered against the ledger, so it waits for the last
+        // one; a commit without one never does.
+        if !reorgs.is_empty() || orphans.is_some() {
+            self.settle_ledger().await?;
+        }
         self.append_some(self.position(Table::Reorg), &reorgs)
             .await?;
         if let Some((floor, hashes)) = &orphans {
@@ -713,12 +757,17 @@ impl DeltaSink {
         let batches = self.record_batches(&appends)?;
         let built = built.elapsed();
         let written = Instant::now();
-        self.append_all(batches).await?;
+        let appended = self.append_all(batches).await;
         let written = written.elapsed();
+        // The last commit's ledger append ran beside these appends; this waits out what is
+        // left of it, which is usually nothing. Waited for even when an append failed, so
+        // it is not left running.
         let ledger = Instant::now();
-        self.append_some(self.position(Table::AcceptedBlock), &accepted)
-            .await?;
+        let settled = self.settle_ledger().await;
         let ledger = ledger.elapsed();
+        appended?;
+        settled?;
+        self.start_ledger(&accepted)?;
 
         let first = accepted.iter().filter_map(|row| row.block_number()).min();
         let orphaned = orphans.map(|(_, hashes)| hashes).unwrap_or_default();
@@ -732,7 +781,7 @@ impl DeltaSink {
             tables = appends.len(),
             build_ms = millis(built),
             write_ms = millis(written),
-            ledger_ms = millis(ledger),
+            ledger_wait_ms = millis(ledger),
             elapsed_ms = millis(started.elapsed()),
             "lake commit"
         );
@@ -742,6 +791,38 @@ impl DeltaSink {
         }
         batch.clear();
         self.batch = batch;
+        Ok(())
+    }
+
+    /// Starts appending `accepted` to the ledger, on a task of its own, and returns: the
+    /// rows of these blocks are all present, so their entries may go in any time, and the
+    /// next commit's table appends overlap them, which takes a whole commit's round trips
+    /// off every commit. A failure surfaces when it is next waited for.
+    ///
+    /// Safe for the reason the ledger is written last at all: until an entry lands, its
+    /// block's rows are rows the ledger does not name, which a reopen deletes and ingest
+    /// fetches again. Every later commit's rows are, too, until its own entry lands.
+    fn start_ledger(&mut self, accepted: &[&Row]) -> Result<(), StoreError> {
+        if accepted.is_empty() {
+            return Ok(());
+        }
+        let lake = &self.lakes[self.position(Table::AcceptedBlock)];
+        let batch = lake.record_batch(accepted)?;
+        self.ledger = Some(tokio::spawn(lake.append(&self.writer, vec![batch])));
+        Ok(())
+    }
+
+    /// Waits for the ledger append [`start_ledger`](Self::start_ledger) left running, if
+    /// any, and takes the ledger as of it.
+    async fn settle_ledger(&mut self) -> Result<(), StoreError> {
+        let Some(task) = self.ledger.take() else {
+            return Ok(());
+        };
+        let table = task
+            .await
+            .unwrap_or_else(|join| std::panic::resume_unwind(join.into_panic()))?;
+        let position = self.position(Table::AcceptedBlock);
+        self.lakes[position].committed(table);
         Ok(())
     }
 
@@ -795,7 +876,7 @@ impl DeltaSink {
         let mut failure = None;
         for (position, task) in tasks {
             match task.await {
-                Ok(Ok(table)) => self.lakes[position].table = table,
+                Ok(Ok(table)) => self.lakes[position].committed(table),
                 Ok(Err(error)) => {
                     failure.get_or_insert(error);
                 }
@@ -908,6 +989,7 @@ impl DeltaSink {
 /// repair left it, and the contracts it kept.
 impl Store for DeltaSink {
     async fn restore(&mut self) -> Result<Restored, StoreError> {
+        self.settle_ledger().await?;
         Ok(Restored {
             contracts: self.contracts().await?,
             ledger: self.read_ledger().await?,
@@ -924,7 +1006,10 @@ impl Store for DeltaSink {
         if self.failed {
             return Err(StoreError::Failed);
         }
-        let rewound = self.delete_above(height).await;
+        let rewound = match self.settle_ledger().await {
+            Ok(()) => self.delete_above(height).await,
+            Err(error) => Err(error),
+        };
         self.failed = rewound.is_err();
         rewound?;
         self.committed.retain(|_, committed| *committed <= height);
@@ -958,6 +1043,18 @@ impl EnvelopeSink for DeltaSink {
 
     fn buffered_bytes(&self) -> usize {
         self.batch.bytes()
+    }
+
+    /// Waits for the last commit's ledger append, so its blocks count once the stream
+    /// ends. Final on failure, as a commit is.
+    async fn finish(&mut self) -> Result<(), SinkError> {
+        if self.failed {
+            return Err(StoreError::Failed.into());
+        }
+        let settled = self.settle_ledger().await;
+        self.failed = settled.is_err();
+        settled?;
+        Ok(())
     }
 }
 
@@ -1000,15 +1097,17 @@ impl Storage {
 }
 
 /// How every commit to the lake is made, by the store and by `maintenance` alike: without
-/// delta-rs's cleanup of expired log entries.
+/// delta-rs's cleanup of expired log entries, and without its checkpoints.
 ///
 /// delta-rs otherwise runs that cleanup after every commit, and it lists the table's whole
 /// `_delta_log` to do it, a list request per thousand entries. A table committed to at the
 /// tip gains thousands of entries a day and keeps a month of them, so each commit would
 /// cost tens of requests, and more every day. `maintenance` cleans each log once a day
-/// instead.
+/// instead. Checkpoints are started beside the writer (see [`Lake::committed`]).
 fn commit_properties() -> CommitProperties {
-    CommitProperties::default().with_cleanup_expired_logs(Some(false))
+    CommitProperties::default()
+        .with_cleanup_expired_logs(Some(false))
+        .with_create_checkpoint(false)
 }
 
 /// Opens the table of `def` at `uri`, creating it when it does not exist, and checks an
@@ -1045,10 +1144,12 @@ async fn open_table(
     }
     let arrow =
         arrow::arrow_schema(def).map_err(StoreError::engine(Operation::Create, Some(name)))?;
+    let checkpointed = table.version().unwrap_or_default();
     Ok(Lake {
         def: Arc::clone(def),
         arrow,
         table,
+        checkpointed,
     })
 }
 

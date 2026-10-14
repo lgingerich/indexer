@@ -247,6 +247,7 @@ impl ChannelReceiver {
         if pending > 0 {
             stored += self.flush(sink, &mut pending).await?;
         }
+        sink.finish().await?;
         self.progress.finish(
             progress::sampled_head(self.head.load(Ordering::Acquire)),
             Instant::now(),

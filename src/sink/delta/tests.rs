@@ -141,10 +141,13 @@ async fn buffer(sink: &mut DeltaSink, envelopes: Vec<Envelope>) {
     }
 }
 
-/// Hands `envelopes` to the lake and commits them.
+/// Hands `envelopes` to the lake and commits them, the ledger entries included: a
+/// commit's ledger append runs on past its flush, so this waits for it as the end of a
+/// stream does.
 async fn publish(sink: &mut DeltaSink, envelopes: Vec<Envelope>) {
     buffer(sink, envelopes).await;
     sink.flush().await.expect("flushed");
+    sink.finish().await.expect("the ledger appended");
 }
 
 /// The distinct values of `column` the lake holds in `table`.
@@ -889,4 +892,53 @@ async fn a_table_larger_than_one_batch_commits_every_row() {
     let mut sink = open(&dir).await;
     assert_eq!(stored(&sink, Table::Log, "dedupe_key").await.len(), logs);
     assert_eq!(ledger(&mut sink).await.len(), 1);
+}
+
+/// A commit's ledger append runs on past its flush, beside the next commit's appends,
+/// and a restore waits for it: every block committed is in the ledger it reads.
+#[tokio::test]
+async fn a_ledger_append_overlaps_the_next_commit() {
+    let dir = Dir::new();
+    let mut sink = open(&dir).await;
+    for height in 1..=3 {
+        buffer(&mut sink, block(height, 0)).await;
+        sink.flush().await.expect("flushed");
+    }
+    assert_eq!(
+        ledger(&mut sink)
+            .await
+            .iter()
+            .map(|block| block.height)
+            .collect::<Vec<_>>(),
+        [1, 2, 3]
+    );
+    assert_eq!(blocks(&sink).await, expected(&[(1, 0), (2, 0), (3, 0)]));
+}
+
+/// The store checkpoints a table beside its writes once enough versions pass, rather
+/// than inside the commit that reaches the interval.
+#[tokio::test]
+async fn a_checkpoint_is_written_beside_the_commits() {
+    let dir = Dir::new();
+    let mut sink = open(&dir).await;
+    let commits = super::CHECKPOINT_EVERY + 1;
+    for height in 1..=commits {
+        publish(&mut sink, block(height, 0)).await;
+    }
+    let log = PathBuf::from(dir.table("accepted_blocks")).join("_delta_log");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        let checkpointed = std::fs::read_dir(&log)
+            .expect("the log")
+            .flatten()
+            .any(|entry| entry.file_name().to_string_lossy().contains(".checkpoint."));
+        if checkpointed {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no checkpoint was written"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
 }

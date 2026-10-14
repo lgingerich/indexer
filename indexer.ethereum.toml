@@ -54,6 +54,9 @@ endpoint = { env = "S3_ENDPOINT" }
 region = "auto"
 access_key_id = { env = "S3_ACCESS_KEY_ID" }
 secret_access_key = { env = "S3_SECRET_ACCESS_KEY" }
+# How long an idle connection to R2 is kept for reuse. The client's default, 90 s, is
+# shorter than a commit interval, so every commit at the tip opened new connections.
+pool_idle_timeout = "5m"
 
 # Every protocol manifest under `protocols/`; each lists its addresses per chain.
 [decode]

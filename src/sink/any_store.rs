@@ -49,6 +49,10 @@ impl EnvelopeSink for AnyStore {
         each!(self, sink => sink.flush().await)
     }
 
+    async fn finish(&mut self) -> Result<(), SinkError> {
+        each!(self, sink => sink.finish().await)
+    }
+
     fn buffered_bytes(&self) -> usize {
         each!(self, sink => sink.buffered_bytes())
     }

@@ -117,6 +117,16 @@ pub trait EnvelopeSink: Send {
         async { Ok(()) }
     }
 
+    /// Waits for what a flush left running, once nothing more will be published. A sink
+    /// whose flush is whole when it returns has nothing to wait for, which is the default.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if what was left running failed.
+    fn finish(&mut self) -> impl Future<Output = Result<(), SinkError>> + Send {
+        async { Ok(()) }
+    }
+
     /// Roughly how many bytes the sink holds that the next flush would write, as they
     /// sit in memory. The storage drain flushes early once this passes its limit.
     ///
