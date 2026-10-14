@@ -3,9 +3,10 @@
 //!
 //! `HyperSync` is a hosted copy of a chain's history served through one filtering query
 //! endpoint, so a range that costs an RPC node one call per height comes back in a
-//! single response. It has no live heads: a run on it backfills the buried heights and
-//! stops (see [`crate::ingest::pipeline::Machine::backfill_buried`]), and following the chain
-//! is a restart on an RPC source, which resumes after what this run committed.
+//! single response. It has no live heads, so it does not
+//! [follow them](BlockSource::follows_heads): a run on it backfills the buried heights and
+//! stops, and following the chain is a restart on an RPC source, which resumes after what
+//! this run committed.
 //!
 //! # Wire format
 //!
@@ -25,39 +26,36 @@
 //! Every block in the requested range is asked for (`include_all_blocks`), so a height
 //! with nothing selected still has its identity, and the pipeline still links it to its
 //! parent. Within a block, transactions must be in index order with no gap, and logs in
-//! `log_index` order, each naming the block it was returned for. The same two guards the
-//! RPC source applies catch a backend that answers short: logs are required when the
-//! header's `logsBloom` is set, and with transactions read, the last receipt's cumulative
-//! gas must be the block's `gas_used`, so a dropped transaction cannot pass unseen.
+//! `log_index` order, each naming the block it was returned for. Two guards catch a
+//! backend that answers short. Logs are required when the header's `logsBloom` is set,
+//! as the RPC source requires them. And wherever transactions are read, the last one's
+//! cumulative gas must be the block's `gas_used`: the RPC source counts a receipt per
+//! transaction instead, which cannot fail here, where each row is a transaction joined to
+//! its receipt, so this is the check that a trailing transaction was not dropped.
 //!
 //! [Envio HyperSync]: https://docs.envio.dev/docs/`HyperSync`/overview
 
 use std::fmt;
-use std::num::NonZeroUsize;
 use std::time::Duration;
 
 use alloy_primitives::{Address, B64, B256, Bloom, Bytes, TxHash, U256};
 use alloy_rpc_types_eth::{
     AccessList, AccessListItem, Authorization, SignedAuthorization, Withdrawal,
 };
+use futures_util::stream;
 use serde::de::{self, DeserializeOwned};
 use serde::{Deserialize, Deserializer, Serialize};
-use tracing::warn;
 
-use super::{BlockSource, Datasets, FetchedBlock, HeadStream, SourceError};
+use super::retry::{Backoff, os_seed, transient_status};
+use super::{
+    BlockSource, Datasets, FetchedBlock, HeadStream, SourceError, inconsistent, malformed,
+};
 use crate::wire::datasets::evm::{Block, Log, Transaction};
 use crate::wire::envelope::{BlockMeta, ChainId, Event};
 
 /// The context every error from this source names.
 const CONTEXT: &str = "hypersync";
 
-/// Retries after the first attempt, for a refused rate, an overloaded backend, or a
-/// dropped connection. The waits add up to a few minutes, as the RPC source's do.
-const MAX_RETRIES: u32 = 10;
-/// The wait after a first failure, doubled on each one after.
-const MIN_DELAY: Duration = Duration::from_millis(250);
-/// The longest wait.
-const MAX_DELAY: Duration = Duration::from_secs(30);
 /// Heights backfill asks for in one [`BlockSource::fetch_blocks`] call. One response
 /// covers anywhere from a few dozen heights on a busy stretch to tens of thousands on a
 /// quiet one, so a range is paged through as many requests as it takes; this bounds how
@@ -78,78 +76,14 @@ const IDENTITY_FIELDS: &[&str] = &[
     "gas_used",
 ];
 
-/// Every field the `blocks` dataset carries.
-const BLOCK_FIELDS: &[&str] = &[
-    "number",
-    "hash",
-    "parent_hash",
-    "timestamp",
-    "nonce",
-    "sha3_uncles",
-    "transactions_root",
-    "state_root",
-    "receipts_root",
-    "withdrawals_root",
-    "logs_bloom",
-    "miner",
-    "difficulty",
-    "total_difficulty",
-    "size",
-    "extra_data",
-    "gas_limit",
-    "gas_used",
-    "base_fee_per_gas",
-    "blob_gas_used",
-    "excess_blob_gas",
-    "parent_beacon_block_root",
-    "mix_hash",
-    "withdrawals",
-    "l1_block_number",
-    "send_count",
-    "send_root",
-    "uncles",
-];
-
-/// A transaction's place in its block: what a block row lists, and nothing else.
-const TRANSACTION_HASH_FIELDS: &[&str] =
-    &["block_hash", "block_number", "transaction_index", "hash"];
-
-/// Every field the `transactions` dataset carries, receipt fields included.
-const TRANSACTION_FIELDS: &[&str] = &[
+/// A transaction's place in its block: what a block row lists, and the cumulative gas
+/// that shows none is missing.
+const TRANSACTION_POSITION_FIELDS: &[&str] = &[
     "block_hash",
     "block_number",
     "transaction_index",
     "hash",
-    "nonce",
-    "from",
-    "to",
-    "value",
-    "gas",
-    "gas_price",
-    "max_fee_per_gas",
-    "max_priority_fee_per_gas",
-    "max_fee_per_blob_gas",
-    "input",
-    "type",
-    "chain_id",
-    "access_list",
-    "blob_versioned_hashes",
-    "authorization_list",
-    "r",
-    "s",
-    "v",
-    "y_parity",
-    "status",
-    "root",
-    "gas_used",
     "cumulative_gas_used",
-    "effective_gas_price",
-    "contract_address",
-    "logs_bloom",
-    "blob_gas_used",
-    "blob_gas_price",
-    "gas_used_for_l1",
-    "l1_block_number",
 ];
 
 /// A log's place in its block: enough to count a transaction's logs.
@@ -160,21 +94,124 @@ const LOG_POSITION_FIELDS: &[&str] = &[
     "log_index",
 ];
 
-/// Every field the `logs` dataset carries.
-const LOG_FIELDS: &[&str] = &[
-    "block_hash",
-    "block_number",
-    "transaction_index",
-    "transaction_hash",
-    "log_index",
-    "address",
-    "data",
-    "topic0",
-    "topic1",
-    "topic2",
-    "topic3",
-    "removed",
-];
+/// The columns one query selects, decided once from the dataset selection.
+///
+/// This is the whole fetch policy; the query, the checks, and the projection read it
+/// rather than the selection, so the table below is the one place the choice is made:
+///
+/// | Selected | Block columns | Transaction columns | Log columns |
+/// | --- | --- | --- | --- |
+/// | nothing (a header read) | identity | — | — |
+/// | `logs` | identity | — | all |
+/// | `blocks` | all | position | — |
+/// | `blocks`, `logs` | all | position | all |
+/// | `transactions`, with any others | all with `blocks`, else identity | all | all with `logs`, else position |
+///
+/// "All" is every field of [`RawBlock`], [`RawTransaction`], or [`RawLog`]. Every block
+/// of the range is read whatever is selected, so each height has its identity and the
+/// pipeline links it. A block row lists its transactions' hashes, so `blocks` alone
+/// still reads each transaction's position, with the cumulative gas that checks none is
+/// missing; a transaction row counts its logs, so `transactions` alone still reads each
+/// log's position.
+#[derive(Debug, Clone, Copy)]
+struct Plan {
+    /// The rows projected.
+    datasets: Datasets,
+    /// The columns queried for them.
+    fields: FieldSelection,
+}
+
+impl Plan {
+    fn new(datasets: Datasets) -> Self {
+        let Datasets {
+            blocks,
+            transactions,
+            logs,
+        } = datasets;
+        let fields = FieldSelection {
+            block: if blocks {
+                columns::<RawBlock>()
+            } else {
+                IDENTITY_FIELDS
+            },
+            transaction: if transactions {
+                columns::<RawTransaction>()
+            } else if blocks {
+                TRANSACTION_POSITION_FIELDS
+            } else {
+                &[]
+            },
+            log: if logs {
+                columns::<RawLog>()
+            } else if transactions {
+                LOG_POSITION_FIELDS
+            } else {
+                &[]
+            },
+        };
+        Self { datasets, fields }
+    }
+
+    /// A header read: each block's identity, and no rows.
+    fn headers() -> Self {
+        Self::new(Datasets {
+            blocks: false,
+            transactions: false,
+            logs: false,
+        })
+    }
+
+    /// Whether the query reads transactions, which are then checked for a gap and
+    /// against the block's gas.
+    const fn reads_transactions(self) -> bool {
+        !self.fields.transaction.is_empty()
+    }
+
+    /// Whether the query reads logs, which are then checked against the block's bloom.
+    const fn reads_logs(self) -> bool {
+        !self.fields.log.is_empty()
+    }
+}
+
+/// The fields `T` deserializes, read from its derived `Deserialize`: a row's struct is
+/// the one list of the columns a full selection asks for, so a field added to it is
+/// selected, and none is selected that it lacks.
+fn columns<T: DeserializeOwned>() -> &'static [&'static str] {
+    /// Answers nothing, and records the field names a struct asks it for.
+    struct Columns<'a>(&'a mut &'static [&'static str]);
+
+    impl<'de> Deserializer<'de> for Columns<'_> {
+        type Error = de::value::Error;
+
+        fn deserialize_struct<V: de::Visitor<'de>>(
+            self,
+            _name: &'static str,
+            fields: &'static [&'static str],
+            _visitor: V,
+        ) -> Result<V::Value, Self::Error> {
+            *self.0 = fields;
+            Err(de::Error::custom("columns recorded"))
+        }
+
+        fn deserialize_any<V: de::Visitor<'de>>(
+            self,
+            _visitor: V,
+        ) -> Result<V::Value, Self::Error> {
+            Err(de::Error::custom("not a struct"))
+        }
+
+        serde::forward_to_deserialize_any! {
+            bool i8 i16 i32 i64 i128 u8 u16 u32 u64 u128 f32 f64 char str string bytes
+            byte_buf option unit unit_struct newtype_struct seq tuple tuple_struct map enum
+            identifier ignored_any
+        }
+    }
+
+    let mut fields: &'static [&'static str] = &[];
+    // Always an error: the deserializer only records what it is asked for.
+    drop(T::deserialize(Columns(&mut fields)));
+    fields
+}
 
 /// A source that backfills one EVM chain from a `HyperSync` endpoint.
 pub struct HyperSyncSource {
@@ -184,15 +221,13 @@ pub struct HyperSyncSource {
     height_url: reqwest::Url,
     /// The API token, sent as a bearer token. Never logged: `Debug` leaves it out.
     token: String,
-    datasets: Datasets,
-    /// Backfill ranges in flight at once.
-    concurrency: NonZeroUsize,
+    plan: Plan,
+    backoff: Backoff,
 }
 
 impl HyperSyncSource {
     /// Builds a source for `chain` that reads `datasets` from the `HyperSync` endpoint at
-    /// `url` (such as `https://4663.hypersync.xyz`), authorized by `token`. Backfill keeps
-    /// `concurrency` ranges in flight, each its own run of requests.
+    /// `url` (such as `https://4663.hypersync.xyz`), authorized by `token`.
     ///
     /// # Errors
     ///
@@ -202,7 +237,6 @@ impl HyperSyncSource {
         url: &str,
         token: &str,
         datasets: Datasets,
-        concurrency: NonZeroUsize,
     ) -> Result<Self, SourceError> {
         let base = reqwest::Url::parse(url).map_err(|error| {
             malformed(
@@ -226,95 +260,46 @@ impl HyperSyncSource {
             query_url: endpoint("query")?,
             height_url: endpoint("height")?,
             token: token.to_owned(),
-            datasets,
-            concurrency,
+            plan: Plan::new(datasets),
+            backoff: Backoff::new(os_seed()),
         })
     }
 
-    /// What one query asks for, from the selected datasets.
-    ///
-    /// A block row lists its transactions' hashes, so `blocks` alone still reads each
-    /// transaction's hash; a transaction row counts its logs, so `transactions` alone
-    /// still reads each log's position.
-    fn selection(&self) -> FieldSelection {
-        let Datasets {
-            blocks,
-            transactions,
-            logs,
-        } = self.datasets;
-        FieldSelection {
-            block: if blocks {
-                BLOCK_FIELDS
-            } else {
-                IDENTITY_FIELDS
-            },
-            transaction: if transactions {
-                TRANSACTION_FIELDS
-            } else if blocks {
-                TRANSACTION_HASH_FIELDS
-            } else {
-                &[]
-            },
-            log: if logs {
-                LOG_FIELDS
-            } else if transactions {
-                LOG_POSITION_FIELDS
-            } else {
-                &[]
-            },
-        }
-    }
-
-    /// Queries the heights `from ..= to`. The response may stop short of `to`.
-    async fn query(
-        &self,
-        from: u64,
-        to: u64,
-        field_selection: FieldSelection,
-    ) -> Result<Response, SourceError> {
+    /// Queries the heights `from ..= to` for what `plan` selects. The response may stop
+    /// short of `to`.
+    async fn query(&self, from: u64, to: u64, plan: Plan) -> Result<Response, SourceError> {
         let query = Query {
             from_block: from,
             to_block: to.saturating_add(1),
             include_all_blocks: true,
             join_mode: "JoinNothing",
-            transactions: (!field_selection.transaction.is_empty()).then_some([All {}]),
-            logs: (!field_selection.log.is_empty()).then_some([All {}]),
-            field_selection,
+            transactions: plan.reads_transactions().then_some([All {}]),
+            logs: plan.reads_logs().then_some([All {}]),
+            field_selection: plan.fields,
         };
         self.send(|client| client.post(self.query_url.clone()).json(&query))
             .await
     }
 
-    /// Sends a request, retrying a refused rate, an overloaded backend, or a dropped
-    /// connection with a doubling wait, and decodes the answer.
+    /// Sends a request and decodes the answer, retrying a refused rate, an overloaded
+    /// backend, or a dropped connection through the source's [`Backoff`], as the RPC
+    /// source retries its calls. After the last retry, the last error is returned as it
+    /// was.
     async fn send<T: DeserializeOwned>(
         &self,
         request: impl Fn(&reqwest::Client) -> reqwest::RequestBuilder,
     ) -> Result<T, SourceError> {
-        let mut delay = MIN_DELAY;
         let mut retries = 0;
         loop {
-            let cause = match self.attempt(&request).await {
-                Attempt::Done(value) => return Ok(value),
-                Attempt::Failed(error) => return Err(error),
-                Attempt::Transient(cause) => cause,
+            let mark = self.backoff.ready().await;
+            let result = self.attempt(&request).await;
+            let Some(cause) = transient(&result) else {
+                self.backoff.settled();
+                return result;
             };
-            if retries == MAX_RETRIES {
-                return Err(malformed(
-                    CONTEXT,
-                    format!("gave up after {MAX_RETRIES} retries: {cause}"),
-                ));
+            if !self.backoff.retry(mark, &mut retries, &cause, CONTEXT) {
+                return result;
             }
-            retries += 1;
-            warn!(
-                retry = retries,
-                max_retries = MAX_RETRIES,
-                delay_ms = delay.as_millis(),
-                %cause,
-                "hypersync request failed transiently; backing off"
-            );
-            tokio::time::sleep(delay).await;
-            delay = (delay * 2).min(MAX_DELAY);
         }
     }
 
@@ -322,86 +307,56 @@ impl HyperSyncSource {
     async fn attempt<T: DeserializeOwned>(
         &self,
         request: &impl Fn(&reqwest::Client) -> reqwest::RequestBuilder,
-    ) -> Attempt<T> {
-        let response = match request(&self.client).bearer_auth(&self.token).send().await {
-            Ok(response) => response,
-            Err(error) => return Attempt::from_reqwest(error),
-        };
+    ) -> Result<T, SourceError> {
+        // Without the URL, as every logged error is.
+        let failed = |error: reqwest::Error| SourceError::Http(error.without_url());
+        let response = request(&self.client)
+            .bearer_auth(&self.token)
+            .send()
+            .await
+            .map_err(failed)?;
         let status = response.status();
-        let body = match response.bytes().await {
-            Ok(body) => body,
-            Err(error) => return Attempt::from_reqwest(error),
-        };
-        if status.is_success() {
-            return match serde_json::from_slice(&body) {
-                Ok(value) => Attempt::Done(value),
-                Err(source) => Attempt::Failed(SourceError::Json {
-                    context: CONTEXT,
-                    source,
-                }),
-            };
-        }
-        let detail = String::from_utf8_lossy(&body)
-            .chars()
-            .take(500)
-            .collect::<String>();
-        if matches!(status.as_u16(), 408 | 429 | 500 | 502 | 503 | 504) {
-            Attempt::Transient(format!("http status {status}: {detail}"))
-        } else {
-            Attempt::Failed(SourceError::Status {
+        let body = response.bytes().await.map_err(failed)?;
+        if !status.is_success() {
+            return Err(SourceError::Status {
                 context: CONTEXT,
                 status: status.as_u16(),
-                detail,
-            })
+                detail: String::from_utf8_lossy(&body).chars().take(500).collect(),
+            });
         }
+        serde_json::from_slice(&body).map_err(|source| SourceError::Json {
+            context: CONTEXT,
+            source,
+        })
     }
 
     /// The header at `height`, read alone.
     async fn header_at(&self, height: u64) -> Result<BlockMeta, SourceError> {
-        let only_headers = FieldSelection {
-            block: IDENTITY_FIELDS,
-            transaction: &[],
-            log: &[],
-        };
-        let block = self
-            .query(height, height, only_headers)
-            .await?
-            .data
-            .into_iter()
-            .flat_map(|batch| batch.blocks)
-            .next()
-            .ok_or_else(|| malformed(CONTEXT, format!("no block at {height}")))?;
-        let meta = block.meta()?;
-        if meta.height != height {
-            return Err(malformed(
-                CONTEXT,
-                format!("requested block {height}, received {}", meta.height),
-            ));
-        }
-        Ok(meta)
+        let headers = Plan::headers();
+        let response = self.query(height, height, headers).await?;
+        assemble(height, height, response, headers)?
+            .pop()
+            .map(|block| block.meta)
+            .ok_or_else(|| malformed(CONTEXT, format!("no block at {height}")))
     }
 }
 
-/// How one try at a request ended.
-enum Attempt<T> {
-    /// The decoded answer.
-    Done(T),
-    /// Worth asking again: why it failed.
-    Transient(String),
-    /// Asking again would fail the same way.
-    Failed(SourceError),
-}
-
-impl<T> Attempt<T> {
-    /// A connection that failed or timed out is transient; anything else, such as a
-    /// request that could not be built, is not.
-    fn from_reqwest(error: reqwest::Error) -> Self {
-        let error = error.without_url();
-        if error.is_timeout() || error.is_connect() || error.is_request() || error.is_body() {
-            Self::Transient(format!("network error: {error}"))
-        } else {
-            Self::Failed(SourceError::Http(error))
+/// Why `result` is worth sending again — a transient status, or a request that timed out
+/// or lost its connection — or `None` when it succeeded or failed for good.
+fn transient<T>(result: &Result<T, SourceError>) -> Option<String> {
+    match result {
+        Err(error @ SourceError::Status { status, .. }) if transient_status(*status) => {
+            Some(error.to_string())
         }
+        Err(SourceError::Http(error))
+            if error.is_timeout()
+                || error.is_connect()
+                || error.is_request()
+                || error.is_body() =>
+        {
+            Some(format!("network error: {error}"))
+        }
+        _ => None,
     }
 }
 
@@ -410,7 +365,7 @@ impl fmt::Debug for HyperSyncSource {
         f.debug_struct("HyperSyncSource")
             .field("chain", &self.chain)
             .field("query_url", &self.query_url.as_str())
-            .field("datasets", &self.datasets)
+            .field("datasets", &self.plan.datasets)
             .finish_non_exhaustive()
     }
 }
@@ -427,11 +382,14 @@ impl BlockSource for HyperSyncSource {
         &self.chain
     }
 
+    fn follows_heads(&self) -> bool {
+        false
+    }
+
+    /// Ends at once: `HyperSync` announces no heads, and the pipeline never subscribes to
+    /// a source that does not follow them.
     async fn subscribe_heads(&self) -> Result<HeadStream, SourceError> {
-        Err(SourceError::Unsupported {
-            context: CONTEXT,
-            detail: "HyperSync has no live heads; restart on an RPC source to follow the chain",
-        })
+        Ok(Box::pin(stream::empty()))
     }
 
     async fn fetch_block(
@@ -448,12 +406,11 @@ impl BlockSource for HyperSyncSource {
     /// Fetches every height `from ..= to`, with the selected datasets: one request after
     /// another, each starting where the last response stopped.
     async fn fetch_blocks(&self, from: u64, to: u64) -> Result<Vec<FetchedBlock>, SourceError> {
-        let selection = self.selection();
         let mut blocks = Vec::new();
         let mut next = from;
         while next <= to {
-            let response = self.query(next, to, selection).await?;
-            let page = assemble(next, to, response, self.datasets)?;
+            let response = self.query(next, to, self.plan).await?;
+            let page = assemble(next, to, response, self.plan)?;
             next = page
                 .last()
                 .map_or(to, |block| block.meta.height)
@@ -467,8 +424,11 @@ impl BlockSource for HyperSyncSource {
         SPAN
     }
 
+    /// One range at a time, whatever `ingest.backfill_concurrency` says: a range of
+    /// `SPAN` heights with every dataset is gigabytes on a busy chain, and each range in
+    /// flight, or answered and waiting for the one below it, holds one.
     fn backfill_concurrency(&self) -> usize {
-        self.concurrency.get()
+        1
     }
 
     async fn fetch_header(&self, height: Option<u64>) -> Result<BlockMeta, SourceError> {
@@ -868,13 +828,14 @@ fn assemble(
     from: u64,
     to: u64,
     response: Response,
-    datasets: Datasets,
+    plan: Plan,
 ) -> Result<Vec<FetchedBlock>, SourceError> {
     let Response { data, next_block } = response;
     if next_block <= from {
-        return Err(inconsistent(format!(
-            "made no progress past {from}; its archive may not reach that height yet"
-        )));
+        return Err(inconsistent(
+            CONTEXT,
+            format!("made no progress past {from}; its archive may not reach that height yet"),
+        ));
     }
     let last = next_block - 1;
     if last > to {
@@ -914,7 +875,7 @@ fn assemble(
             (row.block_number, row.block_hash)
         })?;
         let own_logs = take_block(&mut logs, meta, |row| (row.block_number, row.block_hash))?;
-        let events = project(block, meta, own_transactions, own_logs, datasets)?;
+        let events = project(block, meta, own_transactions, own_logs, plan)?;
         fetched.push(FetchedBlock { meta, events });
     }
     if transactions.next().is_some() || logs.next().is_some() {
@@ -939,10 +900,13 @@ fn take_block<T>(
             break;
         }
         if hash != meta.hash {
-            return Err(inconsistent(format!(
-                "a row at {} belongs to block {hash}, not {}",
-                meta.height, meta.hash
-            )));
+            return Err(inconsistent(
+                CONTEXT,
+                format!(
+                    "a row at {} belongs to block {hash}, not {}",
+                    meta.height, meta.hash
+                ),
+            ));
         }
         own.extend(rows.next());
     }
@@ -979,22 +943,23 @@ fn place_logs(logs: Vec<RawLog>, meta: BlockMeta) -> Result<Placed, SourceError>
 }
 
 /// Checks a block's rows against each other and its header: logs present when the bloom
-/// is set, transactions in index order with no gap, the receipts' gas adding to the
+/// is set, transactions in index order with no gap, the last one's cumulative gas the
 /// block's, and every log naming a transaction the block has.
 fn check_block(
     block: &RawBlock,
     meta: BlockMeta,
     transactions: &[RawTransaction],
     placed: &Placed,
-    datasets: Datasets,
+    plan: Plan,
 ) -> Result<(), SourceError> {
-    let reads_transactions = datasets.blocks || datasets.transactions;
-    let reads_logs = datasets.logs || datasets.transactions;
-    if reads_logs && placed.is_empty() && block.logs_bloom != Bloom::ZERO {
-        return Err(inconsistent(format!(
-            "no logs returned for block {}, whose logsBloom is set",
-            meta.height
-        )));
+    if plan.reads_logs() && placed.is_empty() && block.logs_bloom != Bloom::ZERO {
+        return Err(inconsistent(
+            CONTEXT,
+            format!(
+                "no logs returned for block {}, whose logsBloom is set",
+                meta.height
+            ),
+        ));
     }
     for (position, transaction) in transactions.iter().enumerate() {
         if transaction.transaction_index.to_u64("transaction_index")? != position as u64 {
@@ -1007,7 +972,7 @@ fn check_block(
             ));
         }
     }
-    if datasets.transactions {
+    if plan.reads_transactions() {
         let cumulative = match transactions.last() {
             Some(last) => required(last.cumulative_gas_used, "cumulative_gas_used")?
                 .to_u64("cumulative_gas_used")?,
@@ -1015,13 +980,16 @@ fn check_block(
         };
         let gas_used = block.gas_used.to_u64("gas_used")?;
         if cumulative != gas_used {
-            return Err(inconsistent(format!(
-                "block {} used {gas_used} gas, but its receipts add to {cumulative}",
-                meta.height
-            )));
+            return Err(inconsistent(
+                CONTEXT,
+                format!(
+                    "block {} used {gas_used} gas, but its receipts add to {cumulative}",
+                    meta.height
+                ),
+            ));
         }
     }
-    if reads_transactions
+    if plan.reads_transactions()
         && let Some((_, index, _)) = placed
             .iter()
             .find(|(_, index, _)| *index >= transactions.len() as u64)
@@ -1043,10 +1011,11 @@ fn project(
     meta: BlockMeta,
     transactions: Vec<RawTransaction>,
     logs: Vec<RawLog>,
-    datasets: Datasets,
+    plan: Plan,
 ) -> Result<Vec<Event>, SourceError> {
     let placed = place_logs(logs, meta)?;
-    check_block(&block, meta, &transactions, &placed, datasets)?;
+    check_block(&block, meta, &transactions, &placed, plan)?;
+    let datasets = plan.datasets;
 
     let mut events = Vec::new();
     if datasets.blocks {
@@ -1337,29 +1306,17 @@ fn optional_u128(value: Option<Quantity>, field: &str) -> Result<Option<u128>, S
     value.map(|value| value.to_u128(field)).transpose()
 }
 
-fn malformed(context: &str, detail: impl fmt::Display) -> SourceError {
-    SourceError::Malformed {
-        context: context.to_owned(),
-        detail: detail.to_string(),
-    }
-}
-
-fn inconsistent(detail: impl fmt::Display) -> SourceError {
-    SourceError::Inconsistent {
-        context: CONTEXT.to_owned(),
-        detail: detail.to_string(),
-    }
-}
-
 #[cfg(test)]
 // The crate denies `expect`/`unwrap` to keep production paths honest; tests are
 // allowed them per the repository test style, since a failed expectation there
 // means the fixture or setup is wrong.
 #[expect(clippy::expect_used)]
 mod tests {
-    use std::num::NonZeroUsize;
-
-    use super::{HyperSyncSource, assemble, authorization_list, parse_quantity, withdrawals};
+    use super::{
+        HyperSyncSource, IDENTITY_FIELDS, LOG_POSITION_FIELDS, Plan, RawBlock, RawLog,
+        RawTransaction, TRANSACTION_POSITION_FIELDS, assemble, authorization_list, columns,
+        parse_quantity, withdrawals,
+    };
     use crate::ingest::source::evm::{http_client, ws_connect};
     use crate::ingest::source::{BlockSource, Datasets, EvmSource, SourceError};
     use crate::wire::envelope::Event;
@@ -1429,14 +1386,13 @@ mod tests {
             };
             for &datasets in selections {
                 let hypersync =
-                    HyperSyncSource::new(chain, hypersync, &token, datasets, NonZeroUsize::MIN)
-                        .expect("hypersync");
+                    HyperSyncSource::new(chain, hypersync, &token, datasets).expect("hypersync");
                 let rpc = EvmSource::new(
                     chain,
                     http_client(rpc).expect("rpc"),
                     ws_connect(rpc),
                     datasets,
-                    NonZeroUsize::MIN,
+                    std::num::NonZeroUsize::MIN,
                 );
                 for &height in heights {
                     let expected = rpc.fetch_block(height, None).await.expect("rpc block");
@@ -1515,14 +1471,9 @@ mod tests {
             transactions: false,
             logs: true,
         };
-        let source = HyperSyncSource::new(
-            "robinhood",
-            "https://4663.hypersync.xyz",
-            &token,
-            logs_only,
-            NonZeroUsize::MIN,
-        )
-        .expect("hypersync");
+        let source =
+            HyperSyncSource::new("robinhood", "https://4663.hypersync.xyz", &token, logs_only)
+                .expect("hypersync");
         let blocks = source
             .fetch_blocks(1_000_000, 1_049_999)
             .await
@@ -1658,7 +1609,7 @@ mod tests {
             &[block(10, true, 0), block(11, false, 0), block(12, true, 0)],
             &[log(10, 0, 0), log(10, 1, 1), log(12, 0, 0)],
         );
-        let blocks = assemble(10, 20, response, logs_only()).expect("assembles");
+        let blocks = assemble(10, 20, response, Plan::new(logs_only())).expect("assembles");
         let shape: Vec<_> = blocks
             .iter()
             .map(|block| (block.meta.height, block.events.len()))
@@ -1683,7 +1634,7 @@ mod tests {
     fn a_short_or_mismatched_response_is_refused() {
         let skipped = respond(12, &[block(10, false, 0)], &[]);
         assert!(
-            assemble(10, 20, skipped, logs_only()).is_err(),
+            assemble(10, 20, skipped, Plan::new(logs_only())).is_err(),
             "a skipped height"
         );
 
@@ -1691,27 +1642,31 @@ mod tests {
         foreign["block_hash"] = hash(99).into();
         let foreign = respond(11, &[block(10, true, 0)], &[foreign]);
         assert!(matches!(
-            assemble(10, 20, foreign, logs_only()),
+            assemble(10, 20, foreign, Plan::new(logs_only())),
             Err(SourceError::Inconsistent { .. })
         ));
 
         let bloomed = respond(11, &[block(10, true, 0)], &[]);
         assert!(matches!(
-            assemble(10, 20, bloomed, logs_only()),
+            assemble(10, 20, bloomed, Plan::new(logs_only())),
             Err(SourceError::Inconsistent { .. })
         ));
 
         let misordered = respond(11, &[block(10, true, 0)], &[log(10, 0, 1), log(10, 0, 0)]);
         assert!(
-            assemble(10, 20, misordered, logs_only()).is_err(),
+            assemble(10, 20, misordered, Plan::new(logs_only())).is_err(),
             "misordered logs"
         );
 
         let past = respond(12, &[block(10, false, 0), block(11, false, 0)], &[]);
-        assert!(assemble(10, 10, past, logs_only()).is_err(), "past the end");
+        assert!(
+            assemble(10, 10, past, Plan::new(logs_only())).is_err(),
+            "past the end"
+        );
     }
 
-    /// With transactions read, the last receipt's cumulative gas must be the block's.
+    /// With transactions read, the last receipt's cumulative gas must be the block's: for
+    /// the `transactions` dataset, and for `blocks` alone, whose row lists the hashes.
     #[test]
     fn a_dropped_transaction_fails_the_gas_check() {
         let transaction = |index: u64, cumulative: u64| {
@@ -1733,29 +1688,65 @@ mod tests {
             transactions: true,
             logs: false,
         };
-        let whole = serde_json::from_value(serde_json::json!({
-            "data": [{
-                "blocks": [block(10, false, 42_000)],
-                "transactions": [transaction(0, 21_000), transaction(1, 42_000)],
-            }],
-            "next_block": 11,
-        }))
-        .expect("response");
-        let blocks = assemble(10, 10, whole, transactions).expect("assembles");
+        let response = |rows: &[serde_json::Value]| -> super::Response {
+            serde_json::from_value(serde_json::json!({
+                "data": [{ "blocks": [block(10, false, 42_000)], "transactions": rows }],
+                "next_block": 11,
+            }))
+            .expect("response")
+        };
+        let whole = [transaction(0, 21_000), transaction(1, 42_000)];
+        let blocks =
+            assemble(10, 10, response(&whole), Plan::new(transactions)).expect("assembles");
         assert_eq!(blocks[0].events.len(), 2);
-
-        let short = serde_json::from_value(serde_json::json!({
-            "data": [{
-                "blocks": [block(10, false, 42_000)],
-                "transactions": [transaction(0, 21_000)],
-            }],
-            "next_block": 11,
-        }))
-        .expect("response");
         assert!(matches!(
-            assemble(10, 10, short, transactions),
+            assemble(10, 10, response(&whole[..1]), Plan::new(transactions)),
             Err(SourceError::Inconsistent { .. })
         ));
+
+        // `blocks` alone reads only the transactions' positions, and checks them the same.
+        let positions: Vec<_> = whole
+            .iter()
+            .map(|row| {
+                let mut row = row.clone();
+                row.as_object_mut()
+                    .expect("an object")
+                    .retain(|field, _| TRANSACTION_POSITION_FIELDS.contains(&field.as_str()));
+                row
+            })
+            .collect();
+        let blocks_only = Datasets {
+            blocks: true,
+            transactions: false,
+            logs: false,
+        };
+        assert!(matches!(
+            assemble(10, 10, response(&positions[..1]), Plan::new(blocks_only)),
+            Err(SourceError::Inconsistent { .. })
+        ));
+    }
+
+    /// A full selection asks for every field of a row's struct, by its wire name, and the
+    /// partial ones only for fields the structs have.
+    #[test]
+    fn a_full_selection_is_every_field_of_the_row() {
+        let blocks = columns::<RawBlock>();
+        let transactions = columns::<RawTransaction>();
+        let logs = columns::<RawLog>();
+        assert_eq!((blocks.len(), transactions.len(), logs.len()), (28, 34, 12));
+        assert!(
+            transactions.contains(&"type"),
+            "the renamed field's wire name"
+        );
+        for (partial, full) in [
+            (IDENTITY_FIELDS, blocks),
+            (TRANSACTION_POSITION_FIELDS, transactions),
+            (LOG_POSITION_FIELDS, logs),
+        ] {
+            for field in partial {
+                assert!(full.contains(field), "{field}");
+            }
+        }
     }
 
     #[test]
@@ -1764,6 +1755,6 @@ mod tests {
             "data": [], "next_block": 10, "archive_height": 9
         }))
         .expect("response");
-        assert!(assemble(10, 20, response, Datasets::all()).is_err());
+        assert!(assemble(10, 20, response, Plan::new(Datasets::all())).is_err());
     }
 }

@@ -1,4 +1,5 @@
-//! Adaptive pacing and retries for the HTTP JSON-RPC transport.
+//! Adaptive pacing and retries for the HTTP JSON-RPC transport, and for the `HyperSync`
+//! source, which sends its requests through the same [`Backoff`].
 //!
 //! Providers publish their limits in incompatible units, if at all, so the rate is
 //! learned rather than configured: back off fast, recover slowly, as TCP does. One
@@ -198,11 +199,78 @@ impl NetworkError {
     }
 }
 
+/// One source's shared delay and jitter, and the bookkeeping of each retry: what
+/// [`RetryLayer`] wraps a JSON-RPC transport in, and what the `HyperSync` source sends
+/// its requests through. See the [module docs](self).
+#[derive(Debug, Clone)]
+pub(crate) struct Backoff {
+    pacing: Pacing,
+    jitter: Jitter,
+}
+
+impl Backoff {
+    /// Backoff whose jitter is drawn from `seed`. A deployment seeds it from the OS; a
+    /// simulation passes its own, so a run replays.
+    pub(crate) fn new(seed: u64) -> Self {
+        Self {
+            pacing: Pacing::default(),
+            jitter: Jitter::new(seed),
+        }
+    }
+
+    /// Waits out the shared delay, then marks a request about to be sent, for
+    /// [`retry`](Self::retry).
+    pub(crate) async fn ready(&self) -> u64 {
+        let delay = self.pacing.current();
+        if delay > 0 {
+            tokio::time::sleep(self.jitter.delay(delay)).await;
+        }
+        self.pacing.sent()
+    }
+
+    /// Records a request that succeeded, or failed for good: the delay shrinks.
+    pub(crate) fn settled(&self) {
+        self.pacing.speed_up();
+    }
+
+    /// Records a transient failure, for `cause`, of a request [`ready`](Self::ready) at
+    /// `mark` after `retries` retries, and whether to send it again. After
+    /// [`MAX_RETRIES`] it is not, and the caller returns the last error as it was.
+    pub(crate) fn retry(&self, mark: u64, retries: &mut u32, cause: &str, source: &str) -> bool {
+        let delay = self.pacing.slow_down(mark);
+        if *retries == MAX_RETRIES {
+            return false;
+        }
+        *retries += 1;
+        metrics::rpc_retry();
+        warn!(
+            source,
+            retry = *retries,
+            max_retries = MAX_RETRIES,
+            delay_ms = delay,
+            %cause,
+            "request failed transiently; backing off"
+        );
+        true
+    }
+}
+
+/// A deployment's jitter seed. Jitter only has to differ between processes, so the
+/// OS-keyed hasher seeds it.
+pub(crate) fn os_seed() -> u64 {
+    std::hash::BuildHasher::hash_one(&std::hash::RandomState::new(), ())
+}
+
+/// Whether an HTTP status is worth asking again: a timeout, a refused rate, or an
+/// overloaded or restarting backend.
+pub(crate) const fn transient_status(status: u16) -> bool {
+    matches!(status, 408 | 429 | 500 | 502 | 503 | 504)
+}
+
 /// A tower layer that paces and retries requests. See the [module docs](self).
 #[derive(Debug, Clone)]
 pub(crate) struct RetryLayer {
-    pacing: Pacing,
-    jitter: Jitter,
+    backoff: Backoff,
 }
 
 impl RetryLayer {
@@ -210,8 +278,7 @@ impl RetryLayer {
     /// OS; a simulation passes its own, so a run replays.
     pub(crate) fn new(seed: u64) -> Self {
         Self {
-            pacing: Pacing::default(),
-            jitter: Jitter::new(seed),
+            backoff: Backoff::new(seed),
         }
     }
 }
@@ -222,8 +289,7 @@ impl<S> Layer<S> for RetryLayer {
     fn layer(&self, inner: S) -> Self::Service {
         RetryService {
             inner,
-            pacing: self.pacing.clone(),
-            jitter: self.jitter.clone(),
+            backoff: self.backoff.clone(),
         }
     }
 }
@@ -232,8 +298,7 @@ impl<S> Layer<S> for RetryLayer {
 #[derive(Debug, Clone)]
 pub(crate) struct RetryService<S> {
     inner: S,
-    pacing: Pacing,
-    jitter: Jitter,
+    backoff: Backoff,
 }
 
 impl<S> Service<RequestPacket> for RetryService<S>
@@ -260,16 +325,11 @@ where
         // request and leave a fresh clone behind.
         let clone = self.inner.clone();
         let mut inner = std::mem::replace(&mut self.inner, clone);
-        let pacing = self.pacing.clone();
-        let jitter = self.jitter.clone();
+        let backoff = self.backoff.clone();
         Box::pin(async move {
             let mut retries = 0;
             loop {
-                let delay = pacing.current();
-                if delay > 0 {
-                    tokio::time::sleep(jitter.delay(delay)).await;
-                }
-                let mark = pacing.sent();
+                let mark = backoff.ready().await;
                 let result = inner
                     .call(request.clone())
                     .await
@@ -278,22 +338,12 @@ where
                     return result;
                 }
                 let Some(cause) = transient(&request, &result) else {
-                    pacing.speed_up();
+                    backoff.settled();
                     return result;
                 };
-                let delay = pacing.slow_down(mark);
-                if retries == MAX_RETRIES {
+                if !backoff.retry(mark, &mut retries, &cause, "rpc") {
                     return result;
                 }
-                retries += 1;
-                metrics::rpc_retry();
-                warn!(
-                    retry = retries,
-                    max_retries = MAX_RETRIES,
-                    delay_ms = delay,
-                    %cause,
-                    "rpc request failed transiently; backing off"
-                );
                 std::future::poll_fn(|cx| inner.poll_ready(cx)).await?;
             }
         })
@@ -327,8 +377,7 @@ fn transient(
                 .map(|(_, error)| format!("rpc error {}: {}", error.code, error.message))
         }
         Err(RpcError::Transport(TransportErrorKind::HttpError(error))) => {
-            matches!(error.status, 408 | 429 | 500 | 502 | 503 | 504)
-                .then(|| format!("http status {}", error.status))
+            transient_status(error.status).then(|| format!("http status {}", error.status))
         }
         Err(RpcError::Transport(TransportErrorKind::MissingBatchResponse(_))) => {
             Some("batch response missing a call".to_owned())
@@ -427,7 +476,7 @@ mod tests {
         .await;
         assert!(result.expect("succeeds").as_error().is_none());
         assert_eq!(calls, 3);
-        assert!(layer.pacing.current() > 0);
+        assert!(layer.backoff.pacing.current() > 0);
         for _ in 0..40 {
             let (result, _) = send(&layer, |_| {
                 Ok(response(r#"{"jsonrpc":"2.0","id":1,"result":"0x1"}"#))
@@ -435,7 +484,7 @@ mod tests {
             .await;
             result.expect("succeeds");
         }
-        assert_eq!(layer.pacing.current(), 0);
+        assert_eq!(layer.backoff.pacing.current(), 0);
     }
 
     /// A permanent error, like the `-32601` the receipt fallback depends on, is

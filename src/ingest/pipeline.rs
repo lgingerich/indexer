@@ -138,9 +138,12 @@ pub enum PipelineError {
         /// The height the run starts at.
         start: u64,
     },
-    /// A backfill-only run has no stored blocks and no start height, so there is nothing
-    /// to backfill: starting at the head leaves no buried height below it.
-    #[error("a backfill-only run needs ingest.start_block, or a store that already holds blocks")]
+    /// A source that does not follow heads has no stored blocks and no start height to
+    /// backfill from: starting at the head leaves no buried height below it.
+    #[error(
+        "a source that does not follow the chain needs ingest.start_block, or a store that \
+         already holds blocks"
+    )]
     BackfillWithoutStart,
     /// A range fetch returned other than one block per requested height.
     #[error("source returned {returned} blocks for heights {from}..={to}")]
@@ -412,7 +415,10 @@ impl<T> Drop for Spawned<T> {
 
 impl<S: BlockSource + 'static, K: EnvelopeSink> Machine<S, K> {
     /// Indexes from `start` through the sampled head, then follows live heads; or, given a
-    /// `stop`, indexes through `stop` and returns.
+    /// `stop`, indexes through `stop` and returns. A source that does not
+    /// [follow heads](BlockSource::follows_heads) only backfills: the run indexes the
+    /// buried heights, no further than `stop`, and returns, leaving the rest to a run on a
+    /// source that does, which resumes after it.
     ///
     /// `start` is a fresh run's first height; `None` starts at the sampled head. A machine
     /// built with a ledger resumes after its tip instead: a `start` the stored history
@@ -430,15 +436,24 @@ impl<S: BlockSource + 'static, K: EnvelopeSink> Machine<S, K> {
     /// history, so partially delivered output cannot be followed by reuse.
     /// Returns [`PipelineError::StartAboveHistory`] for a `start` past a ledger's tip,
     /// [`PipelineError::StartAboveHead`] for one above the sampled head,
-    /// [`PipelineError::StopAboveHead`] and [`PipelineError::StopBelowStart`] for a `stop`
-    /// outside those bounds, [`PipelineError::SubscriptionClosed`] when the subscription
-    /// ends, and permanent source, invariant, or sink failures.
+    /// [`PipelineError::BackfillWithoutStart`] for neither on a source that only
+    /// backfills, [`PipelineError::StopAboveHead`] and [`PipelineError::StopBelowStart`]
+    /// for a `stop` outside those bounds, [`PipelineError::IdentityMismatch`] when a source
+    /// that only backfills holds another block at the stored tip,
+    /// [`PipelineError::SubscriptionClosed`] when the subscription ends, and permanent
+    /// source, invariant, or sink failures.
     pub async fn run(mut self, start: Option<u64>, stop: Option<u64>) -> Result<(), PipelineError> {
         info!(chain = %self.source.chain(), start_block = ?start, stop_block = ?stop,
             "ingest started");
         // Backfill is headless: it samples its target itself and reads concrete heights
         // only, so the subscription is opened after it converges.
         self.sync(start, stop).await?;
+        if !self.source.follows_heads() {
+            info!(chain = %self.source.chain(), through = ?self.ring.tip().map(|tip| tip.height),
+                "backfill complete; this source does not follow the chain, so restart on one \
+                 that does to continue");
+            return Ok(());
+        }
         if let Some(stop) = stop {
             info!(chain = %self.source.chain(), stop_block = stop, "ingest reached the stop block");
             return Ok(());
@@ -482,7 +497,12 @@ impl<S: BlockSource + 'static, K: EnvelopeSink> Machine<S, K> {
     /// A `stop` caps both phases: backfill ends at it when it is buried, and the tail is
     /// filled to it rather than to the head. It is checked against the first sampled head,
     /// before any output; a later sample only moves the head further from it.
+    ///
+    /// A source that does not [follow heads](BlockSource::follows_heads) stops after the
+    /// backfill, so a fresh run on it needs a `start`: at the head, nothing is buried.
+    /// Nor does it resume past a stored tip it disagrees with; see [`Self::resume`].
     async fn sync(&mut self, start: Option<u64>, stop: Option<u64>) -> Result<(), PipelineError> {
+        let follows = self.source.follows_heads();
         let restored = self.ring.tip();
         if let (Some(start), Some(tip)) = (start, restored) {
             if start > tip.height.saturating_add(1) {
@@ -519,13 +539,21 @@ impl<S: BlockSource + 'static, K: EnvelopeSink> Machine<S, K> {
             info!(height = tip.height, hash = %tip.hash, head = head.height,
                 "resuming from the stored tip");
             // A source behind the store is not ahead of it: live reconciliation takes
-            // over directly.
+            // over directly, and a source that does not follow heads has nothing to add.
             if head.height < tip.height {
-                return self.process_head(head).await;
+                return if follows {
+                    self.process_head(head).await
+                } else {
+                    Ok(())
+                };
             }
             Self::next(self.resume(tip).await?.height)?
         } else {
-            let next = start.unwrap_or(head.height);
+            let next = match start {
+                Some(start) => start,
+                None if follows => head.height,
+                None => return Err(PipelineError::BackfillWithoutStart),
+            };
             if next > head.height {
                 return Err(PipelineError::StartAboveHead {
                     start: next,
@@ -540,6 +568,10 @@ impl<S: BlockSource + 'static, K: EnvelopeSink> Machine<S, K> {
             next
         };
         (next, head) = self.backfill(next, head, stop).await?;
+        // The reorgable tail is the live phase's.
+        if !follows {
+            return Ok(());
+        }
         let tip = if let Some(tip) = self.ring.tip() {
             tip
         } else {
@@ -556,134 +588,23 @@ impl<S: BlockSource + 'static, K: EnvelopeSink> Machine<S, K> {
         self.catch_up(tip, target).await
     }
 
-    /// Indexes the buried heights from `start`, or after the stored tip, and stops: the
-    /// whole run for a source that cannot follow the chain, such as `HyperSync`.
-    ///
-    /// It goes as far as [`Self::run`]'s backfill does — up to the reorg window below
-    /// the sampled head, resampling while the chain buries more, and no further than
-    /// `stop` — and leaves the rest to the run that follows: a restart on a source that
-    /// does follow the chain resumes after the last block this one committed. A stored
-    /// tip is checked against the source first; a different block there is not a fork
-    /// this run can retract, so it stops. A stored tip at the stop, or one the source has
-    /// not reached yet, leaves nothing to do.
-    ///
-    /// # Errors
-    /// Consumes this instance, as [`Self::run`] does. Returns
-    /// [`PipelineError::StartAboveHistory`] for a `start` past a ledger's tip,
-    /// [`PipelineError::BackfillWithoutStart`] for neither,
-    /// [`PipelineError::StartAboveHead`] for one above the sampled head,
-    /// [`PipelineError::StopAboveHead`] and [`PipelineError::StopBelowStart`] for a `stop`
-    /// outside those bounds, [`PipelineError::IdentityMismatch`] when the source holds
-    /// another block at the stored tip, and source, invariant, or sink failures.
-    pub async fn backfill_buried(
-        mut self,
-        start: Option<u64>,
-        stop: Option<u64>,
-    ) -> Result<(), PipelineError> {
-        info!(chain = %self.source.chain(), start_block = ?start, stop_block = ?stop,
-            "backfill started");
-        self.backfill_only(start, stop).await
-    }
-
-    /// [`Self::backfill_buried`]'s work, on a machine that outlives it.
-    async fn backfill_only(
-        &mut self,
-        start: Option<u64>,
-        stop: Option<u64>,
-    ) -> Result<(), PipelineError> {
-        let restored = self.ring.tip();
-        if let (Some(start), Some(tip)) = (start, restored) {
-            if start > tip.height.saturating_add(1) {
-                return Err(PipelineError::StartAboveHistory {
-                    start,
-                    tip: tip.height,
-                });
-            }
-            info!(
-                start,
-                tip = tip.height,
-                "the store already holds blocks past the start; resuming from the stored tip"
-            );
-        }
-        if let (Some(tip), Some(stop)) = (restored, stop)
-            && tip.height >= stop
-        {
-            info!(
-                tip = tip.height,
-                stop, "the store already holds the stop block; nothing to backfill"
-            );
-            return Ok(());
-        }
-        let head = self.sample_head().await?;
-        if let Some(stop) = stop
-            && stop > head.height
-        {
-            return Err(PipelineError::StopAboveHead {
-                stop,
-                head: head.height,
-            });
-        }
-        let next = match (restored, start) {
-            (Some(tip), _) => {
-                if tip.height > head.height {
-                    info!(
-                        tip = tip.height,
-                        head = head.height,
-                        "the stored tip is past the source's head; nothing to backfill"
-                    );
-                    return Ok(());
-                }
-                let current = self.header(tip.height).await?;
-                if current != tip {
-                    return Err(PipelineError::IdentityMismatch {
-                        expected: Box::new(tip),
-                        actual: Box::new(current),
-                    });
-                }
-                info!(height = tip.height, hash = %tip.hash, head = head.height,
-                    "resuming from the stored tip");
-                Self::next(tip.height)?
-            }
-            (None, Some(start)) if start > head.height => {
-                return Err(PipelineError::StartAboveHead {
-                    start,
-                    head: head.height,
-                });
-            }
-            (None, Some(start)) => start,
-            (None, None) => return Err(PipelineError::BackfillWithoutStart),
-        };
-        if let Some(stop) = stop
-            && stop < next
-        {
-            return Err(PipelineError::StopBelowStart { stop, start: next });
-        }
-        let (next, head) = self.backfill(next, head, stop).await?;
-        match self.ring.tip() {
-            Some(tip) if tip.height.checked_add(1) == Some(next) => info!(
-                through = tip.height,
-                head = head.height,
-                "backfill complete; restart on an RPC source to follow the chain"
-            ),
-            _ => info!(
-                next,
-                head = head.height,
-                "nothing buried to backfill; restart on an RPC source to follow the chain"
-            ),
-        }
-        Ok(())
-    }
-
     /// Reconciles a restored tip against the source, returning the tip to continue from.
     ///
     /// Only the tip's header is re-read, since on the usual path only its hash is
     /// compared. A different hash means the stored suffix was orphaned while no process
     /// was running, and the ordinary fork walk retracts it before anything new is
-    /// published.
+    /// published. A source that does not follow heads has no view of the tail to walk,
+    /// so on one the difference is an error.
     async fn resume(&mut self, tip: BlockMeta) -> Result<BlockMeta, PipelineError> {
         let current = self.header(tip.height).await?;
         if current.hash == tip.hash {
             return Ok(tip);
+        }
+        if !self.source.follows_heads() {
+            return Err(PipelineError::IdentityMismatch {
+                expected: Box::new(tip),
+                actual: Box::new(current),
+            });
         }
         self.handle_reorg(current).await?;
         Ok(current)
@@ -730,7 +651,10 @@ impl<S: BlockSource + 'static, K: EnvelopeSink> Machine<S, K> {
     ///
     /// Buried means at or below `head - window`, and at or below `stop`. Reaching that
     /// bound, the head is sampled again, and backfill continues while the chain has
-    /// buried more; a bound at the stop has nothing more to wait for.
+    /// buried more; a bound at the stop has nothing more to wait for. A source that does
+    /// not follow heads samples it once more and stops at that bound: no live phase takes
+    /// over after it, and on a fast chain the head moves on during every pass, so a run
+    /// that waited for it to stand still would never end.
     ///
     /// Ranges of [`BlockSource::backfill_span`] heights are requested ahead, up to
     /// [`BlockSource::backfill_concurrency`] at once, and accepted strictly in order, so
@@ -754,6 +678,8 @@ impl<S: BlockSource + 'static, K: EnvelopeSink> Machine<S, K> {
             return Ok((next, head));
         }
         let source = Arc::clone(&self.source);
+        let resample_once = !source.follows_heads();
+        let mut resampled = false;
         let concurrency = source.backfill_concurrency().max(1);
         let mut fetches = FuturesOrdered::new();
         // The first height not yet requested; `next` is the first not yet accepted.
@@ -773,10 +699,11 @@ impl<S: BlockSource + 'static, K: EnvelopeSink> Machine<S, K> {
             }
             let Some((from, to, answer)) = fetches.next().await else {
                 // Everything requested is accepted, through `end`.
-                if stop == Some(end) {
+                if stop == Some(end) || (resample_once && resampled) {
                     return Ok((next, head));
                 }
                 head = self.sample_head().await?;
+                resampled = true;
                 end = bound(head);
                 if next > end {
                     return Ok((next, head));
@@ -1033,6 +960,8 @@ mod tests {
         /// `fetch_blocks` calls in flight now, and the most there ever were.
         in_flight: AtomicUsize,
         peak: AtomicUsize,
+        /// Whether the source follows heads, or only backfills.
+        follows: bool,
     }
 
     impl Source {
@@ -1055,8 +984,16 @@ mod tests {
                     slow: None,
                     in_flight: AtomicUsize::new(0),
                     peak: AtomicUsize::new(0),
+                    follows: true,
                 },
             }
+        }
+
+        /// [`Self::linear`], as a source that only backfills.
+        fn backfilling(head: u64) -> Self {
+            let mut source = Self::linear(head);
+            source.data.follows = false;
+            source
         }
 
         /// The metadata a source would announce for its current head.
@@ -1075,6 +1012,9 @@ mod tests {
     impl BlockSource for Source {
         fn chain(&self) -> &ChainId {
             &self.chain
+        }
+        fn follows_heads(&self) -> bool {
+            self.data.follows
         }
         async fn subscribe_heads(&self) -> Result<HeadStream, SourceError> {
             Ok(Box::pin(stream::pending()))
@@ -1966,36 +1906,27 @@ mod tests {
         assert_eq!(machine.tip(), Some(meta));
     }
 
-    /// A backfill-only run indexes every buried height from its start and stops at the
+    /// A run on a source that only backfills indexes every buried height from its start and stops at the
     /// reorg window, leaving the window to the run that follows.
     #[tokio::test]
     async fn a_backfill_stops_at_the_reorg_window() {
         let head = MAX_UNFINALIZED_BLOCKS as u64 + 5;
-        let mut machine = Machine::new(Source::linear(head), Sink::default(), Vec::new());
-        machine
-            .backfill_only(Some(2), None)
-            .await
-            .expect("backfill");
+        let mut machine = Machine::new(Source::backfilling(head), Sink::default(), Vec::new());
+        machine.sync(Some(2), None).await.expect("backfill");
         assert_eq!(heights(&machine), (2..=5).collect::<Vec<_>>());
     }
 
-    /// A stop below the reorg window ends a backfill-only run there; one already stored
+    /// A stop below the reorg window ends a backfill there; one already stored
     /// leaves nothing to do.
     #[tokio::test]
     async fn a_backfill_ends_at_its_stop_block() {
         let head = MAX_UNFINALIZED_BLOCKS as u64 + 9;
-        let mut machine = Machine::new(Source::linear(head), Sink::default(), Vec::new());
-        machine
-            .backfill_only(Some(2), Some(4))
-            .await
-            .expect("backfill");
+        let mut machine = Machine::new(Source::backfilling(head), Sink::default(), Vec::new());
+        machine.sync(Some(2), Some(4)).await.expect("backfill");
         assert_eq!(heights(&machine), (2..=4).collect::<Vec<_>>());
 
-        let mut machine = Machine::new(Source::linear(head), Sink::default(), ledger(0..=5));
-        machine
-            .backfill_only(None, Some(5))
-            .await
-            .expect("backfill");
+        let mut machine = Machine::new(Source::backfilling(head), Sink::default(), ledger(0..=5));
+        machine.sync(None, Some(5)).await.expect("backfill");
         assert!(machine.sink.events.is_empty());
     }
 
@@ -2004,15 +1935,15 @@ mod tests {
     #[tokio::test]
     async fn a_backfill_resumes_after_the_stored_tip_or_refuses_a_different_one() {
         let head = MAX_UNFINALIZED_BLOCKS as u64 + 9;
-        let mut machine = Machine::new(Source::linear(head), Sink::default(), ledger(0..=5));
-        machine.backfill_only(None, None).await.expect("backfill");
+        let mut machine = Machine::new(Source::backfilling(head), Sink::default(), ledger(0..=5));
+        machine.sync(None, None).await.expect("backfill");
         assert_eq!(heights(&machine), (6..=9).collect::<Vec<_>>());
 
         let mut stored = ledger(0..=5);
         stored[5].hash = hash(105);
-        let mut machine = Machine::new(Source::linear(head), Sink::default(), stored);
+        let mut machine = Machine::new(Source::backfilling(head), Sink::default(), stored);
         assert!(matches!(
-            machine.backfill_only(None, None).await,
+            machine.sync(None, None).await,
             Err(PipelineError::IdentityMismatch { .. })
         ));
         assert!(machine.sink.events.is_empty());
@@ -2023,9 +1954,9 @@ mod tests {
     #[tokio::test]
     async fn a_backfill_needs_a_start_or_stored_blocks() {
         let head = MAX_UNFINALIZED_BLOCKS as u64 + 5;
-        let mut machine = Machine::new(Source::linear(head), Sink::default(), Vec::new());
+        let mut machine = Machine::new(Source::backfilling(head), Sink::default(), Vec::new());
         assert!(matches!(
-            machine.backfill_only(None, None).await,
+            machine.sync(None, None).await,
             Err(PipelineError::BackfillWithoutStart)
         ));
     }
@@ -2036,23 +1967,40 @@ mod tests {
     async fn a_backfill_resumes_past_a_start_the_store_reaches_and_refuses_a_gap() {
         let head = MAX_UNFINALIZED_BLOCKS as u64 + 9;
         for start in [0, 5, 6] {
-            let mut machine = Machine::new(Source::linear(head), Sink::default(), ledger(0..=5));
-            machine
-                .backfill_only(Some(start), None)
-                .await
-                .expect("backfill");
+            let mut machine =
+                Machine::new(Source::backfilling(head), Sink::default(), ledger(0..=5));
+            machine.sync(Some(start), None).await.expect("backfill");
             assert_eq!(
                 heights(&machine),
                 (6..=9).collect::<Vec<_>>(),
                 "start {start}"
             );
         }
-        let mut machine = Machine::new(Source::linear(head), Sink::default(), ledger(0..=5));
+        let mut machine = Machine::new(Source::backfilling(head), Sink::default(), ledger(0..=5));
         assert!(matches!(
-            machine.backfill_only(Some(7), None).await,
+            machine.sync(Some(7), None).await,
             Err(PipelineError::StartAboveHistory { start: 7, tip: 5 })
         ));
         assert!(machine.sink.events.is_empty());
+    }
+
+    /// A source that only backfills resamples the head once after reaching the reorg
+    /// window and stops at the new bound, rather than chasing a head that keeps moving.
+    #[tokio::test]
+    async fn a_backfill_resamples_the_head_once() {
+        let window = MAX_UNFINALIZED_BLOCKS as u64;
+        let source = Source::backfilling(window + 20);
+        // The first sample, then one for each pass: the head moves every time.
+        source
+            .data
+            .samples
+            .lock()
+            .expect("samples")
+            .extend([window + 5, window + 10, window + 15]);
+        let mut machine = Machine::new(source, Sink::default(), Vec::new());
+        machine.sync(Some(2), None).await.expect("backfill");
+        assert_eq!(heights(&machine), (2..=10).collect::<Vec<_>>());
+        assert_eq!(machine.source.data.head_calls.load(Ordering::Relaxed), 2);
     }
 
     #[tokio::test]

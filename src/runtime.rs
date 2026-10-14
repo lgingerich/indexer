@@ -65,7 +65,6 @@ use crate::ingest::source::evm::{http_client, ws_connect};
 use crate::ingest::source::{AnySource, BlockSource, EvmSource, HyperSyncSource, SourceError};
 #[cfg(feature = "store")]
 use crate::sink;
-use crate::sink::EnvelopeSink;
 #[cfg(feature = "store")]
 use crate::sink::any_store::AnyStore;
 #[cfg(any(feature = "duckdb", feature = "postgres"))]
@@ -172,36 +171,12 @@ impl RuntimeError {
             Self::Ingest(error) => matches!(
                 error,
                 PipelineError::StartAboveHistory { .. }
+                    | PipelineError::BackfillWithoutStart
                     | PipelineError::StartAboveHead { .. }
                     | PipelineError::StopAboveHead { .. }
                     | PipelineError::StopBelowStart { .. }
             ),
             _ => false,
-        }
-    }
-}
-
-/// How ingest runs: following the chain, or backfilling and stopping.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Mode {
-    /// Backfill, then follow live heads until something fails: [`Machine::run`].
-    Follow,
-    /// Backfill the buried heights and stop: [`Machine::backfill_buried`], for a source with no
-    /// live heads.
-    Backfill,
-}
-
-impl Mode {
-    /// Drives `machine` this way from `start`, no further than `stop`.
-    async fn drive<S: BlockSource + 'static, K: EnvelopeSink>(
-        self,
-        machine: Machine<S, K>,
-        start: Option<u64>,
-        stop: Option<u64>,
-    ) -> Result<(), PipelineError> {
-        match self {
-            Self::Follow => machine.run(start, stop).await,
-            Self::Backfill => machine.backfill_buried(start, stop).await,
         }
     }
 }
@@ -217,8 +192,6 @@ pub(crate) struct Pipeline<B = AnySource> {
     start_block: Option<u64>,
     /// The last height to index; `None` follows live heads.
     stop_block: Option<u64>,
-    /// Whether ingest follows the chain or only backfills.
-    mode: Mode,
     decoder: Decoder,
     /// Every table the run has: the dataset tables and each decoded event's.
     schema: Arc<Schema>,
@@ -260,34 +233,25 @@ impl Pipeline {
         let datasets = route::datasets(routes.iter().map(|(_, tables)| tables));
         info!(%datasets, "fetching what the sinks write");
         let chain = settings.ingest.chain.as_str();
-        let concurrency = settings.ingest.backfill_concurrency;
-        let (source, mode) = match settings.ingest.source()? {
-            IngestSource::Rpc { http_url, ws_url } => (
-                AnySource::Rpc(EvmSource::new(
-                    chain,
-                    http_client(http_url.expose())?,
-                    ws_connect(ws_url.expose()),
-                    datasets,
-                    concurrency,
-                )),
-                Mode::Follow,
-            ),
+        let source = match settings.ingest.source()? {
+            IngestSource::Rpc { http_url, ws_url } => AnySource::Rpc(EvmSource::new(
+                chain,
+                http_client(http_url.expose())?,
+                ws_connect(ws_url.expose()),
+                datasets,
+                settings.ingest.backfill_concurrency,
+            )),
             IngestSource::HyperSync(hypersync) => {
                 info!(url = %hypersync.url, "backfilling from HyperSync; the run stops at the reorg window");
-                (
-                    AnySource::HyperSync(HyperSyncSource::new(
-                        chain,
-                        &hypersync.url,
-                        hypersync.token.expose(),
-                        datasets,
-                        concurrency,
-                    )?),
-                    Mode::Backfill,
-                )
+                AnySource::HyperSync(HyperSyncSource::new(
+                    chain,
+                    &hypersync.url,
+                    hypersync.token.expose(),
+                    datasets,
+                )?)
             }
         };
         Ok(Self {
-            mode,
             routes,
             ..Self::new(
                 source,
@@ -311,7 +275,6 @@ impl<B: BlockSource + 'static> Pipeline<B> {
             source,
             start_block,
             stop_block,
-            mode: Mode::Follow,
             schema: Arc::new(catalog.schema().clone()),
             decoder: Decoder::new(catalog),
             routes: Vec::new(),
@@ -350,7 +313,6 @@ impl<B: BlockSource + 'static> Pipeline<B> {
             source,
             start_block,
             stop_block,
-            mode,
             decoder,
             schema,
             routes,
@@ -360,12 +322,9 @@ impl<B: BlockSource + 'static> Pipeline<B> {
             .map(|(_, tables)| (StdoutJsonSink::new(), tables))
             .collect();
         let sink = DecodingSink::new(decoder, Router::new(schema, sinks));
-        mode.drive(
-            Machine::new(source, sink, Vec::new()),
-            start_block,
-            stop_block,
-        )
-        .await?;
+        Machine::new(source, sink, Vec::new())
+            .run(start_block, stop_block)
+            .await?;
         Ok(())
     }
 
@@ -445,7 +404,6 @@ impl<B: BlockSource + 'static> Pipeline<B> {
             source,
             start_block,
             stop_block,
-            mode,
             decoder,
             schema,
             ..
@@ -480,7 +438,7 @@ impl<B: BlockSource + 'static> Pipeline<B> {
             DecodingSink::new(decoder, Router::new(schema, sinks)),
             ledger,
         );
-        let ingest = mode.drive(machine, start_block, stop_block).await;
+        let ingest = machine.run(start_block, stop_block).await;
 
         // Ingest's halves of the channels are gone by now, so each store drains what is
         // queued and ends. The join order is [`finish`].

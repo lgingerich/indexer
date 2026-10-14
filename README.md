@@ -542,7 +542,7 @@ the field:
 | Key | Default | Meaning |
 | --- | --- | --- |
 | `ingest.start_block` | the sampled head | First height to index on an empty store. Absent starts live at the observed head; a value backfills that inclusive height forward before following live heads. A value above the sampled head is a startup error. When the store already holds blocks a run resumes from the store: a value the stored history reaches is ignored, and one more than a block past the stored tip is a startup error |
-| `ingest.backfill_concurrency` | `4` | Backfill fetches in flight at once. Blocks are still accepted in height order; this overlaps requests so the node is read while the stores write. Each counts against the provider's rate limit. Zero is refused |
+| `ingest.backfill_concurrency` | `4` | Backfill fetches in flight at once. Blocks are still accepted in height order; this overlaps requests so the node is read while the stores write. Each counts against the provider's rate limit. Zero is refused. A [HyperSync backfill](#backfilling-from-hypersync) ignores it |
 | `sink.duckdb.batch_records` | `500` | Most records one store commit may cover; a backlog of blocks is folded into one commit up to this, and a block is never split |
 | `sink.duckdb.path` | `indexer.duckdb` | Path to the store, relative to the settings file. Tables live in a schema named for the chain: `base.logs` |
 
@@ -584,13 +584,24 @@ url = "https://4663.hypersync.xyz"
 token = { env = "INDEXER_ENVIO_HYPERSYNC_TOKEN" }
 ```
 
-Responses are checked as the RPC source checks a node's: every height is present and
-linked to its parent, logs are present when a block's bloom says they are, and with
-transactions read, the receipts' gas adds up to the block's.
+HyperSync answers thousands of blocks per request, so the run fetches one range of
+10,000 heights at a time; `backfill_concurrency` does not apply. Responses are checked
+as the RPC source checks a node's: every height is present and linked to its parent, and
+logs are present when a block's bloom says they are. Wherever transactions are read, the
+last one's cumulative gas must also be the block's `gas_used`, which catches a dropped
+transaction.
 
-Every field matches the RPC source's but two HyperSync does not serve: a block's
-`requests_hash` (EIP-7685) is null, and so is an OP-stack deposit transaction's
-`y_parity`, which an RPC node reports as 0.
+A few fields differ from what the RPC source stores for the same block:
+
+| Field | Chains | HyperSync | RPC source |
+| --- | --- | --- | --- |
+| block `requests_hash` (EIP-7685) | any, past Prague | null: not served | the header's |
+| transaction `y_parity` on an OP-stack deposit (`0x7e`) | Base and other OP chains | null | `0` |
+| transaction `max_fee_per_gas` on Arbitrum types `0x69`, `0x6a` | Robinhood | the node's value | null: dropped reading an unknown type |
+| block `total_difficulty` | Ethereum, pre-merge | the block's | null: public nodes no longer serve it |
+| block `size` | BSC | one of two sizes the node reports | the other: BSC's answer depends on how the block was asked for |
+
+So where a backfill hands over to an RPC run, those columns can change at the boundary.
 
 ### Secrets
 

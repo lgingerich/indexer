@@ -27,6 +27,10 @@ impl BlockSource for AnySource {
         each!(self, source => source.chain())
     }
 
+    fn follows_heads(&self) -> bool {
+        each!(self, source => source.follows_heads())
+    }
+
     async fn subscribe_heads(&self) -> Result<HeadStream, SourceError> {
         each!(self, source => source.subscribe_heads().await)
     }

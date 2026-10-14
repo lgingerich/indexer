@@ -154,7 +154,8 @@ pub struct IngestSettings {
     /// How many backfill fetches are in flight at once. Blocks are still accepted one at a
     /// time, in height order; this only overlaps the requests, so the node is read while
     /// the stores write. Zero is refused. Each fetch counts against the provider's rate
-    /// limit, so a provider that throttles hard wants this low.
+    /// limit, so a provider that throttles hard wants this low. A `HyperSync` backfill
+    /// ignores it and fetches one range at a time, since each range is far larger.
     #[serde(default = "default_backfill_concurrency")]
     pub backfill_concurrency: NonZeroUsize,
 }
