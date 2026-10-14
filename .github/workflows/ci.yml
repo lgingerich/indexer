@@ -16,9 +16,9 @@ env:
 # push it out of the repository's cache space with its own.
 jobs:
   all-features:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: 1.95.0
@@ -39,9 +39,9 @@ jobs:
   # compile, and a fixture naming `[sink.duckdb]` fails to parse, so both hide until
   # someone runs this.
   no-default-features:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: 1.95.0
@@ -56,9 +56,9 @@ jobs:
   # The lake alone is the one store build that shares nothing SQL with the others, so a
   # SQL-only item it reaches through the shared store code shows up only here.
   delta:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: 1.95.0
