@@ -8,4 +8,5 @@ Replay a seed on the commit it was found on (later changes reshuffle seeds) with
 
 | ID | Found | Seeds | Bug | Impact | Fix |
 | --- | --- | --- | --- | --- | --- |
+| DST-002 | 2026-10-14, `3446889` | 236 | A restart whose node reported a head behind the store, below every block it handed back, sent that head to the fork walk, which stopped with `UndoWindowExceeded` although the head was the oldest stored block's parent. | Liveness: a stop and a supervisor restart after a fresh start on a lagging node | [`6f8e7a3`](https://github.com/lgingerich/indexer/commit/6f8e7a3) |
 | DST-001 | 2026-10-08, `bf9a787` | 17, 68, 172, 202 | A fork replacing the first indexed block stopped the pipeline with `UndoWindowExceeded`, again on every restart. | Liveness: stuck until an operator edits the store | [#1](https://github.com/lgingerich/indexer/pull/1) |
