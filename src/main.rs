@@ -69,7 +69,8 @@ async fn main() -> ExitCode {
         .init();
 
     let path = settings_path();
-    match indexer::runtime::run(&path).await {
+    // Boxed: the whole run's state is one future, too large to keep on the stack.
+    match Box::pin(indexer::runtime::run(&path)).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             // Display, not Debug: every variant in the chain prints its cause — `{source}`

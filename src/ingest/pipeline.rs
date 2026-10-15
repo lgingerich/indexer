@@ -52,7 +52,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll, ready};
 use thiserror::Error;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 /// Hardcoded budget for the recovered undo window.
 ///
@@ -61,6 +61,23 @@ use tracing::{info, warn};
 /// the pipeline can no longer identify. Identities cost nothing beside the payloads
 /// they describe, so the value is a bounded-memory choice, not a tuning knob.
 pub const MAX_UNFINALIZED_BLOCKS: usize = 4096;
+
+/// How soon a live head the source answered inconsistently is asked about again, and the
+/// longest wait it doubles to while the source keeps answering so. A head arriving first
+/// covers it instead, so on a fast chain the wait seldom matters.
+const RETRY_FIRST: std::time::Duration = std::time::Duration::from_millis(100);
+const RETRY_LONGEST: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Resolves to the head in `retry` once its wait is over; never, with none to retry.
+async fn retry_after(retry: Option<(BlockMeta, std::time::Duration)>) -> BlockMeta {
+    match retry {
+        Some((head, delay)) => {
+            tokio::time::sleep(delay).await;
+            head
+        }
+        None => std::future::pending().await,
+    }
+}
 
 /// How many times startup asks a source that answered inconsistently, and how long it
 /// waits between: about a minute, ample for a lagging backend to catch up.
@@ -467,27 +484,54 @@ impl<S: BlockSource + 'static, K: EnvelopeSink> Machine<S, K> {
             return Ok(());
         }
         let mut heads = self.source.subscribe_heads().await?;
+        // The last head the source answered inconsistently, to ask about again, and how
+        // long to wait first.
+        let mut retry: Option<(BlockMeta, std::time::Duration)> = None;
         loop {
-            let result = tokio::select! {
-                // A head and the reconcile timer can be ready together; checking the head
-                // first makes the choice the same every time instead of tokio's random
-                // pick. Either order is correct: a reconcile reads the head itself.
+            let (attempted, result) = tokio::select! {
+                // A head, a retry, and the reconcile timer can be ready together; checking
+                // them in this order makes the choice the same every time instead of
+                // tokio's random pick. Any order is correct: each brings coverage up to a
+                // head, and a newer one covers an older.
                 biased;
                 head = heads.next() => match head {
-                    Some(head) => self.process_head(head?).await,
+                    Some(head) => {
+                        let head = head?;
+                        (Some(head), self.process_head(head).await)
+                    }
                     None => return Err(PipelineError::SubscriptionClosed),
                 },
+                head = retry_after(retry) => (Some(head), self.process_head(head).await),
                 () = tokio::time::sleep(std::time::Duration::from_secs(30)) => {
-                    self.reconcile().await
+                    (None, self.reconcile().await)
                 }
             };
             match result {
-                // Accepted history matches what was delivered, so the next head retries.
+                // Accepted history matches what was delivered, so asking again is safe. The
+                // head is asked about again shortly rather than at the next one: a backend
+                // behind the one that announced it catches up in well under a second, and
+                // on a slow chain the next head is seconds away.
                 Err(
                     error @ (PipelineError::UnstableSource
                     | PipelineError::Source(SourceError::Inconsistent { .. })),
-                ) => warn!(%error, "skipping a live head the source answered inconsistently"),
-                result => result?,
+                ) => {
+                    let delay = retry.map_or(RETRY_FIRST, |(_, delay)| {
+                        delay.saturating_mul(2).min(RETRY_LONGEST)
+                    });
+                    if let Some(head) = attempted.or_else(|| retry.map(|(head, _)| head)) {
+                        debug!(%error, height = head.height, delay_ms = delay.as_millis(),
+                            "the source does not serve this head yet; asking again");
+                        if delay == RETRY_LONGEST {
+                            warn!(%error, height = head.height,
+                                "the source still does not serve this head; asking again");
+                        }
+                        retry = Some((head, delay));
+                    }
+                }
+                Err(error) => return Err(error),
+                // Coverage reached a head, which covers any older one waiting to be asked
+                // about again.
+                Ok(()) => retry = None,
             }
         }
     }
@@ -2064,6 +2108,58 @@ mod tests {
             };
             assert_eq!(block.number, expected);
         }
+        drop(hints);
+        assert!(matches!(
+            run.await.expect("driver task"),
+            Err(PipelineError::SubscriptionClosed)
+        ));
+    }
+
+    /// A live head the source answers inconsistently is asked about again within a
+    /// fraction of a second, without waiting for the next head or the reconcile timer:
+    /// on a slow chain those are seconds away, and the head's rows with them.
+    #[tokio::test(start_paused = true)]
+    async fn an_inconsistent_live_head_is_asked_about_again_soon() {
+        let inconsistent = Arc::new(AtomicBool::new(false));
+        let (hints, hint_stream) = tokio::sync::mpsc::unbounded_channel();
+        let (events, mut received) = tokio::sync::mpsc::unbounded_channel();
+        let source = LiveSource {
+            source: Source::linear(6),
+            head: Arc::new(AtomicU64::new(1)),
+            forked: Arc::default(),
+            inconsistent: Arc::clone(&inconsistent),
+            hints: std::sync::Mutex::new(Some(hint_stream)),
+        };
+        let run = tokio::spawn(Machine::new(source, LiveSink(events), Vec::new()).run(None, None));
+        let Some(Event::Block(block)) = received.recv().await else {
+            panic!("startup delivers block 1");
+        };
+        assert_eq!(block.number, 1);
+        inconsistent.store(true, Ordering::Relaxed);
+        let announced = tokio::time::Instant::now();
+        hints
+            .send(BlockMeta {
+                height: 2,
+                hash: hash(2),
+                parent_hash: hash(1),
+                timestamp: 2,
+            })
+            .expect("hint");
+        // No other head is announced: only the retry can deliver block 2, and well before
+        // the reconcile timer, which would not either, since the source's head is still 1.
+        let Some(Event::Block(block)) =
+            tokio::time::timeout(std::time::Duration::from_secs(5), received.recv())
+                .await
+                .expect("the head is asked about again within seconds")
+        else {
+            panic!("the head is asked about again");
+        };
+        assert_eq!(block.number, 2);
+        assert!(
+            announced.elapsed() < std::time::Duration::from_secs(1),
+            "asked again after {:?}, not at the next head or reconcile",
+            announced.elapsed()
+        );
         drop(hints);
         assert!(matches!(
             run.await.expect("driver task"),
