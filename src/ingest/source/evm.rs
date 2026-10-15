@@ -348,6 +348,34 @@ fn invalid_json(context: &'static str, source: serde_json::Error) -> SourceError
 
 /// The error for a failed call at `context`, without the request URL a reqwest error
 /// carries: a provider's URL usually holds its API key, and these errors are logged.
+/// [`transport`], for a read of a block, header, or receipt at a height, except that an
+/// error response saying the node has not reached that height is [`inconsistent`]: it
+/// is a `null` answer in other words, from a backend behind the one that announced the
+/// block (see [`NOT_SERVED`]). Envio's `HyperRPC` answers so, with `-32602` and "requested
+/// block N is greater than latest block N-1".
+fn block_read(context: &'static str, source: TransportError) -> SourceError {
+    if let RpcError::ErrorResp(payload) = &source
+        && not_reached(&payload.message)
+    {
+        return inconsistent(context, format!("{NOT_SERVED}: {}", payload.message));
+    }
+    transport(context, source)
+}
+
+/// Whether a node's error message says it has not reached the height asked for, in the
+/// words the providers this indexer runs on use.
+fn not_reached(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    [
+        "greater than latest",
+        "header not found",
+        "block not found",
+        "unknown block",
+    ]
+    .iter()
+    .any(|phrase| message.contains(phrase))
+}
+
 fn transport(context: &'static str, source: TransportError) -> SourceError {
     let source = match source {
         RpcError::Transport(TransportErrorKind::Custom(error)) => RpcError::Transport(
@@ -1049,7 +1077,7 @@ impl<C: PubSubConnect + Clone> BlockSource for EvmSource<C> {
             .client()
             .request(BLOCK, (tag, false))
             .await
-            .map_err(|source| transport(CONTEXT, source))?;
+            .map_err(|source| block_read(CONTEXT, source))?;
         let missing = format!("no block at {tag}");
         header.map(BlockMeta::from).ok_or_else(|| match height {
             Some(_) => inconsistent(CONTEXT, format!("{missing}: {NOT_SERVED}")),
@@ -1089,7 +1117,7 @@ impl<C> EvmSource<C> {
             for call in calls {
                 receipts.push(
                     call.await
-                        .map_err(|source| transport(RECEIPT, source))?
+                        .map_err(|source| block_read(RECEIPT, source))?
                         .ok_or_else(|| inconsistent(RECEIPT, NOT_SERVED))?,
                 );
             }
@@ -1123,12 +1151,12 @@ impl<C> EvmSource<C> {
             .map_err(|source| transport("rpc batch", source))?;
         let block = block
             .await
-            .map_err(|source| transport(BLOCK, source))?
+            .map_err(|source| block_read(BLOCK, source))?
             .ok_or_else(|| inconsistent(BLOCK, NOT_SERVED))?;
         let receipts = match receipts.await {
             Ok(receipts) => receipts,
             Err(RpcError::ErrorResp(error)) if error.code == METHOD_NOT_FOUND => None,
-            Err(source) => return Err(transport(RECEIPTS, source)),
+            Err(source) => return Err(block_read(RECEIPTS, source)),
         };
         Ok((block, receipts))
     }
@@ -1173,7 +1201,7 @@ impl<C> EvmSource<C> {
             blocks.push(
                 header
                     .await
-                    .map_err(|source| transport(BLOCK, source))?
+                    .map_err(|source| block_read(BLOCK, source))?
                     .ok_or_else(|| inconsistent(BLOCK, NOT_SERVED))?,
             );
         }
@@ -1298,6 +1326,47 @@ mod tests {
             .await
             .expect_err("a null block is not a block");
         assert!(matches!(error, SourceError::Inconsistent { .. }), "{error}");
+        server.join().expect("server");
+    }
+
+    /// A node that answers a height it has not reached with an error rather than `null`,
+    /// as Envio's `HyperRPC` does, is just as inconsistent: the run skips and asks again.
+    #[tokio::test]
+    async fn a_block_beyond_the_nodes_latest_is_inconsistent() {
+        let (url, server) = rpc_server(1, |request| {
+            let calls = request.as_array().expect("a batch");
+            let refused = |call: &Value| {
+                json!({"jsonrpc": "2.0", "id": call["id"], "error": {"code": -32602,
+                    "message": "Invalid params: requested block 18000000 is greater than latest block 17999999"}})
+            };
+            json!([refused(&calls[0]), refused(&calls[1])])
+        });
+        let source = from_urls("ethereum", url, "ws://unused", Datasets::all()).expect("source");
+        let error = source
+            .fetch_block(18_000_000, None)
+            .await
+            .expect_err("a refused block is not a block");
+        assert!(matches!(error, SourceError::Inconsistent { .. }), "{error}");
+        server.join().expect("server");
+    }
+
+    /// Any other error response is still the transport failure it was.
+    #[tokio::test]
+    async fn another_error_response_is_still_a_transport_failure() {
+        let (url, server) = rpc_server(1, |request| {
+            let calls = request.as_array().expect("a batch");
+            let refused = |call: &Value| {
+                json!({"jsonrpc": "2.0", "id": call["id"], "error": {"code": -32000,
+                    "message": "execution aborted"}})
+            };
+            json!([refused(&calls[0]), refused(&calls[1])])
+        });
+        let source = from_urls("ethereum", url, "ws://unused", Datasets::all()).expect("source");
+        let error = source
+            .fetch_block(18_000_000, None)
+            .await
+            .expect_err("refused");
+        assert!(matches!(error, SourceError::Transport { .. }), "{error}");
         server.join().expect("server");
     }
 
