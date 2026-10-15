@@ -20,9 +20,12 @@
 //! that joined a running deployment and committed ahead of a slower store before the
 //! process stopped. Its ledger reaches back to its first block, so it holds nothing at or
 //! below that block, and rewinding it there deletes only what it wrote since joining. A
-//! ledger as long as the window a restore reads may have history below it, so it always
-//! has a say: a store that far ahead is a startup error rather than a rewind that could
-//! delete days of rows.
+//! ledger as long as the window a restore reads may have history below it. When even
+//! its oldest block is above the slowest store's tip, the stores show no conflict, only
+//! a lag: a lake whose commit, of thousands of small blocks, was dropped by a stop the
+//! database's commits outlived. Within `MAX_RESUME_LAG` blocks of that tip it has no
+//! say, and is rewound to it, its rows above re-fetched; further ahead is a startup
+//! error rather than a rewind that could delete days of rows.
 //!
 //! A rewind is not a retraction, so it writes no `reorgs` row. A store rewound past
 //! blocks a reorg orphaned, which a faster store already recorded, never records that
@@ -185,6 +188,13 @@ fn millis(started: Instant) -> u64 {
     u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
+/// How far past the slowest store's tip a store whose whole ledger window lies above that
+/// tip may be, and still be rewound to it: four windows of blocks, minutes on a fast
+/// chain and about two days on Ethereum. The storage drain commits at most half a window
+/// at a time (see `channel::MAX_BLOCKS`), so a stop leaves stores at most that far apart;
+/// this allows for more, and refuses a store further ahead.
+const MAX_RESUME_LAG: u64 = 4 * LEDGER_WINDOW as u64;
+
 /// Non-empty ledgers that share no block.
 #[derive(Debug)]
 struct Disjoint;
@@ -194,7 +204,9 @@ struct Disjoint;
 ///
 /// A ledger has no say about a block below its oldest one when it is shorter than
 /// [`LEDGER_WINDOW`], since a restore reads up to that many: it is the store's whole
-/// history, so the store holds nothing at or below the block. See the module docs.
+/// history, so the store holds nothing at or below the block. A full one has none
+/// either while its tip is within [`MAX_RESUME_LAG`] of the block: no hash disagrees,
+/// so the store is only ahead. See the module docs.
 fn common_block(ledgers: &[&[BlockMeta]]) -> Result<Option<(BlockMeta, usize)>, Disjoint> {
     let held: Vec<HashSet<(u64, B256)>> = ledgers
         .iter()
@@ -215,10 +227,12 @@ fn common_block(ledgers: &[&[BlockMeta]]) -> Result<Option<(BlockMeta, usize)>, 
         return Ok(None);
     };
     let has_say = |ledger: &[BlockMeta], block: &BlockMeta| {
-        ledger.len() >= LEDGER_WINDOW
-            || ledger
-                .first()
-                .is_some_and(|oldest| oldest.height <= block.height)
+        let (Some(oldest), Some(tip)) = (ledger.first(), ledger.last()) else {
+            return false;
+        };
+        oldest.height <= block.height
+            || (ledger.len() >= LEDGER_WINDOW
+                && tip.height.saturating_sub(block.height) > MAX_RESUME_LAG)
     };
     let common = ledger.iter().rev().find(|block| {
         held.iter().zip(ledgers).all(|(held, ledger)| {
@@ -297,12 +311,23 @@ mod tests {
         assert_eq!(common(&[&slow, &joined]), Some((5, 0)));
     }
 
-    /// A full window may have history below it, so a store that far ahead is refused
-    /// rather than rewound past all of it.
+    /// A full window whose oldest block is above the slowest tip, close behind it: a
+    /// database that outran a lake whose commit a stop dropped. No hash disagrees, so the
+    /// slowest tip is the common block, and the store ahead is rewound to it.
     #[test]
-    fn a_full_ledger_above_the_slowest_tip_is_refused() {
+    fn a_full_ledger_just_above_the_slowest_tip_is_rewound_to_it() {
         let behind = ledger(0xa0, 1..=5);
-        let ahead = ledger(0xa0, 100..=99 + LEDGER_WINDOW as u64);
+        let ahead = ledger(0xa0, 5_000..=4_999 + LEDGER_WINDOW as u64);
+        assert_eq!(common(&[&behind, &ahead]), Some((5, 0)));
+    }
+
+    /// A full window may have history below it, so a store far ahead is refused rather
+    /// than rewound past all of it.
+    #[test]
+    fn a_full_ledger_far_above_the_slowest_tip_is_refused() {
+        let behind = ledger(0xa0, 1..=5);
+        let start = 5 + super::MAX_RESUME_LAG;
+        let ahead = ledger(0xa0, start..=start + LEDGER_WINDOW as u64);
         assert!(matches!(common_block(&[&behind, &ahead]), Err(Disjoint)));
     }
 }

@@ -68,6 +68,16 @@ const CAPACITY: usize = 1024;
 /// about 256 MB. A block larger than this on its own still passes, alone.
 const ENVELOPES: usize = 1 << 17;
 
+/// The most blocks one flush gathers, whatever a store's own limits allow: half the
+/// window of accepted blocks a store hands back to a restart.
+///
+/// A stop drops what a store has gathered but not begun committing, and the stores
+/// commit on their own schedules, so one can be this far behind another after a stop.
+/// Resume needs a block both hand back, within that window; the lake's byte limit alone
+/// let a commit gather over ten thousand of Robinhood's small blocks, and a stop left it
+/// further behind the database than resume could reach.
+const MAX_BLOCKS: usize = crate::ingest::pipeline::LEDGER_WINDOW / 2;
+
 /// A block on its way to storage, holding its share of the envelope budget until the
 /// drain takes it.
 #[derive(Debug)]
@@ -224,7 +234,7 @@ impl ChannelReceiver {
         mut stop: Stop,
     ) -> Result<u64, SinkError> {
         let mut stored = 0_u64;
-        let mut pending = 0_usize;
+        let mut pending = Pending::default();
         // When the oldest gathered block must be flushed; `None` with nothing gathered.
         let mut deadline: Option<Instant> = None;
         loop {
@@ -248,7 +258,7 @@ impl ChannelReceiver {
             };
             let due = *deadline.get_or_insert_with(|| Instant::now() + batching.wait);
             self.publish(sink, block, &mut pending).await?;
-            while !full(sink, pending, batching) {
+            while !full(sink, &pending, batching) {
                 let Ok(block) = self.receiver.try_recv() else {
                     break;
                 };
@@ -257,17 +267,17 @@ impl ChannelReceiver {
             if stop.requested() {
                 break;
             }
-            if full(sink, pending, batching) || Instant::now() >= due {
+            if full(sink, &pending, batching) || Instant::now() >= due {
                 stored += self.flush(sink, &mut pending).await?;
                 deadline = None;
             }
         }
         if stop.requested() {
             info!(
-                uncommitted = pending,
+                uncommitted = pending.envelopes,
                 "storage stopping on request; the uncommitted blocks are fetched again on the next start"
             );
-        } else if pending > 0 {
+        } else if pending.blocks > 0 {
             stored += self.flush(sink, &mut pending).await?;
         }
         sink.finish().await?;
@@ -284,9 +294,10 @@ impl ChannelReceiver {
         &mut self,
         sink: &mut K,
         block: Parcel,
-        pending: &mut usize,
+        pending: &mut Pending,
     ) -> Result<(), SinkError> {
-        *pending += block.envelopes.len();
+        pending.envelopes += block.envelopes.len();
+        pending.blocks += 1;
         for envelope in block.envelopes {
             self.progress.note(&envelope);
             sink.publish(envelope).await?;
@@ -299,13 +310,13 @@ impl ChannelReceiver {
     async fn flush<K: EnvelopeSink>(
         &mut self,
         sink: &mut K,
-        pending: &mut usize,
+        pending: &mut Pending,
     ) -> Result<u64, SinkError> {
         let started = Instant::now();
         sink.flush().await?;
         let elapsed = started.elapsed();
         let head = progress::sampled_head(self.head.load(Ordering::Acquire));
-        let records = std::mem::take(pending) as u64;
+        let records = std::mem::take(pending).envelopes as u64;
         self.progress
             .committed(self.store, records, elapsed, head, Instant::now());
         Ok(records)
@@ -331,8 +342,19 @@ async fn recv_until(receiver: &mut mpsc::Receiver<Parcel>, deadline: Option<Inst
 }
 
 /// Whether what is gathered has reached a limit of `batching`.
-fn full<K: EnvelopeSink>(sink: &K, pending: usize, batching: Batching) -> bool {
-    pending >= batching.records || sink.buffered_bytes() >= batching.bytes
+fn full<K: EnvelopeSink>(sink: &K, pending: &Pending, batching: Batching) -> bool {
+    pending.envelopes >= batching.records
+        || pending.blocks >= MAX_BLOCKS
+        || sink.buffered_bytes() >= batching.bytes
+}
+
+/// What the drain has gathered since its last flush.
+#[derive(Debug, Default)]
+struct Pending {
+    /// Envelopes, as [`Batching::records`] counts them.
+    envelopes: usize,
+    /// Blocks, each arriving whole.
+    blocks: usize,
 }
 
 #[cfg(test)]
@@ -550,6 +572,34 @@ mod tests {
             .await
             .expect("drain");
         assert_eq!(store.flushed, [keys(0..3), keys(3..4)]);
+    }
+
+    /// However much a store's own limits would gather, one flush holds at most
+    /// [`MAX_BLOCKS`](super::MAX_BLOCKS) blocks, so a stop can leave the stores no
+    /// further apart than a restart reaches back.
+    #[tokio::test]
+    async fn a_flush_holds_at_most_half_a_window_of_blocks() {
+        let max = super::MAX_BLOCKS as u64;
+        let (mut sink, receiver) = ChannelSink::new(Backend::DuckDb);
+        let batching = Batching {
+            records: usize::MAX,
+            bytes: usize::MAX,
+            wait: Duration::from_hours(1),
+        };
+        let storage = tokio::spawn(async move {
+            let mut store = Batches::default();
+            receiver
+                .drain(&mut store, batching, Stop::never())
+                .await
+                .expect("drain");
+            store.flushed
+        });
+        for height in 0..max + 10 {
+            send_block(&mut sink, height..height + 1).await;
+        }
+        drop(sink);
+        let flushed = storage.await.expect("storage");
+        assert_eq!(flushed, [keys(0..max), keys(max..max + 10)]);
     }
 
     /// The channel is bounded, so a stalled store is felt as a waiting sender rather
