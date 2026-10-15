@@ -7,26 +7,25 @@
 
 [ingest]
 chain = "robinhood"
-# Backfilling from HyperSync (README: Backfilling from HyperSync): it indexes up to
-# `finality_depth` blocks under the head and exits. To follow the chain after it, uncomment
-# http_url, ws_url, and backfill_concurrency, and remove [ingest.hypersync] below.
-# http_url = { env = "INDEXER_ROBINHOOD_HTTP_URL" }
-# ws_url = { env = "INDEXER_ROBINHOOD_WS_URL" }
+http_url = { env = "INDEXER_ROBINHOOD_HTTP_URL" }
+ws_url = { env = "INDEXER_ROBINHOOD_WS_URL" }
 # The Metric factory's first event, the earliest log of any Metric contract on this
 # chain. Stores already past it resume from their ledger and ignore it.
 start_block = 63835167
-# backfill_concurrency = 16
+backfill_concurrency = 16
 # No `finality_depth`: an Orbit chain's blocks are final once their batch is final on
 # Ethereum, deeper than a run retracts, so it keeps the default, 4,096 blocks.
 # stop_block = <height>    # index through this height and exit instead
 
-[ingest.hypersync]
-url = "https://4663.hypersync.xyz"
-token = { env = "INDEXER_ENVIO_HYPERSYNC_TOKEN" }
-# Ranges of `span` heights, `concurrency` in flight, each held whole until accepted, so
-# memory is about span × concurrency blocks: a few hundred MB a range: ~40 rows a block.
-span = 10000
-concurrency = 3
+# Instead of http_url and ws_url, a HyperSync backfill that exits `finality_depth` blocks
+# under the head (README: Backfilling from HyperSync). Ranges of `span` heights,
+# `concurrency` in flight, each held whole until accepted, so memory is about span ×
+# concurrency blocks: a few hundred MB a range, ~40 rows a block.
+# [ingest.hypersync]
+# url = "https://4663.hypersync.xyz"
+# token = { env = "INDEXER_ENVIO_HYPERSYNC_TOKEN" }
+# span = 10000
+# concurrency = 3
 
 # The app's PostgreSQL (PlanetScale): only what the app serves, a subset of the lake below,
 # in the database schema named for the chain. Requires the `postgres` feature. The connection
