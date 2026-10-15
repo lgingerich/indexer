@@ -517,6 +517,9 @@ impl<S: BlockSource + 'static, K: EnvelopeSink> Machine<S, K> {
                 head = heads.next() => match head {
                     Some(head) => {
                         let head = head?;
+                        // The newest head, as a sample is: on a live chain a head arrives
+                        // well within the reconcile interval, so the timer never fires.
+                        self.observe_head(head.height);
                         (Some(head), self.process_head(head).await)
                     }
                     None => return Err(PipelineError::SubscriptionClosed),
@@ -865,9 +868,15 @@ impl<S: BlockSource + 'static, K: EnvelopeSink> Machine<S, K> {
     /// Samples the source's head and reports it to the sink.
     async fn sample_head(&mut self) -> Result<BlockMeta, PipelineError> {
         let head = self.source.fetch_header(None).await?;
-        self.sink.observe_head(head.height);
-        metrics::chain_head(head.height);
+        self.observe_head(head.height);
         Ok(head)
+    }
+
+    /// Reports the source's newest head to the sink, which measures each commit's lag
+    /// against it, and to the metrics.
+    fn observe_head(&mut self, height: u64) {
+        self.sink.observe_head(height);
+        metrics::chain_head(height);
     }
 
     /// Reconciles the live tail: duplicate, gap, or fork against the sampled head.
@@ -1065,8 +1074,7 @@ impl<S: BlockSource + 'static, K: EnvelopeSink> Machine<S, K> {
         }
         let block = self.replacement(lowest).await?;
 
-        self.sink.observe_head(target.height);
-        metrics::chain_head(target.height);
+        self.observe_head(target.height);
         let orphaned = self.ring.orphaned(ancestor);
         if !orphaned.is_empty() {
             metrics::reorg(orphaned.len());
@@ -2012,6 +2020,64 @@ mod tests {
         async fn flush(&mut self) -> Result<(), SinkError> {
             Ok(())
         }
+    }
+
+    /// Forwards as [`LiveSink`] does, and keeps the newest head it was told of.
+    struct HeadSink(LiveSink, Arc<AtomicU64>);
+    impl EnvelopeSink for HeadSink {
+        async fn publish(&mut self, envelope: Envelope) -> Result<(), SinkError> {
+            self.0.publish(envelope).await
+        }
+        async fn flush(&mut self) -> Result<(), SinkError> {
+            self.0.flush().await
+        }
+        fn observe_head(&mut self, height: u64) {
+            self.1.store(height, Ordering::Relaxed);
+        }
+    }
+
+    /// A head the subscription announces is observed as a sampled one is. On a live
+    /// chain the reconcile timer never fires, so without it every commit's lag was
+    /// measured against the head sampled at startup, and read zero.
+    #[tokio::test(start_paused = true)]
+    async fn an_announced_head_is_observed() {
+        let observed = Arc::new(AtomicU64::new(0));
+        let (hints, hint_stream) = tokio::sync::mpsc::unbounded_channel();
+        let (events, mut received) = tokio::sync::mpsc::unbounded_channel();
+        let source = LiveSource {
+            source: Source::linear(6),
+            head: Arc::new(AtomicU64::new(1)),
+            forked: Arc::default(),
+            inconsistent: Arc::default(),
+            hints: std::sync::Mutex::new(Some(hint_stream)),
+        };
+        let sink = HeadSink(LiveSink(events), Arc::clone(&observed));
+        let run = tokio::spawn(Machine::new(source, sink, Vec::new()).run(None, None));
+        let Some(Event::Block(block)) = received.recv().await else {
+            panic!("startup delivers block 1");
+        };
+        assert_eq!(block.number, 1);
+        assert_eq!(observed.load(Ordering::Relaxed), 1);
+        hints
+            .send(BlockMeta {
+                height: 3,
+                hash: hash(3),
+                parent_hash: hash(2),
+                timestamp: 3,
+            })
+            .expect("hint");
+        for expected in [2, 3] {
+            let Some(Event::Block(block)) = received.recv().await else {
+                panic!("the announced head is caught up to");
+            };
+            assert_eq!(block.number, expected);
+        }
+        assert_eq!(observed.load(Ordering::Relaxed), 3);
+        drop(hints);
+        assert!(matches!(
+            run.await.expect("driver task"),
+            Err(PipelineError::SubscriptionClosed)
+        ));
     }
 
     #[tokio::test(start_paused = true)]

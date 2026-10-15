@@ -12,7 +12,7 @@
 //! | Series | Kind | What it answers |
 //! | --- | --- | --- |
 //! | `indexer_start_time_seconds` | gauge | When the process started; a change is a restart |
-//! | `indexer_chain_head_height` | gauge | The newest head sampled from the node |
+//! | `indexer_chain_head_height` | gauge | The newest head the node announced or was sampled at |
 //! | `indexer_ingest_height` | gauge | The newest block ingest handed to the stores |
 //! | `indexer_reorgs_total` | counter | Reorgs retracted |
 //! | `indexer_reorg_orphaned_blocks_total` | counter | Blocks those reorgs orphaned |

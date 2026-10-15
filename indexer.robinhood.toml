@@ -12,7 +12,9 @@ ws_url = { env = "INDEXER_ROBINHOOD_WS_URL" }
 # The Metric factory's first event, the earliest log of any Metric contract on this
 # chain. Stores already past it resume from their ledger and ignore it.
 start_block = 63835167
-backfill_concurrency = 16
+# Blocks fetched at once while catching up. At 16 a restart's catch-up ran into the
+# provider's requests-per-second limit; at about 10 blocks a second, 4 still gains fast.
+backfill_concurrency = 4
 # No `finality_depth`: an Orbit chain's blocks are final once their batch is final on
 # Ethereum, deeper than a run retracts, so it keeps the default, 4,096 blocks.
 # stop_block = <height>    # index through this height and exit instead
