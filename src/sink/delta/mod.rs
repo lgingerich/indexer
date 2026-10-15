@@ -80,13 +80,17 @@ use deltalake::datafusion::error::DataFusionError;
 use deltalake::datafusion::prelude::{Expr, SessionContext, cast, ident, lit};
 use deltalake::datafusion::scalar::ScalarValue;
 use deltalake::kernel::transaction::CommitProperties;
+use deltalake::logstore::object_store::GetOptions;
 use deltalake::logstore::{ObjectStoreRef, store_for};
 use deltalake::parquet::basic::{Compression, ZstdLevel};
 use deltalake::parquet::file::properties::WriterProperties;
 use deltalake::protocol::SaveMode;
-use deltalake::{DeltaTable, DeltaTableBuilder, DeltaTableError, checkpoints, ensure_table_uri};
+use deltalake::{
+    DeltaTable, DeltaTableBuilder, DeltaTableError, ObjectStoreError, checkpoints, ensure_table_uri,
+};
 use futures_util::stream::{self, StreamExt as _, TryStreamExt as _};
 use serde::Deserialize;
+use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 use tracing::{info, warn};
@@ -115,6 +119,13 @@ const ROWS_PER_BATCH: usize = 1 << 16;
 /// How many versions of a table pass between the checkpoints the store starts: delta-rs's
 /// own default interval.
 const CHECKPOINT_EVERY: u64 = 100;
+
+/// How many checkpoints run at once. Each replays its table's whole log and holds its
+/// state while writing it out, and the first open of a lake whose tables were never
+/// checkpointed finds most of them due at once. delta-rs writes a checkpoint on the
+/// task that asked for it, holding a runtime worker throughout, so few run at once:
+/// opening's own reads run on the same workers.
+const CONCURRENT_CHECKPOINTS: usize = 2;
 
 /// The `contracts` columns a restore reads back.
 const CONTRACT_COLUMNS: [&str; 4] = ["protocol", "name", "address", "block_hash"];
@@ -225,9 +236,12 @@ struct Lake {
     def: Arc<TableDef>,
     arrow: Arc<ArrowSchema>,
     table: DeltaTable,
-    /// The newest version a checkpoint was started for, or the version the table opened
-    /// at: the next is due [`CHECKPOINT_EVERY`] versions later.
+    /// The newest version a checkpoint was started for, or the table's newest checkpoint
+    /// as of opening (zero when it had none): the next is due [`CHECKPOINT_EVERY`]
+    /// versions later.
     checkpointed: u64,
+    /// The permits every table's checkpoints share, [`CONCURRENT_CHECKPOINTS`] of them.
+    checkpoints: Arc<Semaphore>,
 }
 
 impl Lake {
@@ -244,18 +258,34 @@ impl Lake {
     /// is written for is as good, so it runs beside the writer, and a failed one is
     /// logged and left to the next.
     fn committed(&mut self, table: DeltaTable) {
-        let version = table.version().unwrap_or_default();
-        if version.saturating_sub(self.checkpointed) >= CHECKPOINT_EVERY {
-            self.checkpointed = version;
-            let name = self.def.name.clone();
-            let snapshot = table.clone();
-            tokio::spawn(async move {
-                if let Err(error) = checkpoints::create_checkpoint(&snapshot, None).await {
-                    warn!(table = %name, version, %error, "lake checkpoint failed; the next is due later");
-                }
-            });
-        }
         self.table = table;
+        self.checkpoint_if_due();
+    }
+
+    /// Starts a checkpoint of the table as it stands, in the background, once
+    /// [`CHECKPOINT_EVERY`] versions have passed since the last.
+    ///
+    /// Opening calls it too: a table committed to less often than that between restarts
+    /// would otherwise never be checkpointed, and every open would read its whole log.
+    /// One a stop interrupted is noticed at the next open and started again.
+    fn checkpoint_if_due(&mut self) {
+        let version = self.table.version().unwrap_or_default();
+        if version.saturating_sub(self.checkpointed) < CHECKPOINT_EVERY {
+            return;
+        }
+        self.checkpointed = version;
+        let name = self.def.name.clone();
+        let snapshot = self.table.clone();
+        let permits = Arc::clone(&self.checkpoints);
+        tokio::spawn(async move {
+            // Never closed, so a permit always comes.
+            let Ok(_permit) = permits.acquire_owned().await else {
+                return;
+            };
+            if let Err(error) = checkpoints::create_checkpoint(&snapshot, None).await {
+                warn!(table = %name, version, %error, "lake checkpoint failed; the next is due later");
+            }
+        });
     }
 
     /// `rows` as this table's Arrow batch: the CPU half of an append.
@@ -407,10 +437,14 @@ impl DeltaSink {
         let started = Instant::now();
         let root = settings.uri.trim_end_matches('/');
         let storage = Storage::new(root, &settings.storage)?;
+        let checkpoints = Arc::new(Semaphore::new(CONCURRENT_CHECKPOINTS));
         // Each open is a few requests that wait on the store, and a run has a table per
         // event, so they overlap: one after another, a hundred tables took minutes.
         let lakes: Vec<Lake> = stream::iter(schema.tables())
-            .map(|def| open_table(&storage, format!("{root}/{chain}/{}", def.name), def))
+            .map(|def| {
+                let uri = format!("{root}/{chain}/{}", def.name);
+                open_table(&storage, uri, def, Arc::clone(&checkpoints))
+            })
             .buffered(CONCURRENT_TABLES)
             .try_collect()
             .await?;
@@ -1181,12 +1215,13 @@ fn commit_properties() -> CommitProperties {
         .with_create_checkpoint(false)
 }
 
-/// Opens the table of `def` at `uri`, creating it when it does not exist, and checks an
-/// existing one against its definition.
+/// Opens the table of `def` at `uri`, creating it when it does not exist, checks an
+/// existing one against its definition, and starts its checkpoint if one is due.
 async fn open_table(
     storage: &Storage,
     uri: String,
     def: &Arc<TableDef>,
+    checkpoints: Arc<Semaphore>,
 ) -> Result<Lake, StoreError> {
     let name = def.name.as_str();
     if def.position(PARTITION).is_some() {
@@ -1201,7 +1236,7 @@ async fn open_table(
         .table(&uri)
         .await
         .map_err(StoreError::engine(Operation::Open, Some(name)))?;
-    if table.version().is_none() {
+    let checkpointed = if table.version().is_none() {
         let partitions = arrow::partitioned(def).map(|_| PARTITION.to_owned());
         table = table
             .create()
@@ -1210,18 +1245,59 @@ async fn open_table(
             .with_partition_columns(partitions)
             .await
             .map_err(StoreError::engine(Operation::Create, Some(name)))?;
+        0
     } else {
         check(&table, &expected, name)?;
-    }
+        // Only a hint: without it the next checkpoint comes early, which is no reason to
+        // stop the run.
+        match last_checkpoint(&table).await {
+            Ok(version) => version.unwrap_or_default(),
+            Err(error) => {
+                warn!(table = name, %error, "lake checkpoint hint unreadable; counting from zero");
+                0
+            }
+        }
+    };
     let arrow =
         arrow::arrow_schema(def).map_err(StoreError::engine(Operation::Create, Some(name)))?;
-    let checkpointed = table.version().unwrap_or_default();
-    Ok(Lake {
+    let mut lake = Lake {
         def: Arc::clone(def),
         arrow,
         table,
         checkpointed,
-    })
+        checkpoints,
+    };
+    lake.checkpoint_if_due();
+    Ok(lake)
+}
+
+/// The version of `table`'s newest checkpoint, as its log's `_last_checkpoint` names it;
+/// `None` when it names none. delta-rs reads the same file while loading, but keeps the
+/// version to itself.
+///
+/// The file is only a hint, written after its checkpoint, so it may name an older one:
+/// then the next checkpoint comes early, which costs one checkpoint and nothing else.
+/// One that does not parse counts as absent, as it does for delta-rs.
+async fn last_checkpoint(table: &DeltaTable) -> Result<Option<u64>, DeltaTableError> {
+    #[derive(Deserialize)]
+    struct Hint {
+        version: u64,
+    }
+    let log_store = table.log_store();
+    let path = log_store.log_path().clone().join("_last_checkpoint");
+    let read = match log_store
+        .object_store(None)
+        .get_opts(&path, GetOptions::default())
+        .await
+    {
+        Ok(read) => read,
+        Err(ObjectStoreError::NotFound { .. }) => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    let bytes = read.bytes().await?;
+    Ok(serde_json::from_slice::<Hint>(&bytes)
+        .ok()
+        .map(|hint| hint.version))
 }
 
 /// Fails when `table` as stored lacks a column, holds one it does not declare, or types

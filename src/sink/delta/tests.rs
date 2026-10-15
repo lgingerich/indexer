@@ -925,16 +925,63 @@ async fn a_checkpoint_is_written_beside_the_commits() {
     for height in 1..=commits {
         publish(&mut sink, block(height, 0)).await;
     }
-    let log = PathBuf::from(dir.table("accepted_blocks")).join("_delta_log");
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-    loop {
-        let checkpointed = std::fs::read_dir(&log)
-            .expect("the log")
-            .flatten()
-            .any(|entry| entry.file_name().to_string_lossy().contains(".checkpoint."));
-        if checkpointed {
-            break;
+    wait_for_checkpoint(&log_of(&dir, "accepted_blocks")).await;
+}
+
+/// A table committed to less often than the checkpoint interval in each run is still
+/// checkpointed once the interval has passed across runs: the count starts at its
+/// newest checkpoint, not at the version a run opened it at.
+#[tokio::test]
+async fn the_checkpoint_interval_counts_across_reopens() {
+    let dir = Dir::new();
+    let log = log_of(&dir, "accepted_blocks");
+    let half = super::CHECKPOINT_EVERY / 2 + 1;
+    let mut sink = open(&dir).await;
+    for height in 1..=half {
+        publish(&mut sink, block(height, 0)).await;
+    }
+    drop(sink);
+    assert!(!log.join("_last_checkpoint").exists(), "checkpointed early");
+    let mut sink = open(&dir).await;
+    for height in half + 1..=super::CHECKPOINT_EVERY + 1 {
+        publish(&mut sink, block(height, 0)).await;
+    }
+    wait_for_checkpoint(&log).await;
+}
+
+/// Opening starts the checkpoint a table is due, so one a stop interrupted, or a table
+/// no commit reaches, is not left to read its whole log on every open.
+#[tokio::test]
+async fn opening_starts_a_checkpoint_that_is_due() {
+    let dir = Dir::new();
+    let log = log_of(&dir, "accepted_blocks");
+    let mut sink = open(&dir).await;
+    for height in 1..=super::CHECKPOINT_EVERY + 1 {
+        publish(&mut sink, block(height, 0)).await;
+    }
+    wait_for_checkpoint(&log).await;
+    drop(sink);
+    // As if the process stopped before the checkpoint was written.
+    for entry in std::fs::read_dir(&log).expect("the log").flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.contains(".checkpoint.") || name == "_last_checkpoint" {
+            std::fs::remove_file(entry.path()).expect("removed");
         }
+    }
+    let _sink = open(&dir).await;
+    wait_for_checkpoint(&log).await;
+}
+
+/// The transaction log of `table` in the lake at `dir`.
+fn log_of(dir: &Dir, table: &str) -> PathBuf {
+    PathBuf::from(dir.table(table)).join("_delta_log")
+}
+
+/// Waits for the log at `log` to name a checkpoint: `_last_checkpoint` is written once
+/// the checkpoint itself is.
+async fn wait_for_checkpoint(log: &std::path::Path) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while !log.join("_last_checkpoint").exists() {
         assert!(
             std::time::Instant::now() < deadline,
             "no checkpoint was written"
