@@ -149,6 +149,13 @@ impl Span {
 /// The method labels these calls are reported under, shared by the fetch path and
 /// the projection so an error names the same boundary wherever it is raised.
 const BLOCK: &str = "eth_getBlockByNumber";
+
+/// Why a `null` answer for a block, its header, or a receipt is [`inconsistent`] rather
+/// than malformed: the heights the source is asked for are ones the chain has
+/// announced or already buried, so the node has them, and a `null` is a backend behind
+/// the one that announced the block, as a load-balanced provider's often is. The live
+/// loop skips that head and catches up at the next; asking again succeeds.
+const NOT_SERVED: &str = "result was null: the node does not serve it yet";
 const RECEIPTS: &str = "eth_getBlockReceipts";
 const LOGS: &str = "eth_getLogs";
 
@@ -1043,9 +1050,11 @@ impl<C: PubSubConnect + Clone> BlockSource for EvmSource<C> {
             .request(BLOCK, (tag, false))
             .await
             .map_err(|source| transport(CONTEXT, source))?;
-        header
-            .map(BlockMeta::from)
-            .ok_or_else(|| malformed(CONTEXT, format!("no block at {tag}")))
+        let missing = format!("no block at {tag}");
+        header.map(BlockMeta::from).ok_or_else(|| match height {
+            Some(_) => inconsistent(CONTEXT, format!("{missing}: {NOT_SERVED}")),
+            None => malformed(CONTEXT, missing),
+        })
     }
 }
 
@@ -1081,7 +1090,7 @@ impl<C> EvmSource<C> {
                 receipts.push(
                     call.await
                         .map_err(|source| transport(RECEIPT, source))?
-                        .ok_or_else(|| malformed(RECEIPT, "result was null"))?,
+                        .ok_or_else(|| inconsistent(RECEIPT, NOT_SERVED))?,
                 );
             }
         }
@@ -1115,7 +1124,7 @@ impl<C> EvmSource<C> {
         let block = block
             .await
             .map_err(|source| transport(BLOCK, source))?
-            .ok_or_else(|| malformed(BLOCK, "result was null"))?;
+            .ok_or_else(|| inconsistent(BLOCK, NOT_SERVED))?;
         let receipts = match receipts.await {
             Ok(receipts) => receipts,
             Err(RpcError::ErrorResp(error)) if error.code == METHOD_NOT_FOUND => None,
@@ -1165,7 +1174,7 @@ impl<C> EvmSource<C> {
                 header
                     .await
                     .map_err(|source| transport(BLOCK, source))?
-                    .ok_or_else(|| malformed(BLOCK, "result was null"))?,
+                    .ok_or_else(|| inconsistent(BLOCK, NOT_SERVED))?,
             );
         }
         let logs = match logs {
@@ -1273,6 +1282,23 @@ mod tests {
             {"jsonrpc": "2.0", "id": calls[0]["id"], "result": block},
             {"jsonrpc": "2.0", "id": calls[1]["id"], "result": receipts},
         ])
+    }
+
+    /// A node behind the one that announced a block answers it `null`. That is a
+    /// backend catching up, which the live loop skips and retries, not malformed data
+    /// that stops the run.
+    #[tokio::test]
+    async fn a_block_the_node_does_not_serve_yet_is_inconsistent() {
+        let (url, server) = rpc_server(1, |request| {
+            primary_reply(request, &Value::Null, &Value::Null)
+        });
+        let source = from_urls("ethereum", url, "ws://unused", Datasets::all()).expect("source");
+        let error = source
+            .fetch_block(0x112_a880, None)
+            .await
+            .expect_err("a null block is not a block");
+        assert!(matches!(error, SourceError::Inconsistent { .. }), "{error}");
+        server.join().expect("server");
     }
 
     #[tokio::test]
