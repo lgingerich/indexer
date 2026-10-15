@@ -68,6 +68,26 @@ pub const MAX_UNFINALIZED_BLOCKS: usize = 4096;
 const RETRY_FIRST: std::time::Duration = std::time::Duration::from_millis(100);
 const RETRY_LONGEST: std::time::Duration = std::time::Duration::from_secs(2);
 
+/// The retry after a failed attempt at `attempted`, given the one pending, `retry`.
+///
+/// Asking about the same head again doubles its wait, up to [`RETRY_LONGEST`]; a newly
+/// announced head starts at [`RETRY_FIRST`], since a source a block behind its own
+/// announcements fails most heads once, and on a fast chain doubling across them reached
+/// the longest wait within a second. A failed reconcile, which names no head, keeps
+/// asking about the pending one.
+fn next_retry(
+    retry: Option<(BlockMeta, std::time::Duration)>,
+    attempted: Option<BlockMeta>,
+) -> Option<(BlockMeta, std::time::Duration)> {
+    let longer = |delay: std::time::Duration| delay.saturating_mul(2).min(RETRY_LONGEST);
+    match (retry, attempted) {
+        (Some((pending, delay)), None) => Some((pending, longer(delay))),
+        (Some((pending, delay)), Some(head)) if head == pending => Some((pending, longer(delay))),
+        (_, Some(head)) => Some((head, RETRY_FIRST)),
+        (None, None) => None,
+    }
+}
+
 /// Resolves to the head in `retry` once its wait is over; never, with none to retry.
 async fn retry_after(retry: Option<(BlockMeta, std::time::Duration)>) -> BlockMeta {
     match retry {
@@ -515,17 +535,14 @@ impl<S: BlockSource + 'static, K: EnvelopeSink> Machine<S, K> {
                     error @ (PipelineError::UnstableSource
                     | PipelineError::Source(SourceError::Inconsistent { .. })),
                 ) => {
-                    let delay = retry.map_or(RETRY_FIRST, |(_, delay)| {
-                        delay.saturating_mul(2).min(RETRY_LONGEST)
-                    });
-                    if let Some(head) = attempted.or_else(|| retry.map(|(head, _)| head)) {
+                    retry = next_retry(retry, attempted);
+                    if let Some((head, delay)) = retry {
                         debug!(%error, height = head.height, delay_ms = delay.as_millis(),
                             "the source does not serve this head yet; asking again");
                         if delay == RETRY_LONGEST {
                             warn!(%error, height = head.height,
                                 "the source still does not serve this head; asking again");
                         }
-                        retry = Some((head, delay));
                     }
                 }
                 Err(error) => return Err(error),
@@ -2165,6 +2182,36 @@ mod tests {
             run.await.expect("driver task"),
             Err(PipelineError::SubscriptionClosed)
         ));
+    }
+
+    /// A head asked about again waits twice as long each time, up to the longest wait;
+    /// a newly announced head starts over, so a source that misses most heads once is
+    /// not taken for one stuck on a head.
+    #[test]
+    fn retry_waits_double_per_head_and_start_over_for_a_new_one() {
+        let meta = |height| BlockMeta {
+            height,
+            hash: hash(height),
+            parent_hash: hash(height - 1),
+            timestamp: height,
+        };
+        let mut retry = next_retry(None, Some(meta(5)));
+        assert_eq!(retry, Some((meta(5), RETRY_FIRST)));
+        for _ in 0..10 {
+            retry = next_retry(retry, Some(meta(5)));
+        }
+        assert_eq!(retry, Some((meta(5), RETRY_LONGEST)));
+        assert_eq!(
+            next_retry(retry, None),
+            Some((meta(5), RETRY_LONGEST)),
+            "a failed reconcile keeps asking about the pending head"
+        );
+        assert_eq!(
+            next_retry(retry, Some(meta(6))),
+            Some((meta(6), RETRY_FIRST)),
+            "a new head starts over"
+        );
+        assert_eq!(next_retry(None, None), None);
     }
 
     #[test]
