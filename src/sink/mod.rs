@@ -173,10 +173,18 @@ pub trait Store: EnvelopeSink + 'static {
     /// a stored value does not parse.
     fn restore(&mut self) -> impl Future<Output = Result<Restored, StoreError>> + Send;
 
+    /// Names `held`, the blocks this store committed above where ingest resumes, which
+    /// ingest will hand it again. Each is settled as its height arrives: a block with the
+    /// same hash is not written again, and one with another hash retracts the store's
+    /// copy as a reorg would. Called at startup, before the first envelope, for a store
+    /// whose ledger reaches down to where ingest resumes (see `sink::resume`).
+    fn reconcile(&mut self, held: &[BlockMeta]);
+
     /// Deletes every block above `height` — its rows and its ledger entry — so the store
     /// holds the chain up to `height` and nothing after it. Run at startup, before the
-    /// first envelope, to bring a store that committed further than the others back to
-    /// the block they all hold (see `sink::resume`).
+    /// first envelope, for a store ahead of the others whose ledger does not reach back
+    /// to the block they all hold, so it cannot [`reconcile`](Self::reconcile) the blocks
+    /// in between (see `sink::resume`).
     ///
     /// Writes no `reorgs` row: the blocks are not retracted from the chain, only from
     /// this store, and are written again as ingest resumes.

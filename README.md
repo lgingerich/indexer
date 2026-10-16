@@ -215,11 +215,15 @@ starting there would leave a gap above the tip. `[sink.stdout]` has no store, so
 With several stores, each commits on its own schedule — the lake every half minute, a
 database every block — so a restart can find them at different heights, or on different
 branches after a reorg the process did not live to finish. Before ingest starts,
-`sink::resume` finds the newest block every store's ledger holds with the same hash,
-rewinds each store that committed past it, and resumes from there. A rewind deletes
-the store's rows above that block and writes no `reorgs` row; ingest fetches those
-blocks again. A store with an empty ledger joins where the others resume, without the
-earlier blocks. See `docs/multi-store-open-items.md` for what this leaves open.
+`sink::resume` finds the newest block every store's ledger holds with the same hash
+and resumes from there. A store that committed past it keeps its rows: ingest hands it
+those blocks again, and it skips each one it holds with the same hash and retracts,
+with a `reorgs` row, each one whose hash changed while it was ahead. So a restart
+deletes nothing from a database that is merely ahead of the lake. Only a store whose
+ledger window does not reach back to that block is rewound instead, deleting its rows
+above it with no `reorgs` row, and ingest fetches those blocks again. A store with an
+empty ledger joins where the others resume, without the earlier blocks. See
+`docs/multi-store-open-items.md` for what this leaves open.
 
 Resume guarantees contiguity from the restored tip forward, not before it: gaps that
 runs before resume existed left behind are not backfilled. And `MAX(block_number)` of a

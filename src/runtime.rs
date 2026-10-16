@@ -52,8 +52,9 @@
 //!
 //! `SIGTERM` or `SIGINT` — a deploy's `docker stop`, or Ctrl-C — stops the run as
 //! asked rather than killing it: ingest stops at once, every store finishes the commit
-//! it has under way and drops what it has not started (see `crate::sink::channel`), and
-//! the process exits 0. Before ingest starts, the stores are being opened and brought
+//! it has under way, commits what it has gathered if that fits a deadline under the
+//! host's stop timeout, and drops the blocks still queued (see `crate::sink::channel`),
+//! and the process exits 0. Before ingest starts, the stores are being opened and brought
 //! to one block, which a restart repeats, so a stop there ends the run without waiting.
 //! A second signal does nothing more; the supervisor's own timeout is the backstop.
 
@@ -168,7 +169,9 @@ impl RuntimeError {
     /// against the same stores fails the same way, so a supervisor should stop rather
     /// than restart. These are an unreadable settings file or manifests, a sink naming a
     /// table the run lacks, and a start or stop height that does not fit the chain or
-    /// the stores' history.
+    /// the stores' history, and stores that cannot be opened or brought to one block as
+    /// they stand: a table that does not match its definition, or stores with no block
+    /// in common.
     ///
     /// A height above the head is counted too, though the chain would grow past it: a
     /// height the chain has not reached is a mistyped one far more often than an early
@@ -178,6 +181,10 @@ impl RuntimeError {
     pub fn is_config(&self) -> bool {
         match self {
             Self::Settings(_) | Self::Catalog(_) | Self::Route { .. } => true,
+            #[cfg(feature = "store")]
+            Self::OpenStore { source, .. } => source.is_permanent(),
+            #[cfg(feature = "store")]
+            Self::Resume(error) => error.is_permanent(),
             Self::Ingest(error) => matches!(
                 error,
                 PipelineError::StartAboveHistory { .. }
@@ -703,6 +710,48 @@ tables = ["blocks", "transactions", "logs", "decoded_logs", "contract_events"]
     }
 
     /// The shipped protocols load, so the example settings a reader copies stay runnable.
+    /// A store that cannot open or resume as it stands is the settings' fault, so the
+    /// process exits as a config error and the supervisor waits for a fix rather than
+    /// restarting into the same failure; a store that may come back is not.
+    #[test]
+    fn a_store_that_cannot_start_as_it_stands_is_a_config_error() {
+        use crate::sink::resume::ResumeError;
+
+        let open = |source| RuntimeError::OpenStore {
+            store: Backend::Postgres,
+            source,
+        };
+        let drift = open(StoreError::Drift {
+            table: "logs".to_owned(),
+            difference: "it has no data column".to_owned(),
+        });
+        assert!(drift.is_config(), "{drift}");
+        let locked = open(StoreError::Locked {
+            schema: "base".to_owned(),
+        });
+        assert!(!locked.is_config(), "{locked}");
+        let unreachable = open(StoreError::Engine {
+            operation: Operation::Open,
+            target: None,
+            source: "connection refused".into(),
+        });
+        assert!(!unreachable.is_config(), "{unreachable}");
+
+        let disjoint = RuntimeError::Resume(ResumeError::NoCommonBlock {
+            tips: vec![(Backend::Postgres, 9), (Backend::Delta, 5)],
+        });
+        assert!(disjoint.is_config(), "{disjoint}");
+        let unread = RuntimeError::Resume(ResumeError::Restore {
+            store: Backend::Delta,
+            source: StoreError::Engine {
+                operation: Operation::Read,
+                target: Some("accepted_blocks".to_owned()),
+                source: "timed out".into(),
+            },
+        });
+        assert!(!unread.is_config(), "{unread}");
+    }
+
     #[test]
     fn the_shipped_protocols_assemble() {
         let decode = format!("\n[decode]\nprotocols = {:?}\n", protocols());
@@ -1211,14 +1260,13 @@ tables = ["blocks", "transactions", "logs", "decoded_logs", "contract_events"]
     }
 
     /// Two stores, the database ahead of the lake when the process stops, and the chain
-    /// forked below the database's tip while nothing ran. The restart rewinds the
-    /// database to the block both hold, so neither keeps the orphaned branch and the lake
-    /// is never handed a block it has; both end on the same canonical chain.
+    /// forked below the database's tip while nothing ran. The restart resumes from the
+    /// block both hold; the database retracts each of its orphaned blocks as ingest hands
+    /// that height again, so neither keeps the orphaned branch and the lake is never
+    /// handed a block it has; both end on the same canonical chain.
     #[cfg(feature = "delta")]
     #[tokio::test]
     async fn stores_at_different_heights_resume_from_the_block_they_share() {
-        use crate::sink::any_store::AnyStore;
-
         let dir = LakeDir(
             std::env::temp_dir().join(format!("indexer-runtime-two-{}", std::process::id())),
         );
@@ -1234,38 +1282,7 @@ tables = ["blocks", "transactions", "logs", "decoded_logs", "contract_events"]
         let connection = duckdb::Connection::open_in_memory().expect("open in-memory DuckDB");
         let pool = Address::from([0xd0; 20]);
         let both = async |chain: FakeChain, start: Option<u64>| {
-            let database =
-                DuckDbSink::connected(connection.try_clone().expect("handle"), schema(), "base")
-                    .await
-                    .expect("open");
-            let lake = sink::DeltaSink::open(&settings, schema(), "base")
-                .await
-                .expect("the lake opens");
-            let catalog =
-                Catalog::load(protocols(), &ChainId::new("base")).expect("shipped protocols load");
-            let stores = vec![
-                every_table(
-                    Backend::DuckDb,
-                    AnyStore::DuckDb(database),
-                    Batching::eager(500),
-                ),
-                every_table(
-                    Backend::Delta,
-                    AnyStore::Delta(Box::new(lake)),
-                    settings.batching(),
-                ),
-            ];
-            let result = Box::pin(
-                Pipeline::new(chain, start, None, catalog).run_with_stores(stores, Stop::never()),
-            )
-            .await;
-            assert!(
-                matches!(
-                    result,
-                    Err(RuntimeError::Ingest(PipelineError::SubscriptionClosed))
-                ),
-                "{result:?}"
-            );
+            run_both(&connection, &settings, chain, start).await;
         };
 
         both(FakeChain::new(4, 0xa0), Some(1)).await;
@@ -1296,12 +1313,12 @@ tables = ["blocks", "transactions", "logs", "decoded_logs", "contract_events"]
         assert_eq!(
             count(&connection, "contracts"),
             0,
-            "the pool went with its rewound block"
+            "the pool went with its orphaned block"
         );
         assert_eq!(
             count(&connection, "reorgs"),
-            0,
-            "a rewind retracts nothing from the chain"
+            2,
+            "each orphaned block the database held is retracted as ingest reaches it"
         );
         let restored = restored(&settings).await;
         assert_eq!(
@@ -1313,5 +1330,116 @@ tables = ["blocks", "transactions", "logs", "decoded_logs", "contract_events"]
             expected,
             "the lake holds the same chain"
         );
+    }
+
+    /// One process lifetime of a database and a lake together, the database first, as
+    /// [`run_once`] is for the database alone.
+    #[cfg(feature = "delta")]
+    async fn run_both(
+        connection: &duckdb::Connection,
+        settings: &sink::DeltaSettings,
+        chain: FakeChain,
+        start: Option<u64>,
+    ) {
+        use crate::sink::any_store::AnyStore;
+
+        let database =
+            DuckDbSink::connected(connection.try_clone().expect("handle"), schema(), "base")
+                .await
+                .expect("open");
+        let lake = sink::DeltaSink::open(settings, schema(), "base")
+            .await
+            .expect("the lake opens");
+        let catalog =
+            Catalog::load(protocols(), &ChainId::new("base")).expect("shipped protocols load");
+        let stores = vec![
+            every_table(
+                Backend::DuckDb,
+                AnyStore::DuckDb(database),
+                Batching::eager(500),
+            ),
+            every_table(
+                Backend::Delta,
+                AnyStore::Delta(Box::new(lake)),
+                settings.batching(),
+            ),
+        ];
+        let result = Box::pin(
+            Pipeline::new(chain, start, None, catalog).run_with_stores(stores, Stop::never()),
+        )
+        .await;
+        assert!(
+            matches!(
+                result,
+                Err(RuntimeError::Ingest(PipelineError::SubscriptionClosed))
+            ),
+            "{result:?}"
+        );
+    }
+
+    /// The database ahead of the lake on the chain that stayed canonical, as every
+    /// deploy leaves them: the restart deletes nothing from the database and writes
+    /// nothing again into it. A value changed by hand in a held block's row survives,
+    /// which neither a delete nor an upsert of the block would let it.
+    #[cfg(feature = "delta")]
+    #[tokio::test]
+    async fn a_store_ahead_on_the_canonical_chain_keeps_its_rows() {
+        let dir = LakeDir(
+            std::env::temp_dir().join(format!("indexer-runtime-ahead-{}", std::process::id())),
+        );
+        let settings = sink::DeltaSettings {
+            tables: serde_json::from_str(r#"["blocks"]"#).expect("tables"),
+            uri: dir.0.display().to_string(),
+            commit_interval_secs: 3600,
+            max_buffer_bytes: usize::MAX,
+            maintenance: false,
+            vacuum_retention_hours: 168,
+            storage: std::collections::BTreeMap::new(),
+        };
+        let connection = duckdb::Connection::open_in_memory().expect("open in-memory DuckDB");
+        let pool = Address::from([0xd0; 20]);
+        let chain = || {
+            let mut chain = FakeChain::new(6, 0xa0);
+            chain.log(6, pool_created(pool, B256::ZERO));
+            chain
+        };
+
+        run_both(&connection, &settings, FakeChain::new(4, 0xa0), Some(1)).await;
+        // The database alone runs on to 6, discovering a pool there.
+        run_once(&connection, chain(), None).await;
+        connection
+            .execute_batch("UPDATE base.contracts SET name = 'kept'")
+            .expect("mark the held row");
+
+        let mut grown = chain();
+        grown.branch(7, 7, 0xa0);
+        run_both(&connection, &settings, grown, None).await;
+
+        let name: String = connection
+            .query_row("SELECT name FROM base.contracts", [], |row| row.get(0))
+            .expect("the pool is still stored");
+        assert_eq!(
+            name, "kept",
+            "the held block was neither deleted nor rewritten"
+        );
+        assert_eq!(count(&connection, "reorgs"), 0);
+        let expected: Vec<(u64, String)> = (1..=7)
+            .map(|height| (height, format!("{:#x}", block_hash(0xa0, height))))
+            .collect();
+        assert_eq!(
+            heights(&connection),
+            expected,
+            "the database holds one chain"
+        );
+        let lake = restored(&settings).await;
+        assert_eq!(
+            lake.ledger
+                .iter()
+                .map(|block| (block.height, format!("{:#x}", block.hash)))
+                .collect::<Vec<_>>(),
+            expected,
+            "the lake caught up to the same chain"
+        );
+        assert_eq!(lake.contracts.len(), 1, "the lake discovered the pool once");
     }
 }

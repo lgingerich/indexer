@@ -115,6 +115,23 @@ pub enum StoreError {
 }
 
 impl StoreError {
+    /// Whether opening the store again fails the same way, so a supervisor should stop
+    /// restarting it: a table whose stored shape or declaration is wrong, or a stored
+    /// value that does not parse. Each needs an operator — a table dropped, a definition
+    /// fixed — not another try.
+    ///
+    /// An engine failure may pass, and so may [`Locked`](Self::Locked): during a deploy
+    /// the old process can hold the lock for a moment after the new one starts.
+    #[must_use]
+    pub fn is_permanent(&self) -> bool {
+        match self {
+            Self::Drift { .. } | Self::Reserved { .. } | Self::Table(_) | Self::Restore(_) => true,
+            Self::Engine { .. } | Self::Locked { .. } | Self::Failed | Self::Replayed { .. } => {
+                false
+            }
+        }
+    }
+
     /// Wraps an engine error from `operation` on `target`.
     pub(crate) fn engine<E: Into<EngineError>>(
         operation: Operation,

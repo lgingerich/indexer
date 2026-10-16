@@ -385,6 +385,10 @@ impl<E: Engine + 'static> Store for SqlStore<E> {
         })
     }
 
+    fn reconcile(&mut self, held: &[BlockMeta]) {
+        self.batch.reconcile(held);
+    }
+
     /// One transaction, so a stop part-way leaves the store as it was.
     async fn rewind(&mut self, height: u64) -> Result<(), StoreError> {
         self.engine

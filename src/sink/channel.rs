@@ -31,10 +31,12 @@
 //!
 //! # Stopping
 //!
-//! A [`Stop`] ends the drain between commits: a commit under way finishes, and what is
-//! gathered or still queued is dropped rather than flushed. Flushing it could take longer
-//! than a supervisor waits, and the blocks are fetched again from the ledger's tip, as
-//! after a crash; what a stop saves is a commit cut off part-way.
+//! A [`Stop`] ends the drain between commits: a commit under way finishes, then what is
+//! gathered is committed too, given [`STOP_FLUSH`] to do it, and what is still queued is
+//! dropped. A lake gathers up to its commit interval of blocks, so committing them on a
+//! deploy saves fetching them all again. A commit that runs out of time is abandoned,
+//! which every store survives as it survives a crash: nothing it wrote counts until its
+//! ledger entry does, and the blocks are fetched again from the ledger's tip.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -71,12 +73,23 @@ const ENVELOPES: usize = 1 << 17;
 /// The most blocks one flush gathers, whatever a store's own limits allow: half the
 /// window of accepted blocks a store hands back to a restart.
 ///
-/// A stop drops what a store has gathered but not begun committing, and the stores
-/// commit on their own schedules, so one can be this far behind another after a stop.
+/// A stop abandons what a store has gathered when its commit does not finish within
+/// [`STOP_FLUSH`], and the stores commit on their own schedules, so one can be this far
+/// behind another after a stop.
 /// Resume needs a block both hand back, within that window; the lake's byte limit alone
 /// let a commit gather over ten thousand of Robinhood's small blocks, and a stop left it
 /// further behind the database than resume could reach.
 const MAX_BLOCKS: usize = crate::ingest::pipeline::LEDGER_WINDOW / 2;
+
+/// How long a stop gives the drain to commit what it has gathered.
+///
+/// The host stops a container with `docker stop -t 30` (`stop_timeout` in the infra
+/// repository's indexer stack) and kills it after that. This is half of it, counted from
+/// when the drain sees the stop, which is after any commit under way: the rest covers
+/// that commit, the last ledger append, and exiting. A lake's commit of its interval at
+/// the tip takes a few seconds; a commit of a full buffer while catching up may not fit,
+/// and is then abandoned.
+const STOP_FLUSH: Duration = Duration::from_secs(15);
 
 /// A block on its way to storage, holding its share of the envelope budget until the
 /// drain takes it.
@@ -217,8 +230,8 @@ impl ChannelReceiver {
     /// oldest gathered block's deadline, so a stalled chain still flushes on time; with
     /// nothing gathered, it waits for as long as the chain does. When the sending half is
     /// dropped, whatever is gathered is flushed before the drain ends. When `stop` is
-    /// requested, it is not: a flush under way finishes, and the rest is dropped (see
-    /// the module docs).
+    /// requested, a flush under way finishes, what is gathered is flushed within
+    /// [`STOP_FLUSH`] or abandoned, and what is queued is dropped (see the module docs).
     ///
     /// A successful flush is reported by the progress log: one line per commit near the
     /// sampled head, and one line per second while catching up.
@@ -273,9 +286,23 @@ impl ChannelReceiver {
             }
         }
         if stop.requested() {
+            let gathered = pending.envelopes;
+            if pending.blocks > 0 {
+                if let Ok(flushed) =
+                    tokio::time::timeout(STOP_FLUSH, self.flush(sink, &mut pending)).await
+                {
+                    stored += flushed?;
+                } else {
+                    info!(
+                        uncommitted = gathered,
+                        seconds = STOP_FLUSH.as_secs(),
+                        "storage stopping on request; the last commit did not finish in time, and its blocks are fetched again on the next start"
+                    );
+                }
+            }
             info!(
-                uncommitted = pending.envelopes,
-                "storage stopping on request; the uncommitted blocks are fetched again on the next start"
+                committed = gathered - pending.envelopes,
+                "storage stopping on request; blocks still queued are fetched again on the next start"
             );
         } else if pending.blocks > 0 {
             stored += self.flush(sink, &mut pending).await?;
@@ -699,11 +726,10 @@ mod tests {
         );
     }
 
-    /// A stop drops what a store with a commit interval has gathered instead of flushing
-    /// it: the blocks are fetched again from the ledger, and the flush could outlast the
-    /// supervisor's wait.
+    /// A stop commits what a store with a commit interval has gathered, rather than
+    /// leaving it to be fetched again, and drops nothing it had in hand.
     #[tokio::test(start_paused = true)]
-    async fn a_stop_drops_what_is_gathered() {
+    async fn a_stop_commits_what_is_gathered() {
         let (mut sink, receiver) = ChannelSink::new(Backend::DuckDb);
         let (request, stop) = Stop::new();
         let batching = Batching {
@@ -726,8 +752,60 @@ mod tests {
         request.send(true).expect("the drain is listening");
 
         let (stored, flushed) = storage.await.expect("storage ends");
+        assert_eq!(stored, 2);
+        assert_eq!(flushed, [keys(0..2)]);
+    }
+
+    /// A stop's commit that outlasts [`STOP_FLUSH`](super::STOP_FLUSH) is abandoned, so
+    /// the process exits before the supervisor kills it, and what the commits before it
+    /// left running is still waited on.
+    #[tokio::test(start_paused = true)]
+    async fn a_stop_abandons_a_commit_that_runs_out_of_time() {
+        /// Never finishes a flush.
+        #[derive(Default)]
+        struct Stuck {
+            finished: bool,
+        }
+
+        impl EnvelopeSink for Stuck {
+            async fn publish(&mut self, _envelope: Envelope) -> Result<(), SinkError> {
+                Ok(())
+            }
+
+            async fn flush(&mut self) -> Result<(), SinkError> {
+                std::future::pending().await
+            }
+
+            async fn finish(&mut self) -> Result<(), SinkError> {
+                self.finished = true;
+                Ok(())
+            }
+        }
+
+        let (mut sink, receiver) = ChannelSink::new(Backend::DuckDb);
+        let (request, stop) = Stop::new();
+        let batching = Batching {
+            records: usize::MAX,
+            bytes: usize::MAX,
+            wait: Duration::from_hours(1),
+        };
+        let storage = tokio::spawn(async move {
+            let mut store = Stuck::default();
+            let stored = receiver
+                .drain(&mut store, batching, stop)
+                .await
+                .expect("an abandoned commit is not an error");
+            (stored, store.finished)
+        });
+        send_block(&mut sink, 0..1).await;
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        request.send(true).expect("the drain is listening");
+
+        let started = tokio::time::Instant::now();
+        let (stored, finished) = storage.await.expect("storage ends");
         assert_eq!(stored, 0);
-        assert!(flushed.is_empty(), "{flushed:?}");
+        assert!(finished, "what earlier commits left running is waited on");
+        assert_eq!(started.elapsed(), super::STOP_FLUSH);
     }
 
     /// A sink error ends the drain with that error, so a failing store stops storage

@@ -10,7 +10,7 @@ use crate::sink::DuckDbSink;
 #[cfg(feature = "postgres")]
 use crate::sink::PostgresSink;
 use crate::sink::{EnvelopeSink, Restored, SinkError, Store, StoreError};
-use crate::wire::envelope::Envelope;
+use crate::wire::envelope::{BlockMeta, Envelope};
 
 /// One opened store, of whichever backend the settings named.
 #[derive(Debug)]
@@ -61,6 +61,10 @@ impl EnvelopeSink for AnyStore {
 impl Store for AnyStore {
     async fn restore(&mut self) -> Result<Restored, StoreError> {
         each!(self, sink => sink.restore().await)
+    }
+
+    fn reconcile(&mut self, held: &[BlockMeta]) {
+        each!(self, sink => sink.reconcile(held));
     }
 
     async fn rewind(&mut self, height: u64) -> Result<(), StoreError> {

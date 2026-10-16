@@ -8,38 +8,27 @@ duplicates data. Structural cleanups from the review of this change are listed l
 
 ## A rewound store can miss a `reorgs` row
 
-**What.** At startup every store is rewound to the newest block all their ledgers hold
-with the same hash. Suppose the database committed a reorg — orphaning blocks 5 and 6 and
-writing a `reorgs` row — but the lake had not yet committed it when the process stopped.
-The lake still holds the orphaned 5 and 6. On restart both stores agree only up to 4, so
-both are rewound to 4, and ingest resumes from 4 on the canonical chain. The lake's
-orphaned rows are gone, but it never gets the `reorgs` row the database has, because a
-rewind is not a retraction and ingest does not see a reorg: its ledger, rewound to 4,
-never named the orphans.
+**What.** A store ahead of the others at startup normally keeps its blocks and
+reconciles them as ingest hands them again (see `src/sink/resume.rs`): one it holds is
+skipped, and one whose hash changed while it was ahead is retracted with a `reorgs` row
+of its own. Only a store whose full ledger window starts above the block after the
+common one is rewound instead, since its ledger may not name every block it holds in
+between. A rewind is not a retraction, so if a reorg orphaned blocks inside that store's
+lead, it never records it.
 
-The block data is right in both stores. Only the audit table differs: the database
-records the reorg, the lake does not.
+The block data is right in every store either way. Only the audit table can differ.
 
-**When.** Only when a reorg lands inside the lag between stores (about one lake commit
-interval, 30 s by default) and the process stops before the slower store commits it.
+**Shape of a reconciled retraction.** A store that reconciles writes one `reorgs` row per
+height whose hash changed, naming that one orphan, where the store that saw the reorg
+live wrote one row naming every orphan. Both name the same blocks.
 
-**Options.**
+**When.** A rewind needs a store more than a ledger window (4,097 blocks) ahead of the
+slowest one, which a stop leaves only if a lake commit of thousands of small blocks is
+dropped; a missed row additionally needs a reorg inside that lead.
 
-- *Accept* (current). `reorgs` is an audit record, and the lake already loses a row in
-  one A→B→A case (see `delta-lake-open-items.md`).
-- *Record the rewind as a retraction.* When a store is rewound past blocks another store
-  does not hold — its ledger names hashes above the common block that some other store's
-  ledger contradicts at the same height — write a `reorgs` row naming them before
-  deleting. The store's own ledger has the orphaned hashes, and the other store's ledger
-  has the new head. Needs care so a store that was merely *ahead* on the canonical chain
-  (the common case) records nothing.
-- *Per-store reconciliation instead of rewind.* Keep each store's blocks above the
-  common block, and have the router compare each replayed block against that store's
-  ledger: skip a block it holds, and send it its own `reorg` where its branch differs.
-  Correct records, but the reorg logic then lives in the router as well as in ingest.
-
-**Recommendation.** Record the rewind as a retraction if anything starts reading `reorgs` as
-authoritative history. Until then, accept.
+**Recommendation.** Accept. Record the rewind as a retraction — write a `reorgs` row for
+held hashes another store's ledger contradicts at the same height — only if anything
+starts reading `reorgs` as authoritative history.
 
 ## A store added later is not backfilled
 
@@ -82,14 +71,15 @@ derived fetch has no logs and the decoder has contracts. Small; do it next.
 
 ## Not yet verified
 
-- The SQL rewind (delete by hash, through the ledger) runs against DuckDB in the
-  two-store restart test, but not against PostgreSQL: those tests need a live database
-  and are ignored by default.
-- A store whose whole history lies above the slowest tip is rewound rather than refused.
-  That rule has unit tests in `resume.rs`, but no end-to-end restart test of its own.
+- Reconciling a store that is ahead runs against DuckDB beside the lake in the
+  two-store restart tests, but not against PostgreSQL: those tests need a live database
+  and are ignored by default. Neither does the SQL rewind, now only a fallback.
+- A store whose whole history lies above the slowest tip reconciles rather than being
+  refused. That rule has unit tests in `resume.rs`, but no end-to-end restart test of its
+  own.
 - The deterministic simulation compiles against the new runtime but has not been run,
   and models one store. Extending it to two stores that fail independently is the best
-  test of the rewind.
+  test of reconciliation.
 
 ## Structural cleanups
 
@@ -129,8 +119,8 @@ read back, and startup fails with "the stores hold no block in common". That hap
 a store taken out of the settings and added back after the others moved on by more than
 the window, and could happen in a fast backfill where a database commits more than a
 window of blocks while the lake waits out its commit interval, if the process stops
-then. (A store whose ledger is shorter than the window — one that joined recently — is
-simply rewound instead; see `src/sink/resume.rs`.)
+then. (A store whose ledger is shorter than the window — one that joined recently —
+simply reconciles instead; see `src/sink/resume.rs`.)
 
 **Options.** Treat the store that is behind as new (empty its ledger by hand and let it
 join), or read a store's ledger by height rather than newest-first, so the common block

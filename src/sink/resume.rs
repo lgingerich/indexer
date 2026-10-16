@@ -9,27 +9,41 @@
 //! orphan, since ingest retracts only what its ledger names.
 //!
 //! [`resume`] settles that before the first envelope. It finds the newest block every
-//! store's ledger holds with the same hash, [rewinds](Store::rewind) every store that
-//! committed past it, and resumes ingest from it. Every store then holds the same chain,
-//! and ingest re-fetches the blocks the rewind took — at most the slowest store's commit
-//! interval of them.
+//! store's ledger holds with the same hash, and resumes ingest from it.
+//!
+//! # A store ahead keeps its blocks
+//!
+//! A store that committed past that block keeps what it holds above it: deleting it would
+//! take rows away from a database an app is reading, only for ingest to write them back
+//! moments later. Instead the store is told which blocks it holds there
+//! ([`Store::reconcile`]), and ingest, resuming from the common block, hands it each of
+//! them again. One with the same hash is not written a second time — the lake, which
+//! appends, would otherwise hold it twice — and one with another hash was orphaned while
+//! the store was ahead, so the store retracts it as a reorg at the tip would, `reorgs`
+//! row included. Every store then holds the same chain, and the only rows deleted are
+//! those of blocks that really left it.
+//!
+//! That needs the store's ledger to name every block it holds above the common block. A
+//! restore reads the newest [`LEDGER_WINDOW`](crate::ingest::pipeline::LEDGER_WINDOW)
+//! blocks, so a full ledger whose oldest block is above the one after the common block
+//! may leave blocks in between unnamed. Such a store is [rewound](Store::rewind) to the
+//! common block instead, and ingest re-fetches its rows above. A rewind is not a retraction, so it writes no `reorgs` row; see
+//! `docs/multi-store-open-items.md`.
+//!
+//! # Stores with no say
 //!
 //! A store with an empty ledger — new to the run, or never committed — has nothing to
 //! agree on. It joins where the others resume; the blocks before that are not
 //! backfilled into it. Nor does a store whose whole history lies above a block: one
 //! that joined a running deployment and committed ahead of a slower store before the
 //! process stopped. Its ledger reaches back to its first block, so it holds nothing at or
-//! below that block, and rewinding it there deletes only what it wrote since joining. A
-//! ledger as long as the window a restore reads may have history below it. When even
-//! its oldest block is above the slowest store's tip, the stores show no conflict, only
-//! a lag: a lake whose commit, of thousands of small blocks, was dropped by a stop the
-//! database's commits outlived. Within `MAX_RESUME_LAG` blocks of that tip it has no
-//! say, and is rewound to it, its rows above re-fetched; further ahead is a startup
-//! error rather than a rewind that could delete days of rows.
-//!
-//! A rewind is not a retraction, so it writes no `reorgs` row. A store rewound past
-//! blocks a reorg orphaned, which a faster store already recorded, never records that
-//! reorg; see `docs/multi-store-open-items.md`.
+//! below that block, and its ledger names all it holds. A ledger as long as the window a
+//! restore reads may have history below it. When even its oldest block is above the
+//! slowest store's tip, the stores show no conflict, only a lag: a lake whose commit, of
+//! thousands of small blocks, was dropped by a stop the database's commits outlived.
+//! Within `MAX_RESUME_LAG` blocks of that tip it has no say, and is rewound to it, its
+//! rows above re-fetched; further ahead is a startup error rather than a rewind that
+//! could delete days of rows.
 
 use std::collections::HashSet;
 use std::time::Instant;
@@ -88,6 +102,19 @@ pub enum ResumeError {
     },
 }
 
+impl ResumeError {
+    /// Whether starting again against the same stores fails the same way: they hold no
+    /// block in common, which no restart changes, or a store's error is permanent (see
+    /// [`StoreError::is_permanent`]).
+    #[must_use]
+    pub fn is_permanent(&self) -> bool {
+        match self {
+            Self::NoCommonBlock { .. } => true,
+            Self::Restore { source, .. } | Self::Rewind { source, .. } => source.is_permanent(),
+        }
+    }
+}
+
 fn describe_tips(tips: &[(Backend, u64)]) -> String {
     tips.iter()
         .map(|(store, height)| format!("{store} at {height}"))
@@ -128,6 +155,8 @@ pub(crate) async fn resume<S: Store>(stores: &mut [Opened<S>]) -> Result<Restore
         .copied()
         .filter(|block| block.height <= common.height)
         .collect();
+    // The blocks stores kept above the common block, which ingest hands them again.
+    let mut held = HashSet::new();
     for (opened, restored) in stores.iter_mut().zip(&mut restored) {
         let Some(tip) = restored.ledger.last() else {
             info!(store = %opened.backend, from = common.height + 1,
@@ -137,8 +166,21 @@ pub(crate) async fn resume<S: Store>(stores: &mut [Opened<S>]) -> Result<Restore
         if tip.height == common.height {
             continue;
         }
+        if names_all_above(&restored.ledger, common.height) {
+            let above: Vec<BlockMeta> = restored
+                .ledger
+                .iter()
+                .copied()
+                .filter(|block| block.height > common.height)
+                .collect();
+            info!(store = %opened.backend, from = common.height + 1, to = tip.height,
+                "store committed past the others; it keeps its blocks and is handed each again");
+            held.extend(above.iter().map(|block| block.hash));
+            opened.store.reconcile(&above);
+            continue;
+        }
         warn!(store = %opened.backend, from = tip.height, to = common.height,
-            "rewinding a store that committed past the others");
+            "rewinding a store that committed past the others, whose ledger does not reach back to them");
         let started = Instant::now();
         opened
             .store
@@ -154,10 +196,26 @@ pub(crate) async fn resume<S: Store>(stores: &mut [Opened<S>]) -> Result<Restore
         // The contracts it discovered above the block went with their blocks.
         *restored = restore(opened).await?;
     }
+    // A contract from a block above the common block is discovered again as ingest
+    // hands that block back, and only if the block is still canonical.
     Ok(Restored {
-        contracts: restored.into_iter().flat_map(|r| r.contracts).collect(),
+        contracts: restored
+            .into_iter()
+            .flat_map(|r| r.contracts)
+            .filter(|contract| !held.contains(&contract.block_hash))
+            .collect(),
         ledger,
     })
+}
+
+/// Whether `ledger` names every block its store holds above `common`: it is the store's
+/// whole history, being shorter than the window a restore reads, or it reaches down to
+/// the block after `common`.
+fn names_all_above(ledger: &[BlockMeta], common: u64) -> bool {
+    ledger.len() < LEDGER_WINDOW
+        || ledger
+            .first()
+            .is_some_and(|oldest| oldest.height <= common.saturating_add(1))
 }
 
 /// Reads back what `opened` holds, and logs how long it took: a lake's read is a scan of
@@ -248,7 +306,7 @@ mod tests {
 
     use crate::wire::envelope::BlockMeta;
 
-    use super::{Disjoint, LEDGER_WINDOW, common_block};
+    use super::{Disjoint, LEDGER_WINDOW, common_block, names_all_above};
 
     /// Blocks `heights`, each hashed `tag:height` and linked to the one below.
     fn ledger(tag: u8, heights: std::ops::RangeInclusive<u64>) -> Vec<BlockMeta> {
@@ -319,6 +377,27 @@ mod tests {
         let behind = ledger(0xa0, 1..=5);
         let ahead = ledger(0xa0, 5_000..=4_999 + LEDGER_WINDOW as u64);
         assert_eq!(common(&[&behind, &ahead]), Some((5, 0)));
+    }
+
+    /// A store ahead keeps its blocks only when its ledger names all of them: its whole
+    /// history, or a window reaching down to the block after the common one. A full
+    /// window starting higher may hide blocks in between, so that store is rewound.
+    #[test]
+    fn a_store_ahead_reconciles_only_what_its_ledger_names() {
+        assert!(names_all_above(&ledger(0xa0, 1..=9), 5), "reaches below");
+        assert!(
+            names_all_above(&ledger(0xa0, 6..=9), 5),
+            "its whole history"
+        );
+        let full = |from: u64| ledger(0xa0, from..=from + LEDGER_WINDOW as u64 - 1);
+        assert!(
+            names_all_above(&full(6), 5),
+            "a full window from the next block"
+        );
+        assert!(
+            !names_all_above(&full(7), 5),
+            "a full window with a gap below"
+        );
     }
 
     /// A full window may have history below it, so a store far ahead is refused rather

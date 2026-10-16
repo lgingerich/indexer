@@ -993,8 +993,9 @@ impl DeltaSink {
 
     /// Refuses a batch that accepts a block already committed, unless the batch orphans
     /// it first: the lake appends rather than upserts, so the block's rows would be
-    /// written twice. The pipeline resumes above the ledger's tip, so this never happens
-    /// unless an invariant upstream broke.
+    /// written twice. A restart that resumes below the lake's tip hands the lake blocks
+    /// it holds, which [`reconcile`](Store::reconcile) drops before they reach a commit,
+    /// so this never happens unless an invariant upstream broke.
     fn refuse_replays(&self) -> Result<(), StoreError> {
         let replayed = self
             .batch
@@ -1098,6 +1099,12 @@ impl Store for DeltaSink {
         }
         let (contracts, ledger) = tokio::try_join!(self.contracts(), self.read_ledger())?;
         Ok(Restored { contracts, ledger })
+    }
+
+    /// A held block whose hash changed is retracted at the next commit like any orphan:
+    /// it is among the committed blocks opening read from the ledger.
+    fn reconcile(&mut self, held: &[BlockMeta]) {
+        self.batch.reconcile(held);
     }
 
     /// Deletes in the order a retraction does: the blocks out of the ledger first, then
