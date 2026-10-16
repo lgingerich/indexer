@@ -67,6 +67,9 @@ pub(crate) mod stop;
 pub mod store;
 #[cfg(feature = "store")]
 pub mod store_error;
+/// The runtime each store's work runs on, apart from ingest's and every other store's.
+#[cfg(feature = "store")]
+pub(crate) mod store_runtime;
 pub mod table;
 
 #[cfg(feature = "postgres")]

@@ -49,16 +49,19 @@ use std::collections::HashSet;
 use std::time::Instant;
 
 use alloy_primitives::B256;
+use futures_util::FutureExt as _;
+use futures_util::future::BoxFuture;
 use tracing::{info, warn};
 
 use crate::ingest::pipeline::LEDGER_WINDOW;
 use crate::sink::channel::Batching;
 use crate::sink::route::Backend;
+use crate::sink::store_runtime::StoreRuntime;
 use crate::sink::table::TableId;
 use crate::sink::{Restored, Store, StoreError};
 use crate::wire::envelope::BlockMeta;
 
-/// A store, opened, with what the run routes to it.
+/// A store, opened, with what the run routes to it and the runtime its work runs on.
 #[derive(Debug)]
 pub(crate) struct Opened<S> {
     /// Which store it is.
@@ -69,6 +72,28 @@ pub(crate) struct Opened<S> {
     pub(crate) batching: Batching,
     /// The tables routed to it.
     pub(crate) tables: HashSet<TableId>,
+    /// Where the store's async calls run: its startup reads and rewind here, and its
+    /// drain once ingest starts.
+    pub(crate) runtime: StoreRuntime,
+}
+
+impl<S: Store> Opened<S> {
+    /// Runs `call` on the store's own runtime, so what it spawns lands there too, and
+    /// takes the store back with what it returns.
+    async fn on_runtime<T: Send + 'static>(
+        self,
+        call: impl for<'a> FnOnce(&'a mut S) -> BoxFuture<'a, T> + Send + 'static,
+    ) -> (Self, T) {
+        let mut store = self.store;
+        let (store, out) = self
+            .runtime
+            .run(async move {
+                let out = call(&mut store).await;
+                (store, out)
+            })
+            .await;
+        (Self { store, ..self }, out)
+    }
 }
 
 /// Why the stores could not be brought to one block.
@@ -129,11 +154,14 @@ fn describe_tips(tips: &[(Backend, u64)]) -> String {
 ///
 /// Returns [`ResumeError::Restore`] or [`ResumeError::Rewind`] naming the store that
 /// failed, and [`ResumeError::NoCommonBlock`] when no block is held by them all.
-pub(crate) async fn resume<S: Store>(stores: &mut [Opened<S>]) -> Result<Restored, ResumeError> {
-    let mut restored = Vec::with_capacity(stores.len());
-    for opened in stores.iter_mut() {
-        restored.push(restore(opened).await?);
+pub(crate) async fn resume<S: Store>(
+    stores: Vec<Opened<S>>,
+) -> Result<(Vec<Opened<S>>, Restored), ResumeError> {
+    let mut read = Vec::with_capacity(stores.len());
+    for opened in stores {
+        read.push(restore(opened).await?);
     }
+    let (stores, mut restored): (Vec<_>, Vec<_>) = read.into_iter().unzip();
     let ledgers: Vec<&[BlockMeta]> = restored.iter().map(|r| r.ledger.as_slice()).collect();
     let common = common_block(&ledgers).map_err(|Disjoint| ResumeError::NoCommonBlock {
         tips: stores
@@ -144,10 +172,11 @@ pub(crate) async fn resume<S: Store>(stores: &mut [Opened<S>]) -> Result<Restore
     })?;
     let Some((common, slowest)) = common else {
         // Every ledger is empty: a fresh run, with nothing to agree on.
-        return Ok(Restored {
+        let restored = Restored {
             contracts: restored.into_iter().flat_map(|r| r.contracts).collect(),
             ledger: Vec::new(),
-        });
+        };
+        return Ok((stores, restored));
     };
     let ledger: Vec<BlockMeta> = restored[slowest]
         .ledger
@@ -157,55 +186,71 @@ pub(crate) async fn resume<S: Store>(stores: &mut [Opened<S>]) -> Result<Restore
         .collect();
     // The blocks stores kept above the common block, which ingest hands them again.
     let mut held = HashSet::new();
-    for (opened, restored) in stores.iter_mut().zip(&mut restored) {
-        let Some(tip) = restored.ledger.last() else {
-            info!(store = %opened.backend, from = common.height + 1,
-                "store has no accepted blocks; it joins where the others resume");
-            continue;
-        };
-        if tip.height == common.height {
-            continue;
-        }
-        if names_all_above(&restored.ledger, common.height) {
-            let above: Vec<BlockMeta> = restored
-                .ledger
-                .iter()
-                .copied()
-                .filter(|block| block.height > common.height)
-                .collect();
-            info!(store = %opened.backend, from = common.height + 1, to = tip.height,
-                "store committed past the others; it keeps its blocks and is handed each again");
-            held.extend(above.iter().map(|block| block.hash));
-            opened.store.reconcile(&above);
-            continue;
-        }
-        warn!(store = %opened.backend, from = tip.height, to = common.height,
-            "rewinding a store that committed past the others, whose ledger does not reach back to them");
-        let started = Instant::now();
-        opened
-            .store
-            .rewind(common.height)
-            .await
-            .map_err(|source| ResumeError::Rewind {
-                store: opened.backend,
-                height: common.height,
-                source,
-            })?;
-        info!(store = %opened.backend, to = common.height, elapsed_ms = millis(started),
-            "store rewound");
-        // The contracts it discovered above the block went with their blocks.
-        *restored = restore(opened).await?;
+    let mut settled = Vec::with_capacity(stores.len());
+    for (opened, restored) in stores.into_iter().zip(&mut restored) {
+        settled.push(settle(opened, restored, common.height, &mut held).await?);
     }
     // A contract from a block above the common block is discovered again as ingest
     // hands that block back, and only if the block is still canonical.
-    Ok(Restored {
+    let restored = Restored {
         contracts: restored
             .into_iter()
             .flat_map(|r| r.contracts)
             .filter(|contract| !held.contains(&contract.block_hash))
             .collect(),
         ledger,
-    })
+    };
+    Ok((settled, restored))
+}
+
+/// Brings `opened`, which read back `restored`, to the block every store holds at
+/// `common`, and returns it: a store at that block or with nothing stored is left as it
+/// is, one ahead whose ledger names all it holds above reconciles those blocks (adding
+/// them to `held`), and any other is rewound and read back again into `restored`.
+async fn settle<S: Store>(
+    mut opened: Opened<S>,
+    restored: &mut Restored,
+    common: u64,
+    held: &mut HashSet<B256>,
+) -> Result<Opened<S>, ResumeError> {
+    let Some(tip) = restored.ledger.last().map(|block| block.height) else {
+        info!(store = %opened.backend, from = common + 1,
+            "store has no accepted blocks; it joins where the others resume");
+        return Ok(opened);
+    };
+    if tip == common {
+        return Ok(opened);
+    }
+    if names_all_above(&restored.ledger, common) {
+        let above: Vec<BlockMeta> = restored
+            .ledger
+            .iter()
+            .copied()
+            .filter(|block| block.height > common)
+            .collect();
+        info!(store = %opened.backend, from = common + 1, to = tip,
+            "store committed past the others; it keeps its blocks and is handed each again");
+        held.extend(above.iter().map(|block| block.hash));
+        opened.store.reconcile(&above);
+        return Ok(opened);
+    }
+    warn!(store = %opened.backend, from = tip, to = common,
+        "rewinding a store that committed past the others, whose ledger does not reach back to them");
+    let started = Instant::now();
+    let (opened, rewound) = opened
+        .on_runtime(move |store| store.rewind(common).boxed())
+        .await;
+    rewound.map_err(|source| ResumeError::Rewind {
+        store: opened.backend,
+        height: common,
+        source,
+    })?;
+    info!(store = %opened.backend, to = common, elapsed_ms = millis(started),
+        "store rewound");
+    // The contracts it discovered above the block went with their blocks.
+    let (opened, back) = restore(opened).await?;
+    *restored = back;
+    Ok(opened)
 }
 
 /// Whether `ledger` names every block its store holds above `common`: it is the store's
@@ -220,16 +265,13 @@ fn names_all_above(ledger: &[BlockMeta], common: u64) -> bool {
 
 /// Reads back what `opened` holds, and logs how long it took: a lake's read is a scan of
 /// object storage, and one of the slower parts of a start.
-async fn restore<S: Store>(opened: &mut Opened<S>) -> Result<Restored, ResumeError> {
+async fn restore<S: Store>(opened: Opened<S>) -> Result<(Opened<S>, Restored), ResumeError> {
     let started = Instant::now();
-    let restored = opened
-        .store
-        .restore()
-        .await
-        .map_err(|source| ResumeError::Restore {
-            store: opened.backend,
-            source,
-        })?;
+    let (opened, result) = opened.on_runtime(|store| store.restore().boxed()).await;
+    let restored = result.map_err(|source| ResumeError::Restore {
+        store: opened.backend,
+        source,
+    })?;
     info!(
         store = %opened.backend,
         blocks = restored.ledger.len(),
@@ -238,7 +280,7 @@ async fn restore<S: Store>(opened: &mut Opened<S>) -> Result<Restored, ResumeErr
         elapsed_ms = millis(started),
         "store read back"
     );
-    Ok(restored)
+    Ok((opened, restored))
 }
 
 /// Milliseconds since `started`, as the startup logs report them.
@@ -301,12 +343,106 @@ fn common_block(ledgers: &[&[BlockMeta]]) -> Result<Option<(BlockMeta, usize)>, 
 }
 
 #[cfg(test)]
+// The crate denies `expect`/`unwrap` to keep production paths honest; tests are
+// allowed them per the repository test style, since a failed expectation there
+// means the fixture or setup is wrong.
+#[expect(clippy::expect_used)]
 mod tests {
+    use std::collections::HashSet;
+    use std::sync::{Arc, Mutex};
+
     use alloy_primitives::B256;
 
-    use crate::wire::envelope::BlockMeta;
+    use crate::sink::channel::Batching;
+    use crate::sink::route::Backend;
+    use crate::sink::store_runtime::StoreRuntime;
+    use crate::sink::{EnvelopeSink, Restored, SinkError, Store, StoreError};
+    use crate::wire::envelope::{BlockMeta, Envelope};
 
-    use super::{Disjoint, LEDGER_WINDOW, common_block, names_all_above};
+    use super::{Disjoint, LEDGER_WINDOW, Opened, common_block, names_all_above, resume};
+
+    /// A store that holds `ledger` and notes which thread each startup call ran on.
+    struct Probe {
+        ledger: Vec<BlockMeta>,
+        threads: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl Probe {
+        fn note(&self, call: &str) {
+            let thread = std::thread::current().name().unwrap_or("-").to_owned();
+            self.threads
+                .lock()
+                .expect("not poisoned")
+                .push(format!("{call} on {thread}"));
+        }
+    }
+
+    impl EnvelopeSink for Probe {
+        async fn publish(&mut self, _envelope: Envelope) -> Result<(), SinkError> {
+            Ok(())
+        }
+    }
+
+    impl Store for Probe {
+        async fn restore(&mut self) -> Result<Restored, StoreError> {
+            self.note("restore");
+            Ok(Restored {
+                contracts: Vec::new(),
+                ledger: self.ledger.clone(),
+            })
+        }
+
+        fn reconcile(&mut self, _held: &[BlockMeta]) {}
+
+        async fn rewind(&mut self, height: u64) -> Result<(), StoreError> {
+            self.note("rewind");
+            self.ledger.retain(|block| block.height <= height);
+            Ok(())
+        }
+    }
+
+    /// The startup calls `resume` makes run on each store's own runtime, so what they
+    /// spawn lands there: the lake's reads read back, and its rewind, on the lake's
+    /// threads, and the database's on its own.
+    #[tokio::test]
+    async fn every_startup_call_runs_on_the_stores_own_runtime() {
+        let threads = Arc::new(Mutex::new(Vec::new()));
+        let opened = |backend, ledger| Opened {
+            backend,
+            store: Probe {
+                ledger,
+                threads: Arc::clone(&threads),
+            },
+            batching: Batching::eager(1),
+            tables: HashSet::new(),
+            runtime: StoreRuntime::dedicated(backend).expect("a runtime"),
+        };
+        // The lake is ahead with a full window that starts above the database's tip, so
+        // it is rewound rather than reconciled, and read back again.
+        let stores = vec![
+            opened(Backend::Postgres, ledger(0xa0, 1..=5)),
+            opened(Backend::Delta, ledger(0xa0, 7..=6 + LEDGER_WINDOW as u64)),
+        ];
+        let (stores, restored) = resume(stores).await.expect("resumed");
+        assert_eq!(restored.ledger.last().map(|block| block.height), Some(5));
+        assert_eq!(
+            stores
+                .iter()
+                .map(|opened| opened.backend)
+                .collect::<Vec<_>>(),
+            [Backend::Postgres, Backend::Delta],
+            "every store comes back, in order"
+        );
+        assert_eq!(
+            *threads.lock().expect("not poisoned"),
+            [
+                "restore on store-postgres",
+                "restore on store-delta",
+                "rewind on store-delta",
+                "restore on store-delta",
+            ]
+        );
+    }
 
     /// Blocks `heights`, each hashed `tag:height` and linked to the one below.
     fn ledger(tag: u8, heights: std::ops::RangeInclusive<u64>) -> Vec<BlockMeta> {

@@ -154,7 +154,7 @@ const REORG_COLUMNS: [&str; 3] = ["height", "dedupe_key", "orphaned_hashes"];
 /// access_key_id = { env = "S3_ACCESS_KEY_ID" }
 /// secret_access_key = { env = "S3_SECRET_ACCESS_KEY" }
 /// ```
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DeltaSettings {
     /// The tables this store writes. Required.
@@ -440,11 +440,15 @@ impl DeltaSink {
         let checkpoints = Arc::new(Semaphore::new(CONCURRENT_CHECKPOINTS));
         // Each open is a few requests that wait on the store, and a run has a table per
         // event, so they overlap: one after another, a hundred tables took minutes.
+        // Boxed, as is the repair's scan: the compiler cannot otherwise prove the open
+        // `Send` through these closures' borrowed arguments, which running it on the
+        // store's own runtime needs (rust-lang/rust#102211).
         let lakes: Vec<Lake> = stream::iter(schema.tables())
             .map(|def| {
                 let uri = format!("{root}/{chain}/{}", def.name);
                 open_table(&storage, uri, def, Arc::clone(&checkpoints))
             })
+            .boxed()
             .buffered(CONCURRENT_TABLES)
             .try_collect()
             .await?;
@@ -648,6 +652,7 @@ impl DeltaSink {
                     Ok::<_, StoreError>((position, stray))
                 }
             })
+            .boxed()
             .buffered(CONCURRENT_TABLES)
             .try_filter(|(_, stray)| std::future::ready(!stray.is_empty()))
             .try_collect::<Vec<(usize, Vec<String>)>>();
@@ -842,7 +847,7 @@ impl DeltaSink {
             .iter()
             .filter_map(|row| Some((row.block_hash()?.to_owned(), row.block_number()?)))
             .collect();
-        let batches = self.record_batches(appends)?;
+        let batches = self.record_batches(appends).await?;
         let built = built.elapsed();
         let written = Instant::now();
         let appended = self.append_all(batches).await;
@@ -918,52 +923,68 @@ impl DeltaSink {
         Ok(())
     }
 
-    /// Each table's rows as Arrow batches, built in parallel: a thread per table, and per
+    /// Each table's rows as Arrow batches, built in parallel: a task per table, and per
     /// [`ROWS_PER_BATCH`] rows of a large one, since one table, the logs, usually holds
     /// most of a commit's rows. Building them is the CPU half of a commit.
     ///
-    /// Each thread owns its rows and frees them once their batch is built, so the rows
+    /// The tasks run on the store's own runtime, so as many build at once as it has
+    /// workers and no more. Threads of their own would each take a share of the cores
+    /// beside them, and a large commit made over a hundred, crowding out every other
+    /// part of the process (see `sink::store_runtime`).
+    ///
+    /// Each task owns its rows and frees them once their batch is built, so the rows
     /// go as the batches come: a commit never holds every row and every batch at once,
     /// which at the end of the build was its largest moment.
-    fn record_batches(
+    async fn record_batches(
         &self,
         appends: Vec<(usize, Vec<Row>)>,
     ) -> Result<Vec<(usize, Vec<RecordBatch>)>, StoreError> {
         let tables = appends.len();
-        std::thread::scope(|scope| {
-            // Every build starts before any is waited for.
-            let mut builds = Vec::new();
-            for (position, rows) in appends {
-                let lake = &self.lakes[position];
-                let mut rows = rows.into_iter();
-                loop {
-                    let chunk: Vec<Row> = rows.by_ref().take(ROWS_PER_BATCH).collect();
-                    if chunk.is_empty() {
-                        break;
-                    }
-                    builds.push((
-                        position,
-                        scope.spawn(move || lake.record_batch(&chunk.iter().collect::<Vec<_>>())),
-                    ));
+        // Every build starts before any is waited for.
+        let mut builds = Vec::new();
+        for (position, rows) in appends {
+            let lake = &self.lakes[position];
+            let mut rows = rows.into_iter();
+            loop {
+                let chunk: Vec<Row> = rows.by_ref().take(ROWS_PER_BATCH).collect();
+                if chunk.is_empty() {
+                    break;
                 }
+                let (arrow, def) = (Arc::clone(&lake.arrow), Arc::clone(&lake.def));
+                let build = tokio::spawn(async move {
+                    arrow::record_batch(&arrow, &def, &chunk.iter().collect::<Vec<_>>())
+                        .map_err(StoreError::engine(Operation::Append, Some(&def.name)))
+                });
+                builds.push((position, build));
             }
-            let mut batches: Vec<(usize, Vec<RecordBatch>)> = Vec::with_capacity(tables);
-            for (position, build) in builds {
-                let batch = build
-                    .join()
-                    .unwrap_or_else(|panic| std::panic::resume_unwind(panic))?;
-                match batches.last_mut() {
+        }
+        // Every build is waited for, failed or not, before the first failure is returned,
+        // as every append is: none is left running, holding its rows, once the commit
+        // has given up.
+        let mut batches: Vec<(usize, Vec<RecordBatch>)> = Vec::with_capacity(tables);
+        let mut failure = None;
+        for (position, build) in builds {
+            let built = build
+                .await
+                .unwrap_or_else(|join| std::panic::resume_unwind(join.into_panic()));
+            match built {
+                Ok(batch) => match batches.last_mut() {
                     Some((last, table)) if *last == position => table.push(batch),
                     _ => batches.push((position, vec![batch])),
+                },
+                Err(error) => {
+                    failure.get_or_insert(error);
                 }
             }
-            Ok(batches)
-        })
+        }
+        failure.map_or(Ok(batches), Err)
     }
 
     /// Appends each table's batch as a commit of its own log, every table on its own task
-    /// so their Parquet encoding spreads over the cores. Each table has its own log and no
-    /// rule orders one table's rows against another's, so they go at once.
+    /// so their Parquet encoding spreads over the store runtime's workers. Each table has
+    /// its own log and no rule orders one table's rows against another's, so they go at
+    /// once: most tables' appends are small, and their time is the store's round trips,
+    /// which overlap only when they run together.
     ///
     /// Every append is waited for, failed or not, before the first failure is returned:
     /// none is left running to commit after the store has given up.

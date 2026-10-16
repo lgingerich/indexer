@@ -4,22 +4,24 @@
 //! settings file already states. This module reads them and builds the pipeline, so the
 //! binary is "load the settings, run it" rather than a place that names every layer.
 //!
-//! # One ingest task, a task per store
+//! # One ingest task, a runtime per store
 //!
 //! ```text
-//! task 1:  ingest ─▶ DecodingSink ─▶ Router ─┬─ ChannelSink ══╗ bounded channel of blocks
-//!                    (direct calls, no queue) └─ ChannelSink ══╬═══════╗
-//! task 2:  DeltaSink    ◀─ ChannelReceiver::drain ◀════════════╝       ║
-//! task 3:  PostgresSink ◀─ ChannelReceiver::drain ◀════════════════════╝
+//! main:      ingest ─▶ DecodingSink ─▶ Router ─┬─ ChannelSink ══╗ bounded channel of blocks
+//!                      (direct calls, no queue) └─ ChannelSink ══╬═══════╗
+//! lake:      DeltaSink    ◀─ ChannelReceiver::drain ◀════════════╝       ║
+//! postgres:  PostgresSink ◀─ ChannelReceiver::drain ◀════════════════════╝
+//!            (each label is a runtime of its own, with its own threads)
 //! ```
 //!
 //! Ingest and decode are one task because decoding a block is far cheaper than the block
-//! time and needs no decoupling. Each store is its own task because a store stalls, and
-//! the channel in front of it is what keeps a stall from stopping ingest; see
-//! `crate::sink::channel`. A store gets its own task — spawned, not merely polled
-//! alongside ingest — because its writes block, and a blocked poll would stall ingest
-//! anyway. The router hands each store the envelopes of the tables it writes; see
-//! [`crate::sink::route`].
+//! time and needs no decoupling. Each store drains its own channel because a store
+//! stalls, and the channel in front of it is what keeps a stall from stopping ingest;
+//! see `crate::sink::channel`. And each store runs on a runtime of its own, with its
+//! own threads, because tokio cannot interrupt a task: on one shared runtime, the lake's
+//! seconds of Parquet encoding held every worker while a database commit and ingest
+//! waited for one. See `crate::sink::store_runtime`. The router hands each store the
+//! envelopes of the tables it writes; see [`crate::sink::route`].
 //!
 //! # What the settings decide
 //!
@@ -77,12 +79,14 @@ use crate::ingest::source::{
 use crate::sink;
 #[cfg(feature = "store")]
 use crate::sink::any_store::AnyStore;
-#[cfg(any(feature = "duckdb", feature = "postgres"))]
+#[cfg(feature = "store")]
 use crate::sink::channel::Batching;
 #[cfg(feature = "store")]
 use crate::sink::resume::{Opened, ResumeError};
 use crate::sink::route::{self, Backend, RouteError, Router};
 use crate::sink::stop::Stop;
+#[cfg(feature = "store")]
+use crate::sink::store_runtime::StoreRuntime;
 use crate::sink::table::{Schema, TableId};
 use crate::sink::{SinkError, StdoutJsonSink};
 use crate::wire::envelope::ChainId;
@@ -129,6 +133,15 @@ pub enum RuntimeError {
         store: Backend,
         /// Why it could not be opened.
         source: sink::StoreError,
+    },
+    /// A store's runtime could not be made: the operating system refused its threads.
+    #[cfg(feature = "store")]
+    #[error("{store}'s runtime could not be started: {source}")]
+    StoreRuntime {
+        /// The store.
+        store: Backend,
+        /// The operating system's error.
+        source: std::io::Error,
     },
     /// The stores could not be read back and brought to one block.
     #[cfg(feature = "store")]
@@ -362,53 +375,77 @@ impl<B: BlockSource + 'static> Pipeline<B> {
         Ok(())
     }
 
-    /// Opens every store the settings name, each with the tables routed to it. Opened
-    /// before ingest starts, so a bad path or connection fails at startup rather than
-    /// after the first block.
+    /// Opens every store the settings name, each with the tables routed to it and on a
+    /// runtime of its own (see `crate::sink::store_runtime`). Opened before ingest
+    /// starts, so a bad path or connection fails at startup rather than after the first
+    /// block.
     #[cfg(feature = "store")]
     async fn open(&self, settings: &Settings) -> Result<Vec<Opened<AnyStore>>, RuntimeError> {
-        let chain = settings.ingest.chain.as_str();
+        let chain = &settings.ingest.chain;
         let mut stores = Vec::new();
         #[cfg(feature = "duckdb")]
         if let Some(duckdb) = &settings.sink.duckdb {
-            let (schema, tables) = self.route(Backend::DuckDb);
-            let store = sink::DuckDbSink::open(duckdb, schema, chain)
-                .await
-                .map_err(opening(Backend::DuckDb))?;
-            stores.push(Opened {
-                backend: Backend::DuckDb,
-                store: AnyStore::DuckDb(store),
-                batching: Batching::eager(duckdb.batch_records),
-                tables,
+            let (settings, chain) = (duckdb.clone(), chain.clone());
+            let batching = Batching::eager(duckdb.batch_records);
+            let opened = self.open_store(Backend::DuckDb, batching, async move |schema| {
+                Ok(AnyStore::DuckDb(
+                    sink::DuckDbSink::open(&settings, schema, &chain).await?,
+                ))
             });
+            stores.push(opened.await?);
         }
         #[cfg(feature = "postgres")]
         if let Some(postgres) = &settings.sink.postgres {
-            let (schema, tables) = self.route(Backend::Postgres);
-            let store = sink::PostgresSink::open(postgres, schema, chain)
-                .await
-                .map_err(opening(Backend::Postgres))?;
-            stores.push(Opened {
-                backend: Backend::Postgres,
-                store: AnyStore::Postgres(store),
-                batching: Batching::eager(postgres.batch_records),
-                tables,
+            let (settings, chain) = (postgres.clone(), chain.clone());
+            let batching = Batching::eager(postgres.batch_records);
+            let opened = self.open_store(Backend::Postgres, batching, async move |schema| {
+                Ok(AnyStore::Postgres(
+                    sink::PostgresSink::open(&settings, schema, &chain).await?,
+                ))
             });
+            stores.push(opened.await?);
         }
         #[cfg(feature = "delta")]
         if let Some(delta) = &settings.sink.delta {
-            let (schema, tables) = self.route(Backend::Delta);
-            let store = sink::DeltaSink::open(delta, schema, chain)
-                .await
-                .map_err(opening(Backend::Delta))?;
-            stores.push(Opened {
-                backend: Backend::Delta,
-                store: AnyStore::Delta(Box::new(store)),
-                batching: delta.batching(),
-                tables,
+            let (settings, chain) = (delta.clone(), chain.clone());
+            let batching = delta.batching();
+            let opened = self.open_store(Backend::Delta, batching, async move |schema| {
+                Ok(AnyStore::Delta(Box::new(
+                    sink::DeltaSink::open(&settings, schema, &chain).await?,
+                )))
             });
+            stores.push(opened.await?);
         }
         Ok(stores)
+    }
+
+    /// Opens `backend` with `open`, handed the schema of the tables routed to it, on a
+    /// runtime of the store's own, so what opening spawns — a connection's task, the
+    /// lake's checkpoints and maintenance — runs there too.
+    #[cfg(feature = "store")]
+    async fn open_store<F>(
+        &self,
+        backend: Backend,
+        batching: Batching,
+        open: impl FnOnce(Arc<Schema>) -> F,
+    ) -> Result<Opened<AnyStore>, RuntimeError>
+    where
+        F: Future<Output = Result<AnyStore, sink::StoreError>> + Send + 'static,
+    {
+        let (schema, tables) = self.route(backend);
+        let runtime =
+            StoreRuntime::dedicated(backend).map_err(|source| RuntimeError::StoreRuntime {
+                store: backend,
+                source,
+            })?;
+        let store = runtime.run(open(schema)).await.map_err(opening(backend))?;
+        Ok(Opened {
+            backend,
+            store,
+            batching,
+            tables,
+            runtime,
+        })
     }
 
     /// The tables routed to `backend`, and the schema of them a store opens with.
@@ -433,7 +470,7 @@ impl<B: BlockSource + 'static> Pipeline<B> {
     #[cfg(feature = "store")]
     pub(crate) async fn run_with_stores<S: sink::Store>(
         self,
-        mut stores: Vec<Opened<S>>,
+        stores: Vec<Opened<S>>,
         mut stop: Stop,
     ) -> Result<(), RuntimeError> {
         let Self {
@@ -445,10 +482,10 @@ impl<B: BlockSource + 'static> Pipeline<B> {
             ..
         } = self;
         let chain = source.chain().clone();
-        let resumed = tokio::select! {
+        let (stores, resumed) = tokio::select! {
             biased;
             () = stop.wait() => return Ok(()),
-            resumed = sink::resume::resume(&mut stores) => resumed?,
+            resumed = sink::resume::resume(stores) => resumed?,
         };
         let decoder = restore(decoder, &chain, resumed.contracts);
         let ledger = ledger(&chain, resumed.ledger);
@@ -460,17 +497,18 @@ impl<B: BlockSource + 'static> Pipeline<B> {
             mut store,
             batching,
             tables,
+            runtime,
         } in stores
         {
             let (sender, receiver) = sink::channel::ChannelSink::new(backend);
-            // `ponytail:` the store's writes block, so this holds one runtime worker for
-            // the length of each flush. Fine on the multi-threaded runtime the binary
-            // uses; a dedicated blocking thread is the upgrade if a store gets slow
-            // enough to starve other tasks.
+            // On the store's own runtime, so its commits never wait behind ingest's work
+            // or another store's, nor theirs behind its own.
             let stopping = stop.clone();
             let drain = async move { receiver.drain(&mut store, batching, stopping).await }
                 .instrument(info_span!("storage", store = %backend));
-            drains.push((backend, tokio::spawn(drain)));
+            let drain = runtime.spawn(drain);
+            // The runtime is held until its drain is joined, and let go after.
+            drains.push((backend, drain, runtime));
             sinks.push((sender, tables));
         }
 
@@ -492,7 +530,7 @@ impl<B: BlockSource + 'static> Pipeline<B> {
         // queued, or on a stop finishes its commit under way, and ends. The join order is
         // [`finish`].
         let mut stopped = Vec::with_capacity(drains.len());
-        for (backend, drain) in drains {
+        for (backend, drain, _runtime) in drains {
             stopped.push((backend, drain.await));
         }
         finish(stopped, ingest)
@@ -650,6 +688,7 @@ mod tests {
     use crate::sink::resume::Opened;
     use crate::sink::route::Backend;
     use crate::sink::stop::Stop;
+    use crate::sink::store_runtime::StoreRuntime;
     use crate::sink::table::Schema;
     use crate::sink::{self, DuckDbSink, EnvelopeSink as _, SinkError, Store as _};
     use crate::sink::{Operation, StoreError};
@@ -772,6 +811,7 @@ tables = ["blocks", "transactions", "logs", "decoded_logs", "contract_events"]
             store,
             batching,
             tables: schema().tables().iter().map(|def| def.id).collect(),
+            runtime: StoreRuntime::current(),
         }
     }
 
@@ -1352,17 +1392,23 @@ tables = ["blocks", "transactions", "logs", "decoded_logs", "contract_events"]
             .expect("the lake opens");
         let catalog =
             Catalog::load(protocols(), &ChainId::new("base")).expect("shipped protocols load");
+        // Each store drains on a runtime of its own, as in a deployment; unlike one, they
+        // were opened on the test's runtime.
+        let own = |opened: Opened<AnyStore>| Opened {
+            runtime: StoreRuntime::dedicated(opened.backend).expect("a runtime"),
+            ..opened
+        };
         let stores = vec![
-            every_table(
+            own(every_table(
                 Backend::DuckDb,
                 AnyStore::DuckDb(database),
                 Batching::eager(500),
-            ),
-            every_table(
+            )),
+            own(every_table(
                 Backend::Delta,
                 AnyStore::Delta(Box::new(lake)),
                 settings.batching(),
-            ),
+            )),
         ];
         let result = Box::pin(
             Pipeline::new(chain, start, None, catalog).run_with_stores(stores, Stop::never()),

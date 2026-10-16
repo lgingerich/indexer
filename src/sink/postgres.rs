@@ -30,7 +30,7 @@ use crate::sink::store_error::{EngineError, Operation, StoreError};
 use crate::sink::table::{ColumnType, Row, Schema, TableDef, Value};
 
 /// `PostgreSQL` connection and backlog batching settings for `[sink.postgres]`.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PostgresSettings {
     /// The tables this store writes. Required.

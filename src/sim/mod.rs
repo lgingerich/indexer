@@ -49,6 +49,7 @@ use crate::sink::duckdb::DuckDb;
 use crate::sink::resume::Opened;
 use crate::sink::route::Backend;
 use crate::sink::stop::Stop;
+use crate::sink::store_runtime::StoreRuntime;
 use crate::sink::{SinkError, SqlStore};
 
 const CHAIN: &str = "sim";
@@ -261,6 +262,8 @@ fn live(world: &Shared, path: &Path, plan: Plan, lifetime: u64, crash: Option<Du
                         store,
                         batching: Batching::eager(plan.batch_records),
                         tables,
+                        // The simulation runs on one thread to stay deterministic.
+                        runtime: StoreRuntime::current(),
                     }],
                     Stop::never(),
                 )

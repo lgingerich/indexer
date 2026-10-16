@@ -44,7 +44,7 @@ const DEFAULT_BATCH_RECORDS: usize = 500;
 /// `duckdb` feature has no use for either. What the *file* may say about `DuckDB` is the
 /// `[sink.duckdb]` table, which [`Sinks::duckdb`](crate::config::Sinks::duckdb)
 /// holds.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DuckDbSettings {
     /// The tables this store writes. Required.
@@ -115,15 +115,19 @@ impl DuckDbSink {
         schema: Arc<Schema>,
         chain: &str,
     ) -> Result<Self, StoreError> {
-        let mut config = duckdb::Config::default();
-        for (key, value) in &settings.settings {
-            config = config
-                .with(key, value.expose())
-                .map_err(StoreError::engine(Operation::Configure, Some(key)))?;
-        }
         let path = settings.path.display().to_string();
-        let connection = Connection::open_with_flags(&settings.path, config)
-            .map_err(StoreError::engine(Operation::Open, Some(&path)))?;
+        // In its own scope: the engine's configuration is not `Send`, so it must be gone
+        // before the open awaits anything, for the open to run on the store's runtime.
+        let connection = {
+            let mut config = duckdb::Config::default();
+            for (key, value) in &settings.settings {
+                config = config
+                    .with(key, value.expose())
+                    .map_err(StoreError::engine(Operation::Configure, Some(key)))?;
+            }
+            Connection::open_with_flags(&settings.path, config)
+                .map_err(StoreError::engine(Operation::Open, Some(&path)))?
+        };
         info!(store = %path, "storage opened");
         Self::connected(connection, schema, chain).await
     }
