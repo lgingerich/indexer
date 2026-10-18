@@ -365,16 +365,17 @@ mod tests {
 
         assert_eq!(decoder.retract(&[orphaned, B256::ZERO]), 2);
         assert_eq!(decoder.contracts(), before - 2);
-        for (pool, decodes) in [
-            (kept, true),
-            (dropped, false),
-            (restored, true),
-            (restored_orphan, false),
-            (twice, true),
+        for (case, pool, decodes) in [
+            ("created in a canonical block", kept, true),
+            ("created in an orphaned block", dropped, false),
+            ("restored from a canonical block", restored, true),
+            ("restored from an orphaned block", restored_orphan, false),
+            ("created in both", twice, true),
         ] {
             assert_eq!(
                 decoder.decode(&swap(pool)).expect("decode").is_some(),
-                decodes
+                decodes,
+                "{case}"
             );
         }
     }

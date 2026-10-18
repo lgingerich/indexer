@@ -1231,9 +1231,9 @@ mod tests {
     use alloy_primitives::{Address, B256, U256};
     use serde_json::{Value, json};
 
-    use super::{EvmSource, RpcBatch, decode_block, http_client, ws_connect};
+    use super::{EvmSource, NOT_SERVED, RpcBatch, decode_block, http_client, ws_connect};
     use crate::ingest::source::Datasets;
-    use crate::ingest::source::{BlockSource, SourceError};
+    use crate::ingest::source::{BlockSource, FetchedBlock, SourceError};
     use crate::wire::envelope::BlockMeta;
     use crate::wire::envelope::Event;
 
@@ -1254,10 +1254,16 @@ mod tests {
         ))
     }
 
+    /// A source reading the RPC node at `url`, with no subscription.
+    fn rpc_source(url: String, datasets: Datasets) -> EvmSource {
+        from_urls("ethereum", url, "ws://unused", datasets).expect("source")
+    }
+
     /// Matches the `block()` fixture's `timestamp`, so metadata and body agree.
     const TIMESTAMP: u64 = 0x6530_a1b0;
 
-    /// A real HTTP boundary: inspect requests and return replies in reverse order.
+    /// A real HTTP boundary: answers each of `requests` requests with `reply`, and
+    /// returns what was asked.
     fn rpc_server(
         requests: usize,
         mut reply: impl FnMut(&Value) -> Value + Send + 'static,
@@ -1312,74 +1318,113 @@ mod tests {
         ])
     }
 
+    /// Fetches block 18,000,000 with every dataset from a node that answers its one
+    /// request with `reply`.
+    async fn fetch_primary(
+        reply: impl FnMut(&Value) -> Value + Send + 'static,
+    ) -> Result<FetchedBlock, SourceError> {
+        let (url, server) = rpc_server(1, reply);
+        let fetched = rpc_source(url, Datasets::all())
+            .fetch_block(18_000_000, None)
+            .await;
+        assert_eq!(server.join().expect("server").len(), 1);
+        fetched
+    }
+
+    /// The metadata of the `block()` fixture.
+    fn block_meta() -> BlockMeta {
+        BlockMeta {
+            height: 18_000_000,
+            hash: hash(0xab).parse().expect("hash"),
+            parent_hash: hash(0xaa).parse().expect("hash"),
+            timestamp: TIMESTAMP,
+        }
+    }
+
     /// A node behind the one that announced a block answers it `null`. That is a
     /// backend catching up, which the live loop skips and retries, not malformed data
-    /// that stops the run.
+    /// that stops the run. A node that answers a height it has not reached with an error
+    /// rather than `null`, as Envio's `HyperRPC` does, is just as inconsistent. Any other
+    /// error response is still the transport failure it was.
     #[tokio::test]
     async fn a_block_the_node_does_not_serve_yet_is_inconsistent() {
-        let (url, server) = rpc_server(1, |request| {
-            primary_reply(request, &Value::Null, &Value::Null)
-        });
-        let source = from_urls("ethereum", url, "ws://unused", Datasets::all()).expect("source");
-        let error = source
-            .fetch_block(0x112_a880, None)
+        const BEYOND: &str =
+            "Invalid params: requested block 18000000 is greater than latest block 17999999";
+        let cases: [(&str, Value, fn(&SourceError) -> bool); 3] = [
+            ("a null block", json!({"result": null}), |error| {
+                matches!(error, SourceError::Inconsistent { context, detail }
+                    if context == "eth_getBlockByNumber" && detail == NOT_SERVED)
+            }),
+            (
+                "a block beyond the latest",
+                json!({"error": {"code": -32602, "message": BEYOND}}),
+                |error| {
+                    matches!(error, SourceError::Inconsistent { context, detail }
+                        if context == "eth_getBlockByNumber"
+                            && *detail == format!("{NOT_SERVED}: {BEYOND}"))
+                },
+            ),
+            (
+                "another error",
+                json!({"error": {"code": -32000, "message": "execution aborted"}}),
+                |error| {
+                    matches!(error, SourceError::Transport {
+                        context: "eth_getBlockByNumber",
+                        source: alloy_json_rpc::RpcError::ErrorResp(payload),
+                    } if payload.code == -32000)
+                },
+            ),
+        ];
+        for (case, answer, expected) in cases {
+            let error = fetch_primary(move |request| {
+                let calls = request.as_array().expect("a batch");
+                Value::Array(
+                    calls
+                        .iter()
+                        .map(|call| {
+                            let mut response = json!({"jsonrpc": "2.0", "id": call["id"]});
+                            response
+                                .as_object_mut()
+                                .expect("response")
+                                .extend(answer.as_object().expect("answer").clone());
+                            response
+                        })
+                        .collect(),
+                )
+            })
             .await
-            .expect_err("a null block is not a block");
-        assert!(matches!(error, SourceError::Inconsistent { .. }), "{error}");
-        server.join().expect("server");
+            .expect_err(case);
+            assert!(expected(&error), "{case}: {error:?}");
+        }
     }
 
-    /// A node that answers a height it has not reached with an error rather than `null`,
-    /// as Envio's `HyperRPC` does, is just as inconsistent: the run skips and asks again.
+    /// With transactions, a height is one batch of two calls — the full block and its
+    /// receipts — matched to its answers however the node orders them, and the header is
+    /// reported as metadata with no further call. Transactions come with their receipts,
+    /// which are per block, so a backfill fetches a height at a time, the same way.
     #[tokio::test]
-    async fn a_block_beyond_the_nodes_latest_is_inconsistent() {
-        let (url, server) = rpc_server(1, |request| {
-            let calls = request.as_array().expect("a batch");
-            let refused = |call: &Value| {
-                json!({"jsonrpc": "2.0", "id": call["id"], "error": {"code": -32602,
-                    "message": "Invalid params: requested block 18000000 is greater than latest block 17999999"}})
-            };
-            json!([refused(&calls[0]), refused(&calls[1])])
+    async fn a_transaction_dataset_fetches_a_height_as_one_two_call_batch() {
+        let (url, server) = rpc_server(2, |request| {
+            let mut reply = primary_reply(request, &block(), &receipts());
+            reply.as_array_mut().expect("batch").reverse();
+            reply
         });
-        let source = from_urls("ethereum", url, "ws://unused", Datasets::all()).expect("source");
-        let error = source
-            .fetch_block(18_000_000, None)
-            .await
-            .expect_err("a refused block is not a block");
-        assert!(matches!(error, SourceError::Inconsistent { .. }), "{error}");
-        server.join().expect("server");
-    }
-
-    /// Any other error response is still the transport failure it was.
-    #[tokio::test]
-    async fn another_error_response_is_still_a_transport_failure() {
-        let (url, server) = rpc_server(1, |request| {
-            let calls = request.as_array().expect("a batch");
-            let refused = |call: &Value| {
-                json!({"jsonrpc": "2.0", "id": call["id"], "error": {"code": -32000,
-                    "message": "execution aborted"}})
-            };
-            json!([refused(&calls[0]), refused(&calls[1])])
-        });
-        let source = from_urls("ethereum", url, "ws://unused", Datasets::all()).expect("source");
-        let error = source
-            .fetch_block(18_000_000, None)
-            .await
-            .expect_err("refused");
-        assert!(matches!(error, SourceError::Transport { .. }), "{error}");
-        server.join().expect("server");
-    }
-
-    #[tokio::test]
-    async fn primary_fetch_is_one_two_call_batch_with_reversed_responses() {
-        let (url, server) = rpc_server(1, |request| primary_reply(request, &block(), &receipts()));
-        let source = from_urls("ethereum", url, "ws://unused", Datasets::all()).expect("source");
+        let source = rpc_source(url, Datasets::all());
+        assert_eq!(source.backfill_span(), 1);
         let fetched = source.fetch_block(18_000_000, None).await.expect("fetch");
-        assert_eq!(fetched.events.len(), 5);
-        // The header is reported as metadata, and no finalized call is made.
-        assert_eq!(fetched.meta.height, 18_000_000);
-        assert_eq!(fetched.meta.timestamp, TIMESTAMP);
-        assert_eq!(server.join().expect("server").len(), 1);
+        let backfilled = source
+            .fetch_blocks(18_000_000, 18_000_000)
+            .await
+            .expect("backfill");
+        assert_eq!(server.join().expect("server").len(), 2);
+        assert_eq!(fetched.meta, block_meta());
+        let kinds: Vec<&str> = fetched.events.iter().map(Event::kind).collect();
+        assert_eq!(kinds, ["block", "transaction", "log", "log", "transaction"]);
+        let [backfilled] = &backfilled[..] else {
+            panic!("one block, not {}", backfilled.len());
+        };
+        assert_eq!(backfilled.meta, fetched.meta);
+        assert_eq!(backfilled.events, fetched.events);
     }
 
     /// Reads a hex quantity out of a request.
@@ -1450,13 +1495,7 @@ mod tests {
     }
 
     fn logs_only(url: String) -> EvmSource {
-        from_urls(
-            "base",
-            url,
-            "ws://unused",
-            serde_json::from_str(r#"["logs"]"#).expect("datasets"),
-        )
-        .expect("source")
+        rpc_source(url, serde_json::from_str(r#"["logs"]"#).expect("datasets"))
     }
 
     /// A range is one batch — a header per height and one `eth_getLogs` — split back into
@@ -1473,13 +1512,7 @@ mod tests {
         ] {
             let logs = [log_at(100, 0), log_at(100, 1), log_at(102, 0)];
             let (url, server) = rpc_server(1, move |request| range_reply(request, &logs, None));
-            let source = from_urls(
-                "base",
-                url,
-                "ws://unused",
-                serde_json::from_str(selection).expect("datasets"),
-            )
-            .expect("source");
+            let source = rpc_source(url, serde_json::from_str(selection).expect("datasets"));
             let blocks = source.fetch_blocks(100, 102).await.expect("range");
             let observed = server.join().expect("server");
             assert_eq!(observed[0].as_array().expect("batch").len(), 4);
@@ -1505,7 +1538,8 @@ mod tests {
         assert_eq!(observed[0].as_array().expect("batch").len(), 2);
         assert_eq!(span(&observed[0]), 1);
         assert_eq!(fetched.meta.height, 100);
-        assert_eq!(fetched.events.len(), 1);
+        let kinds: Vec<&str> = fetched.events.iter().map(Event::kind).collect();
+        assert_eq!(kinds, ["log"]);
     }
 
     /// A reused head's empty `eth_getLogs` answer falls through to the header read, which
@@ -1518,11 +1552,12 @@ mod tests {
             parent_hash: hash(99).parse().expect("hash"),
             timestamp: TIMESTAMP,
         };
-        for (logs, bloom_at, requests) in [
-            (vec![log_at(100, 0)], None, 1),
-            (vec![], None, 2),
-            (vec![], Some(100), 2),
+        for (case, logs, bloom_at, requests) in [
+            ("logs", vec![log_at(100, 0)], None, 1),
+            ("no logs under an empty bloom", vec![], None, 2),
+            ("no logs under a set bloom", vec![], Some(100), 2),
         ] {
+            let count = logs.len();
             let (url, server) = rpc_server(requests, move |request| {
                 if request.is_array() {
                     return range_reply(request, &logs, bloom_at);
@@ -1531,10 +1566,18 @@ mod tests {
                 json!({"jsonrpc": "2.0", "id": request["id"], "result": logs})
             });
             let fetched = logs_only(url).fetch_block(100, Some(&head)).await;
-            assert_eq!(server.join().expect("server").len(), requests);
+            assert_eq!(server.join().expect("server").len(), requests, "{case}");
             match bloom_at {
-                None => assert_eq!(fetched.expect("fetch").meta, head),
-                Some(_) => assert!(matches!(fetched, Err(SourceError::Inconsistent { .. }))),
+                None => {
+                    let fetched = fetched.expect(case);
+                    assert_eq!(fetched.meta, head, "{case}");
+                    assert_eq!(fetched.events.len(), count, "{case}");
+                }
+                Some(_) => assert_eq!(
+                    fetched.expect_err(case).to_string(),
+                    "inconsistent data from eth_getLogs: no logs returned for block 100, whose logsBloom is set",
+                    "{case}"
+                ),
             }
         }
     }
@@ -1584,13 +1627,16 @@ mod tests {
         let result = logs_only(url).fetch_blocks(100, 101).await;
         let observed = server.join().expect("server");
         assert_eq!(observed.iter().map(span).collect::<Vec<_>>(), spans);
-        assert!(matches!(
-            result,
-            Err(SourceError::Transport {
-                context: "eth_getLogs",
-                ..
-            })
-        ));
+        assert!(
+            matches!(
+                &result,
+                Err(SourceError::Transport {
+                    context: "eth_getLogs",
+                    source: alloy_json_rpc::RpcError::ErrorResp(payload),
+                }) if payload.code == -32602
+            ),
+            "{result:?}"
+        );
     }
 
     /// The span grows back after enough ranges in a row are served, up to the limit.
@@ -1616,51 +1662,45 @@ mod tests {
     /// would not fix data the node got wrong.
     #[tokio::test]
     async fn a_range_that_fails_its_checks_is_not_retried_smaller() {
+        const MISORDERED: &str = "malformed data from eth_getLogs: logs of block 101 are not in ascending logIndex order";
+        const LEFTOVER: &str =
+            "malformed data from eth_getLogs: rows outside the blocks 100..=102, or out of order";
         let mut wrong_hash = log_at(101, 0);
         wrong_hash["blockHash"] = json!(hash(0xee));
-        for (case, logs, bloom_at) in [
-            ("a log from another block", vec![wrong_hash], None),
+        let another_block = format!(
+            "inconsistent data from eth_getLogs: log belongs to block {}, not {}",
+            hash(0xee),
+            hash(101)
+        );
+        for (case, logs, bloom_at, expected) in [
+            ("a log from another block", vec![wrong_hash], None, another_block),
             (
                 "logs out of order",
                 vec![log_at(101, 1), log_at(101, 0)],
                 None,
+                MISORDERED.to_owned(),
             ),
             (
                 "a duplicate log",
                 vec![log_at(101, 0), log_at(101, 0)],
                 None,
+                MISORDERED.to_owned(),
             ),
-            ("a log below the range", vec![log_at(99, 0)], None),
-            ("a log above the range", vec![log_at(103, 0)], None),
-            ("no logs for a header whose bloom is set", vec![], Some(101)),
+            ("a log below the range", vec![log_at(99, 0)], None, LEFTOVER.to_owned()),
+            ("a log above the range", vec![log_at(103, 0)], None, LEFTOVER.to_owned()),
+            (
+                "no logs for a header whose bloom is set",
+                vec![],
+                Some(101),
+                "inconsistent data from eth_getLogs: no logs returned for block 101, whose logsBloom is set"
+                    .to_owned(),
+            ),
         ] {
             let (url, server) = rpc_server(1, move |request| range_reply(request, &logs, bloom_at));
             let error = logs_only(url).fetch_blocks(100, 102).await.expect_err(case);
-            assert!(
-                matches!(
-                    error,
-                    SourceError::Malformed { .. } | SourceError::Inconsistent { .. }
-                ),
-                "{case}: {error}"
-            );
+            assert_eq!(error.to_string(), expected, "{case}");
             assert_eq!(server.join().expect("server").len(), 1, "{case}");
         }
-    }
-
-    /// Transactions come with their receipts, which are per block, so a transaction
-    /// dataset backfills a height at a time.
-    #[tokio::test]
-    async fn a_transaction_dataset_backfills_one_height_at_a_time() {
-        let (url, server) = rpc_server(1, |request| primary_reply(request, &block(), &receipts()));
-        let source = from_urls("ethereum", url, "ws://unused", Datasets::all()).expect("source");
-        assert_eq!(source.backfill_span(), 1);
-        let blocks = source
-            .fetch_blocks(18_000_000, 18_000_000)
-            .await
-            .expect("fetch");
-        assert_eq!(blocks.len(), 1);
-        assert_eq!(blocks[0].meta.height, 18_000_000);
-        server.join().expect("server");
     }
 
     /// A reusable head stands in for the header only when logs are the only thing
@@ -1671,13 +1711,10 @@ mod tests {
     async fn a_reusable_head_still_reads_the_body_for_a_transaction_dataset() {
         // One batch, two calls: the body is read even though a head was announced.
         let (url, server) = rpc_server(1, |request| primary_reply(request, &block(), &receipts()));
-        let source = from_urls(
-            "ethereum",
+        let source = rpc_source(
             url,
-            "ws://unused",
             serde_json::from_str(r#"["transactions", "logs"]"#).expect("datasets"),
-        )
-        .expect("source");
+        );
         let head = BlockMeta {
             height: 18_000_000,
             hash: hash(0xab).parse().expect("hash"),
@@ -1693,6 +1730,11 @@ mod tests {
             kinds,
             ["transaction", "log", "log", "transaction"],
             "the body rows survive a reusable head"
+        );
+        assert_eq!(
+            fetched.meta,
+            block_meta(),
+            "the body's metadata, not the head's"
         );
         server.join().expect("server");
     }
@@ -1744,19 +1786,20 @@ mod tests {
                     )
                 }
             });
-            let source = from_urls("base", url, "ws://unused", Datasets::all()).expect("source");
+            let source = rpc_source(url, Datasets::all());
             let fetched = source
                 .fetch_block(18_000_000, None)
                 .await
                 .expect("fallback fetch");
-            assert_eq!(fetched.events.len(), 22);
+            assert_eq!(fetched.events.len(), 22, "unsupported: {unsupported}");
             let observed = server.join().expect("server");
             assert_eq!(
                 observed
                     .iter()
                     .map(|batch| batch.as_array().expect("batch").len())
                     .collect::<Vec<_>>(),
-                [2, 10, 10, 1]
+                [2, 10, 10, 1],
+                "unsupported: {unsupported}"
             );
             for (index, event) in fetched.events.iter().skip(1).enumerate() {
                 let Event::Transaction(transaction) = event else {
@@ -1774,7 +1817,7 @@ mod tests {
     #[tokio::test]
     async fn rpc_and_decode_errors_remain_typed_and_do_not_trigger_fallback() {
         for malformed in [false, true] {
-            let (url, server) = rpc_server(1, move |request| {
+            let error = fetch_primary(move |request| {
                 let mut response = primary_reply(request, &block(), &receipts());
                 if malformed {
                     response[0]["result"]["number"] = json!("not a quantity");
@@ -1786,27 +1829,26 @@ mod tests {
                     response[1]["error"] = json!({"code": -32000, "message": "internal"});
                 }
                 response
-            });
-            let source =
-                from_urls("ethereum", url, "ws://unused", Datasets::all()).expect("source");
-            let error = source
-                .fetch_block(18_000_000, None)
-                .await
-                .expect_err("must fail");
+            })
+            .await
+            .expect_err("must fail");
             if malformed {
-                assert!(matches!(
-                    error,
-                    SourceError::Transport {
-                        context: "eth_getBlockByNumber",
-                        source: alloy_json_rpc::RpcError::DeserError { .. }
-                    }
-                ));
+                assert!(
+                    matches!(
+                        error,
+                        SourceError::Transport {
+                            context: "eth_getBlockByNumber",
+                            source: alloy_json_rpc::RpcError::DeserError { .. }
+                        }
+                    ),
+                    "{error:?}"
+                );
             } else {
                 assert!(
-                    matches!(error, SourceError::Transport { context: "eth_getBlockReceipts", source: alloy_json_rpc::RpcError::ErrorResp(ref payload) } if payload.code == -32000)
+                    matches!(error, SourceError::Transport { context: "eth_getBlockReceipts", source: alloy_json_rpc::RpcError::ErrorResp(ref payload) } if payload.code == -32000),
+                    "{error:?}"
                 );
             }
-            server.join().expect("server");
         }
     }
 
@@ -2175,6 +2217,26 @@ mod tests {
             (header.l1_block_number, header.send_count, header.send_root),
             (None, None, None)
         );
+        let transactions: Vec<_> = fetched
+            .events
+            .iter()
+            .filter_map(|event| match event {
+                Event::Transaction(transaction) => Some(transaction),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(transactions.len(), 2);
+        for transaction in transactions {
+            assert_eq!(
+                (
+                    transaction.receipt_gas_used_for_l1,
+                    transaction.receipt_l1_block_number
+                ),
+                (None, None),
+                "transaction {}",
+                transaction.transaction_index
+            );
+        }
     }
 
     #[test]
@@ -2195,100 +2257,128 @@ mod tests {
         );
     }
 
+    /// Receipts that do not answer the block's transactions are refused: one from
+    /// another block means the chain moved mid-request, so asking again can help; a
+    /// missing or misplaced one cannot be right.
     #[test]
-    fn receipts_from_another_block_are_rejected() {
-        let mut receipts = receipts();
-        receipts[1]["blockHash"] = json!(hash(0xcd));
-        let error = decode_block(batch(&block(), &receipts)).expect_err("fork mismatch must fail");
-        assert!(error.to_string().contains("reorganised"), "{error}");
-    }
-
-    #[test]
-    fn receipt_count_must_match_transactions() {
-        let mut receipts = receipts();
-        receipts
-            .as_array_mut()
-            .expect("receipts are an array")
-            .pop();
-        let error = decode_block(batch(&block(), &receipts)).expect_err("count mismatch must fail");
-        assert!(
-            error.to_string().contains("1 receipts for 2 transactions"),
-            "{error}"
-        );
-    }
-
-    #[tokio::test]
-    async fn a_missing_log_index_is_rejected() {
-        // Alloy rejects an absent logIndex at the RPC decode boundary.
-        let mut receipts = receipts();
-        for log in receipts[0]["logs"]
-            .as_array_mut()
-            .expect("logs are an array")
-        {
-            log.as_object_mut()
-                .expect("log is an object")
-                .remove("logIndex");
+    fn receipts_that_do_not_match_the_block_are_rejected() {
+        let cases: [(&str, fn(&mut Value), String); 3] = [
+            (
+                "a receipt from another block",
+                |receipts| receipts[1]["blockHash"] = json!(hash(0xcd)),
+                format!(
+                    "inconsistent data from eth_getBlockReceipts: receipt belongs to block {}, not {}; the chain reorganised mid-request",
+                    hash(0xcd),
+                    hash(0xab)
+                ),
+            ),
+            (
+                "a missing receipt",
+                |receipts| {
+                    receipts.as_array_mut().expect("receipts").pop();
+                },
+                "malformed data from eth_getBlockReceipts: 1 receipts for 2 transactions"
+                    .to_owned(),
+            ),
+            (
+                "a receipt at another index",
+                |receipts| receipts[1]["transactionIndex"] = json!("0x5"),
+                "malformed data from eth_getBlockReceipts: receipt 1 has transactionIndex Some(5), not 1"
+                    .to_owned(),
+            ),
+        ];
+        for (case, change, expected) in cases {
+            let mut receipts = receipts();
+            change(&mut receipts);
+            let error = decode_block(batch(&block(), &receipts)).expect_err(case);
+            assert_eq!(error.to_string(), expected, "{case}");
         }
-        let (url, server) = rpc_server(1, move |request| {
-            primary_reply(request, &block(), &receipts)
-        });
-        let source = from_urls("ethereum", url, "ws://unused", Datasets::all()).expect("source");
-        let error = source
-            .fetch_block(18_000_000, None)
-            .await
-            .expect_err("missing logIndex");
-        assert!(matches!(
-            error,
-            SourceError::Transport {
-                context: "eth_getBlockReceipts",
-                source: alloy_json_rpc::RpcError::DeserError { .. }
+    }
+
+    /// A log's transaction hash and its index in the block are its identity, and a log
+    /// lacking either is rejected rather than filled in. An absent `logIndex` fails
+    /// alloy's decode. An explicit `null` is the case the old fallback got wrong: alloy
+    /// accepts it and hands over `None`, and the fallback supplied the log's position
+    /// *within its receipt*, which is not the block index the field means. On a block
+    /// whose second transaction emits a log the two differ, and the wrong value collides
+    /// on dedupe with a different log. A defaulted transaction hash would make unrelated
+    /// logs dedupe together the same way.
+    #[tokio::test]
+    async fn a_log_without_its_identity_is_rejected() {
+        let cases: [(&str, fn(&mut Value), fn(&SourceError) -> bool); 3] = [
+            (
+                "a missing logIndex",
+                |log| {
+                    log.as_object_mut().expect("log").remove("logIndex");
+                },
+                |error| {
+                    matches!(
+                        error,
+                        SourceError::Transport {
+                            context: "eth_getBlockReceipts",
+                            source: alloy_json_rpc::RpcError::DeserError { .. }
+                        }
+                    )
+                },
+            ),
+            (
+                "a null logIndex",
+                |log| log["logIndex"] = Value::Null,
+                |error| {
+                    error.to_string()
+                        == "malformed data from eth_getBlockReceipts: log has no logIndex; it cannot be placed in the block"
+                },
+            ),
+            (
+                "a missing transactionHash",
+                |log| {
+                    log.as_object_mut().expect("log").remove("transactionHash");
+                },
+                |error| {
+                    error.to_string()
+                        == "malformed data from eth_getBlockReceipts: log has no transactionHash"
+                },
+            ),
+        ];
+        for (case, change, expected) in cases {
+            let mut receipts = receipts();
+            for log in receipts[0]["logs"].as_array_mut().expect("logs") {
+                change(log);
             }
-        ));
-        server.join().expect("server");
+            let error = fetch_primary(move |request| primary_reply(request, &block(), &receipts))
+                .await
+                .expect_err(case);
+            assert!(expected(&error), "{case}: {error:?}");
+        }
     }
 
     /// A provider's URL holds its API key, and a failed request's error is logged with
-    /// `{:?}`, so neither rendering may carry the URL reqwest attaches. A refused
-    /// connection is retried with backoff first; paused time skips those waits.
+    /// `{:?}`, so neither rendering may carry the URL reqwest attaches. The listener
+    /// stays bound and never answers, so each request times out and is retried with
+    /// backoff first; paused time skips those waits.
     #[tokio::test(start_paused = true)]
     async fn a_transport_error_does_not_carry_the_endpoint_url() {
-        let port = std::net::TcpListener::bind("127.0.0.1:0")
-            .and_then(|listener| listener.local_addr())
-            .expect("a free port")
-            .port();
-        let url = format!("http://127.0.0.1:{port}/v2/secret-api-key");
-        let source = from_urls("ethereum", url, "ws://unused", Datasets::all()).expect("source");
-        let error = source
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let address = listener.local_addr().expect("address");
+        let url = format!("http://{address}/v2/secret-api-key");
+        let error = rpc_source(url, Datasets::all())
             .fetch_block(1, None)
             .await
-            .expect_err("nothing listens on the port");
+            .expect_err("nothing answers");
+        drop(listener);
 
-        assert!(matches!(error, SourceError::Transport { .. }), "{error:?}");
+        assert!(
+            matches!(
+                error,
+                SourceError::Transport {
+                    context: "rpc batch",
+                    ..
+                }
+            ),
+            "{error:?}"
+        );
         let printed = format!("{error} {error:?}");
         assert!(!printed.contains("secret-api-key"), "{printed}");
-    }
-
-    /// An explicit `null` `logIndex` is the case the old fallback got wrong. alloy
-    /// accepts it and hands over `None`, so the fallback was reachable — and it supplied
-    /// the log's position *within its receipt*, which is not the block index the field
-    /// means. On a block whose second transaction emits a log, the two differ, and the
-    /// wrong value collides on dedupe with a different log.
-    #[test]
-    fn a_null_log_index_is_rejected_rather_than_filled_from_the_receipt() {
-        let mut receipts = receipts();
-        for log in receipts[0]["logs"]
-            .as_array_mut()
-            .expect("logs are an array")
-        {
-            log["logIndex"] = Value::Null;
-        }
-        let error =
-            decode_block(batch(&block(), &receipts)).expect_err("a null logIndex must fail");
-        let message = error.to_string();
-        assert!(
-            message.contains("eth_getBlockReceipts") && message.contains("logIndex"),
-            "a log that cannot be placed in the block must not be filed under a guess: {message}"
-        );
     }
 
     /// An OP-stack block carrying a deposit transaction (`type: 0x7e`), which
@@ -2320,13 +2410,9 @@ mod tests {
         receipts[0]["type"] = json!("0x7e");
         receipts[0]["logs"] = json!([]);
 
-        let (url, server) = rpc_server(1, move |request| primary_reply(request, &block, &receipts));
-        let source = from_urls("base", url, "ws://unused", Datasets::all()).expect("source");
-        let fetched = source
-            .fetch_block(18_000_000, None)
+        let fetched = fetch_primary(move |request| primary_reply(request, &block, &receipts))
             .await
             .expect("OP deposit block decodes");
-        server.join().expect("server");
         assert_eq!(fetched.events.len(), 2, "block, transaction");
 
         let Event::Transaction(transaction) = &fetched.events[1] else {
@@ -2337,27 +2423,5 @@ mod tests {
         assert_eq!(transaction.input.len(), 4);
         assert_eq!(transaction.nonce, 1);
         assert!(transaction.receipt_status);
-    }
-
-    /// A log's transaction hash is part of its identity; defaulting it would make
-    /// unrelated logs dedupe together, so it is rejected instead.
-    #[test]
-    fn a_log_without_a_transaction_hash_is_rejected() {
-        let mut receipts = receipts();
-        for log in receipts[0]["logs"]
-            .as_array_mut()
-            .expect("logs are an array")
-        {
-            log.as_object_mut()
-                .expect("log is an object")
-                .remove("transactionHash");
-        }
-        let error = decode_block(batch(&block(), &receipts))
-            .expect_err("a log without an identity must fail");
-        let message = error.to_string();
-        assert!(
-            message.contains("eth_getBlockReceipts") && message.contains("transactionHash"),
-            "{message}"
-        );
     }
 }

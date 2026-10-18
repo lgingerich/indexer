@@ -133,6 +133,7 @@ mod tests {
     fn keeps_selects_only_the_named_datasets() {
         let datasets: Datasets = serde_json::from_str(r#"["logs"]"#).expect("datasets");
         let block = Event::Block(Box::default());
+        let transaction = Event::Transaction(Box::default());
         let log = Event::Log(Box::new(Log {
             block_number: 1,
             block_hash: B256::ZERO,
@@ -163,6 +164,7 @@ mod tests {
         });
 
         assert!(!datasets.keeps(&block), "block is not selected");
+        assert!(!datasets.keeps(&transaction), "transaction is not selected");
         assert!(datasets.keeps(&log), "log is selected");
         assert!(datasets.keeps(&decoded), "a decoded record follows its log");
         assert!(datasets.keeps(&reorg), "a reorg always passes");

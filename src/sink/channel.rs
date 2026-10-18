@@ -395,12 +395,14 @@ mod tests {
 
     use alloy_primitives::B256;
     use tokio::sync::Notify;
+    use tokio::sync::mpsc::error::TryRecvError;
+    use tokio::task::JoinHandle;
 
     use crate::sink::route::Backend;
     use crate::sink::{EnvelopeSink, SinkError};
     use crate::wire::envelope::{Block, ChainId, Envelope, Event};
 
-    use super::{Batching, ChannelSink, ENVELOPES};
+    use super::{Batching, CAPACITY, ChannelReceiver, ChannelSink, ENVELOPES, MAX_BLOCKS};
     use crate::sink::stop::Stop;
 
     /// A block at `height`, which stands in for a block's worth of envelopes. The
@@ -464,65 +466,107 @@ mod tests {
         sink.flush().await.expect("flush");
     }
 
+    /// Batching bounded only by `wait`: no record or byte limit gathers a flush early.
+    const fn waiting(wait: Duration) -> Batching {
+        Batching {
+            records: usize::MAX,
+            bytes: usize::MAX,
+            wait,
+        }
+    }
+
+    /// Drains `receiver` into a [`Batches`] on a task of its own, returning how many
+    /// envelopes it stored and the batches it flushed.
+    fn spawn_drain(
+        receiver: ChannelReceiver,
+        batching: Batching,
+        stop: Stop,
+    ) -> JoinHandle<(u64, Vec<Vec<String>>)> {
+        tokio::spawn(async move {
+            let mut store = Batches::default();
+            let stored = receiver
+                .drain(&mut store, batching, stop)
+                .await
+                .expect("drain");
+            (stored, store.flushed)
+        })
+    }
+
+    /// Whether `send` is still waiting once every task that could let it finish has run.
+    ///
+    /// Under a paused clock the runtime advances time only when no task can make
+    /// progress, so a timeout that fires means `send` was waiting on something that would
+    /// never come by itself, and one that does not means it finished without waiting on
+    /// time at all. Neither depends on how fast the machine is.
+    async fn waits(send: impl Future<Output = ()>) -> bool {
+        tokio::time::timeout(Duration::from_secs(1), send)
+            .await
+            .is_err()
+    }
+
     /// Nothing crosses the channel until the flush, and then the block crosses whole and
     /// in order: the flush is the block boundary.
     #[tokio::test]
     async fn a_block_crosses_whole_and_only_on_flush() {
-        let (mut sink, receiver) = ChannelSink::new(Backend::DuckDb);
+        let (mut sink, mut receiver) = ChannelSink::new(Backend::DuckDb);
         sink.publish(envelope(0)).await.expect("publish");
         sink.publish(envelope(1)).await.expect("publish");
         assert!(
-            tokio::time::timeout(Duration::from_millis(50), async {
-                let mut store = Batches::default();
-                // Sender still alive and nothing flushed, so this waits.
-                receiver
-                    .drain(&mut store, Batching::eager(100), Stop::never())
-                    .await
-            })
-            .await
-            .is_err(),
+            matches!(receiver.receiver.try_recv(), Err(TryRecvError::Empty)),
             "an unflushed block must not reach storage"
         );
-
-        let (mut sink, receiver) = ChannelSink::new(Backend::DuckDb);
-        send_block(&mut sink, 0..3).await;
+        sink.publish(envelope(2)).await.expect("publish");
+        sink.flush().await.expect("flush");
+        sink.flush().await.expect("an empty flush");
         drop(sink);
+
         let mut store = Batches::default();
         let stored = receiver
             .drain(&mut store, Batching::eager(100), Stop::never())
             .await
             .expect("drain");
         assert_eq!(stored, 3);
-        assert_eq!(store.flushed, [keys(0..3)]);
+        assert_eq!(
+            store.flushed,
+            [keys(0..3)],
+            "one block, and nothing for the empty flush"
+        );
     }
 
     /// Large blocks wait on the envelope budget long before the block count is reached,
     /// get room back as storage takes them, and one larger than the whole budget still
     /// goes, alone.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn the_envelope_budget_holds_back_large_blocks() {
-        let wait = Duration::from_millis(50);
         let half = u64::try_from(ENVELOPES / 2 + 1).expect("fits");
         let (mut sink, mut receiver) = ChannelSink::new(Backend::DuckDb);
         send_block(&mut sink, 0..half).await;
         assert!(
-            tokio::time::timeout(wait, send_block(&mut sink, half..2 * half))
-                .await
-                .is_err(),
+            waits(send_block(&mut sink, half..2 * half)).await,
             "a second block over the budget must wait"
         );
         let first = receiver.receiver.recv().await.expect("the first block");
         assert_eq!(first.envelopes.len(), ENVELOPES / 2 + 1);
         drop(first);
-        tokio::time::timeout(wait, send_block(&mut sink, half..2 * half))
-            .await
-            .expect("room again once storage took the first");
+        assert!(
+            !waits(send_block(&mut sink, half..2 * half)).await,
+            "room again once storage took the first"
+        );
 
-        let (mut sink, _receiver) = ChannelSink::new(Backend::DuckDb);
+        let (mut sink, mut receiver) = ChannelSink::new(Backend::DuckDb);
         let whole = u64::try_from(ENVELOPES + 1).expect("fits");
-        tokio::time::timeout(wait, send_block(&mut sink, 0..whole))
-            .await
-            .expect("a block over the whole budget goes alone");
+        assert!(
+            !waits(send_block(&mut sink, 0..whole)).await,
+            "a block over the whole budget goes"
+        );
+        assert!(
+            waits(send_block(&mut sink, whole..whole + 1)).await,
+            "and goes alone: it holds the whole budget"
+        );
+        let large = receiver.receiver.recv().await.expect("the large block");
+        assert_eq!(large.envelopes.len(), ENVELOPES + 1, "whole, never split");
+        drop(large);
+        assert!(!waits(send_block(&mut sink, whole..whole + 1)).await);
     }
 
     /// A store that fell behind commits its backlog in one flush, but never splits a
@@ -552,19 +596,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_gathered_block_is_flushed_by_its_deadline_in_a_stall() {
         let (mut sink, receiver) = ChannelSink::new(Backend::DuckDb);
-        let batching = Batching {
-            records: usize::MAX,
-            bytes: usize::MAX,
-            wait: Duration::from_secs(30),
-        };
-        let storage = tokio::spawn(async move {
-            let mut store = Batches::default();
-            receiver
-                .drain(&mut store, batching, Stop::never())
-                .await
-                .expect("drain");
-            store.flushed
-        });
+        let storage = spawn_drain(receiver, waiting(Duration::from_secs(30)), Stop::never());
         send_block(&mut sink, 0..1).await;
         tokio::time::sleep(Duration::from_secs(10)).await;
         send_block(&mut sink, 1..2).await;
@@ -573,7 +605,8 @@ mod tests {
         send_block(&mut sink, 2..3).await;
         drop(sink);
 
-        let flushed = storage.await.expect("storage ends");
+        let (stored, flushed) = storage.await.expect("storage ends");
+        assert_eq!(stored, 3);
         assert_eq!(flushed, [keys(0..2), keys(2..3)]);
     }
 
@@ -589,9 +622,8 @@ mod tests {
 
         // Ten bytes an envelope: the third crosses 25.
         let batching = Batching {
-            records: usize::MAX,
             bytes: 25,
-            wait: Duration::from_hours(1),
+            ..waiting(Duration::from_hours(1))
         };
         let mut store = Batches::default();
         receiver
@@ -602,47 +634,57 @@ mod tests {
     }
 
     /// However much a store's own limits would gather, one flush holds at most
-    /// [`MAX_BLOCKS`](super::MAX_BLOCKS) blocks, so a stop can leave the stores no
-    /// further apart than a restart reaches back.
+    /// [`MAX_BLOCKS`] blocks, so a stop can leave the stores no further apart than a
+    /// restart reaches back.
     #[tokio::test]
     async fn a_flush_holds_at_most_half_a_window_of_blocks() {
-        let max = super::MAX_BLOCKS as u64;
+        let max = MAX_BLOCKS as u64;
         let (mut sink, receiver) = ChannelSink::new(Backend::DuckDb);
-        let batching = Batching {
-            records: usize::MAX,
-            bytes: usize::MAX,
-            wait: Duration::from_hours(1),
-        };
-        let storage = tokio::spawn(async move {
-            let mut store = Batches::default();
-            receiver
-                .drain(&mut store, batching, Stop::never())
-                .await
-                .expect("drain");
-            store.flushed
-        });
+        let storage = spawn_drain(receiver, waiting(Duration::from_hours(1)), Stop::never());
         for height in 0..max + 10 {
             send_block(&mut sink, height..height + 1).await;
         }
         drop(sink);
-        let flushed = storage.await.expect("storage");
+        let (_, flushed) = storage.await.expect("storage");
         assert_eq!(flushed, [keys(0..max), keys(max..max + 10)]);
     }
 
     /// The channel is bounded, so a stalled store is felt as a waiting sender rather
-    /// than as unbounded growth or dropped blocks.
-    #[tokio::test]
+    /// than as unbounded growth or dropped blocks: it holds [`CAPACITY`] blocks, the next
+    /// waits until storage takes one, and none is lost.
+    #[tokio::test(start_paused = true)]
     async fn a_full_channel_blocks_the_sender() {
-        let (mut sink, _parked) = ChannelSink::new(Backend::DuckDb);
-        let sent = tokio::time::timeout(Duration::from_secs(2), async {
-            let mut sequence = 0;
-            loop {
-                send_block(&mut sink, sequence..sequence + 1).await;
-                sequence += 1;
-            }
-        })
-        .await;
-        assert!(sent.is_err(), "a full channel must make the sender wait");
+        let capacity = CAPACITY as u64;
+        let (mut sink, mut receiver) = ChannelSink::new(Backend::DuckDb);
+        for height in 0..capacity {
+            assert!(
+                !waits(send_block(&mut sink, height..height + 1)).await,
+                "block {height} fits in the channel"
+            );
+        }
+        assert!(
+            waits(send_block(&mut sink, capacity..capacity + 1)).await,
+            "a full channel must make the sender wait"
+        );
+        let oldest = receiver.receiver.recv().await.expect("the oldest block");
+        assert_eq!(oldest.envelopes.len(), 1);
+        assert_eq!(oldest.envelopes[0].event.dedupe_key(), envelope_key(0));
+        assert!(
+            !waits(send_block(&mut sink, capacity..capacity + 1)).await,
+            "room again once storage took one"
+        );
+        drop(sink);
+
+        let mut store = Batches::default();
+        receiver
+            .drain(&mut store, Batching::eager(usize::MAX), Stop::never())
+            .await
+            .expect("drain");
+        assert_eq!(
+            store.flushed.concat(),
+            keys(1..=capacity),
+            "every other block arrives, in order"
+        );
     }
 
     /// A store that has stopped is an error on the sender's next flush, not a silent
@@ -721,6 +763,10 @@ mod tests {
         assert_eq!(stored, 1);
         assert_eq!(store.inner.flushed, [keys(0..1)]);
         assert!(
+            store.inner.open.is_empty(),
+            "the queued block is dropped, not published"
+        );
+        assert!(
             store.finished,
             "what the last commit left running is waited on"
         );
@@ -732,22 +778,11 @@ mod tests {
     async fn a_stop_commits_what_is_gathered() {
         let (mut sink, receiver) = ChannelSink::new(Backend::DuckDb);
         let (request, stop) = Stop::new();
-        let batching = Batching {
-            records: usize::MAX,
-            bytes: usize::MAX,
-            wait: Duration::from_hours(1),
-        };
-        let storage = tokio::spawn(async move {
-            let mut store = Batches::default();
-            let stored = receiver
-                .drain(&mut store, batching, stop)
-                .await
-                .expect("drain");
-            (stored, store.flushed)
-        });
+        let storage = spawn_drain(receiver, waiting(Duration::from_hours(1)), stop);
         send_block(&mut sink, 0..1).await;
         send_block(&mut sink, 1..2).await;
-        // Long enough for the drain to gather both, far short of their wait.
+        // The clock is paused, so this returns once the drain has gathered both and is
+        // waiting again, far short of their wait.
         tokio::time::sleep(Duration::from_secs(1)).await;
         request.send(true).expect("the drain is listening");
 
@@ -784,15 +819,10 @@ mod tests {
 
         let (mut sink, receiver) = ChannelSink::new(Backend::DuckDb);
         let (request, stop) = Stop::new();
-        let batching = Batching {
-            records: usize::MAX,
-            bytes: usize::MAX,
-            wait: Duration::from_hours(1),
-        };
         let storage = tokio::spawn(async move {
             let mut store = Stuck::default();
             let stored = receiver
-                .drain(&mut store, batching, stop)
+                .drain(&mut store, waiting(Duration::from_hours(1)), stop)
                 .await
                 .expect("an abandoned commit is not an error");
             (stored, store.finished)
@@ -809,7 +839,7 @@ mod tests {
     }
 
     /// A sink error ends the drain with that error, so a failing store stops storage
-    /// rather than being read as an ended stream.
+    /// rather than being read as an ended stream, and the sender fails on its next flush.
     #[tokio::test]
     async fn a_failing_sink_ends_the_drain_with_its_error() {
         /// A sink whose storage is out of space, which is a real store condition and so
@@ -828,10 +858,17 @@ mod tests {
             .drain(&mut OutOfSpace, Batching::eager(100), Stop::never())
             .await
             .expect_err("the sink failed");
-        assert!(
-            matches!(error, SinkError::Write(_)),
-            "the sink's own error must survive the drain, not be reshaped: {error}"
+        let SinkError::Write(io) = error else {
+            panic!("the sink's own error must survive the drain, not be reshaped: {error}");
+        };
+        assert_eq!(
+            (io.kind(), io.to_string()),
+            (std::io::ErrorKind::Other, "disk is full".to_owned())
         );
-        assert!(error.to_string().contains("disk is full"), "{error}");
+        sink.publish(envelope(1)).await.expect("publish buffers");
+        assert!(
+            matches!(sink.flush().await, Err(SinkError::StorageClosed)),
+            "the sender fails on its next flush once the drain has ended"
+        );
     }
 }

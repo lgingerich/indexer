@@ -118,32 +118,67 @@ mod tests {
     use alloy_primitives::Bloom;
 
     use super::{check_height, check_log_order, check_logs_present, check_no_leftovers};
-    use crate::ingest::source::SourceError;
 
+    /// Each check passes what it allows and refuses what it names, as the error that
+    /// says whether asking again can help: a set bloom with no logs is inconsistent,
+    /// every other refusal malformed.
     #[test]
     fn each_check_refuses_what_it_names() {
-        assert!(check_height("test", 5, 5).is_ok());
-        assert!(matches!(
-            check_height("test", 5, 6),
-            Err(SourceError::Malformed { .. })
-        ));
-
-        assert!(check_log_order("test", 1, [0, 1, 3]).is_ok());
-        assert!(
-            check_log_order("test", 1, [0, 2, 2]).is_err(),
-            "a duplicate"
-        );
-        assert!(check_log_order("test", 1, [1, 0]).is_err(), "misordered");
-
+        const MISORDERED: &str =
+            "malformed data from test: logs of block 1 are not in ascending logIndex order";
         let bloom = Bloom::repeat_byte(1);
-        assert!(check_logs_present("test", 1, false, &Bloom::ZERO).is_ok());
-        assert!(check_logs_present("test", 1, true, &bloom).is_ok());
-        assert!(matches!(
-            check_logs_present("test", 1, false, &bloom),
-            Err(SourceError::Inconsistent { .. })
-        ));
-
-        assert!(check_no_leftovers("test", 1, 2, false).is_ok());
-        assert!(check_no_leftovers("test", 1, 2, true).is_err());
+        for (case, result, expected) in [
+            ("the height asked for", check_height("test", 5, 5), None),
+            (
+                "another height",
+                check_height("test", 5, 6),
+                Some("malformed data from test: requested block 5, received 6"),
+            ),
+            (
+                "ascending logs",
+                check_log_order("test", 1, [0, 1, 3]),
+                None,
+            ),
+            (
+                "a duplicate log",
+                check_log_order("test", 1, [0, 2, 2]),
+                Some(MISORDERED),
+            ),
+            (
+                "misordered logs",
+                check_log_order("test", 1, [1, 0]),
+                Some(MISORDERED),
+            ),
+            (
+                "no logs under an empty bloom",
+                check_logs_present("test", 1, false, &Bloom::ZERO),
+                None,
+            ),
+            (
+                "logs under a set bloom",
+                check_logs_present("test", 1, true, &bloom),
+                None,
+            ),
+            (
+                "no logs under a set bloom",
+                check_logs_present("test", 1, false, &bloom),
+                Some(
+                    "inconsistent data from test: no logs returned for block 1, whose logsBloom is set",
+                ),
+            ),
+            (
+                "nothing left over",
+                check_no_leftovers("test", 1, 2, false),
+                None,
+            ),
+            (
+                "a row left over",
+                check_no_leftovers("test", 1, 2, true),
+                Some("malformed data from test: rows outside the blocks 1..=2, or out of order"),
+            ),
+        ] {
+            let error = result.err().map(|error| error.to_string());
+            assert_eq!(error.as_deref(), expected, "{case}");
+        }
     }
 }

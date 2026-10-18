@@ -602,6 +602,7 @@ mod tests {
 
     use crate::wire::envelope::{ChainId, TypedValue};
 
+    use super::super::DeriveError;
     use super::fixtures::{catalog, details, int128s, uint128s};
     use super::{
         BIN_FILLS, LIQUIDITY, POOL_BINS, SWAPS, bin_fill, fixtures, liquidity, pool_bins, swap,
@@ -620,6 +621,24 @@ mod tests {
 
     fn max_pos() -> U256 {
         (U256::ONE << 104) - U256::ONE
+    }
+
+    /// Asserts that `derived` refused argument `position`, `name`, for not holding
+    /// `expected`.
+    fn refused(
+        derived: Result<Vec<Vec<TypedValue>>, DeriveError>,
+        position: usize,
+        name: &str,
+        expected: &str,
+    ) {
+        match derived {
+            Err(DeriveError::Argument {
+                position: at,
+                name: named,
+                expected: wanted,
+            }) => assert_eq!((at, named, wanted), (position, name, expected)),
+            Ok(rows) => panic!("expected {name} refused, derived {rows:?}"),
+        }
     }
     /// The boundaries `Packed.t.sol` pins: both int128 extremes in either half, a
     /// negative low half that must not leak into the high one, both uint128 halves full,
@@ -725,14 +744,29 @@ mod tests {
                     uint(U256::from(u128::MAX), 128),
                 ],
             ),
+            (
+                bin(i16::MIN.into()),
+                U256::ZERO,
+                U256::ZERO,
+                [
+                    int(i16::MIN.into(), 16),
+                    int(0, 128),
+                    int(0, 128),
+                    uint(U256::ZERO, 128),
+                    uint(U256::ZERO, 128),
+                ],
+            ),
         ];
         for (bin_idx, deltas, fees, expected) in cases {
             let rows = bin_fill(&fixtures::bin_swapped(bin_idx, deltas, fees)).expect("derives");
             assert_eq!(rows, [expected]);
         }
         for outside in [i32::from(i16::MIN) - 1, i32::from(i16::MAX) + 1] {
-            assert!(
-                bin_fill(&fixtures::bin_swapped(bin(outside), U256::ZERO, U256::ZERO)).is_err()
+            refused(
+                bin_fill(&fixtures::bin_swapped(bin(outside), U256::ZERO, U256::ZERO)),
+                0,
+                "binIdx",
+                "bin indexes in the int16 range",
             );
         }
     }
@@ -797,13 +831,20 @@ mod tests {
             panic!("shares");
         };
         shares.pop();
-        assert!(liquidity(&uneven).is_err());
-        assert!(
+        refused(
+            liquidity(&uneven),
+            4,
+            "shares",
+            "an array with one entry per bin",
+        );
+        refused(
             liquidity(&fixtures::liquidity(
                 false,
-                &[(i32::from(i16::MAX) + 1, 1, 1, 1)]
-            ))
-            .is_err()
+                &[(i32::from(i16::MAX) + 1, 1, 1, 1)],
+            )),
+            2,
+            "binIdxs",
+            "bin indexes in the int16 range",
         );
     }
 

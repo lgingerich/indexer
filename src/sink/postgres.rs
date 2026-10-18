@@ -557,30 +557,43 @@ mod tests {
             let label = &table.name;
             let ddl = sql::create_table::<Postgres>(table);
             assert!(
-                ddl.contains("PRIMARY KEY (\"chain\", \"dedupe_key\")"),
-                "{label} upserts on its identity and can publish a delete"
+                ddl.ends_with(", PRIMARY KEY (\"chain\", \"dedupe_key\"))"),
+                "{label} upserts on its identity and can publish a delete: {ddl}"
             );
             let retracted = table.id != Table::Reorg.into();
+            let block = table.block_hash.as_ref().zip(table.block_number.as_ref());
+            assert_eq!(
+                block.is_some(),
+                retracted,
+                "{label} names its block exactly when a reorg deletes from it"
+            );
+            let by_block: Vec<String> = block
+                .into_iter()
+                .flat_map(|(hash, number)| [hash, number])
+                .map(|column| format!(" (\"chain\", \"{column}\")"))
+                .collect();
             let indexes = sql::create_indexes::<Postgres>(table);
             assert_eq!(
-                !indexes.is_empty(),
-                retracted,
-                "{label} is indexed by block exactly when a reorg deletes from it"
+                indexes.len(),
+                by_block.len(),
+                "{label} is indexed by block exactly when a reorg deletes from it: {indexes:?}"
             );
-            if let Some((hash, number)) = table.block_hash.as_ref().zip(table.block_number.as_ref())
-            {
-                for column in [hash, number] {
-                    let columns = format!("(\"chain\", \"{column}\")");
-                    assert!(
-                        indexes.iter().any(|index| index.ends_with(&columns)),
-                        "{label} is indexed on {columns}"
-                    );
-                }
+            for (index, columns) in indexes.iter().zip(&by_block) {
+                assert!(
+                    index.ends_with(columns),
+                    "{label} is indexed on{columns}: {index}"
+                );
             }
-            assert_eq!(sql::delete_blocks::<Postgres>(table).is_some(), retracted);
+            assert_eq!(
+                sql::delete_blocks::<Postgres>(table).is_some(),
+                retracted,
+                "{label}"
+            );
             for column in &table.columns {
+                // Every column is followed by another or by the key, so the separator
+                // keeps a nullable column from matching a required one's prefix.
                 let definition = format!(
-                    "\"{}\" {}{}",
+                    "\"{}\" {}{}, ",
                     column.name,
                     Postgres::type_name(column.kind),
                     if column.nullable { "" } else { " NOT NULL" }
@@ -596,15 +609,21 @@ mod tests {
             "tables = ['logs']\nconnection_string = 'postgres://user:secret@localhost/indexer'",
         )
         .expect("settings");
-        assert_eq!(settings.batch_records, 20_000);
-        assert!(!format!("{settings:?}").contains("secret"));
-        assert!(toml::from_str::<PostgresSettings>("tables = ['logs']").is_err());
+        let debug = format!("{settings:?}");
         assert!(
-            toml::from_str::<PostgresSettings>(
-                "tables = ['logs']\nconnection_string = 'host=localhost'\nbatch_record = 1"
-            )
-            .is_err()
+            !debug.contains("secret") && debug.contains("[redacted]"),
+            "{debug}"
         );
+        for (toml, reason) in [
+            ("tables = ['logs']", "missing field `connection_string`"),
+            (
+                "tables = ['logs']\nconnection_string = 'host=localhost'\nbatch_record = 1",
+                "unknown field `batch_record`",
+            ),
+        ] {
+            let error = toml::from_str::<PostgresSettings>(toml).expect_err(toml);
+            assert!(error.to_string().contains(reason), "{toml}: {error}");
+        }
     }
 
     fn db(sink: &PostgresSink) -> &Client {
@@ -616,6 +635,43 @@ mod tests {
         PostgresSink::connected(client, datasets(), database_schema)
             .await
             .expect("sink")
+    }
+
+    /// A schema of a test's own on the `INDEXER_TEST_POSTGRES_URL` database, named for the
+    /// test and this process, and the task driving the connection that created it.
+    struct Scratch {
+        schema: String,
+        connection: tokio::task::JoinHandle<Result<(), tokio_postgres::Error>>,
+    }
+
+    impl Scratch {
+        /// Connects, creates the schema `{name}_test_{pid}`, and makes it the connection's
+        /// search path, returning the client for a sink to take.
+        async fn create(name: &str) -> (Client, Self) {
+            let url = std::env::var("INDEXER_TEST_POSTGRES_URL").expect("test database URL");
+            let (client, connection) = tokio_postgres::connect(&url, tokio_postgres::NoTls)
+                .await
+                .expect("connect");
+            let connection = tokio::spawn(connection);
+            let schema = format!("{name}_test_{}", std::process::id());
+            client
+                .batch_execute(&format!(
+                    "CREATE SCHEMA \"{schema}\"; SET search_path TO \"{schema}\""
+                ))
+                .await
+                .expect("test schema");
+            (client, Self { schema, connection })
+        }
+
+        /// Drops the schema with everything in it, then the sink and its connection.
+        async fn remove(self, sink: PostgresSink) {
+            db(&sink)
+                .batch_execute(&format!("DROP SCHEMA \"{}\" CASCADE", self.schema))
+                .await
+                .expect("drop test schema");
+            drop(sink);
+            self.connection.abort();
+        }
     }
 
     async fn count(sink: &PostgresSink, table: Table) -> i64 {
@@ -657,19 +713,9 @@ mod tests {
 
         use crate::wire::envelope::Contract;
 
-        let url = std::env::var("INDEXER_TEST_POSTGRES_URL").expect("test database URL");
-        let (client, connection) = tokio_postgres::connect(&url, tokio_postgres::NoTls)
-            .await
-            .expect("connect");
-        let task = tokio::spawn(connection);
-        let schema = format!("contract_test_{}", std::process::id());
-        client
-            .batch_execute(&format!(
-                "CREATE SCHEMA \"{schema}\"; SET search_path TO \"{schema}\""
-            ))
-            .await
-            .expect("test schema");
-        let mut sink = dataset_sink(client, &schema).await;
+        let (client, scratch) = Scratch::create("contract").await;
+        let schema = &scratch.schema;
+        let mut sink = dataset_sink(client, schema).await;
         let chain = ChainId::new("base");
         let contract = Contract {
             protocol: "uniswap_v3".to_owned(),
@@ -721,12 +767,7 @@ mod tests {
             "the other chain's contract stays"
         );
 
-        db(&sink)
-            .batch_execute(&format!("DROP SCHEMA \"{schema}\" CASCADE"))
-            .await
-            .expect("drop test schema");
-        drop(sink);
-        task.abort();
+        scratch.remove(sink).await;
     }
 
     /// The ledger reads back the newest unorphaned accepted blocks of one chain, oldest
@@ -736,19 +777,9 @@ mod tests {
     async fn the_ledger_reads_back_the_newest_canonical_window_and_prunes_below_it() {
         use crate::wire::envelope::BlockMeta;
 
-        let url = std::env::var("INDEXER_TEST_POSTGRES_URL").expect("test database URL");
-        let (client, connection) = tokio_postgres::connect(&url, tokio_postgres::NoTls)
-            .await
-            .expect("connect");
-        let task = tokio::spawn(connection);
-        let schema = format!("ledger_test_{}", std::process::id());
-        client
-            .batch_execute(&format!(
-                "CREATE SCHEMA \"{schema}\"; SET search_path TO \"{schema}\""
-            ))
-            .await
-            .expect("test schema");
-        let mut sink = dataset_sink(client, &schema).await;
+        let (client, scratch) = Scratch::create("ledger").await;
+        let schema = &scratch.schema;
+        let mut sink = dataset_sink(client, schema).await;
         let chain = ChainId::new("base");
         let accepted = |height: u64| BlockMeta {
             height,
@@ -799,12 +830,7 @@ mod tests {
             [accepted(1)]
         );
 
-        db(&sink)
-            .batch_execute(&format!("DROP SCHEMA \"{schema}\" CASCADE"))
-            .await
-            .expect("drop test schema");
-        drop(sink);
-        task.abort();
+        scratch.remove(sink).await;
     }
 
     /// A rewind deletes every block above the height from every table, the ledger
@@ -816,20 +842,10 @@ mod tests {
         use crate::wire::datasets::evm::Block;
         use crate::wire::envelope::BlockMeta;
 
-        let url = std::env::var("INDEXER_TEST_POSTGRES_URL").expect("test database URL");
-        let (client, connection) = tokio_postgres::connect(&url, tokio_postgres::NoTls)
-            .await
-            .expect("connect");
-        let task = tokio::spawn(connection);
-        let schema = format!("rewind_test_{}", std::process::id());
-        client
-            .batch_execute(&format!(
-                "CREATE SCHEMA \"{schema}\"; SET search_path TO \"{schema}\""
-            ))
-            .await
-            .expect("test schema");
+        let (client, scratch) = Scratch::create("rewind").await;
+        let schema = &scratch.schema;
         // A store rewinds the chain it was opened for, which is named like its schema.
-        let mut sink = dataset_sink(client, &schema).await;
+        let mut sink = dataset_sink(client, schema).await;
         for name in [schema.as_str(), "ethereum"] {
             for height in 1..=5_u64 {
                 let meta = BlockMeta {
@@ -877,12 +893,7 @@ mod tests {
             }
         }
 
-        db(&sink)
-            .batch_execute(&format!("DROP SCHEMA \"{schema}\" CASCADE"))
-            .await
-            .expect("drop test schema");
-        drop(sink);
-        task.abort();
+        scratch.remove(sink).await;
     }
 
     /// A reorg deletes its orphaned blocks' rows in every table — committed earlier or
@@ -895,19 +906,9 @@ mod tests {
         use crate::wire::datasets::evm::{Block, Log};
         use crate::wire::envelope::BlockMeta;
 
-        let url = std::env::var("INDEXER_TEST_POSTGRES_URL").expect("test database URL");
-        let (client, connection) = tokio_postgres::connect(&url, tokio_postgres::NoTls)
-            .await
-            .expect("connect");
-        let task = tokio::spawn(connection);
-        let schema = format!("reorg_test_{}", std::process::id());
-        client
-            .batch_execute(&format!(
-                "CREATE SCHEMA \"{schema}\"; SET search_path TO \"{schema}\""
-            ))
-            .await
-            .expect("test schema");
-        let mut sink = dataset_sink(client, &schema).await;
+        let (client, scratch) = Scratch::create("reorg").await;
+        let schema = &scratch.schema;
+        let mut sink = dataset_sink(client, schema).await;
         db(&sink)
             .batch_execute(&format!(
                 "CREATE PUBLICATION \"{schema}\" FOR TABLES IN SCHEMA \"{schema}\""
@@ -988,13 +989,10 @@ mod tests {
         assert_eq!(count(&sink, Table::Reorg).await, 2);
 
         db(&sink)
-            .batch_execute(&format!(
-                "DROP PUBLICATION \"{schema}\"; DROP SCHEMA \"{schema}\" CASCADE"
-            ))
+            .batch_execute(&format!("DROP PUBLICATION \"{}\"", scratch.schema))
             .await
-            .expect("drop test schema");
-        drop(sink);
-        task.abort();
+            .expect("drop the publication");
+        scratch.remove(sink).await;
     }
 
     /// A decoded array of scalars lands as a native array of its element type, and a
@@ -1003,19 +1001,9 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires INDEXER_TEST_POSTGRES_URL pointing to PostgreSQL 18"]
     async fn an_array_is_a_typed_array_and_a_tuple_one_object() {
-        let url = std::env::var("INDEXER_TEST_POSTGRES_URL").expect("test database URL");
-        let (client, connection) = tokio_postgres::connect(&url, tokio_postgres::NoTls)
-            .await
-            .expect("connect");
-        let task = tokio::spawn(connection);
-        let schema = format!("array_test_{}", std::process::id());
-        client
-            .batch_execute(&format!(
-                "CREATE SCHEMA \"{schema}\"; SET search_path TO \"{schema}\""
-            ))
-            .await
-            .expect("test schema");
-        let mut sink = PostgresSink::connected(client, crate::sink::fixtures::schema(), &schema)
+        let (client, scratch) = Scratch::create("array").await;
+        let schema = &scratch.schema;
+        let mut sink = PostgresSink::connected(client, crate::sink::fixtures::schema(), schema)
             .await
             .expect("sink");
         let created = crate::sink::fixtures::decoded_pool_created();
@@ -1056,12 +1044,7 @@ mod tests {
         assert_eq!(row.get::<_, String>(5), "3");
         assert_eq!(row.get::<_, String>(6), U256::MAX.to_string());
 
-        db(&sink)
-            .batch_execute(&format!("DROP SCHEMA \"{schema}\" CASCADE"))
-            .await
-            .expect("drop test schema");
-        drop(sink);
-        task.abort();
+        scratch.remove(sink).await;
     }
 
     /// A decoded record lands in its event's table with exact `NUMERIC` and `BIGINT`
@@ -1069,19 +1052,9 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires INDEXER_TEST_POSTGRES_URL pointing to PostgreSQL 18"]
     async fn a_decoded_record_lands_in_its_typed_event_table() {
-        let url = std::env::var("INDEXER_TEST_POSTGRES_URL").expect("test database URL");
-        let (client, connection) = tokio_postgres::connect(&url, tokio_postgres::NoTls)
-            .await
-            .expect("connect");
-        let task = tokio::spawn(connection);
-        let schema = format!("event_test_{}", std::process::id());
-        client
-            .batch_execute(&format!(
-                "CREATE SCHEMA \"{schema}\"; SET search_path TO \"{schema}\""
-            ))
-            .await
-            .expect("test schema");
-        let mut sink = PostgresSink::connected(client, crate::sink::fixtures::schema(), &schema)
+        let (client, scratch) = Scratch::create("event").await;
+        let schema = &scratch.schema;
+        let mut sink = PostgresSink::connected(client, crate::sink::fixtures::schema(), schema)
             .await
             .expect("sink");
         let chain = ChainId::new("base");
@@ -1133,12 +1106,7 @@ mod tests {
             .get(0);
         assert_eq!(remaining, 0, "the reorg deleted the typed row");
 
-        db(&sink)
-            .batch_execute(&format!("DROP SCHEMA \"{schema}\" CASCADE"))
-            .await
-            .expect("drop test schema");
-        drop(sink);
-        task.abort();
+        scratch.remove(sink).await;
     }
 
     /// Run against an isolated `PostgreSQL` 18 database with `INDEXER_TEST_POSTGRES_URL`.
@@ -1146,18 +1114,8 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires INDEXER_TEST_POSTGRES_URL pointing to PostgreSQL 18"]
     async fn copy_is_atomic_retains_failed_batches_and_upserts_a_replay() {
-        let url = std::env::var("INDEXER_TEST_POSTGRES_URL").expect("test database URL");
-        let (client, connection) = tokio_postgres::connect(&url, tokio_postgres::NoTls)
-            .await
-            .expect("connect");
-        let task = tokio::spawn(connection);
-        let schema = format!("sink_test_{}", std::process::id());
-        client
-            .batch_execute(&format!(
-                "CREATE SCHEMA \"{schema}\"; SET search_path TO \"{schema}\""
-            ))
-            .await
-            .expect("test schema");
+        let (client, scratch) = Scratch::create("sink").await;
+        let schema = &scratch.schema;
         assert_eq!(
             client
                 .query_one("SHOW server_version_num", &[])
@@ -1169,7 +1127,7 @@ mod tests {
                 / 10_000,
             18
         );
-        let mut sink = dataset_sink(client, &schema).await;
+        let mut sink = dataset_sink(client, schema).await;
         sink.flush().await.expect("empty flush");
         let chain = ChainId::new("tab\tnewline\nslash\\unicodeé");
         for height in [1, u64::MAX] {
@@ -1216,7 +1174,7 @@ mod tests {
             .await
             .expect("remove constraint");
         sink.flush().await.expect("retry");
-        assert!(sink.buffered() == 0);
+        assert_eq!(sink.buffered(), 0);
         assert_eq!(count(&sink, Table::Reorg).await, 1);
         assert_eq!(
             db(&sink)
@@ -1241,7 +1199,9 @@ mod tests {
             .await
             .expect("drop test schema");
         drop(sink);
-        task.await
+        scratch
+            .connection
+            .await
             .expect("connection task")
             .expect("connection closes");
     }

@@ -721,37 +721,57 @@ addresses = { base = ["0x33128a8fC17869897dcE68Ed026d694621f6FDfD"], ethereum = 
         let manifest = |extra: &str| {
             format!("protocol = \"p\"\n[[contract]]\nabi = [\"Token.json\"]\n{extra}")
         };
-        assert!(matches!(
-            protocol(&[
-                abi,
-                (
-                    "protocol.toml",
-                    &manifest(&format!("table = \"{}\"\n", "t".repeat(60)))
-                )
-            ]),
-            Err(CatalogError::TableName { .. })
-        ));
-        assert!(
-            matches!(
-                protocol(&[abi, ("protocol.toml", &manifest(""))]),
-                Err(CatalogError::DuplicateTable { .. })
+        let long = "t".repeat(60);
+        match protocol(&[
+            abi,
+            ("protocol.toml", &manifest(&format!("table = \"{long}\"\n"))),
+        ]) {
+            Err(CatalogError::TableName { table, contract }) => assert_eq!(
+                (table, contract.as_str()),
+                (format!("p_{long}_transfer"), "p.Token")
             ),
-            "ERC-20's and ERC-721's Transfer share a name"
-        );
+            other => panic!("a long name: {other:?}"),
+        }
         let one = r#"[{"type":"event","name":"Transfer","anonymous":false,"inputs":[]}]"#;
-        assert!(matches!(
-            protocol(&[
-                ("Token.json", one),
-                ("Other.json", one),
-                (
-                    "protocol.toml",
-                    &manifest(
-                        "table = \"t\"\n[[contract]]\nabi = [\"Other.json\"]\ntable = \"t\"\n"
-                    )
-                ),
-            ]),
-            Err(CatalogError::DuplicateTable { .. })
-        ));
+        for (case, files, (repeated, by)) in [
+            (
+                "ERC-20's and ERC-721's Transfer share a name",
+                vec![
+                    ("Token.json", TRANSFERS.to_owned()),
+                    ("protocol.toml", manifest("")),
+                ],
+                ("p_token_transfer", "p.Token"),
+            ),
+            (
+                "two contracts share a table",
+                vec![
+                    ("Token.json", one.to_owned()),
+                    ("Other.json", one.to_owned()),
+                    (
+                        "protocol.toml",
+                        manifest(
+                            "table = \"t\"\n[[contract]]\nabi = [\"Other.json\"]\ntable = \"t\"\n",
+                        ),
+                    ),
+                ],
+                ("p_t_transfer", "p.Other"),
+            ),
+        ] {
+            let files: Vec<_> = files
+                .iter()
+                .map(|(name, contents)| (*name, contents.as_str()))
+                .collect();
+            match protocol(&files) {
+                Err(CatalogError::DuplicateTable { table, contract }) => {
+                    assert_eq!(
+                        (table.as_str(), contract.as_str()),
+                        (repeated, by),
+                        "{case}"
+                    );
+                }
+                other => panic!("{case}: {other:?}"),
+            }
+        }
         assert_eq!(
             table_names(
                 &protocol(&[
@@ -765,20 +785,42 @@ addresses = { base = ["0x33128a8fC17869897dcE68Ed026d694621f6FDfD"], ethereum = 
         );
     }
 
+    /// The shipped Uniswap V3 manifest wires as written: the factory's `PoolCreated`
+    /// discovers pools from its `pool` argument, and the pool is seeded with exactly its
+    /// Base addresses, so a short run decodes swaps out of the box.
     #[test]
-    fn the_shipped_protocols_load() {
+    fn the_shipped_pools_are_discovered_and_seeded() {
         let catalog = Catalog::load(repository(), &ChainId::new("base")).expect("loads");
-        assert!(catalog.entries.iter().any(|entry| !entry.rules.is_empty()));
+        let factory = catalog
+            .entry("uniswap_v3", "UniswapV3Factory")
+            .expect("factory");
         let pool = catalog.entry("uniswap_v3", "UniswapV3Pool").expect("pool");
-        assert!(catalog.seeds.iter().any(|&(_, entry)| entry == pool));
-        assert!(catalog.entry("uniswap_v4", "PoolManager").is_some());
-        assert!(catalog.entry("metric_v1", "MetricOmmPool").is_some());
-        assert!(catalog.entry("pyth_lazer", "PythLazer").is_some());
-        assert!(
-            catalog
-                .entry("chainlink_data_streams", "Verifier")
-                .is_some()
+        let rules: Vec<_> = catalog.entries[factory]
+            .rules
+            .values()
+            .flatten()
+            .map(|rule| (rule.position, rule.child))
+            .collect();
+        assert_eq!(
+            rules,
+            [(4, pool)],
+            "PoolCreated's fifth input names the pool"
         );
+        let mut seeded: Vec<_> = catalog
+            .seeds
+            .iter()
+            .filter(|&&(_, entry)| entry == pool)
+            .map(|&(address, _)| address)
+            .collect();
+        seeded.sort_unstable();
+        let mut listed: Vec<alloy_primitives::Address> = [
+            "0x2df380544b88adb3ad0a94100dcc45fd705aae2d",
+            "0xd0b53D9277642d899DF5C87A3966A349A798F224",
+        ]
+        .map(|address| address.parse().expect("address"))
+        .to_vec();
+        listed.sort_unstable();
+        assert_eq!(seeded, listed);
     }
 
     /// A contract is named after its first ABI file, and a rule resolves its parameter's

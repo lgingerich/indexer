@@ -438,12 +438,12 @@ mod tests {
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::{Arc, Mutex};
 
-    use alloy_json_rpc::{Id, Request, RequestPacket, ResponsePacket};
+    use alloy_json_rpc::{Id, Request, RequestPacket, ResponsePacket, RpcError};
     use alloy_transport::{TransportError, TransportErrorKind, TransportFut};
     use serde_json::{Value, json};
     use tower::{Layer as _, ServiceExt as _};
 
-    use super::{MAX_RETRIES, MIN_DELAY_MS, Pacing, RetryLayer};
+    use super::{MAX_RETRIES, MIN_DELAY_MS, Pacing, RetryLayer, timed_out};
 
     fn response(body: &str) -> ResponsePacket {
         serde_json::from_str(body).expect("response")
@@ -477,11 +477,12 @@ mod tests {
         (result, calls.load(Ordering::SeqCst))
     }
 
-    /// A refusal — an HTTP `429`, or a provider's code in a `200` — is retried, and
-    /// the slowdown it caused wears off as requests succeed.
+    /// A refusal — an HTTP `429`, or a provider's code in a `200` — is retried after the
+    /// doubled delay, and the slowdown it caused wears off as requests succeed.
     #[tokio::test(start_paused = true)]
     async fn a_refusal_is_retried_and_the_slowdown_recovers() {
         let layer = RetryLayer::new(0);
+        let start = tokio::time::Instant::now();
         let (result, calls) = send(&layer, |n| match n {
             0 => Err(TransportErrorKind::http_error(429, String::new())),
             1 => Ok(response(
@@ -490,9 +491,20 @@ mod tests {
             _ => Ok(response(r#"{"jsonrpc":"2.0","id":1,"result":"0x1"}"#)),
         })
         .await;
-        assert!(result.expect("succeeds").as_error().is_none());
+        let waited = start.elapsed();
+        let answer = result.expect("succeeds");
+        assert_eq!(answer.first_error_code(), None);
         assert_eq!(calls, 3);
-        assert!(layer.backoff.pacing.current() > 0);
+        // The retries waited out the jittered 250 ms, then 500 ms: each between half and
+        // all of its delay. Paused time makes the clock exact.
+        let (least, most) = (MIN_DELAY_MS / 2 + MIN_DELAY_MS, MIN_DELAY_MS * 3);
+        assert!(
+            (least..=most).contains(&u64::try_from(waited.as_millis()).expect("millis")),
+            "waited {waited:?}"
+        );
+        // Doubled twice, then an eighth off for the success.
+        let doubled = MIN_DELAY_MS * 2;
+        assert_eq!(layer.backoff.pacing.current(), doubled - doubled / 8);
         for _ in 0..40 {
             let (result, _) = send(&layer, |_| {
                 Ok(response(r#"{"jsonrpc":"2.0","id":1,"result":"0x1"}"#))
@@ -525,7 +537,10 @@ mod tests {
         })
         .await;
         let error = result.expect_err("gives up");
-        assert!(error.to_string().contains("503"), "{error}");
+        assert!(
+            matches!(&error, RpcError::Transport(TransportErrorKind::HttpError(http)) if http.status == 503),
+            "{error}"
+        );
         assert_eq!(calls, MAX_RETRIES + 1);
     }
 
@@ -577,7 +592,7 @@ mod tests {
                     .expect("a timeout per call"))
             })
             .await;
-            result.expect_err("times out");
+            assert!(timed_out(&result), "{filter}: {result:?}");
             assert_eq!(calls, expected, "{filter}");
         }
     }
@@ -585,20 +600,22 @@ mod tests {
     /// `-32005` is returned at once for a ranged log query, and retried otherwise.
     #[tokio::test(start_paused = true)]
     async fn only_a_ranged_log_query_limit_exceeded_is_returned_at_once() {
-        for (method, filter, expected) in [
+        for (method, filter, expected, code) in [
             (
                 "eth_getLogs",
                 json!([{"fromBlock": "0x64", "toBlock": "0x6d"}]),
                 1,
+                Some(-32005),
             ),
             (
                 "eth_getLogs",
                 json!([{"fromBlock": "0x64", "toBlock": "0x64"}]),
                 2,
+                None,
             ),
-            ("eth_blockNumber", Value::Null, 2),
+            ("eth_blockNumber", Value::Null, 2, None),
         ] {
-            let (result, calls) = send_call(&RetryLayer::new(0), method, filter, |n| {
+            let (result, calls) = send_call(&RetryLayer::new(0), method, filter.clone(), |n| {
                 Ok(response(if n == 0 {
                     r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32005,"message":"query returned more than 10000 results"}}"#
                 } else {
@@ -606,8 +623,9 @@ mod tests {
                 }))
             })
             .await;
-            assert!(result.is_ok(), "{method}");
-            assert_eq!(calls, expected, "{method}");
+            let answer = result.expect(method);
+            assert_eq!(answer.first_error_code(), code, "{method} {filter}");
+            assert_eq!(calls, expected, "{method} {filter}");
         }
     }
 

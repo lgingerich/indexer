@@ -19,7 +19,7 @@ use deltalake::{DeltaTable, ensure_table_uri};
 
 use super::{DeltaSettings, DeltaSink, in_texts, maintenance, texts, texts_of};
 use crate::sink::table::{Schema, Table, TableId};
-use crate::sink::{EnvelopeSink, SinkError, Store as _, StoreError, fixtures};
+use crate::sink::{EnvelopeSink, Operation, SinkError, Store as _, StoreError, fixtures};
 use crate::wire::envelope::{Block, BlockMeta, ChainId, Envelope, Event, Log, Reorg, Transaction};
 
 const CHAIN: &str = "base";
@@ -134,6 +134,15 @@ async fn ledger(sink: &mut DeltaSink) -> Vec<BlockMeta> {
     sink.restore().await.expect("the lake restores").ledger
 }
 
+/// The heights of the ledger a restart resumes from, oldest first.
+async fn ledger_heights(sink: &mut DeltaSink) -> Vec<u64> {
+    ledger(sink)
+        .await
+        .iter()
+        .map(|block| block.height)
+        .collect()
+}
+
 /// Hands `envelopes` to the lake without committing them.
 async fn buffer(sink: &mut DeltaSink, envelopes: Vec<Envelope>) {
     for envelope in envelopes {
@@ -177,6 +186,17 @@ async fn blocks(sink: &DeltaSink) -> BTreeSet<String> {
     held
 }
 
+/// How many rows the lake holds in `table`, duplicates included.
+async fn rows(sink: &DeltaSink, table: Table) -> usize {
+    sink.lake(table)
+        .read(Ok)
+        .await
+        .expect("the table reads")
+        .iter()
+        .map(deltalake::arrow::array::RecordBatch::num_rows)
+        .sum()
+}
+
 fn expected(blocks: &[(u64, u8)]) -> BTreeSet<String> {
     blocks
         .iter()
@@ -197,11 +217,7 @@ async fn committed_blocks_survive_a_reopen() {
 
     let mut sink = open(&dir).await;
     assert_eq!(
-        ledger(&mut sink)
-            .await
-            .iter()
-            .map(|block| block.height)
-            .collect::<Vec<_>>(),
+        ledger_heights(&mut sink).await,
         (1..=12).collect::<Vec<_>>()
     );
     let heights: Vec<(u64, u8)> = (1..=12).map(|height| (height, 0)).collect();
@@ -225,22 +241,11 @@ async fn a_reorg_of_buffered_blocks_never_reaches_the_lake() {
     for height in 1..=3 {
         buffer(&mut sink, block(height, 0)).await;
     }
-    buffer(
-        &mut sink,
-        vec![Envelope::new(
-            ChainId::new(CHAIN),
-            Event::Reorg(Reorg {
-                height: 3,
-                new_head_hash: hash(3, 1),
-                orphaned_hashes: vec![hash(3, 0)],
-            }),
-        )],
-    )
-    .await;
+    buffer(&mut sink, vec![reorg(3..=3, 1)]).await;
     publish(&mut sink, block(3, 1)).await;
 
     assert_eq!(blocks(&sink).await, expected(&[(1, 0), (2, 0), (3, 1)]));
-    assert_eq!(stored(&sink, Table::Reorg, "new_head_hash").await.len(), 1);
+    assert_eq!(retractions(&sink).await, expected(&[(3, 1)]));
 }
 
 /// Committed blocks a reorg orphans are deleted from every table, the ledger included,
@@ -266,8 +271,18 @@ async fn a_reorg_of_committed_blocks_deletes_them_everywhere() {
     drop(sink);
 
     let mut sink = open(&dir).await;
-    let ledger = ledger(&mut sink).await;
-    assert_eq!(ledger.last().map(|block| block.hash), Some(hash(12, 1)));
+    assert_eq!(
+        ledger(&mut sink)
+            .await
+            .iter()
+            .map(|block| (block.height, block.hash))
+            .collect::<Vec<_>>(),
+        canonical
+            .iter()
+            .map(|&(height, branch)| (height, hash(height, branch)))
+            .collect::<Vec<_>>(),
+        "the ledger names the replacements in the orphans' place"
+    );
     assert_eq!(blocks(&sink).await, expected(&canonical));
     assert_eq!(retractions(&sink).await, expected(&[(12, 1)]));
 }
@@ -299,6 +314,17 @@ async fn append_only(sink: &mut DeltaSink, envelope: &Envelope) {
         .expect("a row");
     let position = sink.positions[&row.table().id];
     sink.append_some(position, &[&row]).await.expect("appended");
+}
+
+/// Deletes the block `hash`'s rows straight from `table`, as a retraction that stopped
+/// part-way would have.
+async fn delete_only(sink: &mut DeltaSink, table: Table, column: &str, hash: B256) {
+    let position = sink.positions[&TableId::Dataset(table)];
+    let writer = sink.writer.clone();
+    sink.lakes[position]
+        .delete(&writer, in_texts(column, &[hex(hash)]))
+        .await
+        .expect("deleted");
 }
 
 /// A commit that stopped after recording a retraction but before taking its orphans out
@@ -339,18 +365,13 @@ async fn a_retraction_out_of_the_ledger_keeps_its_record() {
         publish(&mut sink, block(height, 0)).await;
     }
     append_only(&mut sink, &reorg(3..=3, 1)).await;
-    let position = sink.positions[&TableId::Dataset(Table::AcceptedBlock)];
-    let writer = sink.writer.clone();
-    sink.lakes[position]
-        .delete(&writer, in_texts("hash", &[hex(hash(3, 0))]))
-        .await
-        .expect("deleted");
+    delete_only(&mut sink, Table::AcceptedBlock, "hash", hash(3, 0)).await;
     drop(sink);
 
     let mut sink = open(&dir).await;
     assert_eq!(retractions(&sink).await, expected(&[(3, 1)]));
     assert_eq!(blocks(&sink).await, expected(&[(1, 0), (2, 0)]));
-    assert_eq!(ledger(&mut sink).await.len(), 2);
+    assert_eq!(ledger_heights(&mut sink).await, [1, 2]);
 }
 
 /// A commit that stopped after writing rows but before their ledger entry leaves rows the
@@ -384,7 +405,7 @@ async fn opening_repairs_rows_a_stopped_commit_left_behind() {
 
     let mut sink = open(&dir).await;
     assert_eq!(blocks(&sink).await, expected(&[(1, 0), (2, 0), (3, 0)]));
-    assert_eq!(ledger(&mut sink).await.len(), 3);
+    assert_eq!(ledger_heights(&mut sink).await, [1, 2, 3]);
 }
 
 /// With no ledger at all, no block row counts: the first commit stopped before its
@@ -403,7 +424,7 @@ async fn opening_with_no_ledger_keeps_no_block_rows() {
     drop(sink);
 
     let mut sink = open(&dir).await;
-    assert!(stored(&sink, Table::Block, "hash").await.is_empty());
+    assert_eq!(rows(&sink, Table::Block).await, 0);
     assert!(ledger(&mut sink).await.is_empty());
 }
 
@@ -425,7 +446,18 @@ async fn a_failed_commit_refuses_every_later_write() {
         }
     }
     buffer(&mut sink, broken).await;
-    assert!(sink.flush().await.is_err());
+    let error = sink.flush().await.expect_err("the commit fails");
+    assert!(
+        matches!(
+            &error,
+            SinkError::Store(StoreError::Engine {
+                operation: Operation::Append,
+                target: Some(table),
+                ..
+            }) if table == "blocks"
+        ),
+        "{error:?}"
+    );
 
     assert!(matches!(
         sink.flush().await,
@@ -439,7 +471,7 @@ async fn a_failed_commit_refuses_every_later_write() {
 
     let mut sink = open(&dir).await;
     assert_eq!(blocks(&sink).await, expected(&[(1, 0)]));
-    assert_eq!(ledger(&mut sink).await.len(), 1);
+    assert_eq!(ledger_heights(&mut sink).await, [1]);
 }
 
 /// A batch that accepts a committed block again, with no reorg orphaning it first, is
@@ -457,15 +489,18 @@ async fn a_replayed_block_is_refused() {
         sink.flush().await,
         Err(SinkError::Store(StoreError::Replayed { block })) if block == hex(hash(3, 0))
     ));
-    let rows: usize = sink
-        .lake(Table::Block)
-        .read(Ok)
-        .await
-        .expect("the table reads")
-        .iter()
-        .map(deltalake::arrow::array::RecordBatch::num_rows)
-        .sum();
-    assert_eq!(rows, 3, "nothing of the replay was written");
+    for table in [
+        Table::Block,
+        Table::Transaction,
+        Table::Log,
+        Table::AcceptedBlock,
+    ] {
+        assert_eq!(
+            rows(&sink, table).await,
+            3,
+            "nothing of the replay was written to {table}"
+        );
+    }
 }
 
 /// A rewind deletes every block above its height from every table, keeps no record of
@@ -490,18 +525,12 @@ async fn a_rewind_takes_the_blocks_above_it_and_they_can_be_written_again() {
         blocks(&sink).await,
         expected(&[(1, 0), (2, 0), (3, 0), (4, 0), (5, 1)])
     );
-    assert_eq!(
-        ledger(&mut sink)
-            .await
-            .iter()
-            .map(|block| block.height)
-            .collect::<Vec<_>>(),
-        [1, 2, 3, 4, 5]
-    );
+    assert_eq!(ledger_heights(&mut sink).await, [1, 2, 3, 4, 5]);
 }
 
-/// The lake reports what it buffers, so the drain can commit by size: it grows with
-/// every block, shrinks when a reorg drops buffered blocks, and is empty after a commit.
+/// The lake reports what it buffers, so the drain can commit by size: it grows by each
+/// block's rows, a reorg takes back exactly the rows of the buffered blocks it drops
+/// and adds its own, and it is empty after a commit.
 #[tokio::test]
 async fn the_lake_reports_what_it_buffers() {
     let dir = Dir::new();
@@ -511,11 +540,21 @@ async fn the_lake_reports_what_it_buffers() {
     let one = sink.buffered_bytes();
     assert!(one > 0);
     buffer(&mut sink, block(2, 0)).await;
-    assert!(sink.buffered_bytes() > one);
+    assert_eq!(
+        sink.buffered_bytes(),
+        2 * one,
+        "a second block of the same shape"
+    );
     buffer(&mut sink, vec![reorg(2..=2, 1)]).await;
-    assert!(sink.buffered_bytes() < 2 * one);
+    let after_reorg = sink.buffered_bytes();
     sink.flush().await.expect("commits");
     assert_eq!(sink.buffered_bytes(), 0);
+
+    // The reorg's own row, measured alone.
+    buffer(&mut sink, vec![reorg(2..=2, 1)]).await;
+    let marker = sink.buffered_bytes();
+    assert!(marker > 0);
+    assert_eq!(after_reorg, one + marker, "block 2's rows are dropped");
 }
 
 /// A reorg that orphans committed blocks and buffered ones at once deletes the first and
@@ -566,7 +605,11 @@ async fn a_block_orphaned_and_canonical_again_in_one_buffer_is_stored() {
     publish(&mut sink, flips).await;
 
     assert_eq!(blocks(&sink).await, expected(&[(1, 0), (2, 0), (3, 0)]));
-    assert!(sink.committed.contains_key(&hex(hash(3, 0))));
+
+    let mut replacement = vec![reorg(3..=3, 2)];
+    replacement.extend(block(3, 2));
+    publish(&mut sink, replacement).await;
+    assert_eq!(blocks(&sink).await, expected(&[(1, 0), (2, 0), (3, 2)]));
 }
 
 /// A commit that stopped part-way through deleting a retraction's orphans — out of the
@@ -579,19 +622,15 @@ async fn opening_finishes_a_retraction_stopped_between_tables() {
         publish(&mut sink, block(height, 0)).await;
     }
     append_only(&mut sink, &reorg(3..=3, 1)).await;
-    for (table, column) in [(Table::AcceptedBlock, "hash"), (Table::Block, "hash")] {
-        let position = sink.positions[&TableId::Dataset(table)];
-        let writer = sink.writer.clone();
-        sink.lakes[position]
-            .delete(&writer, in_texts(column, &[hex(hash(3, 0))]))
-            .await
-            .expect("deleted");
+    for table in [Table::AcceptedBlock, Table::Block] {
+        delete_only(&mut sink, table, "hash", hash(3, 0)).await;
     }
     drop(sink);
 
-    let sink = open(&dir).await;
+    let mut sink = open(&dir).await;
     assert_eq!(retractions(&sink).await, expected(&[(3, 1)]));
     assert_eq!(blocks(&sink).await, expected(&[(1, 0), (2, 0)]));
+    assert_eq!(ledger_heights(&mut sink).await, [1, 2]);
 }
 
 /// The ledger is read from its newest two partitions: the window across a partition
@@ -606,14 +645,7 @@ async fn the_ledger_is_read_from_its_newest_partitions() {
     drop(sink);
 
     let mut sink = open(&dir).await;
-    assert_eq!(
-        ledger(&mut sink)
-            .await
-            .iter()
-            .map(|block| block.height)
-            .collect::<Vec<_>>(),
-        [199_999, 200_000, 200_001]
-    );
+    assert_eq!(ledger_heights(&mut sink).await, [199_999, 200_000, 200_001]);
 }
 
 /// A decoded record is stored twice — its generic row and its event's typed row — with
@@ -669,10 +701,11 @@ async fn a_decoded_record_fills_its_event_table_with_typed_lists() {
          0xe4038fa09f0bb9963068afaf97be0c045155090d, \
          0xebc53e61078976118e384f110c262a263decb84b]"
     );
-    assert!(
-        values[1].starts_with("[2510840694154681225832395181564014445733957084757624461722000,"),
-        "a packed word is its exact integer: {}",
-        values[1]
+    let word = "2510840694154681225832395181564014445733957084757624461722000";
+    assert_eq!(
+        values[1],
+        format!("[{word}, {word}, {word}, {word}]"),
+        "a packed word is its exact integer"
     );
     assert_eq!(
         values[2],
@@ -701,8 +734,9 @@ async fn opening_over_a_different_table_is_drift() {
         .await
         .expect_err("drift stops the open");
     assert!(
-        matches!(&error, StoreError::Drift { table, .. } if *table == name),
-        "{error}"
+        matches!(&error, StoreError::Drift { table, difference }
+            if *table == name && difference == "it has no number column"),
+        "{error:?}"
     );
 }
 
@@ -887,11 +921,16 @@ async fn a_table_larger_than_one_batch_commits_every_row() {
     envelopes.push(ledger_entry);
     publish(&mut sink, envelopes).await;
 
-    assert_eq!(stored(&sink, Table::Log, "dedupe_key").await.len(), logs);
+    assert_eq!(rows(&sink, Table::Log).await, logs);
     drop(sink);
     let mut sink = open(&dir).await;
-    assert_eq!(stored(&sink, Table::Log, "dedupe_key").await.len(), logs);
-    assert_eq!(ledger(&mut sink).await.len(), 1);
+    assert_eq!(rows(&sink, Table::Log).await, logs);
+    assert_eq!(
+        stored(&sink, Table::Log, "dedupe_key").await.len(),
+        logs,
+        "each row once"
+    );
+    assert_eq!(ledger_heights(&mut sink).await, [1]);
 }
 
 /// A commit's ledger append runs on past its flush, beside the next commit's appends,
@@ -900,32 +939,32 @@ async fn a_table_larger_than_one_batch_commits_every_row() {
 async fn a_ledger_append_overlaps_the_next_commit() {
     let dir = Dir::new();
     let mut sink = open(&dir).await;
+    let opened = ledger_version(&sink);
     for height in 1..=3 {
         buffer(&mut sink, block(height, 0)).await;
         sink.flush().await.expect("flushed");
+        assert!(
+            sink.ledger.is_some(),
+            "{height}: the flush left its append running"
+        );
+        assert_eq!(
+            ledger_version(&sink),
+            opened + height - 1,
+            "{height}: the flush took in the last commit's append, not its own"
+        );
     }
-    assert_eq!(
-        ledger(&mut sink)
-            .await
-            .iter()
-            .map(|block| block.height)
-            .collect::<Vec<_>>(),
-        [1, 2, 3]
-    );
+    assert_eq!(ledger_heights(&mut sink).await, [1, 2, 3]);
+    assert!(sink.ledger.is_none(), "the restore waited for the append");
+    assert_eq!(ledger_version(&sink), opened + 3);
     assert_eq!(blocks(&sink).await, expected(&[(1, 0), (2, 0), (3, 0)]));
 }
 
-/// The store checkpoints a table beside its writes once enough versions pass, rather
-/// than inside the commit that reaches the interval.
-#[tokio::test]
-async fn a_checkpoint_is_written_beside_the_commits() {
-    let dir = Dir::new();
-    let mut sink = open(&dir).await;
-    let commits = super::CHECKPOINT_EVERY + 1;
-    for height in 1..=commits {
-        publish(&mut sink, block(height, 0)).await;
-    }
-    wait_for_checkpoint(&log_of(&dir, "accepted_blocks")).await;
+/// The ledger's version as of the last append the sink has taken in.
+fn ledger_version(sink: &DeltaSink) -> u64 {
+    sink.lake(Table::AcceptedBlock)
+        .table
+        .version()
+        .expect("a created table")
 }
 
 /// A table committed to less often than the checkpoint interval in each run is still
@@ -937,16 +976,16 @@ async fn the_checkpoint_interval_counts_across_reopens() {
     let log = log_of(&dir, "accepted_blocks");
     let half = super::CHECKPOINT_EVERY / 2 + 1;
     let mut sink = open(&dir).await;
-    for height in 1..=half {
-        publish(&mut sink, block(height, 0)).await;
-    }
+    accept(&mut sink, 1..=half).await;
     drop(sink);
     assert!(!log.join("_last_checkpoint").exists(), "checkpointed early");
     let mut sink = open(&dir).await;
-    for height in half + 1..=super::CHECKPOINT_EVERY + 1 {
-        publish(&mut sink, block(height, 0)).await;
-    }
-    wait_for_checkpoint(&log).await;
+    accept(&mut sink, half + 1..=super::CHECKPOINT_EVERY).await;
+    assert_eq!(
+        wait_for_checkpoint(&log).await,
+        super::CHECKPOINT_EVERY,
+        "the version that reached the interval"
+    );
 }
 
 /// Opening starts the checkpoint a table is due, so one a stop interrupted, or a table
@@ -956,10 +995,8 @@ async fn opening_starts_a_checkpoint_that_is_due() {
     let dir = Dir::new();
     let log = log_of(&dir, "accepted_blocks");
     let mut sink = open(&dir).await;
-    for height in 1..=super::CHECKPOINT_EVERY + 1 {
-        publish(&mut sink, block(height, 0)).await;
-    }
-    wait_for_checkpoint(&log).await;
+    accept(&mut sink, 1..=super::CHECKPOINT_EVERY + 1).await;
+    assert_eq!(wait_for_checkpoint(&log).await, super::CHECKPOINT_EVERY);
     drop(sink);
     // As if the process stopped before the checkpoint was written.
     for entry in std::fs::read_dir(&log).expect("the log").flatten() {
@@ -969,7 +1006,21 @@ async fn opening_starts_a_checkpoint_that_is_due() {
         }
     }
     let _sink = open(&dir).await;
-    wait_for_checkpoint(&log).await;
+    assert_eq!(
+        wait_for_checkpoint(&log).await,
+        super::CHECKPOINT_EVERY + 1,
+        "a checkpoint of the table as it was opened"
+    );
+}
+
+/// Commits the ledger entries of the canonical blocks at `heights`, one commit each and
+/// nothing else, so each takes the ledger one version on and no other table: all a
+/// checkpoint counts, at a fraction of a whole block's commit.
+async fn accept(sink: &mut DeltaSink, heights: std::ops::RangeInclusive<u64>) {
+    for height in heights {
+        let entry = block(height, 0).pop().expect("the ledger entry");
+        publish(sink, vec![entry]).await;
+    }
 }
 
 /// The transaction log of `table` in the lake at `dir`.
@@ -977,16 +1028,27 @@ fn log_of(dir: &Dir, table: &str) -> PathBuf {
     PathBuf::from(dir.table(table)).join("_delta_log")
 }
 
-/// Waits for the log at `log` to name a checkpoint: `_last_checkpoint` is written once
-/// the checkpoint itself is.
-async fn wait_for_checkpoint(log: &std::path::Path) {
+/// Waits for the log at `log` to name a checkpoint, and returns the version it names:
+/// `_last_checkpoint` is written once the checkpoint itself is. The checkpoint runs on
+/// a task the sink does not hand out, so this polls; the deadline only bounds a
+/// failure, and is far past how long a checkpoint of a small table takes.
+async fn wait_for_checkpoint(log: &std::path::Path) -> u64 {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-    while !log.join("_last_checkpoint").exists() {
+    let hint = log.join("_last_checkpoint");
+    loop {
+        // Read whole or not at all: a hint half-written reads as no hint yet.
+        if let Some(version) = std::fs::read(&hint)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+            .and_then(|hint| hint["version"].as_u64())
+        {
+            return version;
+        }
         assert!(
             std::time::Instant::now() < deadline,
             "no checkpoint was written"
         );
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
 }
 
@@ -1026,7 +1088,14 @@ async fn a_restore_after_opening_hands_on_what_opening_read() {
     let read = sink.restore().await.expect("the lake restores again");
     assert_eq!(handed_on.ledger, read.ledger);
     assert_eq!(handed_on.contracts, read.contracts);
-    assert_eq!(handed_on.contracts.len(), 1);
+    assert_eq!(
+        handed_on
+            .contracts
+            .iter()
+            .map(|contract| contract.block_hash)
+            .collect::<Vec<_>>(),
+        [hash(1, 0)]
+    );
     assert_eq!(
         handed_on
             .ledger
@@ -1038,8 +1107,8 @@ async fn a_restore_after_opening_hands_on_what_opening_read() {
 
     publish(&mut sink, block(3, 0)).await;
     assert_eq!(
-        ledger(&mut sink).await.len(),
-        3,
+        ledger_heights(&mut sink).await,
+        [1, 2, 3],
         "a commit is read, not handed on"
     );
 }
@@ -1059,6 +1128,13 @@ async fn opening_hands_on_contracts_as_repaired() {
 
     let mut sink = open(&dir).await;
     let restored = sink.restore().await.expect("the lake restores");
-    assert_eq!(restored.contracts.len(), 1, "the stray contract is gone");
-    assert_eq!(restored.contracts[0].block_hash, hash(1, 0));
+    assert_eq!(
+        restored
+            .contracts
+            .iter()
+            .map(|contract| contract.block_hash)
+            .collect::<Vec<_>>(),
+        [hash(1, 0)],
+        "the stray contract is gone"
+    );
 }

@@ -262,15 +262,20 @@ mod tests {
     use super::*;
     use crate::sink::table::MAX_IDENTIFIER;
 
-    /// Two long tables that share a prefix get distinct index names within the limit.
+    /// Two long tables that share a prefix get distinct index names within the limit; a
+    /// name that fits is left as it is.
     #[test]
     fn long_index_names_stay_distinct_and_within_the_limit() {
         let index = Index {
             columns: vec!["chain".into(), "block_hash".into()],
         };
-        let first = index_name(&format!("{}_a", "x".repeat(60)), &index);
-        let second = index_name(&format!("{}_b", "x".repeat(60)), &index);
-        assert!(first.len() <= MAX_IDENTIFIER && second.len() <= MAX_IDENTIFIER);
+        let long = "x".repeat(60);
+        let first = index_name(&format!("{long}_a"), &index);
+        let second = index_name(&format!("{long}_b"), &index);
+        for name in [&first, &second] {
+            assert_eq!(name.len(), MAX_IDENTIFIER, "{name}");
+        }
         assert_ne!(first, second);
+        assert_eq!(index_name("logs", &index), "logs_chain_block_hash_index");
     }
 }

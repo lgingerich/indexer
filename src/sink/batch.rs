@@ -349,6 +349,7 @@ mod tests {
         let mut batch = Batch::new(crate::sink::fixtures::schema());
         batch.reconcile(&[meta(5, 0xa0)]);
         block(&mut batch, meta(5, 0xb0));
+        assert_eq!(batch.orphaned.len(), 1, "only the block's own chain");
         let (height, hashes) = &batch.orphaned["base"];
         assert_eq!(*height, 5);
         assert_eq!(
@@ -375,5 +376,6 @@ mod tests {
         batch.clear();
         block(&mut batch, meta(6, 0xa1));
         assert!(batch.is_empty(), "{:?}", tables(&batch));
+        assert!(batch.orphaned.is_empty());
     }
 }

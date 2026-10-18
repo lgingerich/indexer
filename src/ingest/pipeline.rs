@@ -1126,9 +1126,11 @@ impl<S: BlockSource + 'static, K: EnvelopeSink> Machine<S, K> {
 #[expect(clippy::expect_used)]
 mod tests {
     use std::collections::HashMap;
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
     use futures_util::stream;
+    use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
     use super::*;
     use crate::ingest::source::HeadStream;
@@ -1137,6 +1139,16 @@ mod tests {
     /// Produces deterministic distinct identities for test heights and replacement blocks.
     fn hash(height: u64) -> B256 {
         B256::from(alloy_primitives::U256::from(height).to_be_bytes())
+    }
+
+    /// The identity [`Source::linear`] gives `height`.
+    fn meta(height: u64) -> BlockMeta {
+        BlockMeta {
+            height,
+            hash: hash(height),
+            parent_hash: hash(height.saturating_sub(1)),
+            timestamp: height,
+        }
     }
 
     /// A deterministic chain source. `head` moves when `fork` or a test edits it,
@@ -1379,8 +1391,6 @@ mod tests {
         }
     }
 
-    /// Drives the private state operations to convergence without waiting for a live
-    /// subscription. The bounded loop fails the test if indexing stops making progress.
     /// Starts a machine at `from` and syncs it to the sampled head, as `run` does before
     /// going live.
     async fn settle(machine: &mut Machine<Source, Sink>, from: Option<u64>) {
@@ -1400,6 +1410,15 @@ mod tests {
         Arc::get_mut(&mut machine.source).expect("no fetch in flight")
     }
 
+    /// How often the fake chain was asked so far: head samples, then block fetches.
+    fn reads(machine: &Machine<Source, Sink>) -> (usize, usize) {
+        let data = &machine.source.data;
+        (
+            data.head_calls.load(Ordering::Relaxed),
+            data.block_calls.load(Ordering::Relaxed),
+        )
+    }
+
     /// Collects the heights of block events the sink accepted, in order.
     fn heights(machine: &Machine<Source, Sink>) -> Vec<u64> {
         machine
@@ -1413,6 +1432,21 @@ mod tests {
             .collect()
     }
 
+    /// Asserts `result` failed with exactly `expected`, every field compared.
+    #[track_caller]
+    fn fails_with<T: std::fmt::Debug>(result: Result<T, PipelineError>, expected: &PipelineError) {
+        let error = result.expect_err("the operation fails");
+        assert_eq!(format!("{error:?}"), format!("{expected:?}"));
+    }
+
+    /// The error the fake chain answers with, as the pipeline surfaces it.
+    fn malformed(detail: &str) -> PipelineError {
+        PipelineError::Source(SourceError::Malformed {
+            context: "test".into(),
+            detail: detail.into(),
+        })
+    }
+
     #[tokio::test]
     async fn a_near_head_start_seeds_then_extends_one_height_at_a_time() {
         let mut machine = Machine::new(Source::linear(5), Sink::default(), Vec::new());
@@ -1420,57 +1454,72 @@ mod tests {
         // head, so the run is already reconciled above the start.
         settle(&mut machine, Some(2)).await;
         assert_eq!(heights(&machine), [2, 3, 4, 5]);
-        assert_eq!(machine.tip().expect("tip").height, 5);
+        assert_eq!(machine.tip(), Some(meta(5)));
     }
 
+    /// A start or stop outside the sampled head, or a stop below the start, is refused
+    /// before any block is fetched; a start and stop at the head itself are not.
     #[tokio::test]
-    async fn a_start_above_the_head_is_rejected_before_output() {
+    async fn a_start_or_stop_out_of_bounds_is_rejected_before_output() {
+        let cases = [
+            (
+                "start above the head",
+                Some(6),
+                None,
+                PipelineError::StartAboveHead { start: 6, head: 5 },
+            ),
+            (
+                "stop above the head",
+                Some(2),
+                Some(6),
+                PipelineError::StopAboveHead { stop: 6, head: 5 },
+            ),
+            (
+                "stop below the start",
+                Some(3),
+                Some(2),
+                PipelineError::StopBelowStart { stop: 2, start: 3 },
+            ),
+            // Without a start the run starts at the head, so a lower stop is below it too.
+            (
+                "stop below the head without a start",
+                None,
+                Some(4),
+                PipelineError::StopBelowStart { stop: 4, start: 5 },
+            ),
+        ];
+        for (label, start, stop, expected) in cases {
+            let mut machine = Machine::new(Source::linear(5), Sink::default(), Vec::new());
+            let error = machine
+                .sync(start, stop)
+                .await
+                .expect_err(&format!("{label} is refused"));
+            assert_eq!(format!("{error:?}"), format!("{expected:?}"), "{label}");
+            assert_eq!(reads(&machine).1, 0, "{label}: no block is fetched");
+            assert!(machine.sink.events.is_empty(), "{label}");
+        }
         let mut machine = Machine::new(Source::linear(5), Sink::default(), Vec::new());
-        assert!(matches!(
-            machine.sync(Some(6), None).await,
-            Err(PipelineError::StartAboveHead { start: 6, head: 5 })
-        ));
-        assert!(machine.sink.events.is_empty());
-    }
-
-    #[tokio::test]
-    async fn a_stop_above_the_head_is_rejected_before_output() {
-        let mut machine = Machine::new(Source::linear(5), Sink::default(), Vec::new());
-        assert!(matches!(
-            machine.sync(Some(2), Some(6)).await,
-            Err(PipelineError::StopAboveHead { stop: 6, head: 5 })
-        ));
-        assert!(machine.sink.events.is_empty());
-    }
-
-    #[tokio::test]
-    async fn a_stop_below_the_start_is_rejected_before_output() {
-        let mut machine = Machine::new(Source::linear(5), Sink::default(), Vec::new());
-        assert!(matches!(
-            machine.sync(Some(3), Some(2)).await,
-            Err(PipelineError::StopBelowStart { stop: 2, start: 3 })
-        ));
-        // Without a start the run starts at the head, so a lower stop is below it too.
-        assert!(matches!(
-            machine.sync(None, Some(4)).await,
-            Err(PipelineError::StopBelowStart { stop: 4, start: 5 })
-        ));
-        assert!(machine.sink.events.is_empty());
+        machine
+            .sync(Some(5), Some(5))
+            .await
+            .expect("bounds at the head");
+        assert_eq!(heights(&machine), [5]);
     }
 
     /// A buried stop ends backfill there: the head is not sampled again, nothing above
     /// the stop is fetched, and the run returns rather than subscribing, which the test
     /// source would never answer.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_buried_stop_ends_the_run_there() {
         let head = MAX_UNFINALIZED_BLOCKS as u64 + 20;
         let mut source = Source::linear(head);
         source.data.range = 4;
         let mut machine = Machine::new(source, Sink::default(), Vec::new());
-        machine.sync(Some(0), Some(9)).await.expect("sync");
+        assert_eq!(machine.sync(Some(0), Some(9)).await.expect("sync"), Some(9));
         assert_eq!(heights(&machine), (0..=9).collect::<Vec<_>>());
-        assert_eq!(machine.source.data.head_calls.load(Ordering::Relaxed), 1);
-        assert_eq!(machine.source.data.block_calls.load(Ordering::Relaxed), 10);
+        assert_eq!(reads(&machine), (1, 10));
+        // The clock is paused, so the timeout fires only if the run went on to wait for
+        // heads: the reconcile timer is the only thing that would advance it.
         let machine = Machine::new(Source::linear(head), Sink::default(), Vec::new());
         tokio::time::timeout(
             std::time::Duration::from_secs(5),
@@ -1486,7 +1535,8 @@ mod tests {
         let mut machine = Machine::new(Source::linear(5), Sink::default(), Vec::new());
         machine.sync(Some(2), Some(4)).await.expect("sync");
         assert_eq!(heights(&machine), [2, 3, 4]);
-        assert_eq!(machine.tip().expect("tip").height, 4);
+        assert_eq!(machine.tip(), Some(meta(4)));
+        assert_eq!(reads(&machine).1, 3, "nothing above the stop is fetched");
     }
 
     #[tokio::test]
@@ -1494,6 +1544,7 @@ mod tests {
         let mut machine = Machine::new(Source::linear(8), Sink::default(), ledger(0..=3));
         machine.sync(None, Some(6)).await.expect("sync");
         assert_eq!(heights(&machine), [4, 5, 6]);
+        assert_eq!(machine.tip(), Some(meta(6)));
     }
 
     #[tokio::test]
@@ -1502,7 +1553,7 @@ mod tests {
         machine.sync(None, Some(6)).await.expect("sync");
         machine.sync(None, Some(4)).await.expect("sync");
         assert!(machine.sink.events.is_empty());
-        assert_eq!(machine.source.data.head_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(reads(&machine), (0, 0), "the chain is not asked at all");
     }
 
     #[tokio::test]
@@ -1523,62 +1574,47 @@ mod tests {
         settle(&mut machine, Some(0)).await;
         assert_eq!(heights(&machine), (0..=moved).collect::<Vec<_>>());
         assert_eq!(
-            machine.source.data.head_calls.load(Ordering::Relaxed),
-            3,
-            "backfill discovers at startup and at each buried bound only"
+            reads(&machine),
+            (3, usize::try_from(moved + 1).expect("count")),
+            "backfill discovers at startup and at each buried bound only, and fetches each \
+             height once"
         );
     }
 
-    #[tokio::test]
-    async fn gap_catch_up_reads_each_missing_height_once() {
-        let mut machine = Machine::new(Source::linear(3), Sink::default(), Vec::new());
-        settle(&mut machine, Some(3)).await;
-        chain(&mut machine).data.head = 6;
-        chain(&mut machine)
-            .data
-            .blocks
-            .extend((4..=6).map(|h| (h, (hash(h), hash(h.saturating_sub(1))))));
-        machine
-            .process_head(machine.source.head_meta())
-            .await
-            .expect("gap");
-        assert_eq!(machine.tip().expect("tip").height, 6);
-        assert_eq!(heights(&machine), [3, 4, 5, 6]);
-        assert!(
-            !machine
-                .sink
-                .events
-                .iter()
-                .any(|event| matches!(event, Event::Reorg(_)))
-        );
-    }
-
-    /// A gap is fetched ahead, several heights in flight at once, and still accepted one
-    /// at a time in height order, each height read once.
-    #[tokio::test]
+    /// A gap is fetched ahead, as many heights in flight as the source allows, and still
+    /// accepted one at a time in height order, each height read once and none taken for
+    /// a fork.
+    #[tokio::test(start_paused = true)]
     async fn a_gap_is_fetched_ahead_and_accepted_in_order() {
-        let mut machine = Machine::new(Source::linear(3), Sink::default(), Vec::new());
-        settle(&mut machine, Some(3)).await;
-        let source = chain(&mut machine);
-        source.data.concurrency = 4;
-        source.data.slow_blocks = true;
-        source
-            .data
-            .blocks
-            .extend((4..=40).map(|h| (h, (hash(h), hash(h - 1)))));
-        let calls = source.data.block_calls.load(Ordering::Relaxed);
-        observe(&mut machine, 40).await;
-        assert_eq!(heights(&machine), (3..=40).collect::<Vec<_>>());
-        let data = &machine.source.data;
-        assert_eq!(data.block_calls.load(Ordering::Relaxed) - calls, 37);
-        let peak = data.blocks_peak.load(Ordering::Relaxed);
-        assert!((2..=4).contains(&peak), "{peak} fetches overlapped");
-        assert!(reorgs(&machine).is_empty());
+        for concurrency in [1, 4] {
+            let mut machine = Machine::new(Source::linear(3), Sink::default(), Vec::new());
+            settle(&mut machine, Some(3)).await;
+            let source = chain(&mut machine);
+            source.data.concurrency = concurrency;
+            source.data.slow_blocks = true;
+            source
+                .data
+                .blocks
+                .extend((4..=40).map(|h| (h, (hash(h), hash(h - 1)))));
+            let (_, before) = reads(&machine);
+            observe(&mut machine, 40).await;
+            let label = format!("concurrency {concurrency}");
+            assert_eq!(heights(&machine), (3..=40).collect::<Vec<_>>(), "{label}");
+            assert_eq!(reads(&machine).1 - before, 37, "{label}");
+            // The clock is paused, so every fetch requested ahead starts before any ends.
+            assert_eq!(
+                machine.source.data.blocks_peak.load(Ordering::Relaxed),
+                concurrency,
+                "{label}: fetches in flight at once"
+            );
+            assert!(reorgs(&machine).is_empty(), "{label}");
+            assert_eq!(machine.tip(), Some(meta(40)), "{label}");
+        }
     }
 
     /// A fork that orphans the tip while heights are fetched ahead drops those fetches,
     /// retracts the tip once, and replays the new branch in order.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_fork_under_fetches_made_ahead_is_reconciled() {
         let head = MAX_UNFINALIZED_BLOCKS as u64 + 5;
         let mut machine = Machine::new(Source::linear(head), Sink::default(), Vec::new());
@@ -1592,6 +1628,7 @@ mod tests {
         observe(&mut machine, tip + 10).await;
         let markers = reorgs(&machine);
         assert_eq!(markers.len(), 1);
+        assert_eq!(markers[0].height, tip);
         assert_eq!(markers[0].orphaned_hashes, [hash(tip)]);
         assert_eq!(machine.tip().expect("tip").hash, hash(tip + 110));
         let replayed: Vec<u64> = heights(&machine)
@@ -1617,7 +1654,7 @@ mod tests {
             .await
             .expect("a lagging head is not a fork");
         assert!(machine.sink.events.is_empty());
-        assert_eq!(machine.tip().expect("tip").height, 13);
+        assert_eq!(machine.tip(), Some(meta(13)));
     }
 
     /// A head below the window that does not lead to the oldest remembered block is a
@@ -1628,22 +1665,43 @@ mod tests {
         source.data.head = 11;
         source.data.blocks.insert(11, (hash(111), hash(10)));
         let mut machine = Machine::new(source, Sink::default(), ledger(12..=13));
-        assert!(matches!(
+        fails_with(
             machine.sync(None, None).await,
-            Err(PipelineError::UndoWindowExceeded { .. })
-        ));
+            &PipelineError::UndoWindowExceeded {
+                floor: Box::new(meta(12)),
+                actual: Box::new(BlockMeta {
+                    hash: hash(111),
+                    ..meta(11)
+                }),
+            },
+        );
         assert!(machine.sink.events.is_empty());
+        assert_eq!(machine.tip(), Some(meta(13)));
     }
 
+    /// A head already accepted, at the tip or below it in the window, is neither fetched
+    /// again nor published again.
     #[tokio::test]
     async fn a_duplicate_head_is_not_fetched_again() {
         let mut machine = Machine::new(Source::linear(4), Sink::default(), Vec::new());
-        settle(&mut machine, Some(4)).await;
-        let rows = machine.sink.events.len();
-        let head = machine.source.head_meta();
-        assert_eq!(head, machine.tip().expect("tip"));
-        machine.process_head(head).await.expect("duplicate");
-        assert_eq!(machine.sink.events.len(), rows);
+        settle(&mut machine, Some(2)).await;
+        let events = machine.sink.events.clone();
+        let before = reads(&machine);
+        for head in [meta(4), meta(3), meta(2)] {
+            machine.process_head(head).await.expect("duplicate");
+            assert_eq!(
+                reads(&machine),
+                before,
+                "head {}: nothing read",
+                head.height
+            );
+            assert_eq!(
+                machine.sink.events, events,
+                "head {}: nothing published",
+                head.height
+            );
+        }
+        assert_eq!(machine.tip(), Some(meta(4)));
     }
 
     #[tokio::test]
@@ -1659,18 +1717,15 @@ mod tests {
             .insert(head, (hash(head + 100), hash(head - 1)));
         observe(&mut machine, head).await;
         assert_eq!(machine.tip().expect("tip").hash, hash(head + 100));
-        let markers: Vec<_> = machine
-            .sink
-            .events
-            .iter()
-            .filter_map(|event| match event {
-                Event::Reorg(reorg) => Some(reorg),
-                _ => None,
-            })
-            .collect();
+        let markers = reorgs(&machine);
         assert_eq!(markers.len(), 1);
         assert_eq!(markers[0].height, head);
         assert_eq!(markers[0].orphaned_hashes, [hash(head)]);
+        assert_eq!(
+            heights(&machine)[usize::try_from(head).expect("index")..],
+            [head, head],
+            "the tip, then its replacement"
+        );
     }
 
     /// A fresh run's first block has nothing stored below it, so a fork that replaces
@@ -1688,14 +1743,12 @@ mod tests {
         // The replacement is fetched before the first block is retracted, so a failure
         // cannot leave the window empty.
         machine.source.data.fail_once.store(true, Ordering::Relaxed);
-        assert!(
-            machine
-                .process_head(machine.source.head_meta())
-                .await
-                .is_err()
+        fails_with(
+            machine.process_head(machine.source.head_meta()).await,
+            &malformed("injected source failure"),
         );
         assert!(reorgs(&machine).is_empty());
-        assert_eq!(machine.tip().expect("tip").hash, hash(3));
+        assert_eq!(machine.tip(), Some(meta(3)));
         machine
             .process_head(machine.source.head_meta())
             .await
@@ -1725,7 +1778,7 @@ mod tests {
         settle(&mut machine, Some(0)).await;
         assert_eq!(heights(&machine), (0..=head).collect::<Vec<_>>());
         assert_eq!(
-            machine.source.data.block_calls.load(Ordering::Relaxed),
+            reads(&machine).1,
             usize::try_from(head + 1).expect("count"),
             "each height is fetched exactly once"
         );
@@ -1738,14 +1791,14 @@ mod tests {
         source.data.range = 4;
         source.data.short = true;
         let mut machine = Machine::new(source, Sink::default(), Vec::new());
-        assert!(matches!(
+        fails_with(
             machine.sync(Some(0), None).await,
-            Err(PipelineError::InvalidRange {
+            &PipelineError::InvalidRange {
                 from: 0,
                 to: 3,
-                returned: 3
-            })
-        ));
+                returned: 3,
+            },
+        );
         assert!(machine.sink.events.is_empty());
         assert!(machine.tip().is_none());
     }
@@ -1756,12 +1809,12 @@ mod tests {
         let mut source = Source::linear(head);
         source.data.blocks.remove(&3);
         let mut machine = Machine::new(source, Sink::default(), Vec::new());
-        assert!(matches!(
+        fails_with(
             machine.sync(Some(0), None).await,
-            Err(PipelineError::Source(_))
-        ));
+            &malformed("missing block"),
+        );
         assert_eq!(heights(&machine), [0, 1, 2]);
-        assert_eq!(machine.tip().expect("tip").height, 2);
+        assert_eq!(machine.tip(), Some(meta(2)));
     }
 
     /// Ranges are requested ahead, up to the source's concurrency, and accepted in order
@@ -1779,7 +1832,7 @@ mod tests {
         assert_eq!(heights(&machine), (0..=head).collect::<Vec<_>>());
         assert_eq!(machine.source.data.peak.load(Ordering::Relaxed), 3);
         assert_eq!(
-            machine.source.data.block_calls.load(Ordering::Relaxed),
+            reads(&machine).1,
             usize::try_from(head + 1).expect("count"),
             "each height is fetched exactly once"
         );
@@ -1795,12 +1848,12 @@ mod tests {
         source.data.concurrency = 3;
         source.data.blocks.remove(&3);
         let mut machine = Machine::new(source, Sink::default(), Vec::new());
-        assert!(matches!(
+        fails_with(
             machine.sync(Some(0), None).await,
-            Err(PipelineError::Source(_))
-        ));
+            &malformed("missing block"),
+        );
         assert_eq!(heights(&machine), [0, 1]);
-        assert_eq!(machine.tip().expect("tip").height, 1);
+        assert_eq!(machine.tip(), Some(meta(1)));
     }
 
     #[tokio::test]
@@ -1808,10 +1861,10 @@ mod tests {
         let head = MAX_UNFINALIZED_BLOCKS as u64 + 5;
         let mut machine = Machine::new(Source::linear(head), Sink::default(), Vec::new());
         machine.sink.fail = true;
-        assert!(matches!(
+        fails_with(
             machine.sync(Some(0), None).await,
-            Err(PipelineError::Sink(_))
-        ));
+            &PipelineError::Sink(SinkError::StorageClosed),
+        );
         assert_eq!(machine.tip(), None);
     }
 
@@ -1821,12 +1874,12 @@ mod tests {
         let mut sink = Sink::default();
         sink.fail = true;
         sink.dropped = Some(dropped);
-        assert!(matches!(
+        fails_with(
             Machine::new(Source::linear(3), sink, Vec::new())
                 .run(None, None)
                 .await,
-            Err(PipelineError::Sink(SinkError::StorageClosed))
-        ));
+            &PipelineError::Sink(SinkError::StorageClosed),
+        );
         assert_eq!(notification.try_recv(), Ok(()));
     }
 
@@ -1858,20 +1911,15 @@ mod tests {
             .blocks
             .insert(head, (hash(head + 100), hash(head - 1)));
         machine.sink.fail = true;
-        assert!(matches!(
+        fails_with(
             machine.process_head(machine.source.head_meta()).await,
-            Err(PipelineError::Sink(_))
-        ));
+            &PipelineError::Sink(SinkError::StorageClosed),
+        );
         // The failed retraction leaves the accepted branch and its tip untouched, and
         // the reorg record itself never reached the sink.
-        assert_eq!(machine.tip().expect("tip").hash, hash(head));
-        assert!(
-            !machine
-                .sink
-                .events
-                .iter()
-                .any(|event| matches!(event, Event::Reorg(_)))
-        );
+        assert_eq!(machine.tip(), Some(meta(head)));
+        assert_eq!(heights(&machine), (0..=head).collect::<Vec<_>>());
+        assert!(reorgs(&machine).is_empty());
     }
 
     #[tokio::test]
@@ -1891,18 +1939,13 @@ mod tests {
         // Injection fires on the replacement's fetch, which precedes any retraction, so the
         // accepted history must survive intact.
         machine.source.data.fail_once.store(true, Ordering::Relaxed);
-        assert!(matches!(
+        fails_with(
             machine.handle_reorg(candidate).await,
-            Err(PipelineError::Source(_))
-        ));
-        assert_eq!(machine.tip().expect("tip").hash, hash(head));
-        assert!(
-            !machine
-                .sink
-                .events
-                .iter()
-                .any(|event| matches!(event, Event::Reorg(_)))
+            &malformed("injected source failure"),
         );
+        assert_eq!(machine.tip(), Some(meta(head)));
+        assert_eq!(heights(&machine), (0..=head).collect::<Vec<_>>());
+        assert!(reorgs(&machine).is_empty());
     }
 
     /// A source that answers inconsistently at startup is asked again, from the tip it
@@ -1920,22 +1963,28 @@ mod tests {
             Some(6)
         );
         assert_eq!(heights(&machine), [3, 4, 5, 6]);
+        assert_eq!(
+            reads(&machine),
+            (2, 5),
+            "the head is sampled again, and only the failed height fetched twice"
+        );
     }
 
-    #[tokio::test]
+    /// A source failure other than an inconsistent answer stops startup at once: the
+    /// head is sampled once and the failing block fetched once, not asked again.
+    #[tokio::test(start_paused = true)]
     async fn startup_returns_source_errors_without_retrying() {
         let source = Source::linear(3);
         source.data.fail_once.store(true, Ordering::Relaxed);
-        assert!(matches!(
-            Machine::new(source, Sink::default(), Vec::new())
-                .run(None, None)
-                .await,
-            Err(PipelineError::Source(SourceError::Malformed { .. }))
-        ));
+        let mut machine = Machine::new(source, Sink::default(), Vec::new());
+        // The failure is injected once, so a retry would succeed and return `Ok`.
+        fails_with(
+            machine.sync_settled(None, None).await,
+            &malformed("injected source failure"),
+        );
+        assert_eq!(reads(&machine), (1, 1));
+        assert!(machine.sink.events.is_empty());
     }
-
-    use std::sync::Arc;
-    use std::sync::atomic::AtomicU64;
 
     struct LiveSource {
         source: Source,
@@ -1943,7 +1992,22 @@ mod tests {
         forked: Arc<AtomicBool>,
         /// Set to answer the next block fetch inconsistently.
         inconsistent: Arc<AtomicBool>,
-        hints: std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<BlockMeta>>>,
+        hints: std::sync::Mutex<Option<UnboundedReceiver<BlockMeta>>>,
+    }
+    impl LiveSource {
+        /// A live chain over [`Source::linear`]`(6)` whose head starts at 1, and the
+        /// sender of the heads its subscription announces.
+        fn new() -> (Self, UnboundedSender<BlockMeta>) {
+            let (hints, hint_stream) = unbounded_channel();
+            let source = Self {
+                source: Source::linear(6),
+                head: Arc::new(AtomicU64::new(1)),
+                forked: Arc::default(),
+                inconsistent: Arc::default(),
+                hints: std::sync::Mutex::new(Some(hint_stream)),
+            };
+            (source, hints)
+        }
     }
     impl BlockSource for LiveSource {
         fn chain(&self) -> &ChainId {
@@ -2007,7 +2071,7 @@ mod tests {
     }
     /// Forwards every event but the per-block ledger markers, which the live test does
     /// not assert on: it is about which blocks and reorgs reach the sink, and in what order.
-    struct LiveSink(tokio::sync::mpsc::UnboundedSender<Event>);
+    struct LiveSink(UnboundedSender<Event>);
     impl EnvelopeSink for LiveSink {
         async fn publish(&mut self, envelope: Envelope) -> Result<(), SinkError> {
             if matches!(envelope.event, Event::AcceptedBlock(_)) {
@@ -2036,166 +2100,109 @@ mod tests {
         }
     }
 
+    /// The next event a live run forwarded, which must be a block; `what` names it in
+    /// the failure.
+    async fn next_block(received: &mut UnboundedReceiver<Event>, what: &str) -> Box<Block> {
+        match received.recv().await {
+            Some(Event::Block(block)) => block,
+            other => panic!("expected {what}, received {other:?}"),
+        }
+    }
+
+    /// Ends a live run by closing its subscription, and checks that is why it ended.
+    async fn close(
+        hints: UnboundedSender<BlockMeta>,
+        run: tokio::task::JoinHandle<Result<(), PipelineError>>,
+    ) {
+        drop(hints);
+        fails_with(
+            run.await.expect("driver task"),
+            &PipelineError::SubscriptionClosed,
+        );
+    }
+
     /// A head the subscription announces is observed as a sampled one is. On a live
     /// chain the reconcile timer never fires, so without it every commit's lag was
     /// measured against the head sampled at startup, and read zero.
     #[tokio::test(start_paused = true)]
     async fn an_announced_head_is_observed() {
         let observed = Arc::new(AtomicU64::new(0));
-        let (hints, hint_stream) = tokio::sync::mpsc::unbounded_channel();
-        let (events, mut received) = tokio::sync::mpsc::unbounded_channel();
-        let source = LiveSource {
-            source: Source::linear(6),
-            head: Arc::new(AtomicU64::new(1)),
-            forked: Arc::default(),
-            inconsistent: Arc::default(),
-            hints: std::sync::Mutex::new(Some(hint_stream)),
-        };
+        let (events, mut received) = unbounded_channel();
+        let (source, hints) = LiveSource::new();
         let sink = HeadSink(LiveSink(events), Arc::clone(&observed));
         let run = tokio::spawn(Machine::new(source, sink, Vec::new()).run(None, None));
-        let Some(Event::Block(block)) = received.recv().await else {
-            panic!("startup delivers block 1");
-        };
-        assert_eq!(block.number, 1);
+        assert_eq!(next_block(&mut received, "block 1").await.number, 1);
         assert_eq!(observed.load(Ordering::Relaxed), 1);
-        hints
-            .send(BlockMeta {
-                height: 3,
-                hash: hash(3),
-                parent_hash: hash(2),
-                timestamp: 3,
-            })
-            .expect("hint");
+        hints.send(meta(3)).expect("hint");
         for expected in [2, 3] {
-            let Some(Event::Block(block)) = received.recv().await else {
-                panic!("the announced head is caught up to");
-            };
+            let block = next_block(&mut received, "the announced head caught up to").await;
             assert_eq!(block.number, expected);
         }
         assert_eq!(observed.load(Ordering::Relaxed), 3);
-        drop(hints);
-        assert!(matches!(
-            run.await.expect("driver task"),
-            Err(PipelineError::SubscriptionClosed)
-        ));
+        close(hints, run).await;
     }
 
     #[tokio::test(start_paused = true)]
     async fn silent_subscription_reconciles_gaps_and_reorgs_without_duplicate_stale_hints() {
-        let recovery = async {
-            let head = Arc::new(AtomicU64::new(1));
-            let forked = Arc::new(AtomicBool::new(false));
-            let inconsistent = Arc::new(AtomicBool::new(false));
-            let (hints, hint_stream) = tokio::sync::mpsc::unbounded_channel();
-            let (events, mut received) = tokio::sync::mpsc::unbounded_channel();
-            let source = LiveSource {
-                source: Source::linear(6),
-                head: Arc::clone(&head),
-                forked: Arc::clone(&forked),
-                inconsistent: Arc::clone(&inconsistent),
-                hints: std::sync::Mutex::new(Some(hint_stream)),
-            };
-            // The source's head is at 1, so the default start lands there — the live-only
-            // case: startup seeds block 1 and the timer fills the rest, leaving a tallied
-            // window for the later fork.
-            let machine = Machine::new(source, LiveSink(events), Vec::new());
-            let run = tokio::spawn(machine.run(None, None));
-            loop {
-                if let Event::Block(block) = received.recv().await.expect("startup event") {
-                    assert_eq!(block.number, 1);
-                    break;
-                }
-            }
-            // No new head hint arrives during the outage: the timer must discover the gap.
-            head.store(6, Ordering::Relaxed);
-            tokio::time::advance(std::time::Duration::from_secs(30)).await;
-            for expected in 2..=6 {
-                let Event::Block(block) = received.recv().await.expect("catch-up event") else {
-                    panic!("ordinary gap must not emit a reorg");
-                };
-                assert_eq!(block.number, expected);
-            }
-            // A second silent period spans a fork, not just a height gap.
-            forked.store(true, Ordering::Relaxed);
-            tokio::time::advance(std::time::Duration::from_secs(30)).await;
-            let Event::Reorg(reorg) = received.recv().await.expect("reorg marker") else {
-                panic!("the old suffix must be retracted before replacement blocks");
-            };
-            assert_eq!(reorg.orphaned_hashes, [hash(6), hash(5), hash(4), hash(3)]);
-            for expected in 3..=6 {
-                let Event::Block(block) = received.recv().await.expect("replacement event") else {
-                    panic!("replacement blocks must follow the reorg marker");
-                };
-                assert_eq!(block.number, expected);
-                assert_eq!(block.hash, hash(expected + 100));
-            }
-            // Stale, already-accepted hints must not re-fetch or duplicate output.
-            for _ in 0..2 {
-                hints
-                    .send(BlockMeta {
-                        height: 2,
-                        hash: hash(2),
-                        parent_hash: hash(1),
-                        timestamp: 2,
-                    })
-                    .expect("stale hint");
-            }
-            drop(hints);
-            assert!(matches!(
-                run.await.expect("driver task"),
-                Err(PipelineError::SubscriptionClosed)
-            ));
-            assert!(
-                received.try_recv().is_err(),
-                "stale hints must not duplicate output"
-            );
+        let (events, mut received) = unbounded_channel();
+        let (source, hints) = LiveSource::new();
+        let head = Arc::clone(&source.head);
+        let forked = Arc::clone(&source.forked);
+        // The source's head is at 1, so the default start lands there — the live-only
+        // case: startup seeds block 1 and the timer fills the rest, leaving a tallied
+        // window for the later fork.
+        let run = tokio::spawn(Machine::new(source, LiveSink(events), Vec::new()).run(None, None));
+        assert_eq!(next_block(&mut received, "block 1").await.number, 1);
+        // No new head hint arrives during the outage: the timer must discover the gap.
+        head.store(6, Ordering::Relaxed);
+        tokio::time::advance(std::time::Duration::from_secs(30)).await;
+        for expected in 2..=6 {
+            let block = next_block(&mut received, "a catch-up block, not a reorg").await;
+            assert_eq!(block.number, expected);
+        }
+        // A second silent period spans a fork, not just a height gap.
+        forked.store(true, Ordering::Relaxed);
+        tokio::time::advance(std::time::Duration::from_secs(30)).await;
+        let Some(Event::Reorg(reorg)) = received.recv().await else {
+            panic!("the old suffix must be retracted before replacement blocks");
         };
-        tokio::time::timeout(std::time::Duration::from_mins(2), recovery)
-            .await
-            .expect("silent recovery must converge within four fallback intervals");
+        assert_eq!(reorg.height, 3);
+        assert_eq!(reorg.orphaned_hashes, [hash(6), hash(5), hash(4), hash(3)]);
+        for expected in 3..=6 {
+            let block = next_block(&mut received, "a replacement after the reorg").await;
+            assert_eq!(block.number, expected);
+            assert_eq!(block.hash, hash(expected + 100));
+        }
+        // Stale, already-accepted hints must not re-fetch or duplicate output.
+        for _ in 0..2 {
+            hints.send(meta(2)).expect("stale hint");
+        }
+        close(hints, run).await;
+        assert_eq!(
+            received.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected),
+            "stale hints must not duplicate output"
+        );
     }
 
     /// A live head the source answers inconsistently is skipped, not fatal: nothing was
     /// delivered for it, so the next head catches up from the same tip.
     #[tokio::test(start_paused = true)]
     async fn an_inconsistent_live_answer_skips_the_head() {
-        let inconsistent = Arc::new(AtomicBool::new(false));
-        let (hints, hint_stream) = tokio::sync::mpsc::unbounded_channel();
-        let (events, mut received) = tokio::sync::mpsc::unbounded_channel();
-        let source = LiveSource {
-            source: Source::linear(6),
-            head: Arc::new(AtomicU64::new(1)),
-            forked: Arc::default(),
-            inconsistent: Arc::clone(&inconsistent),
-            hints: std::sync::Mutex::new(Some(hint_stream)),
-        };
+        let (events, mut received) = unbounded_channel();
+        let (source, hints) = LiveSource::new();
+        let inconsistent = Arc::clone(&source.inconsistent);
         let run = tokio::spawn(Machine::new(source, LiveSink(events), Vec::new()).run(None, None));
-        let Some(Event::Block(block)) = received.recv().await else {
-            panic!("startup delivers block 1");
-        };
-        assert_eq!(block.number, 1);
+        assert_eq!(next_block(&mut received, "block 1").await.number, 1);
         inconsistent.store(true, Ordering::Relaxed);
         for height in [2, 3] {
-            hints
-                .send(BlockMeta {
-                    height,
-                    hash: hash(height),
-                    parent_hash: hash(height - 1),
-                    timestamp: height,
-                })
-                .expect("hint");
+            hints.send(meta(height)).expect("hint");
         }
         for expected in [2, 3] {
-            let Some(Event::Block(block)) = received.recv().await else {
-                panic!("the next head catches up");
-            };
+            let block = next_block(&mut received, "the next head caught up").await;
             assert_eq!(block.number, expected);
         }
-        drop(hints);
-        assert!(matches!(
-            run.await.expect("driver task"),
-            Err(PipelineError::SubscriptionClosed)
-        ));
+        close(hints, run).await;
     }
 
     /// A live head the source answers inconsistently is asked about again within a
@@ -2203,51 +2210,25 @@ mod tests {
     /// on a slow chain those are seconds away, and the head's rows with them.
     #[tokio::test(start_paused = true)]
     async fn an_inconsistent_live_head_is_asked_about_again_soon() {
-        let inconsistent = Arc::new(AtomicBool::new(false));
-        let (hints, hint_stream) = tokio::sync::mpsc::unbounded_channel();
-        let (events, mut received) = tokio::sync::mpsc::unbounded_channel();
-        let source = LiveSource {
-            source: Source::linear(6),
-            head: Arc::new(AtomicU64::new(1)),
-            forked: Arc::default(),
-            inconsistent: Arc::clone(&inconsistent),
-            hints: std::sync::Mutex::new(Some(hint_stream)),
-        };
+        let (events, mut received) = unbounded_channel();
+        let (source, hints) = LiveSource::new();
+        let inconsistent = Arc::clone(&source.inconsistent);
         let run = tokio::spawn(Machine::new(source, LiveSink(events), Vec::new()).run(None, None));
-        let Some(Event::Block(block)) = received.recv().await else {
-            panic!("startup delivers block 1");
-        };
-        assert_eq!(block.number, 1);
+        assert_eq!(next_block(&mut received, "block 1").await.number, 1);
         inconsistent.store(true, Ordering::Relaxed);
         let announced = tokio::time::Instant::now();
-        hints
-            .send(BlockMeta {
-                height: 2,
-                hash: hash(2),
-                parent_hash: hash(1),
-                timestamp: 2,
-            })
-            .expect("hint");
+        hints.send(meta(2)).expect("hint");
         // No other head is announced: only the retry can deliver block 2, and well before
         // the reconcile timer, which would not either, since the source's head is still 1.
-        let Some(Event::Block(block)) =
-            tokio::time::timeout(std::time::Duration::from_secs(5), received.recv())
-                .await
-                .expect("the head is asked about again within seconds")
-        else {
-            panic!("the head is asked about again");
-        };
+        // The clock is paused, so the time it took is exactly the wait before the retry.
+        let block = next_block(&mut received, "block 2, asked about again").await;
         assert_eq!(block.number, 2);
+        let waited = announced.elapsed();
         assert!(
-            announced.elapsed() < std::time::Duration::from_secs(1),
-            "asked again after {:?}, not at the next head or reconcile",
-            announced.elapsed()
+            (RETRY_FIRST..RETRY_FIRST * 2).contains(&waited),
+            "asked again after {waited:?}, not after the first retry wait"
         );
-        drop(hints);
-        assert!(matches!(
-            run.await.expect("driver task"),
-            Err(PipelineError::SubscriptionClosed)
-        ));
+        close(hints, run).await;
     }
 
     /// A head asked about again waits twice as long each time, up to the longest wait;
@@ -2255,14 +2236,14 @@ mod tests {
     /// not taken for one stuck on a head.
     #[test]
     fn retry_waits_double_per_head_and_start_over_for_a_new_one() {
-        let meta = |height| BlockMeta {
-            height,
-            hash: hash(height),
-            parent_hash: hash(height - 1),
-            timestamp: height,
-        };
         let mut retry = next_retry(None, Some(meta(5)));
         assert_eq!(retry, Some((meta(5), RETRY_FIRST)));
+        retry = next_retry(retry, Some(meta(5)));
+        assert_eq!(
+            retry,
+            Some((meta(5), RETRY_FIRST * 2)),
+            "the same head again waits twice as long"
+        );
         for _ in 0..10 {
             retry = next_retry(retry, Some(meta(5)));
         }
@@ -2280,47 +2261,54 @@ mod tests {
         assert_eq!(next_retry(None, None), None);
     }
 
+    /// A block read for another height, or one that does not extend its predecessor by
+    /// height and parent hash, is refused; the matching ones are not.
     #[test]
     fn wrong_height_and_noncontiguous_parent_are_rejected() {
+        type Driver = Machine<Source, Sink>;
         let marker = BlockMeta {
             height: 4,
             hash: hash(4),
             parent_hash: hash(1),
             timestamp: 0,
         };
-        let fetched = FetchedBlock {
-            meta: marker,
-            events: vec![],
-        };
-        assert!(matches!(
-            Machine::<Source, Sink>::marker(fetched.meta, 3),
-            Err(PipelineError::IdentityMismatch { .. })
-        ));
-        assert!(matches!(
-            Machine::<Source, Sink>::validate_link(
-                BlockMeta {
+        fails_with(
+            Driver::marker(marker, 3),
+            &PipelineError::IdentityMismatch {
+                expected: Box::new(BlockMeta {
                     height: 3,
-                    hash: hash(3),
-                    parent_hash: hash(2),
-                    timestamp: 3,
-                },
-                marker,
-            ),
-            Err(PipelineError::BrokenLink { .. })
-        ));
+                    ..marker
+                }),
+                actual: Box::new(marker),
+            },
+        );
+        assert_eq!(Driver::marker(marker, 4).expect("at its height"), marker);
+        fails_with(
+            Driver::validate_link(meta(3), marker),
+            &PipelineError::BrokenLink {
+                previous: Box::new(meta(3)),
+                actual: Box::new(marker),
+            },
+        );
+        // The right parent does not excuse a skipped height.
+        let skipped = BlockMeta {
+            height: 5,
+            ..meta(4)
+        };
+        fails_with(
+            Driver::validate_link(meta(3), skipped),
+            &PipelineError::BrokenLink {
+                previous: Box::new(meta(3)),
+                actual: Box::new(skipped),
+            },
+        );
+        Driver::validate_link(meta(3), meta(4)).expect("linked");
     }
 
     /// The identities a store would hand back after committing `heights` of the linear
     /// chain [`Source::linear`] builds.
     fn ledger(heights: std::ops::RangeInclusive<u64>) -> Vec<BlockMeta> {
-        heights
-            .map(|height| BlockMeta {
-                height,
-                hash: hash(height),
-                parent_hash: hash(height.saturating_sub(1)),
-                timestamp: height,
-            })
-            .collect()
+        heights.map(meta).collect()
     }
 
     /// Replaces the fake chain from `from` upward with a branch whose hashes are offset
@@ -2369,6 +2357,7 @@ mod tests {
             markers,
             [("block", 2), ("accepted", 2), ("block", 3), ("accepted", 3)]
         );
+        assert_eq!(machine.sink.flushes, 2, "each block is its own batch");
     }
 
     #[tokio::test]
@@ -2387,7 +2376,10 @@ mod tests {
     async fn a_backfill_stops_at_the_reorg_window() {
         let head = MAX_UNFINALIZED_BLOCKS as u64 + 5;
         let mut machine = Machine::new(Source::backfilling(head), Sink::default(), Vec::new());
-        machine.sync(Some(2), None).await.expect("backfill");
+        assert_eq!(
+            machine.sync(Some(2), None).await.expect("backfill"),
+            Some(5)
+        );
         assert_eq!(heights(&machine), (2..=5).collect::<Vec<_>>());
     }
 
@@ -2422,6 +2414,7 @@ mod tests {
         let mut machine = Machine::new(Source::backfilling(head), Sink::default(), ledger(0..=5));
         machine.sync(None, Some(5)).await.expect("backfill");
         assert!(machine.sink.events.is_empty());
+        assert_eq!(reads(&machine).1, 0, "no block is fetched");
     }
 
     /// A backfill resumes after a stored tip that the source agrees with, and refuses one
@@ -2435,11 +2428,15 @@ mod tests {
 
         let mut stored = ledger(0..=5);
         stored[5].hash = hash(105);
+        let tip = stored[5];
         let mut machine = Machine::new(Source::backfilling(head), Sink::default(), stored);
-        assert!(matches!(
+        fails_with(
             machine.sync(None, None).await,
-            Err(PipelineError::IdentityMismatch { .. })
-        ));
+            &PipelineError::IdentityMismatch {
+                expected: Box::new(tip),
+                actual: Box::new(meta(5)),
+            },
+        );
         assert!(machine.sink.events.is_empty());
     }
 
@@ -2449,10 +2446,11 @@ mod tests {
     async fn a_backfill_needs_a_start_or_stored_blocks() {
         let head = MAX_UNFINALIZED_BLOCKS as u64 + 5;
         let mut machine = Machine::new(Source::backfilling(head), Sink::default(), Vec::new());
-        assert!(matches!(
+        fails_with(
             machine.sync(None, None).await,
-            Err(PipelineError::BackfillWithoutStart)
-        ));
+            &PipelineError::BackfillWithoutStart,
+        );
+        assert_eq!(reads(&machine).1, 0, "no block is fetched");
     }
 
     /// A start the stored history already reaches is ignored, as a followed run ignores
@@ -2471,10 +2469,10 @@ mod tests {
             );
         }
         let mut machine = Machine::new(Source::backfilling(head), Sink::default(), ledger(0..=5));
-        assert!(matches!(
+        fails_with(
             machine.sync(Some(7), None).await,
-            Err(PipelineError::StartAboveHistory { start: 7, tip: 5 })
-        ));
+            &PipelineError::StartAboveHistory { start: 7, tip: 5 },
+        );
         assert!(machine.sink.events.is_empty());
     }
 
@@ -2495,13 +2493,13 @@ mod tests {
         let stop = machine.sync(Some(2), None).await.expect("backfill");
         assert_eq!(stop, Some(5));
         assert_eq!(heights(&machine), (2..=5).collect::<Vec<_>>());
-        assert_eq!(machine.source.data.head_calls.load(Ordering::Relaxed), 2);
+        assert_eq!(reads(&machine).0, 2);
     }
 
     #[tokio::test]
     async fn a_resumed_run_continues_after_a_matching_stored_tip() {
         let mut machine = Machine::new(Source::linear(8), Sink::default(), ledger(0..=5));
-        assert_eq!(machine.tip().expect("restored tip").height, 5);
+        assert_eq!(machine.tip(), Some(meta(5)), "the restored tip");
         settle(&mut machine, None).await;
         assert_eq!(
             heights(&machine),
@@ -2549,6 +2547,10 @@ mod tests {
         assert_eq!(markers.len(), 1);
         assert_eq!(markers[0].height, 4);
         assert_eq!(markers[0].orphaned_hashes, [hash(5), hash(4)]);
+        assert!(
+            matches!(machine.sink.events[0], Event::Reorg(_)),
+            "the retraction comes before any replacement"
+        );
         assert_eq!(heights(&machine), [4, 5, 6, 7]);
         assert_eq!(machine.tip().expect("tip").hash, hash(107));
     }
@@ -2562,14 +2564,22 @@ mod tests {
         let mut stored = ledger(0..=1);
         stored.extend(ledger(4..=5));
         let mut machine = Machine::new(source, Sink::default(), stored);
-        assert!(matches!(
+        fails_with(
             machine.sync(None, None).await,
-            Err(PipelineError::UndoWindowExceeded { .. })
-        ));
+            &PipelineError::UndoWindowExceeded {
+                floor: Box::new(meta(4)),
+                actual: Box::new(BlockMeta {
+                    hash: hash(104),
+                    parent_hash: hash(103),
+                    ..meta(4)
+                }),
+            },
+        );
         assert!(
             machine.sink.events.is_empty(),
             "nothing is retracted or replayed"
         );
+        assert_eq!(machine.tip(), Some(meta(5)));
     }
 
     #[tokio::test]
@@ -2578,12 +2588,18 @@ mod tests {
         let mut source = Source::linear(head);
         source.data.blocks.insert(6, (hash(6), hash(99)));
         let mut machine = Machine::new(source, Sink::default(), ledger(0..=5));
-        assert!(matches!(
+        fails_with(
             machine.sync(None, None).await,
-            Err(PipelineError::BrokenLink { .. })
-        ));
+            &PipelineError::BrokenLink {
+                previous: Box::new(meta(5)),
+                actual: Box::new(BlockMeta {
+                    parent_hash: hash(99),
+                    ..meta(6)
+                }),
+            },
+        );
         assert!(machine.sink.events.is_empty());
-        assert_eq!(machine.tip().expect("tip").height, 5);
+        assert_eq!(machine.tip(), Some(meta(5)));
     }
 
     #[tokio::test]
@@ -2592,16 +2608,17 @@ mod tests {
         chain(&mut machine).data.head = 3;
         settle(&mut machine, None).await;
         assert!(machine.sink.events.is_empty());
-        assert_eq!(machine.tip().expect("tip").height, 5);
+        assert_eq!(machine.tip(), Some(meta(5)));
     }
 
     #[tokio::test]
     async fn a_start_height_above_stored_history_is_refused_before_any_read() {
-        let machine = Machine::new(Source::linear(8), Sink::default(), ledger(0..=5));
-        assert!(matches!(
-            machine.run(Some(7), None).await,
-            Err(PipelineError::StartAboveHistory { start: 7, tip: 5 })
-        ));
+        let mut machine = Machine::new(Source::linear(8), Sink::default(), ledger(0..=5));
+        fails_with(
+            machine.sync(Some(7), None).await,
+            &PipelineError::StartAboveHistory { start: 7, tip: 5 },
+        );
+        assert_eq!(reads(&machine), (0, 0), "the chain is not asked at all");
     }
 
     /// A start the stored history already reaches, or the block right after it, is
@@ -2615,70 +2632,74 @@ mod tests {
         }
     }
 
+    /// Only the newest run of a stored ledger whose heights and parent hashes link is
+    /// kept, and a window built from a ledger that lost its older part is marked
+    /// truncated. A whole stored window's worth is kept whole, its oldest as the floor.
     #[test]
     fn only_the_newest_linked_suffix_of_a_stored_ledger_is_kept() {
-        let mut stored = ledger(0..=2);
-        stored.extend(ledger(5..=8));
-        let kept: Vec<_> = linked_suffix(stored)
-            .iter()
-            .map(|meta| meta.height)
-            .collect();
-        assert_eq!(kept, [5, 6, 7, 8]);
+        let kept = |stored: Vec<BlockMeta>| {
+            linked_suffix(stored)
+                .iter()
+                .map(|meta| meta.height)
+                .collect::<Vec<_>>()
+        };
+        let mut gapped = ledger(0..=2);
+        gapped.extend(ledger(5..=8));
+        assert_eq!(kept(gapped.clone()), [5, 6, 7, 8], "a height gap");
+        let mut relinked = ledger(0..=8);
+        relinked[5].parent_hash = hash(99);
+        assert_eq!(
+            kept(relinked),
+            [5, 6, 7, 8],
+            "a parent that is not the block below"
+        );
+        assert_eq!(kept(ledger(3..=3)), [3], "a single block");
         assert!(linked_suffix(Vec::new()).is_empty());
 
-        // A window's worth plus one: the oldest becomes the floor, not a tail entry.
+        let machine = Machine::new(Source::linear(0), Sink::default(), gapped);
+        assert!(machine.ring.truncated);
+        assert_eq!(machine.ring.oldest(), Some(meta(5)));
+
         let window = MAX_UNFINALIZED_BLOCKS as u64;
         let machine = Machine::new(Source::linear(0), Sink::default(), ledger(0..=window));
+        assert!(!machine.ring.truncated);
         assert_eq!(machine.ring.entries.len(), MAX_UNFINALIZED_BLOCKS);
-        assert_eq!(machine.ring.floor.expect("floor").height, 0);
-        assert_eq!(machine.tip().expect("tip").height, window);
+        assert_eq!(machine.ring.floor, Some(meta(0)));
+        assert_eq!(machine.tip(), Some(meta(window)));
     }
 
+    /// The window holds the whole history until it is full; the next block slides the
+    /// oldest into the floor, still addressable for linkage, and the one after that
+    /// moves the floor up past it.
     #[test]
-    fn the_whole_history_is_held_until_the_window_slides() {
+    fn the_ring_slides_and_keeps_a_recoverable_floor() {
+        let window = MAX_UNFINALIZED_BLOCKS as u64;
         let mut ring = UndoRing::default();
-        for height in 0..(MAX_UNFINALIZED_BLOCKS as u64) {
-            ring.push(BlockMeta {
-                height,
-                hash: hash(height),
-                parent_hash: hash(height.saturating_sub(1)),
-                timestamp: height,
-            });
+        for height in 0..window {
+            ring.push(meta(height));
         }
         assert!(ring.holds_whole_history());
-        ring.push(BlockMeta {
-            height: MAX_UNFINALIZED_BLOCKS as u64,
-            hash: hash(MAX_UNFINALIZED_BLOCKS as u64),
-            parent_hash: hash(MAX_UNFINALIZED_BLOCKS as u64 - 1),
-            timestamp: 0,
-        });
+        assert_eq!(ring.floor, None);
+        assert_eq!(ring.oldest(), Some(meta(0)));
+
+        ring.push(meta(window));
         assert!(
             !ring.holds_whole_history(),
             "the first block slid into the floor"
         );
-    }
-
-    #[test]
-    fn the_ring_slides_and_keeps_a_recoverable_floor() {
-        let mut ring = UndoRing::default();
-        for height in 0..=(MAX_UNFINALIZED_BLOCKS as u64) {
-            ring.push(BlockMeta {
-                height,
-                hash: hash(height),
-                parent_hash: hash(height.saturating_sub(1)),
-                timestamp: height,
-            });
-        }
         assert_eq!(ring.entries.len(), MAX_UNFINALIZED_BLOCKS);
-        assert_eq!(ring.oldest().expect("floor").height, 0);
-        assert_eq!(
-            ring.tip().expect("tip").height,
-            MAX_UNFINALIZED_BLOCKS as u64
-        );
+        assert_eq!(ring.floor, Some(meta(0)));
+        assert_eq!(ring.entries.front(), Some(&meta(1)));
+        assert_eq!(ring.tip(), Some(meta(window)));
         // The floor and the whole tail are still addressable.
         assert!(ring.retains(0));
-        assert!(ring.at(0).is_some());
-        assert!(ring.at(1).is_some());
+        assert_eq!(ring.at(0), Some(meta(0)));
+        assert_eq!(ring.at(1), Some(meta(1)));
+
+        ring.push(meta(window + 1));
+        assert_eq!(ring.floor, Some(meta(1)));
+        assert!(!ring.retains(0));
+        assert_eq!(ring.at(0), None);
     }
 
     #[test]
@@ -2686,26 +2707,17 @@ mod tests {
         // A seeded ring whose floor sits above the last backfilled height: the fork
         // walk must stop rather than read below what is remembered.
         let mut ring = UndoRing {
-            floor: Some(BlockMeta {
-                height: 2,
-                hash: hash(2),
-                parent_hash: hash(1),
-                timestamp: 2,
-            }),
+            floor: Some(meta(2)),
             ..UndoRing::default()
         };
         for height in 3..=5 {
-            ring.push(BlockMeta {
-                height,
-                hash: hash(height),
-                parent_hash: hash(height - 1),
-                timestamp: height,
-            });
+            ring.push(meta(height));
         }
-        assert_eq!(ring.oldest().expect("oldest").height, 2);
+        assert_eq!(ring.oldest(), Some(meta(2)));
         assert!(ring.retains(2));
         assert!(ring.retains(5));
         assert!(!ring.retains(1));
-        assert_eq!(ring.at(2).expect("floor").hash, hash(2));
+        assert_eq!(ring.at(2), Some(meta(2)));
+        assert_eq!(ring.at(1), None);
     }
 }

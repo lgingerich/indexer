@@ -527,28 +527,23 @@ mod tests {
             ])],
             None,
         );
-        let TypedValue::Array { value } = &result.body[0].value else {
-            panic!("array");
-        };
         assert_eq!(
-            value[0],
-            TypedValue::String {
-                value: Bytes::from_static(&[0xff]),
-                text: None
-            }
-        );
-        assert_eq!(
-            value[1],
-            TypedValue::String {
-                value: Bytes::from_static(b"hello"),
-                text: Some("hello".into())
-            }
-        );
-        assert_eq!(
-            value[2],
-            TypedValue::String {
-                value: Bytes::from_static(b"a\0b"),
-                text: None
+            result.body[0].value,
+            TypedValue::Array {
+                value: vec![
+                    TypedValue::String {
+                        value: Bytes::from_static(&[0xff]),
+                        text: None
+                    },
+                    TypedValue::String {
+                        value: Bytes::from_static(b"hello"),
+                        text: Some("hello".into())
+                    },
+                    TypedValue::String {
+                        value: Bytes::from_static(b"a\0b"),
+                        text: None
+                    },
+                ]
             }
         );
     }
@@ -567,10 +562,13 @@ mod tests {
             result.body[0].abi_type.components[0].abi_type.kind,
             "address"
         );
-        assert!(matches!(
+        assert_eq!(
             result.indexed[0].value,
-            TypedValue::FixedBytes { .. }
-        ));
+            TypedValue::FixedBytes {
+                value: Bytes::copy_from_slice(B256::ZERO.as_slice()),
+                size: 32
+            }
+        );
     }
 
     #[test]
@@ -589,39 +587,92 @@ mod tests {
     }
 
     #[test]
-    fn functions_decode_and_invalid_integer_widths_fail() {
+    fn functions_decode() {
         let result = decode(
             r#"[{"type":"event","name":"Callback","anonymous":false,"inputs":[{"name":"f","type":"function","indexed":false}]}]"#,
             &[DynSolValue::Function(alloy_primitives::Function::ZERO)],
             None,
         );
-        assert!(matches!(result.body[0].value, TypedValue::Function { .. }));
-        assert!(matches!(
-            convert(&DynSolType::Uint(8), &DynSolValue::Uint(U256::from(256), 8)),
-            Err(DecodeError::Value { .. })
-        ));
+        assert_eq!(
+            result.body[0].value,
+            TypedValue::Function {
+                value: alloy_primitives::Function::ZERO
+            }
+        );
     }
 
+    /// An integer converts up to its declared width's extremes and is refused one past
+    /// them, and a boolean or address word holding more than its type is refused, each
+    /// naming why.
     #[test]
-    fn signed_widths_and_scalar_constraints_are_checked() {
-        use alloy_primitives::{I256, U256};
-        assert!(convert(&DynSolType::Int(8), &DynSolValue::Int(I256::MINUS_ONE, 8)).is_ok());
-        assert!(
-            convert(
-                &DynSolType::Int(8),
-                &DynSolValue::Int(I256::try_from(128).expect("integer"), 8)
-            )
-            .is_err()
-        );
-        assert!(
-            convert(
-                &DynSolType::Int(8),
-                &DynSolValue::Int(I256::try_from(-129).expect("integer"), 8)
-            )
-            .is_err()
-        );
-        assert!(convert(&DynSolType::Bool, &DynSolValue::Uint(U256::from(2), 256)).is_err());
-        assert!(convert(&DynSolType::Address, &DynSolValue::Uint(U256::MAX, 256)).is_err());
+    fn integer_widths_and_scalar_constraints_are_checked() {
+        use alloy_primitives::I256;
+        let int = |value: i64| I256::try_from(value).expect("integer");
+        for (case, ty, value, expected) in [
+            (
+                "int8 -128",
+                DynSolType::Int(8),
+                DynSolValue::Int(int(-128), 8),
+                Ok(TypedValue::Int {
+                    value: int(-128),
+                    bits: 8,
+                }),
+            ),
+            (
+                "int8 127",
+                DynSolType::Int(8),
+                DynSolValue::Int(int(127), 8),
+                Ok(TypedValue::Int {
+                    value: int(127),
+                    bits: 8,
+                }),
+            ),
+            (
+                "int8 128",
+                DynSolType::Int(8),
+                DynSolValue::Int(int(128), 8),
+                Err("signed integer exceeds declared width"),
+            ),
+            (
+                "int8 -129",
+                DynSolType::Int(8),
+                DynSolValue::Int(int(-129), 8),
+                Err("signed integer exceeds declared width"),
+            ),
+            (
+                "uint8 255",
+                DynSolType::Uint(8),
+                DynSolValue::Uint(U256::from(255), 8),
+                Ok(TypedValue::Uint {
+                    value: U256::from(255),
+                    bits: 8,
+                }),
+            ),
+            (
+                "uint8 256",
+                DynSolType::Uint(8),
+                DynSolValue::Uint(U256::from(256), 8),
+                Err("unsigned integer exceeds declared width"),
+            ),
+            (
+                "bool 2",
+                DynSolType::Bool,
+                DynSolValue::Uint(U256::from(2), 256),
+                Err("boolean must be zero or one"),
+            ),
+            (
+                "address of 256 bits",
+                DynSolType::Address,
+                DynSolValue::Uint(U256::MAX, 256),
+                Err("address exceeds 160 bits"),
+            ),
+        ] {
+            let converted = convert(&ty, &value).map_err(|error| match error {
+                DecodeError::Value { kind } => kind,
+                other => panic!("{case}: {other:?}"),
+            });
+            assert_eq!(converted, expected, "{case}");
+        }
     }
 
     const ERC20_TRANSFER: &str = r#"[{"type":"event","name":"Transfer","anonymous":false,"inputs":[{"name":"from","type":"address","indexed":true},{"name":"to","type":"address","indexed":true},{"name":"value","type":"uint256","indexed":false}]}]"#;
@@ -663,10 +714,12 @@ mod tests {
             .expect("identical events merge");
         assert_eq!(abi.events.len(), 1);
         let renamed = ERC20_TRANSFER.replace("\"value\"", "\"amount\"");
-        assert!(matches!(
-            abi.merge(Abi::from_json(&renamed).expect("renamed")),
-            Err(AbiError::Conflict { .. })
-        ));
+        match abi.merge(Abi::from_json(&renamed).expect("renamed")) {
+            Err(AbiError::Conflict { selector }) => {
+                assert_eq!(selector, keccak256("Transfer(address,address,uint256)"));
+            }
+            other => panic!("expected a conflict, got {other:?}"),
+        }
     }
 
     /// An event's identity is its own definition: an unrelated event added to the file
@@ -707,6 +760,14 @@ mod tests {
         };
         let decoded = abi.decode_log(&log).expect("decode").expect("match");
         assert_eq!(decoded.name, "Swap");
+        let names = |args: &[DecodedArg]| -> Vec<String> {
+            args.iter().map(|arg| arg.name.clone()).collect()
+        };
+        assert_eq!(names(&decoded.indexed), ["sender", "recipient"]);
+        assert_eq!(
+            names(&decoded.body),
+            ["amount0", "amount1", "sqrtPriceX96", "liquidity", "tick"]
+        );
         assert!(matches!(
             decoded.body[0].value,
             TypedValue::Int { bits: 256, .. }

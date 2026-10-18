@@ -232,6 +232,8 @@ mod tests {
         sink.inner.records.iter().map(Envelope::kind).collect()
     }
 
+    /// A log no contract decodes and a control marker are each forwarded once, with
+    /// nothing decoded after them, and a flush reaches the inner sink once.
     #[tokio::test]
     async fn misses_and_control_markers_pass_through_once() {
         let mut sink = sink();

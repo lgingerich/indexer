@@ -511,8 +511,7 @@ mod tests {
     use std::str::FromStr as _;
 
     use super::{Settings, SettingsError};
-    #[cfg(all(feature = "duckdb", feature = "postgres", feature = "delta"))]
-    use crate::sink::route::Backend;
+    use crate::sink::route::{Backend, Tables};
 
     /// The minimum a file needs: a chain, its endpoints, and a store.
     fn minimal() -> &'static str {
@@ -581,74 +580,140 @@ tables = ["blocks"]
         std::fs::remove_dir_all(&dir).expect("clean up");
     }
 
+    /// Why `text` is refused, which must be a parse failure: the message names the key.
+    fn parse_refusal(text: &str) -> String {
+        match Settings::from_str(text) {
+            Err(error @ SettingsError::Parse { .. }) => error.to_string(),
+            other => panic!("expected a parse failure, got {other:?}"),
+        }
+    }
+
+    /// `names` as a sink's `tables` list.
+    fn tables(names: &[&str]) -> Tables {
+        serde_json::from_value(serde_json::json!(names)).expect("a tables list")
+    }
+
     /// Every sink lists its tables, at least one sink is named, and printing runs alone.
     #[test]
     fn sinks_name_their_tables_and_stdout_runs_alone() {
+        let settings = Settings::from_str(minimal()).expect("stdout alone parses");
+        assert_eq!(
+            settings.sink.tables(),
+            [(Backend::Stdout, &tables(&["blocks"]))]
+        );
+
         let without_sink = minimal().replace("[sink.stdout]\ntables = [\"blocks\"]\n", "[sink]\n");
-        assert!(matches!(
-            Settings::from_str(&without_sink),
-            Err(SettingsError::NoSink)
-        ));
-        let without_tables = minimal().replace("tables = [\"blocks\"]\n", "");
-        let error = Settings::from_str(&without_tables).expect_err("tables are required");
-        assert!(error.to_string().contains("tables"), "{error}");
-        let empty = minimal().replace("[\"blocks\"]", "[]");
-        assert!(Settings::from_str(&empty).is_err());
-        let unknown = format!("{}\n[sink.kafka]\ntables = [\"logs\"]\n", minimal());
-        assert!(Settings::from_str(&unknown).is_err());
+        assert!(
+            matches!(
+                Settings::from_str(&without_sink),
+                Err(SettingsError::NoSink)
+            ),
+            "no sink"
+        );
+        for (case, text, refusal) in [
+            (
+                "without tables",
+                minimal().replace("tables = [\"blocks\"]\n", ""),
+                "missing field `tables`",
+            ),
+            (
+                "empty tables",
+                minimal().replace("[\"blocks\"]", "[]"),
+                "at least one table",
+            ),
+            (
+                "a blank table",
+                minimal().replace("[\"blocks\"]", "[\" \"]"),
+                "a table name",
+            ),
+            (
+                "an unknown backend",
+                format!("{}\n[sink.kafka]\ntables = [\"logs\"]\n", minimal()),
+                "unknown field `kafka`",
+            ),
+        ] {
+            let message = parse_refusal(&text);
+            assert!(message.contains(refusal), "{case}: {message}");
+        }
     }
+
+    /// `[ingest]` with `keys` after its chain, and a sink.
+    fn ingest(keys: &str) -> String {
+        format!("[ingest]\nchain = \"base\"\n{keys}\n[sink.stdout]\ntables = [\"blocks\"]\n")
+    }
+
+    const RPC: &str =
+        "http_url = \"https://example.invalid\"\nws_url = \"wss://example.invalid\"\n";
+    const HYPERSYNC: &str =
+        "[ingest.hypersync]\nurl = \"https://4663.hypersync.xyz\"\ntoken = \"secret-token\"\n";
 
     /// `[ingest]` names one source: both RPC endpoints, or `HyperSync`, and only the keys
     /// that source reads.
     #[test]
     fn ingest_names_one_source() {
-        /// `[ingest]` with `keys` after its chain, and a sink.
-        fn ingest(keys: &str) -> String {
-            format!("[ingest]\nchain = \"base\"\n{keys}\n[sink.stdout]\ntables = [\"blocks\"]\n")
-        }
-        let rpc = "http_url = \"https://example.invalid\"\nws_url = \"wss://example.invalid\"\n";
-        let hypersync =
-            "[ingest.hypersync]\nurl = \"https://4663.hypersync.xyz\"\ntoken = \"secret-token\"\n";
-
-        let settings = Settings::from_str(&ingest(hypersync)).expect("hypersync alone parses");
-        let super::IngestSource::HyperSync(source) = &settings.ingest.source else {
-            panic!("expected HyperSync");
+        let settings = Settings::from_str(&ingest(RPC)).expect("rpc alone parses");
+        let super::IngestSource::Rpc {
+            http_url, ws_url, ..
+        } = &settings.ingest.source
+        else {
+            panic!("expected RPC, got {:?}", settings.ingest.source);
         };
-        assert_eq!(source.url, "https://4663.hypersync.xyz");
         assert_eq!(
-            (source.span.get(), source.concurrency.get()),
-            (2_000, 2),
-            "the defaults"
+            (http_url.expose(), ws_url.expose()),
+            ("https://example.invalid", "wss://example.invalid")
         );
+
+        let settings = Settings::from_str(&ingest(HYPERSYNC)).expect("hypersync alone parses");
+        let super::IngestSource::HyperSync(source) = &settings.ingest.source else {
+            panic!("expected HyperSync, got {:?}", settings.ingest.source);
+        };
         assert_eq!(
-            settings.ingest.finality_depth.get(),
-            4_096,
-            "the default depth"
+            (source.url.as_str(), source.token.expose()),
+            ("https://4663.hypersync.xyz", "secret-token")
         );
-        for (depth, parses) in [("128", true), ("4096", true), ("0", false), ("4097", false)] {
-            let keys = format!("finality_depth = {depth}\n{rpc}");
-            assert_eq!(
-                Settings::from_str(&ingest(&keys)).is_ok(),
-                parses,
-                "finality_depth = {depth}"
-            );
-        }
         assert!(!format!("{settings:?}").contains("secret-token"));
 
-        let tuned = format!("{hypersync}span = 500\nconcurrency = 4\n");
-        let settings = Settings::from_str(&ingest(&tuned)).expect("a tuned hypersync parses");
-        let super::IngestSource::HyperSync(source) = &settings.ingest.source else {
-            panic!("expected HyperSync");
-        };
-        assert_eq!((source.span.get(), source.concurrency.get()), (500, 4));
-        for zero in ["span = 0", "concurrency = 0"] {
-            assert!(
-                Settings::from_str(&ingest(&format!("{hypersync}{zero}\n"))).is_err(),
-                "{zero} is refused"
-            );
+        for (case, keys, refusal) in [
+            (
+                "both",
+                format!("{RPC}{HYPERSYNC}"),
+                "replaces http_url and ws_url",
+            ),
+            ("neither", String::new(), "name http_url and ws_url"),
+            (
+                "http_url alone",
+                "http_url = \"https://example.invalid\"\n".to_owned(),
+                "named together",
+            ),
+            (
+                "ws_url alone",
+                "ws_url = \"wss://example.invalid\"\n".to_owned(),
+                "named together",
+            ),
+            (
+                "concurrency beside hypersync",
+                format!("backfill_concurrency = 2\n{HYPERSYNC}"),
+                "backfill_concurrency is for http_url",
+            ),
+        ] {
+            let message = parse_refusal(&ingest(&keys));
+            assert!(message.contains(refusal), "{case}: {message}");
+        }
+    }
+
+    /// Each source's tuning is taken as written within its bounds, and refused outside
+    /// them: `finality_depth` is at most the deepest fork a run retracts, and no count may
+    /// be zero.
+    #[test]
+    fn ingest_tuning_is_bounded() {
+        let depth = |depth: &str| ingest(&format!("finality_depth = {depth}\n{RPC}"));
+        for (written, read) in [("128", 128), ("4096", 4_096)] {
+            let settings = Settings::from_str(&depth(written)).expect(written);
+            assert_eq!(settings.ingest.finality_depth.get(), read, "{written}");
         }
 
-        let settings = Settings::from_str(&ingest(rpc)).expect("rpc alone parses");
+        let settings = Settings::from_str(&ingest(&format!("backfill_concurrency = 2\n{RPC}")))
+            .expect("a tuned rpc parses");
         let super::IngestSource::Rpc {
             backfill_concurrency,
             ..
@@ -656,31 +721,36 @@ tables = ["blocks"]
         else {
             panic!("expected RPC");
         };
-        assert_eq!(backfill_concurrency.get(), 4, "the default");
+        assert_eq!(backfill_concurrency.get(), 2);
 
-        for (case, keys, refusal) in [
+        let tuned = format!("{HYPERSYNC}span = 500\nconcurrency = 4\n");
+        let settings = Settings::from_str(&ingest(&tuned)).expect("a tuned hypersync parses");
+        let super::IngestSource::HyperSync(source) = &settings.ingest.source else {
+            panic!("expected HyperSync");
+        };
+        assert_eq!((source.span.get(), source.concurrency.get()), (500, 4));
+
+        for (case, text, refusal) in [
+            ("finality_depth = 0", depth("0"), "nonzero"),
+            ("finality_depth = 4097", depth("4097"), "at most 4,096"),
             (
-                "both",
-                format!("{rpc}{hypersync}"),
-                "replaces http_url and ws_url",
+                "backfill_concurrency = 0",
+                ingest(&format!("backfill_concurrency = 0\n{RPC}")),
+                "nonzero",
             ),
-            ("neither", String::new(), "name http_url and ws_url"),
             (
-                "half",
-                "http_url = \"https://example.invalid\"\n".to_owned(),
-                "named together",
+                "span = 0",
+                ingest(&format!("{HYPERSYNC}span = 0\n")),
+                "nonzero",
             ),
             (
-                "concurrency beside hypersync",
-                format!("backfill_concurrency = 2\n{hypersync}"),
-                "backfill_concurrency is for http_url",
+                "concurrency = 0",
+                ingest(&format!("{HYPERSYNC}concurrency = 0\n")),
+                "nonzero",
             ),
         ] {
-            let error = Settings::from_str(&ingest(&keys)).expect_err(case);
-            assert!(
-                matches!(error, SettingsError::Parse { .. }) && error.to_string().contains(refusal),
-                "{case}: {error}"
-            );
+            let message = parse_refusal(&text);
+            assert!(message.contains(refusal), "{case}: {message}");
         }
     }
 
@@ -714,13 +784,19 @@ uri = "/tmp/lake"
 "#,
         );
         let settings = Settings::from_str(&text).expect("settings parse");
-        let named: Vec<_> = settings
-            .sink
-            .tables()
-            .into_iter()
-            .map(|(backend, _)| backend)
-            .collect();
-        assert_eq!(named, [Backend::DuckDb, Backend::Postgres, Backend::Delta]);
+        let (duckdb, postgres, delta) = (
+            tables(&["blocks"]),
+            tables(&["contract_events"]),
+            tables(&["logs", "decoded_logs"]),
+        );
+        assert_eq!(
+            settings.sink.tables(),
+            [
+                (Backend::DuckDb, &duckdb),
+                (Backend::Postgres, &postgres),
+                (Backend::Delta, &delta)
+            ]
+        );
     }
 
     /// A secret is the value or the environment variable that holds it, and either way it

@@ -436,7 +436,9 @@ impl serde::Serialize for Params<'_> {
 mod tests {
     use alloy_primitives::{Address, B256, Bytes, I256, TxHash, U256};
 
-    use crate::sink::table::{Column, ColumnType, Schema, TableError, TableId, Value};
+    use crate::sink::table::{
+        Column, ColumnType, MAX_IDENTIFIER, Schema, TableError, TableId, Value,
+    };
     use crate::wire::envelope::{ChainId, Decoded, DecodedArg, Derived, DerivedField};
     use crate::wire::typed::{AbiType, TypedValue};
 
@@ -615,7 +617,11 @@ mod tests {
             .expect("a new table");
         let table = schema.tables().last().expect("the event table");
         let (first, second) = (&table.columns[4].name, &table.columns[5].name);
-        assert!(first.len() <= 63 && second.len() <= 63, "{first}, {second}");
+        assert_eq!(
+            (first.len(), second.len()),
+            (MAX_IDENTIFIER, MAX_IDENTIFIER),
+            "{first}, {second}"
+        );
         assert_ne!(first, second);
     }
 
@@ -785,17 +791,25 @@ mod tests {
     }
 
     /// A derived table reorgs by its rows' block, which is what retracts them, and a name
-    /// too long for an identifier is refused rather than truncated by the store.
+    /// too long for an identifier is refused rather than truncated by the store; one that
+    /// just fits is taken.
     #[test]
     fn a_derived_table_reorgs_by_block_and_fits_an_identifier() {
         let mut schema = derived_schema();
         let table = schema.derived_table("p_rows").expect("declared");
         assert_eq!(table.block_hash.as_deref(), Some("block_hash"));
         assert_eq!(table.block_number.as_deref(), Some("block_number"));
+        let long = "p".repeat(MAX_IDENTIFIER + 1);
         assert!(matches!(
-            schema.add_derived(&"p".repeat(64), &COLUMNS),
-            Err(TableError::LongName { .. })
+            schema.add_derived(&long, &COLUMNS),
+            Err(TableError::LongName { table }) if table == long
         ));
+        assert_eq!(
+            schema
+                .add_derived(&"p".repeat(MAX_IDENTIFIER), &COLUMNS)
+                .expect("a name at the limit"),
+            TableId::Derived(1)
+        );
     }
 
     /// A record fills its table, keyed by its log and table.
@@ -822,62 +836,83 @@ mod tests {
             row.text("address"),
             Some(format!("{:#x}", record.address).as_str())
         );
+        assert_eq!(
+            row.text("transaction_from_address"),
+            Some(format!("{:#x}", Address::repeat_byte(0xf0)).as_str())
+        );
+        assert_eq!(
+            row.value("transaction_to_address"),
+            Some(&Value::Null),
+            "a contract creation has no recipient"
+        );
     }
 
     /// A field out of order, of the wrong type, too wide for its column, missing, or
-    /// surplus is refused rather than stored.
+    /// surplus is refused rather than stored, naming the column it did not fit; so is a
+    /// record for a table the schema does not have.
     #[test]
     fn a_record_that_does_not_fit_is_refused() {
         let schema = derived_schema();
         let chain = ChainId::new("base");
-
-        let mut swapped = fields();
-        swapped.swap(0, 1);
-        assert!(matches!(
-            schema.derived_row(&chain, &derived(swapped)),
-            Err(TableError::Field { column, .. }) if column == "amount"
-        ));
-
-        let mut mistyped = fields();
-        mistyped[2].value = TypedValue::Address {
-            value: Address::ZERO,
+        let with = |change: fn(&mut Vec<DerivedField>)| {
+            let mut fields = fields();
+            change(&mut fields);
+            derived(fields)
         };
-        assert!(matches!(
-            schema.derived_row(&chain, &derived(mistyped)),
-            Err(TableError::Field { column, .. }) if column == "buy"
-        ));
-
-        let mut wide = fields();
-        wide[1].value = TypedValue::Int {
-            value: I256::MINUS_ONE,
-            bits: 128,
-        };
-        assert!(matches!(
-            schema.derived_row(&chain, &derived(wide)),
-            Err(TableError::Field { column, .. }) if column == "bin"
-        ));
-
-        let mut surplus = fields();
-        surplus.push(field("extra", TypedValue::Bool { value: false }));
-        assert!(matches!(
-            schema.derived_row(&chain, &derived(surplus)),
-            Err(TableError::Field { column, .. }) if column == "block_number"
-        ));
-
-        let mut short = fields();
-        short.pop();
-        assert!(matches!(
-            schema.derived_row(&chain, &derived(short)),
-            Err(TableError::Width { .. })
-        ));
-
-        let unknown = Derived {
-            table: "p_other".to_owned(),
-            ..derived(fields())
-        };
-        assert!(matches!(
-            schema.derived_row(&chain, &unknown),
-            Err(TableError::UnknownTable { table }) if table == "p_other"
-        ));
+        let misnamed = "the record names another column here";
+        let misfit = "the record's value is not of the column's type, or does not fit it";
+        let cases = [
+            (
+                "out of order",
+                with(|fields| fields.swap(0, 1)),
+                format!("p_rows.amount: {misnamed}"),
+            ),
+            (
+                "the wrong type",
+                with(|fields| {
+                    fields[2].value = TypedValue::Address {
+                        value: Address::ZERO,
+                    };
+                }),
+                format!("p_rows.buy: {misfit}"),
+            ),
+            (
+                "too wide",
+                with(|fields| {
+                    fields[1].value = TypedValue::Int {
+                        value: I256::MINUS_ONE,
+                        bits: 128,
+                    };
+                }),
+                format!("p_rows.bin: {misfit}"),
+            ),
+            (
+                "surplus",
+                with(|fields| fields.push(field("extra", TypedValue::Bool { value: false }))),
+                format!("p_rows.block_number: {misnamed}"),
+            ),
+            (
+                "missing",
+                with(|fields| {
+                    fields.pop();
+                }),
+                "a p_rows row has 11 values for 12 columns".to_owned(),
+            ),
+            (
+                "an unknown table",
+                Derived {
+                    table: "p_other".to_owned(),
+                    ..derived(fields())
+                },
+                "no derived table is named p_other".to_owned(),
+            ),
+        ];
+        for (label, record, expected) in cases {
+            let error = schema
+                .derived_row(&chain, &record)
+                .expect_err(label)
+                .to_string();
+            assert_eq!(error, expected, "{label}");
+        }
     }
 }

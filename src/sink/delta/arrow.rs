@@ -264,22 +264,39 @@ mod tests {
     use super::decimal_text;
 
     /// A `uint256` and an `int256` at their extremes survive as exact decimal text, which
-    /// is the only exact form a 78-digit integer has in Delta.
+    /// is the only exact form a 78-digit integer has in Delta, and read back as the same
+    /// sign and magnitude. A negative zero is plain `0`.
     #[test]
     fn wide_integers_are_exact_decimal_text() {
-        assert_eq!(
-            decimal_text(false, U256::MAX),
-            "115792089237316195423570985008687907853269984665640564039457584007913129639935"
-        );
         let int256_min = U256::from(1) << 255;
-        assert_eq!(
-            decimal_text(true, int256_min),
-            "-57896044618658097711785492504343953926634992332820282019728792003956564819968"
-        );
-        assert_eq!(decimal_text(true, U256::ZERO), "0");
-        assert_eq!(
-            U256::from_str_radix(&decimal_text(false, U256::MAX), 10).expect("parses"),
-            U256::MAX
-        );
+        for (case, negative, magnitude, text) in [
+            (
+                "uint256 max",
+                false,
+                U256::MAX,
+                "115792089237316195423570985008687907853269984665640564039457584007913129639935",
+            ),
+            (
+                "int256 max",
+                false,
+                int256_min - U256::from(1),
+                "57896044618658097711785492504343953926634992332820282019728792003956564819967",
+            ),
+            (
+                "int256 min",
+                true,
+                int256_min,
+                "-57896044618658097711785492504343953926634992332820282019728792003956564819968",
+            ),
+            ("negative zero", true, U256::ZERO, "0"),
+        ] {
+            assert_eq!(decimal_text(negative, magnitude), text, "{case}");
+            let digits = text.strip_prefix('-').unwrap_or(text);
+            assert_eq!(
+                U256::from_str_radix(digits, 10).expect("parses"),
+                magnitude,
+                "{case} reads back"
+            );
+        }
     }
 }

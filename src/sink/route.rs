@@ -323,14 +323,19 @@ mod tests {
 
     #[test]
     fn a_glob_matches_any_run_of_characters_and_nothing_else() {
-        assert!(glob("logs", "logs"));
-        assert!(!glob("logs", "decoded_logs"));
-        assert!(glob("*logs", "decoded_logs"));
-        assert!(glob("uniswap_v3_*", "uniswap_v3_pool_swap"));
-        assert!(glob("uniswap_*_swap", "uniswap_v3_pool_swap"));
-        assert!(glob("*", "blocks"));
-        assert!(!glob("uniswap_*_mint", "uniswap_v3_pool_swap"));
-        assert!(!glob("a*a", "a"), "the prefix and suffix may not overlap");
+        for (pattern, name, matches) in [
+            ("logs", "logs", true),
+            ("logs", "decoded_logs", false),
+            ("*logs", "decoded_logs", true),
+            ("uniswap_v3_*", "uniswap_v3_pool_swap", true),
+            ("uniswap_*_swap", "uniswap_v3_pool_swap", true),
+            ("*", "blocks", true),
+            ("uniswap_*_mint", "uniswap_v3_pool_swap", false),
+            // The prefix and suffix may not overlap.
+            ("a*a", "a", false),
+        ] {
+            assert_eq!(glob(pattern, name), matches, "{pattern:?} against {name:?}");
+        }
     }
 
     /// `contract_events` is every event table and no dataset or derived table; names and
@@ -341,16 +346,17 @@ mod tests {
         let events = tables(&["contract_events"])
             .resolve(&schema)
             .expect("resolves");
-        assert!(!events.is_empty());
-        assert!(events.iter().all(|id| matches!(id, TableId::Event(_))));
-        assert_eq!(
-            events.len(),
-            schema
-                .tables()
-                .iter()
-                .filter(|def| matches!(def.id, TableId::Event(_)))
-                .count()
+        let every_event: HashSet<TableId> = schema
+            .tables()
+            .iter()
+            .map(|def| def.id)
+            .filter(|id| matches!(id, TableId::Event(_)))
+            .collect();
+        assert!(
+            !every_event.is_empty(),
+            "the shipped catalog has event tables"
         );
+        assert_eq!(events, every_event);
 
         let raw = tables(&["blocks", "*logs"])
             .resolve(&schema)
@@ -370,14 +376,23 @@ mod tests {
         );
     }
 
+    /// `*` selects every table a store may list, and no bookkeeping table, which every
+    /// store writes already.
     #[test]
     fn a_glob_never_selects_a_bookkeeping_table() {
         let schema = fixtures::schema();
         let every = tables(&["*"]).resolve(&schema).expect("resolves");
-        assert!(every.iter().all(|id| !matches!(
-            id,
-            TableId::Dataset(table) if table.is_bookkeeping()
-        )));
+        let listable: HashSet<TableId> = schema
+            .tables()
+            .iter()
+            .map(|def| def.id)
+            .filter(|id| !matches!(id, TableId::Dataset(table) if table.is_bookkeeping()))
+            .collect();
+        assert_eq!(every, listable);
+        assert!(
+            listable.len() < schema.tables().len(),
+            "the schema has bookkeeping tables to leave out"
+        );
     }
 
     #[test]
@@ -396,14 +411,19 @@ mod tests {
         let empty = Arc::new(Schema::new().expect("the dataset tables"));
         assert!(matches!(
             tables(&["contract_events"]).resolve(&empty),
-            Err(RouteError::NoMatch { .. })
+            Err(RouteError::NoMatch { entry }) if entry == "contract_events"
         ));
     }
 
     #[test]
     fn an_empty_or_blank_list_does_not_parse() {
-        assert!(serde_json::from_str::<Tables>("[]").is_err());
-        assert!(serde_json::from_str::<Tables>(r#"["logs", " "]"#).is_err());
+        for (json, reason) in [
+            ("[]", "expected at least one table"),
+            (r#"["logs", " "]"#, r#"invalid value: string " ""#),
+        ] {
+            let error = serde_json::from_str::<Tables>(json).expect_err(json);
+            assert!(error.to_string().contains(reason), "{json}: {error}");
+        }
         assert_eq!(
             serde_json::from_str::<Tables>(r#"["logs"]"#).expect("parses"),
             tables(&["logs"])
@@ -503,6 +523,13 @@ mod tests {
             transactions.0.keys,
             [derived.dedupe_key(), accepted.dedupe_key()]
         );
-        assert!(router.sinks.iter().all(|(sink, _)| sink.flushes == 1));
+        assert_eq!(
+            router
+                .sinks
+                .iter()
+                .map(|(sink, _)| sink.flushes)
+                .collect::<Vec<_>>(),
+            [1, 1, 1]
+        );
     }
 }

@@ -1339,7 +1339,7 @@ mod tests {
         parse_quantity, withdrawals,
     };
     use crate::ingest::source::evm::{http_client, ws_connect};
-    use crate::ingest::source::{BlockSource, Datasets, EvmSource, SourceError};
+    use crate::ingest::source::{BlockSource, Datasets, EvmSource};
     use crate::wire::envelope::Event;
 
     /// The ranges the live comparisons fetch in: one at a time, as many heights as a test
@@ -1534,8 +1534,12 @@ mod tests {
             parse_quantity("0x0000").expect("zero").0,
             alloy_primitives::U256::ZERO
         );
-        assert!(parse_quantity("0x").is_err());
-        assert!(parse_quantity("12").is_err());
+        for bare in ["0x", "12"] {
+            assert_eq!(
+                parse_quantity(bare).err(),
+                Some(format!("{bare:?} is not 0x hex"))
+            );
+        }
     }
 
     /// An authorization list as `HyperSync` encoded Ethereum's
@@ -1669,40 +1673,66 @@ mod tests {
     }
 
     /// A response that skips a height, answers a log for another block, leaves logs out
-    /// of a block whose bloom says it has some, or misorders them, is refused.
+    /// of a block whose bloom says it has some, misorders them, runs past the range, or
+    /// makes no progress, is refused: as inconsistent when asking again can help, and as
+    /// malformed when it cannot.
     #[test]
     fn a_short_or_mismatched_response_is_refused() {
-        let skipped = respond(12, &[block(10, false, 0)], &[]);
-        assert!(
-            assemble(10, 20, skipped, Plan::new(logs_only()).expect("plan")).is_err(),
-            "a skipped height"
-        );
-
         let mut foreign = log(10, 0, 0);
         foreign["block_hash"] = hash(99).into();
-        let foreign = respond(11, &[block(10, true, 0)], &[foreign]);
-        assert!(matches!(
-            assemble(10, 20, foreign, Plan::new(logs_only()).expect("plan")),
-            Err(SourceError::Inconsistent { .. })
-        ));
-
-        let bloomed = respond(11, &[block(10, true, 0)], &[]);
-        assert!(matches!(
-            assemble(10, 20, bloomed, Plan::new(logs_only()).expect("plan")),
-            Err(SourceError::Inconsistent { .. })
-        ));
-
-        let misordered = respond(11, &[block(10, true, 0)], &[log(10, 0, 1), log(10, 0, 0)]);
-        assert!(
-            assemble(10, 20, misordered, Plan::new(logs_only()).expect("plan")).is_err(),
-            "misordered logs"
-        );
-
-        let past = respond(12, &[block(10, false, 0), block(11, false, 0)], &[]);
-        assert!(
-            assemble(10, 10, past, Plan::new(logs_only()).expect("plan")).is_err(),
-            "past the end"
-        );
+        let empty: super::Response = serde_json::from_value(serde_json::json!({
+            "data": [], "next_block": 10, "archive_height": 9
+        }))
+        .expect("response");
+        for (case, to, response, expected) in [
+            (
+                "a skipped height",
+                20,
+                respond(12, &[block(10, false, 0)], &[]),
+                "malformed data from hypersync: 1 blocks for heights 10..=11".to_owned(),
+            ),
+            (
+                "a log of another block",
+                20,
+                respond(11, &[block(10, true, 0)], &[foreign]),
+                format!(
+                    "inconsistent data from hypersync: a row at 10 belongs to block {}, not {}",
+                    hash(99),
+                    hash(10)
+                ),
+            ),
+            (
+                "no logs under a set bloom",
+                20,
+                respond(11, &[block(10, true, 0)], &[]),
+                "inconsistent data from hypersync: no logs returned for block 10, whose logsBloom is set"
+                    .to_owned(),
+            ),
+            (
+                "misordered logs",
+                20,
+                respond(11, &[block(10, true, 0)], &[log(10, 0, 1), log(10, 0, 0)]),
+                "malformed data from hypersync: logs of block 10 are not in ascending logIndex order"
+                    .to_owned(),
+            ),
+            (
+                "past the end",
+                10,
+                respond(12, &[block(10, false, 0), block(11, false, 0)], &[]),
+                "malformed data from hypersync: answered through 11 for heights 10..=10".to_owned(),
+            ),
+            (
+                "no progress",
+                20,
+                empty,
+                "inconsistent data from hypersync: made no progress past 10; its archive may not reach that height yet"
+                    .to_owned(),
+            ),
+        ] {
+            let error = assemble(10, to, response, Plan::new(logs_only()).expect("plan"))
+                .expect_err(case);
+            assert_eq!(error.to_string(), expected, "{case}");
+        }
     }
 
     /// With transactions read, the last receipt's cumulative gas must be the block's: for
@@ -1743,16 +1773,17 @@ mod tests {
             Plan::new(transactions).expect("plan"),
         )
         .expect("assembles");
-        assert_eq!(blocks[0].events.len(), 2);
-        assert!(matches!(
-            assemble(
-                10,
-                10,
-                response(&whole[..1]),
-                Plan::new(transactions).expect("plan")
-            ),
-            Err(SourceError::Inconsistent { .. })
-        ));
+        let kinds: Vec<&str> = blocks[0].events.iter().map(Event::kind).collect();
+        assert_eq!(kinds, ["transaction", "transaction"]);
+        let dropped = "inconsistent data from hypersync: block 10 used 42000 gas, but its receipts add to 21000";
+        let error = assemble(
+            10,
+            10,
+            response(&whole[..1]),
+            Plan::new(transactions).expect("plan"),
+        )
+        .expect_err("transactions");
+        assert_eq!(error.to_string(), dropped);
 
         // `blocks` alone reads only the transactions' positions, and checks them the same.
         let positions: Vec<_> = whole
@@ -1770,15 +1801,14 @@ mod tests {
             transactions: false,
             logs: false,
         };
-        assert!(matches!(
-            assemble(
-                10,
-                10,
-                response(&positions[..1]),
-                Plan::new(blocks_only).expect("plan")
-            ),
-            Err(SourceError::Inconsistent { .. })
-        ));
+        let error = assemble(
+            10,
+            10,
+            response(&positions[..1]),
+            Plan::new(blocks_only).expect("plan"),
+        )
+        .expect_err("blocks");
+        assert_eq!(error.to_string(), dropped);
     }
 
     /// A full selection asks for every field of a row's struct, by its wire name, and the
@@ -1802,18 +1832,12 @@ mod tests {
                 assert!(full.contains(field), "{field}");
             }
         }
-        assert!(matches!(
-            columns::<u64>(),
-            Err(SourceError::Malformed { .. })
-        ));
-    }
-
-    #[test]
-    fn an_empty_response_is_no_progress() {
-        let response = serde_json::from_value(serde_json::json!({
-            "data": [], "next_block": 10, "archive_height": 9
-        }))
-        .expect("response");
-        assert!(assemble(10, 20, response, Plan::new(Datasets::all()).expect("plan")).is_err());
+        assert_eq!(
+            columns::<u64>().err().map(|error| error.to_string()),
+            Some(
+                "malformed data from HyperSync columns: u64 does not deserialize as a struct with fields"
+                    .to_owned()
+            )
+        );
     }
 }

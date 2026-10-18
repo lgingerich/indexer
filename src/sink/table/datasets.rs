@@ -408,14 +408,20 @@ mod tests {
     /// dropped. A control signal is a row like any other.
     #[test]
     fn every_event_becomes_exactly_one_row() {
-        let events = every_kind();
-        assert_eq!(events.len(), Table::ALL.len(), "one fixture per table");
-        for event in &events {
+        let mut tables = Vec::new();
+        for event in &every_kind() {
             let row = row_for(&chain(), event);
-            assert_eq!(row.values().len(), row.table().columns.len());
-            assert_eq!(row.chain(), "ethereum");
-            assert_eq!(row.dedupe_key(), event.dedupe_key());
+            let label = &row.table().name;
+            assert_eq!(row.values().len(), row.table().columns.len(), "{label}");
+            assert_eq!(row.chain(), "ethereum", "{label}");
+            assert_eq!(row.dedupe_key(), event.dedupe_key(), "{label}");
+            tables.push(row.table().id);
         }
+        assert_eq!(
+            tables,
+            Table::ALL.map(TableId::from),
+            "one fixture per table, each landing in its own"
+        );
     }
 
     /// Every table but `reorgs` names its block by a required text column, so a reorg
@@ -468,7 +474,8 @@ mod tests {
     }
 
     /// A field the chain does not have is null, never zero: `withdrawals_root` before
-    /// EIP-4895, or the fee cap of a legacy transaction.
+    /// EIP-4895, or the fee cap of a legacy transaction. One it has, even a zero, is its
+    /// value.
     #[test]
     fn an_absent_field_is_null_and_not_zero() {
         let row = row_for(&chain(), &Event::Block(Box::default()));
@@ -480,6 +487,17 @@ mod tests {
         assert_eq!(
             row.value("max_fee_per_gas").expect("a column"),
             &Value::Null
+        );
+        let row = row_for(
+            &chain(),
+            &Event::Transaction(Box::new(Transaction {
+                max_fee_per_gas: Some(0),
+                ..Transaction::default()
+            })),
+        );
+        assert_eq!(
+            row.value("max_fee_per_gas").expect("a column"),
+            &Value::unsigned(U256::ZERO)
         );
     }
 }

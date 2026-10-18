@@ -748,7 +748,6 @@ tables = ["blocks", "transactions", "logs", "decoded_logs", "contract_events"]
         );
     }
 
-    /// The shipped protocols load, so the example settings a reader copies stay runnable.
     /// A store that cannot open or resume as it stands is the settings' fault, so the
     /// process exits as a config error and the supervisor waits for a fix rather than
     /// restarting into the same failure; a store that may come back is not.
@@ -760,37 +759,56 @@ tables = ["blocks", "transactions", "logs", "decoded_logs", "contract_events"]
             store: Backend::Postgres,
             source,
         };
-        let drift = open(StoreError::Drift {
-            table: "logs".to_owned(),
-            difference: "it has no data column".to_owned(),
-        });
-        assert!(drift.is_config(), "{drift}");
-        let locked = open(StoreError::Locked {
-            schema: "base".to_owned(),
-        });
-        assert!(!locked.is_config(), "{locked}");
-        let unreachable = open(StoreError::Engine {
-            operation: Operation::Open,
-            target: None,
-            source: "connection refused".into(),
-        });
-        assert!(!unreachable.is_config(), "{unreachable}");
-
-        let disjoint = RuntimeError::Resume(ResumeError::NoCommonBlock {
-            tips: vec![(Backend::Postgres, 9), (Backend::Delta, 5)],
-        });
-        assert!(disjoint.is_config(), "{disjoint}");
-        let unread = RuntimeError::Resume(ResumeError::Restore {
-            store: Backend::Delta,
-            source: StoreError::Engine {
-                operation: Operation::Read,
-                target: Some("accepted_blocks".to_owned()),
-                source: "timed out".into(),
-            },
-        });
-        assert!(!unread.is_config(), "{unread}");
+        for (case, error, config) in [
+            (
+                "a drifted table",
+                open(StoreError::Drift {
+                    table: "logs".to_owned(),
+                    difference: "it has no data column".to_owned(),
+                }),
+                true,
+            ),
+            (
+                "a locked schema",
+                open(StoreError::Locked {
+                    schema: "base".to_owned(),
+                }),
+                false,
+            ),
+            (
+                "an unreachable store",
+                open(StoreError::Engine {
+                    operation: Operation::Open,
+                    target: None,
+                    source: "connection refused".into(),
+                }),
+                false,
+            ),
+            (
+                "stores with no common block",
+                RuntimeError::Resume(ResumeError::NoCommonBlock {
+                    tips: vec![(Backend::Postgres, 9), (Backend::Delta, 5)],
+                }),
+                true,
+            ),
+            (
+                "a ledger that timed out",
+                RuntimeError::Resume(ResumeError::Restore {
+                    store: Backend::Delta,
+                    source: StoreError::Engine {
+                        operation: Operation::Read,
+                        target: Some("accepted_blocks".to_owned()),
+                        source: "timed out".into(),
+                    },
+                }),
+                false,
+            ),
+        ] {
+            assert_eq!(error.is_config(), config, "{case}: {error}");
+        }
     }
 
+    /// The shipped protocols load, so the example settings a reader copies stay runnable.
     #[test]
     fn the_shipped_protocols_assemble() {
         let decode = format!("\n[decode]\nprotocols = {:?}\n", protocols());
@@ -938,15 +956,7 @@ tables = ["blocks", "transactions", "logs", "decoded_logs", "contract_events"]
                 .await
                 .expect("reopen");
         let stored = store.contracts(&chain).await.expect("read back");
-        assert_eq!(
-            stored,
-            [StoredContract {
-                protocol: "uniswap_v3".to_owned(),
-                name: "UniswapV3Pool".to_owned(),
-                address: pool,
-                block_hash: creating,
-            }]
-        );
+        assert_eq!(stored, [stored_pool(pool, creating)]);
         let mut restarted = decoder();
         assert_eq!(restarted.restore(stored), 1);
         let Event::Log(log) = swap(pool).event else {
@@ -1068,6 +1078,12 @@ tables = ["blocks", "transactions", "logs", "decoded_logs", "contract_events"]
                 Stop::never(),
             )
             .await;
+        ran_to_head(&result);
+    }
+
+    /// Asserts that a run indexed to the head and stopped only because the head
+    /// subscription ended, as every [`FakeChain`] run does.
+    fn ran_to_head(result: &Result<(), RuntimeError>) {
         assert!(
             matches!(
                 result,
@@ -1075,6 +1091,37 @@ tables = ["blocks", "transactions", "logs", "decoded_logs", "contract_events"]
             ),
             "{result:?}"
         );
+    }
+
+    /// The pool [`pool_created`] names, stored with the block that created it.
+    fn stored_pool(pool: Address, block_hash: B256) -> StoredContract {
+        StoredContract {
+            protocol: "uniswap_v3".to_owned(),
+            name: "UniswapV3Pool".to_owned(),
+            address: pool,
+            block_hash,
+        }
+    }
+
+    /// The ledger of blocks `1..=through`, hashed as [`FakeChain`] hashes them: tagged
+    /// `0xa0` below `fork` and `0xb0` from it.
+    fn chain_through(through: u64, fork: u64) -> Vec<(u64, String)> {
+        (1..=through)
+            .map(|height| {
+                let tag = if height < fork { 0xa0 } else { 0xb0 };
+                (height, format!("{:#x}", block_hash(tag, height)))
+            })
+            .collect()
+    }
+
+    /// A restored ledger as `(height, hash)` pairs, to compare with [`chain_through`].
+    #[cfg(feature = "delta")]
+    fn ledger_of(restored: &sink::Restored) -> Vec<(u64, String)> {
+        restored
+            .ledger
+            .iter()
+            .map(|block| (block.height, format!("{:#x}", block.hash)))
+            .collect()
     }
 
     fn heights(reader: &duckdb::Connection) -> Vec<(u64, String)> {
@@ -1100,16 +1147,19 @@ tables = ["blocks", "transactions", "logs", "decoded_logs", "contract_events"]
 
         run_once(&connection, FakeChain::new(4, 0xa0), Some(1)).await;
         assert_eq!(
-            heights(&connection).len(),
-            4,
+            heights(&connection),
+            chain_through(4, u64::MAX),
             "every block, empty ones included"
         );
 
         let mut grown = FakeChain::new(6, 0xa0);
         grown.log(5, pool_created(pool, B256::ZERO));
         run_once(&connection, grown, None).await;
-        let ledger: Vec<u64> = heights(&connection).iter().map(|(h, _)| *h).collect();
-        assert_eq!(ledger, [1, 2, 3, 4, 5, 6], "resumed after 4 with no gap");
+        assert_eq!(
+            heights(&connection),
+            chain_through(6, u64::MAX),
+            "resumed after 4 with no gap"
+        );
         assert_eq!(count(&connection, "reorgs"), 0);
         assert_eq!(
             count(&connection, "contracts"),
@@ -1146,8 +1196,8 @@ tables = ["blocks", "transactions", "logs", "decoded_logs", "contract_events"]
             "the creation went with its orphaned block; only the undecoded swap remains"
         );
         assert_eq!(
-            heights(&connection).len(),
-            7,
+            heights(&connection),
+            chain_through(7, 5),
             "the orphaned blocks left the ledger"
         );
         let mut store =
@@ -1156,21 +1206,21 @@ tables = ["blocks", "transactions", "logs", "decoded_logs", "contract_events"]
                 .expect("open");
         let restored = store.restore().await.expect("restore");
         assert!(restored.contracts.is_empty());
-        let canonical = restored.ledger;
         assert_eq!(
-            canonical
+            restored
+                .ledger
                 .iter()
-                .map(|block| block.height)
+                .map(|block| (block.height, format!("{:#x}", block.hash)))
                 .collect::<Vec<_>>(),
-            [1, 2, 3, 4, 5, 6, 7]
+            chain_through(7, 5)
         );
         assert!(
-            canonical
+            restored
+                .ledger
                 .windows(2)
                 .all(|pair| pair[1].parent_hash == pair[0].hash),
             "the restored ledger is one linked chain"
         );
-        assert_eq!(canonical[6].hash, block_hash(0xb0, 7));
     }
 
     /// A start height above a stored ledger's tip would leave a gap, so the run refuses.
@@ -1185,10 +1235,14 @@ tables = ["blocks", "transactions", "logs", "decoded_logs", "contract_events"]
         let chain = ChainId::new("base");
         let restored = ledger(&chain, store.restore().await.expect("restore").ledger);
         let machine = Machine::new(FakeChain::new(5, 0xa0), store, restored);
-        assert!(matches!(
-            machine.run(Some(5), None).await,
-            Err(PipelineError::StartAboveHistory { start: 5, tip: 3 })
-        ));
+        let result = machine.run(Some(5), None).await;
+        assert!(
+            matches!(
+                result,
+                Err(PipelineError::StartAboveHistory { start: 5, tip: 3 })
+            ),
+            "{result:?}"
+        );
     }
 
     /// A lake directory for one test, removed when the guard drops.
@@ -1200,6 +1254,26 @@ tables = ["blocks", "transactions", "logs", "decoded_logs", "contract_events"]
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    /// A lake in a directory of its own named for `test`, writing `tables`, and the guard
+    /// that removes it. The interval is far longer than any run, so rows reach the lake
+    /// only through the drain's flush when the channel closes.
+    #[cfg(feature = "delta")]
+    fn lake(test: &str, tables: &str) -> (LakeDir, sink::DeltaSettings) {
+        let dir = LakeDir(
+            std::env::temp_dir().join(format!("indexer-runtime-{test}-{}", std::process::id())),
+        );
+        let settings = sink::DeltaSettings {
+            tables: serde_json::from_str(tables).expect("tables"),
+            uri: dir.0.display().to_string(),
+            commit_interval_secs: 3600,
+            max_buffer_bytes: usize::MAX,
+            maintenance: false,
+            vacuum_retention_hours: 168,
+            storage: std::collections::BTreeMap::new(),
+        };
+        (dir, settings)
     }
 
     /// One process lifetime against the lake `settings` names, as [`run_once`] is against
@@ -1218,13 +1292,7 @@ tables = ["blocks", "transactions", "logs", "decoded_logs", "contract_events"]
             Stop::never(),
         ))
         .await;
-        assert!(
-            matches!(
-                result,
-                Err(RuntimeError::Ingest(PipelineError::SubscriptionClosed))
-            ),
-            "{result:?}"
-        );
+        ran_to_head(&result);
     }
 
     /// What a fresh open of the lake restores.
@@ -1246,36 +1314,29 @@ tables = ["blocks", "transactions", "logs", "decoded_logs", "contract_events"]
     #[cfg(feature = "delta")]
     #[tokio::test]
     async fn a_lake_restart_resumes_from_its_ledger_and_reconciles_a_fork_while_down() {
-        let dir = LakeDir(
-            std::env::temp_dir().join(format!("indexer-runtime-lake-{}", std::process::id())),
-        );
-        let settings = sink::DeltaSettings {
-            tables: serde_json::from_str(r#"["contract_events"]"#).expect("tables"),
-            uri: dir.0.display().to_string(),
-            commit_interval_secs: 3600,
-            max_buffer_bytes: usize::MAX,
-            maintenance: false,
-            vacuum_retention_hours: 168,
-            storage: std::collections::BTreeMap::new(),
-        };
-        let heights = |restored: &sink::Restored| -> Vec<u64> {
-            restored.ledger.iter().map(|block| block.height).collect()
-        };
+        let (_dir, settings) = lake("lake", r#"["contract_events"]"#);
         let pool = Address::from([0xd0; 20]);
 
         run_lake(&settings, FakeChain::new(4, 0xa0), Some(1)).await;
-        assert_eq!(heights(&restored(&settings).await), [1, 2, 3, 4]);
+        assert_eq!(
+            ledger_of(&restored(&settings).await),
+            chain_through(4, u64::MAX)
+        );
 
         let mut grown = FakeChain::new(6, 0xa0);
         grown.log(5, pool_created(pool, B256::ZERO));
         run_lake(&settings, grown, None).await;
         let after = restored(&settings).await;
         assert_eq!(
-            heights(&after),
-            [1, 2, 3, 4, 5, 6],
+            ledger_of(&after),
+            chain_through(6, u64::MAX),
             "resumed after 4 with no gap"
         );
-        assert_eq!(after.contracts.len(), 1, "created while down, discovered");
+        assert_eq!(
+            after.contracts,
+            [stored_pool(pool, block_hash(0xa0, 5))],
+            "created while down, discovered"
+        );
 
         let mut forked = FakeChain::new(6, 0xa0);
         forked.log(5, pool_created(pool, B256::ZERO));
@@ -1288,7 +1349,7 @@ tables = ["blocks", "transactions", "logs", "decoded_logs", "contract_events"]
             after.contracts.is_empty(),
             "the creation went with its block"
         );
-        assert_eq!(heights(&after), [1, 2, 3, 4, 5, 6, 7]);
+        assert_eq!(ledger_of(&after), chain_through(7, 5));
         assert!(
             after
                 .ledger
@@ -1296,7 +1357,6 @@ tables = ["blocks", "transactions", "logs", "decoded_logs", "contract_events"]
                 .all(|pair| pair[1].parent_hash == pair[0].hash),
             "the restored ledger is one linked chain"
         );
-        assert_eq!(after.ledger[6].hash, block_hash(0xb0, 7));
     }
 
     /// Two stores, the database ahead of the lake when the process stops, and the chain
@@ -1307,18 +1367,7 @@ tables = ["blocks", "transactions", "logs", "decoded_logs", "contract_events"]
     #[cfg(feature = "delta")]
     #[tokio::test]
     async fn stores_at_different_heights_resume_from_the_block_they_share() {
-        let dir = LakeDir(
-            std::env::temp_dir().join(format!("indexer-runtime-two-{}", std::process::id())),
-        );
-        let settings = sink::DeltaSettings {
-            tables: serde_json::from_str(r#"["blocks"]"#).expect("tables"),
-            uri: dir.0.display().to_string(),
-            commit_interval_secs: 3600,
-            max_buffer_bytes: usize::MAX,
-            maintenance: false,
-            vacuum_retention_hours: 168,
-            storage: std::collections::BTreeMap::new(),
-        };
+        let (_dir, settings) = lake("two", r#"["blocks"]"#);
         let connection = duckdb::Connection::open_in_memory().expect("open in-memory DuckDB");
         let pool = Address::from([0xd0; 20]);
         let both = async |chain: FakeChain, start: Option<u64>| {
@@ -1331,7 +1380,7 @@ tables = ["blocks", "transactions", "logs", "decoded_logs", "contract_events"]
         let mut grown = FakeChain::new(6, 0xa0);
         grown.log(6, pool_created(pool, B256::ZERO));
         run_once(&connection, grown, None).await;
-        assert_eq!(heights(&connection).len(), 6);
+        assert_eq!(heights(&connection), chain_through(6, u64::MAX));
         assert_eq!(count(&connection, "contracts"), 1);
 
         // While down, 5 and 6 were replaced.
@@ -1339,12 +1388,7 @@ tables = ["blocks", "transactions", "logs", "decoded_logs", "contract_events"]
         forked.branch(5, 7, 0xb0);
         both(forked, None).await;
 
-        let expected: Vec<(u64, String)> = (1..=7)
-            .map(|height| {
-                let tag = if height < 5 { 0xa0 } else { 0xb0 };
-                (height, format!("{:#x}", block_hash(tag, height)))
-            })
-            .collect();
+        let expected = chain_through(7, 5);
         assert_eq!(
             heights(&connection),
             expected,
@@ -1360,13 +1404,8 @@ tables = ["blocks", "transactions", "logs", "decoded_logs", "contract_events"]
             2,
             "each orphaned block the database held is retracted as ingest reaches it"
         );
-        let restored = restored(&settings).await;
         assert_eq!(
-            restored
-                .ledger
-                .iter()
-                .map(|block| (block.height, format!("{:#x}", block.hash)))
-                .collect::<Vec<_>>(),
+            ledger_of(&restored(&settings).await),
             expected,
             "the lake holds the same chain"
         );
@@ -1414,13 +1453,7 @@ tables = ["blocks", "transactions", "logs", "decoded_logs", "contract_events"]
             Pipeline::new(chain, start, None, catalog).run_with_stores(stores, Stop::never()),
         )
         .await;
-        assert!(
-            matches!(
-                result,
-                Err(RuntimeError::Ingest(PipelineError::SubscriptionClosed))
-            ),
-            "{result:?}"
-        );
+        ran_to_head(&result);
     }
 
     /// The database ahead of the lake on the chain that stayed canonical, as every
@@ -1430,18 +1463,7 @@ tables = ["blocks", "transactions", "logs", "decoded_logs", "contract_events"]
     #[cfg(feature = "delta")]
     #[tokio::test]
     async fn a_store_ahead_on_the_canonical_chain_keeps_its_rows() {
-        let dir = LakeDir(
-            std::env::temp_dir().join(format!("indexer-runtime-ahead-{}", std::process::id())),
-        );
-        let settings = sink::DeltaSettings {
-            tables: serde_json::from_str(r#"["blocks"]"#).expect("tables"),
-            uri: dir.0.display().to_string(),
-            commit_interval_secs: 3600,
-            max_buffer_bytes: usize::MAX,
-            maintenance: false,
-            vacuum_retention_hours: 168,
-            storage: std::collections::BTreeMap::new(),
-        };
+        let (_dir, settings) = lake("ahead", r#"["blocks"]"#);
         let connection = duckdb::Connection::open_in_memory().expect("open in-memory DuckDB");
         let pool = Address::from([0xd0; 20]);
         let chain = || {
@@ -1469,9 +1491,7 @@ tables = ["blocks", "transactions", "logs", "decoded_logs", "contract_events"]
             "the held block was neither deleted nor rewritten"
         );
         assert_eq!(count(&connection, "reorgs"), 0);
-        let expected: Vec<(u64, String)> = (1..=7)
-            .map(|height| (height, format!("{:#x}", block_hash(0xa0, height))))
-            .collect();
+        let expected = chain_through(7, u64::MAX);
         assert_eq!(
             heights(&connection),
             expected,
@@ -1479,13 +1499,14 @@ tables = ["blocks", "transactions", "logs", "decoded_logs", "contract_events"]
         );
         let lake = restored(&settings).await;
         assert_eq!(
-            lake.ledger
-                .iter()
-                .map(|block| (block.height, format!("{:#x}", block.hash)))
-                .collect::<Vec<_>>(),
+            ledger_of(&lake),
             expected,
             "the lake caught up to the same chain"
         );
-        assert_eq!(lake.contracts.len(), 1, "the lake discovered the pool once");
+        assert_eq!(
+            lake.contracts,
+            [stored_pool(pool, block_hash(0xa0, 6))],
+            "the lake discovered the pool once"
+        );
     }
 }

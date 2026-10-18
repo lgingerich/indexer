@@ -424,7 +424,11 @@ mod tests {
             opened(Backend::Delta, ledger(0xa0, 7..=6 + LEDGER_WINDOW as u64)),
         ];
         let (stores, restored) = resume(stores).await.expect("resumed");
-        assert_eq!(restored.ledger.last().map(|block| block.height), Some(5));
+        assert_eq!(
+            restored.ledger,
+            ledger(0xa0, 1..=5),
+            "the slowest store's ledger"
+        );
         assert_eq!(
             stores
                 .iter()
@@ -463,56 +467,92 @@ mod tests {
         B256::from(bytes)
     }
 
-    fn common(ledgers: &[&[BlockMeta]]) -> Option<(u64, usize)> {
-        common_block(ledgers)
-            .ok()
-            .flatten()
-            .map(|(block, slowest)| (block.height, slowest))
+    /// What [`common_block`] decided, by height rather than whole block.
+    #[derive(Debug, PartialEq, Eq)]
+    enum Outcome {
+        /// Resume from this height, held by the ledger at this position, the slowest.
+        Resume(u64, usize),
+        /// Every ledger is empty.
+        Fresh,
+        /// No block is safe to resume from.
+        Disjoint,
     }
 
+    fn outcome(ledgers: &[&[BlockMeta]]) -> Outcome {
+        match common_block(ledgers) {
+            Ok(Some((block, slowest))) => Outcome::Resume(block.height, slowest),
+            Ok(None) => Outcome::Fresh,
+            Err(Disjoint) => Outcome::Disjoint,
+        }
+    }
+
+    /// Where the stores resume from, for each shape their ledgers can be in after a stop:
+    ///
+    /// - The chains agree: the slowest tip.
+    /// - The slow store still holds a block the fast one saw orphaned: they agree only
+    ///   below it.
+    /// - Different chains throughout: nothing is safe.
+    /// - An empty ledger has no say, and with every ledger empty the run is fresh.
+    /// - A store that joined at 6 and committed ahead of the lake, still at 5, before the
+    ///   process stopped: it holds nothing at or below 5, so 5 is the common block and it
+    ///   is rewound to nothing.
+    /// - A full window whose oldest block is above the slowest tip, its tip within
+    ///   `MAX_RESUME_LAG` of it: a database that outran a lake whose commit a stop
+    ///   dropped. No hash disagrees, so the slowest tip is the common block, and the store
+    ///   ahead is rewound to it.
+    /// - Such a window one block further ahead may have history below it, so the store is
+    ///   refused rather than rewound past all of it.
     #[test]
-    fn the_common_block_is_the_slowest_tip_when_the_chains_agree() {
+    fn the_common_block_is_the_newest_every_ledger_with_a_say_holds() {
+        let window = LEDGER_WINDOW as u64;
+        let lag = super::MAX_RESUME_LAG;
         let slow = ledger(0xa0, 1..=5);
         let fast = ledger(0xa0, 1..=9);
-        assert_eq!(common(&[&fast, &slow]), Some((5, 1)));
-        assert_eq!(common(&[&slow, &slow]), Some((5, 0)));
-    }
-
-    /// The slow store still holds a block the fast one saw orphaned: they agree only
-    /// below it.
-    #[test]
-    fn the_common_block_is_below_where_the_branches_part() {
-        let slow = ledger(0xa0, 1..=6);
-        let mut fast = ledger(0xa0, 1..=4);
-        fast.extend(ledger(0xb0, 5..=8));
-        assert_eq!(common(&[&slow, &fast]), Some((4, 0)));
-    }
-
-    #[test]
-    fn an_empty_ledger_has_no_say() {
-        let stored = ledger(0xa0, 1..=5);
-        assert_eq!(common(&[&[], &stored]), Some((5, 1)));
-        assert_eq!(common(&[&[], &[]]), None);
-    }
-
-    /// A store that joined at 6 and committed ahead of the lake, still at 5, before the
-    /// process stopped: it holds nothing at or below 5, so 5 is the common block and it is
-    /// rewound to nothing.
-    #[test]
-    fn a_store_whose_whole_history_is_above_the_slowest_tip_has_no_say() {
-        let slow = ledger(0xa0, 1..=5);
+        let orphan_held = ledger(0xa0, 1..=6);
+        let mut forked = ledger(0xa0, 1..=4);
+        forked.extend(ledger(0xb0, 5..=8));
+        let other_chain = ledger(0xb0, 1..=9);
         let joined = ledger(0xa0, 6..=9);
-        assert_eq!(common(&[&slow, &joined]), Some((5, 0)));
-    }
-
-    /// A full window whose oldest block is above the slowest tip, close behind it: a
-    /// database that outran a lake whose commit a stop dropped. No hash disagrees, so the
-    /// slowest tip is the common block, and the store ahead is rewound to it.
-    #[test]
-    fn a_full_ledger_just_above_the_slowest_tip_is_rewound_to_it() {
-        let behind = ledger(0xa0, 1..=5);
-        let ahead = ledger(0xa0, 5_000..=4_999 + LEDGER_WINDOW as u64);
-        assert_eq!(common(&[&behind, &ahead]), Some((5, 0)));
+        let just_above = ledger(0xa0, 5_000..=4_999 + window);
+        // Full windows above the slow store's tip of 5, ending `lag` and `lag + 1` past it.
+        let within = ledger(0xa0, 6 + lag - window..=5 + lag);
+        let beyond = ledger(0xa0, 7 + lag - window..=6 + lag);
+        let empty: &[BlockMeta] = &[];
+        let cases: [(&str, [&[BlockMeta]; 2], Outcome); 10] = [
+            ("agreeing chains", [&fast, &slow], Outcome::Resume(5, 1)),
+            ("one ledger twice", [&slow, &slow], Outcome::Resume(5, 0)),
+            (
+                "branches that part",
+                [&orphan_held, &forked],
+                Outcome::Resume(4, 0),
+            ),
+            ("different chains", [&slow, &other_chain], Outcome::Disjoint),
+            ("an empty ledger", [empty, &slow], Outcome::Resume(5, 1)),
+            ("every ledger empty", [empty, empty], Outcome::Fresh),
+            (
+                "a whole history above the slowest tip",
+                [&slow, &joined],
+                Outcome::Resume(5, 0),
+            ),
+            (
+                "a full window just above the slowest tip",
+                [&slow, &just_above],
+                Outcome::Resume(5, 0),
+            ),
+            (
+                "a full window ending MAX_RESUME_LAG past the slowest tip",
+                [&slow, &within],
+                Outcome::Resume(5, 0),
+            ),
+            (
+                "a full window ending further past the slowest tip",
+                [&slow, &beyond],
+                Outcome::Disjoint,
+            ),
+        ];
+        for (label, ledgers, expected) in cases {
+            assert_eq!(outcome(&ledgers), expected, "{label}");
+        }
     }
 
     /// A store ahead keeps its blocks only when its ledger names all of them: its whole
@@ -520,29 +560,14 @@ mod tests {
     /// window starting higher may hide blocks in between, so that store is rewound.
     #[test]
     fn a_store_ahead_reconciles_only_what_its_ledger_names() {
-        assert!(names_all_above(&ledger(0xa0, 1..=9), 5), "reaches below");
-        assert!(
-            names_all_above(&ledger(0xa0, 6..=9), 5),
-            "its whole history"
-        );
         let full = |from: u64| ledger(0xa0, from..=from + LEDGER_WINDOW as u64 - 1);
-        assert!(
-            names_all_above(&full(6), 5),
-            "a full window from the next block"
-        );
-        assert!(
-            !names_all_above(&full(7), 5),
-            "a full window with a gap below"
-        );
-    }
-
-    /// A full window may have history below it, so a store far ahead is refused rather
-    /// than rewound past all of it.
-    #[test]
-    fn a_full_ledger_far_above_the_slowest_tip_is_refused() {
-        let behind = ledger(0xa0, 1..=5);
-        let start = 5 + super::MAX_RESUME_LAG;
-        let ahead = ledger(0xa0, start..=start + LEDGER_WINDOW as u64);
-        assert!(matches!(common_block(&[&behind, &ahead]), Err(Disjoint)));
+        for (label, ledger, names_all) in [
+            ("reaches below", ledger(0xa0, 1..=9), true),
+            ("its whole history", ledger(0xa0, 6..=9), true),
+            ("a full window from the next block", full(6), true),
+            ("a full window with a gap below", full(7), false),
+        ] {
+            assert_eq!(names_all_above(&ledger, 5), names_all, "{label}");
+        }
     }
 }
