@@ -18,6 +18,10 @@
 //!   otherwise do it after every commit, listing the whole log each time (see
 //!   [`commit_properties`](super::commit_properties)).
 //!
+//! Each pass reads every table afresh from its newest checkpoint and lets it go once
+//! done: a table kept from one pass to the next grows by a batch for every commit it is
+//! brought up to date with (see [`Lake::checkpoint_if_due`](super::Lake::checkpoint_if_due)).
+//!
 //! It is a second writer to the same tables, which the lake's one-writer rule allows
 //! because the two never touch the same file: the writer appends to the newest partition
 //! and deletes only within the reorg window, and compaction rewrites only finished
@@ -31,6 +35,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
 
 use deltalake::checkpoints::cleanup_expired_logs_for;
+use deltalake::logstore::LogStoreRef;
 use deltalake::parquet::file::properties::WriterProperties;
 use deltalake::{DeltaTable, DeltaTableError, FilterOp, FilterValue};
 use tokio::task::JoinHandle;
@@ -74,10 +79,10 @@ impl Drop for Maintenance {
     }
 }
 
-/// Starts maintaining `tables`, each by name, against the committed tip the writer
-/// publishes in `tip`. Files go after `retention`.
+/// Starts maintaining `tables`, each by name and the log store it is read through,
+/// against the committed tip the writer publishes in `tip`. Files go after `retention`.
 pub(super) fn spawn(
-    tables: Vec<(String, DeltaTable)>,
+    tables: Vec<(String, LogStoreRef)>,
     tip: Arc<AtomicU64>,
     retention: Duration,
     writer: WriterProperties,
@@ -86,7 +91,7 @@ pub(super) fn spawn(
 }
 
 async fn run(
-    mut tables: Vec<(String, DeltaTable)>,
+    tables: Vec<(String, LogStoreRef)>,
     tip: Arc<AtomicU64>,
     retention: Duration,
     writer: WriterProperties,
@@ -97,16 +102,24 @@ async fn run(
     loop {
         passes.tick().await;
         let vacuum = vacuumed.elapsed() >= VACUUM_EVERY;
-        for (name, table) in &mut tables {
-            if let Err(error) = compact(name, table, tip.load(Ordering::Acquire), &writer).await {
+        for (name, log_store) in &tables {
+            let mut table = DeltaTable::new(Arc::clone(log_store));
+            if let Err(error) = table.load().await {
+                metrics::lake_maintenance_failed("load");
+                warn!(table = %name, %error, "lake table unreadable for maintenance; retrying next pass");
+                continue;
+            }
+            if let Err(error) =
+                compact(name, &mut table, tip.load(Ordering::Acquire), &writer).await
+            {
                 metrics::lake_maintenance_failed("compact");
                 warn!(table = %name, %error, "lake compaction failed; retrying next pass");
             }
-            if vacuum && let Err(error) = self::vacuum(name, table, retention).await {
+            if vacuum && let Err(error) = self::vacuum(name, &mut table, retention).await {
                 metrics::lake_maintenance_failed("vacuum");
                 warn!(table = %name, %error, "lake vacuum failed; retrying next pass");
             }
-            if vacuum && let Err(error) = clean_log(name, table, retention).await {
+            if vacuum && let Err(error) = clean_log(name, &mut table, retention).await {
                 metrics::lake_maintenance_failed("log_cleanup");
                 warn!(table = %name, %error, "lake log cleanup failed; retrying next pass");
             }

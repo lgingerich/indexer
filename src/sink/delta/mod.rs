@@ -68,8 +68,8 @@ mod arrow;
 mod maintenance;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use alloy_primitives::B256;
@@ -242,6 +242,9 @@ struct Lake {
     checkpointed: u64,
     /// The permits every table's checkpoints share, [`CONCURRENT_CHECKPOINTS`] of them.
     checkpoints: Arc<Semaphore>,
+    /// The table read afresh from its newest checkpoint, for the next write to carry on
+    /// from in place of `table` (see [`checkpoint_if_due`](Self::checkpoint_if_due)).
+    reopened: Arc<Mutex<Option<DeltaTable>>>,
 }
 
 impl Lake {
@@ -268,6 +271,15 @@ impl Lake {
     /// Opening calls it too: a table committed to less often than that between restarts
     /// would otherwise never be checkpointed, and every open would read its whole log.
     /// One a stop interrupted is noticed at the next open and started again.
+    ///
+    /// Once written, the checkpoint is read back as a table of its own, which the next
+    /// write carries on from (see [`base`](Self::base)). delta-rs keeps a table's files
+    /// as the batches it read them in, one more for every commit since it was loaded,
+    /// and only drops one once all its files are gone: a partition the tip is still
+    /// writing to, two weeks of Ethereum, held thousands of batches of a single file,
+    /// each a few kilobytes of arrays. The checkpoint holds every file in a few large
+    /// batches, so a table read from it costs a fraction of the one it replaces, and
+    /// while checkpoints succeed, about a hundred commits pile up on it at most.
     fn checkpoint_if_due(&mut self) {
         let version = self.table.version().unwrap_or_default();
         if version.saturating_sub(self.checkpointed) < CHECKPOINT_EVERY {
@@ -277,6 +289,7 @@ impl Lake {
         let name = self.def.name.clone();
         let snapshot = self.table.clone();
         let permits = Arc::clone(&self.checkpoints);
+        let reopened = Arc::clone(&self.reopened);
         tokio::spawn(async move {
             // Never closed, so a permit always comes.
             let Ok(_permit) = permits.acquire_owned().await else {
@@ -284,6 +297,21 @@ impl Lake {
             };
             if let Err(error) = checkpoints::create_checkpoint(&snapshot, None).await {
                 warn!(table = %name, version, %error, "lake checkpoint failed; the next is due later");
+                return;
+            }
+            // The table as of the checkpoint is the one being replaced: freed before its
+            // replacement is read, so the two are never held at once.
+            let log_store = snapshot.log_store();
+            drop(snapshot);
+            let mut table = DeltaTable::new(log_store);
+            if let Err(error) = table.load_version(version).await {
+                warn!(table = %name, version, %error, "lake checkpoint unreadable; the next is read later");
+                return;
+            }
+            let mut slot = reopened.lock().unwrap_or_else(PoisonError::into_inner);
+            // Checkpoints of one table can finish out of order; the newest is kept.
+            if slot.as_ref().and_then(DeltaTable::version) < Some(version) {
+                *slot = Some(table);
             }
         });
     }
@@ -292,6 +320,33 @@ impl Lake {
     fn record_batch(&self, rows: &[&Row]) -> Result<RecordBatch, StoreError> {
         arrow::record_batch(&self.arrow, &self.def, rows)
             .map_err(StoreError::engine(Operation::Append, Some(self.name())))
+    }
+
+    /// The table the next commit starts from: the one a checkpoint left, when one is
+    /// waiting, brought up to date with the commits since, which costs a listing of the
+    /// log and a read of each of them, once a hundred commits; `table` otherwise, or when
+    /// the update fails. A reread is only ever a saving, never a reason for a commit to
+    /// fail.
+    fn base(&self) -> impl Future<Output = DeltaTable> + Send + 'static {
+        let name = self.def.name.clone();
+        let current = self.table.clone();
+        let reopened = self
+            .reopened
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        async move {
+            let Some(mut table) = reopened else {
+                return current;
+            };
+            match table.update_state().await {
+                Ok(()) => table,
+                Err(error) => {
+                    warn!(table = %name, %error, "lake checkpoint not brought up to date; committing without it");
+                    current
+                }
+            }
+        }
     }
 
     /// Appends `batches` as one commit of this table's own log, resolving to the table as of
@@ -303,17 +358,18 @@ impl Lake {
         batches: Vec<RecordBatch>,
     ) -> impl Future<Output = Result<DeltaTable, StoreError>> + Send + 'static {
         let def = Arc::clone(&self.def);
-        let mut write = self
-            .table
-            .clone()
-            .write(batches)
-            .with_save_mode(SaveMode::Append)
-            .with_writer_properties(writer.clone())
-            .with_commit_properties(commit_properties());
-        if arrow::partitioned(&self.def).is_some() {
-            write = write.with_partition_columns([PARTITION]);
-        }
+        let writer = writer.clone();
+        let base = self.base();
         async move {
+            let mut write = base
+                .await
+                .write(batches)
+                .with_save_mode(SaveMode::Append)
+                .with_writer_properties(writer)
+                .with_commit_properties(commit_properties());
+            if arrow::partitioned(&def).is_some() {
+                write = write.with_partition_columns([PARTITION]);
+            }
             write
                 .await
                 .map_err(StoreError::engine(Operation::Append, Some(&def.name)))
@@ -327,8 +383,8 @@ impl Lake {
         predicate: Expr,
     ) -> Result<(), StoreError> {
         let (table, _) = self
-            .table
-            .clone()
+            .base()
+            .await
             .delete()
             .with_predicate(predicate)
             .with_writer_properties(writer.clone())
@@ -492,7 +548,7 @@ impl DeltaSink {
                 .lakes
                 .iter()
                 .filter(|lake| arrow::partitioned(&lake.def).is_some())
-                .map(|lake| (lake.def.name.clone(), lake.table.clone()))
+                .map(|lake| (lake.def.name.clone(), lake.table.log_store()))
                 .collect();
             let retention = Duration::from_hours(settings.vacuum_retention_hours.max(1));
             sink.maintenance = Some(maintenance::spawn(
@@ -1294,6 +1350,7 @@ async fn open_table(
         table,
         checkpointed,
         checkpoints,
+        reopened: Arc::default(),
     };
     lake.checkpoint_if_due();
     Ok(lake)

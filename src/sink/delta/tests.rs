@@ -1013,6 +1013,52 @@ async fn opening_starts_a_checkpoint_that_is_due() {
     );
 }
 
+/// Once a checkpoint is written it is read back as the table as of it, and the next
+/// append takes that table up, keeping every entry before and after, each once. Whether
+/// the append carried on from it or, its update failing, from the table it replaces,
+/// the lake reads the same.
+#[tokio::test]
+async fn an_append_after_a_checkpoint_carries_on_from_it() {
+    let dir = Dir::new();
+    let log = log_of(&dir, "accepted_blocks");
+    let mut sink = open(&dir).await;
+    let last = super::CHECKPOINT_EVERY + 1;
+    accept(&mut sink, 1..=last).await;
+    assert_eq!(wait_for_checkpoint(&log).await, super::CHECKPOINT_EVERY);
+    let position = sink.position(Table::AcceptedBlock);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while reopened(&sink, position).is_none() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the checkpoint was not read back"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        reopened(&sink, position),
+        Some(super::CHECKPOINT_EVERY),
+        "the table as of the checkpoint"
+    );
+
+    accept(&mut sink, last + 1..=last + 2).await;
+    assert_eq!(reopened(&sink, position), None, "taken by the next append");
+    assert_eq!(
+        ledger_heights(&mut sink).await,
+        (1..=last + 2).collect::<Vec<_>>()
+    );
+}
+
+/// The version of the table a checkpoint left for the next append of the table at
+/// `position`, if one is waiting.
+fn reopened(sink: &DeltaSink, position: usize) -> Option<u64> {
+    sink.lakes[position]
+        .reopened
+        .lock()
+        .expect("unpoisoned")
+        .as_ref()
+        .and_then(DeltaTable::version)
+}
+
 /// Commits the ledger entries of the canonical blocks at `heights`, one commit each and
 /// nothing else, so each takes the ledger one version on and no other table: all a
 /// checkpoint counts, at a fraction of a whole block's commit.

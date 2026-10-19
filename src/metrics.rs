@@ -28,7 +28,7 @@
 //! | `indexer_contracts_discovered_total` | counter | Contracts found through a factory's event |
 //! | `indexer_rpc_retries_total` | counter | Source requests retried after a transient failure, by `source`: `rpc` or `hypersync` |
 //! | `indexer_rpc_range_splits_total` | counter | Backfill ranges split after a failed fetch |
-//! | `indexer_lake_maintenance_failures_total` | counter | Failed Delta `operation`s: compact or vacuum |
+//! | `indexer_lake_maintenance_failures_total` | counter | Failed Delta `operation`s: `load`, `compact`, `vacuum`, or `log_cleanup` |
 //!
 //! A stall is `time() - indexer_store_last_commit_timestamp_seconds`; a decode failure
 //! is any increase of the failure counters, since every one of them is a record the
