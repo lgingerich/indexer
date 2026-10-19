@@ -48,4 +48,10 @@ USER indexer
 # The Prometheus endpoint each settings file's `[metrics]` names.
 EXPOSE 9100
 ENV RUST_LOG=warn,indexer=info
+# No transparent huge pages for the process (mimalloc reads this once, at start). mimalloc
+# asks for them on its arenas, and once it frees part of one the kernel keeps charging
+# the container for the whole 2 MiB page until it splits it: about 0.6 GB of Ethereum's
+# 2 GB under its cap was such pages, with a few percent less CPU per commit their only
+# gain.
+ENV MIMALLOC_ALLOW_THP=0
 ENTRYPOINT ["/app/indexer"]
