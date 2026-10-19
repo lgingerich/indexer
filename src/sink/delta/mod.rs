@@ -66,6 +66,9 @@
 
 mod arrow;
 mod maintenance;
+// Temporary: the one-off rewrite of a lake to another width, deleted once Ethereum's is
+// rewritten. Nothing outside it and the `repartition` subcommand uses it.
+mod repartition;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -101,12 +104,13 @@ use crate::sink::batch::Batch;
 use crate::sink::channel::Batching;
 use crate::sink::route::Tables;
 use crate::sink::store_error::{EngineError, InvalidStoredValue, Operation, StoreError};
-use crate::sink::table::{Row, Schema, Table, TableDef, TableError, TableId};
+use crate::sink::table::{ColumnType, Row, Schema, Table, TableDef, TableError, TableId};
 use crate::sink::{EnvelopeSink, Restored, SinkError, Store};
 use crate::wire::envelope::{BlockMeta, ChainId, Envelope, StoredContract};
 
 use self::arrow::{PARTITION, UINT_PRECISION};
 use self::maintenance::Maintenance;
+pub use self::repartition::repartition;
 
 /// How many tables an open, a repair, or a delete across the lake works on at once:
 /// enough to hide the store's latency, few enough not to flood it with requests.
@@ -147,6 +151,7 @@ const REORG_COLUMNS: [&str; 3] = ["height", "dedupe_key", "orphaned_hashes"];
 /// max_buffer_bytes = 268435456
 /// maintenance = true
 /// vacuum_retention_hours = 168
+/// partition_blocks = 100000
 ///
 /// [sink.delta.storage]               # passed to the object store
 /// endpoint = "https://s3.example.com"  # omit for AWS S3
@@ -192,6 +197,22 @@ pub struct DeltaSettings {
     /// vacuumed under it.
     #[serde(default = "default_vacuum_retention_hours")]
     pub vacuum_retention_hours: u64,
+    /// How many block heights one partition covers. Defaults to 100,000: about 2.8 hours
+    /// of Robinhood, half a day of BSC, two weeks of Ethereum. At least 4,097, the
+    /// ledger window: opening reads the ledger from its newest two partitions.
+    ///
+    /// Narrower partitions make a restart and a reorg's delete read less, at the cost of
+    /// more of them. The tip writes a small file into the newest partition every commit
+    /// until compaction, so a chain whose partition fills in weeks wants a narrower one.
+    ///
+    /// Each table records the width it was written with, and a run whose setting differs
+    /// is refused at open: rows stay in the partition they were written to, so changing
+    /// the width of an existing lake means rewriting its tables.
+    #[serde(
+        default = "default_partition_blocks",
+        deserialize_with = "partition_blocks"
+    )]
+    pub partition_blocks: u64,
     /// S3 options, passed straight through, such as `endpoint`, `region`, and
     /// `access_key_id`; the `aws_`-prefixed spellings work too. Every value is a
     /// [`Secret`], so keys can be named by environment variable and none is logged.
@@ -229,6 +250,22 @@ const fn default_vacuum_retention_hours() -> u64 {
     168
 }
 
+const fn default_partition_blocks() -> u64 {
+    arrow::DEFAULT_PARTITION_BLOCKS
+}
+
+/// A partition width no narrower than the ledger window, so the newest two partitions
+/// always hold the whole of it.
+fn partition_blocks<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<u64, D::Error> {
+    let width = u64::deserialize(deserializer)?;
+    if width < LEDGER_WINDOW as u64 {
+        return Err(serde::de::Error::custom(format!(
+            "partition_blocks is at least {LEDGER_WINDOW}, the ledger window"
+        )));
+    }
+    Ok(width)
+}
+
 /// One table: its definition, the Arrow schema its batches are built against, and the
 /// Delta table as of the last commit this process made to it.
 #[derive(Debug)]
@@ -236,6 +273,8 @@ struct Lake {
     def: Arc<TableDef>,
     arrow: Arc<ArrowSchema>,
     table: DeltaTable,
+    /// How many heights one partition covers, when the rows belong to a block.
+    width: u64,
     /// The newest version a checkpoint was started for, or the table's newest checkpoint
     /// as of opening (zero when it had none): the next is due [`CHECKPOINT_EVERY`]
     /// versions later.
@@ -318,7 +357,7 @@ impl Lake {
 
     /// `rows` as this table's Arrow batch: the CPU half of an append.
     fn record_batch(&self, rows: &[&Row]) -> Result<RecordBatch, StoreError> {
-        arrow::record_batch(&self.arrow, &self.def, rows)
+        arrow::record_batch(&self.arrow, &self.def, self.width, rows)
             .map_err(StoreError::engine(Operation::Append, Some(self.name())))
     }
 
@@ -502,7 +541,13 @@ impl DeltaSink {
         let lakes: Vec<Lake> = stream::iter(schema.tables())
             .map(|def| {
                 let uri = format!("{root}/{chain}/{}", def.name);
-                open_table(&storage, uri, def, Arc::clone(&checkpoints))
+                open_table(
+                    &storage,
+                    uri,
+                    def,
+                    settings.partition_blocks,
+                    Arc::clone(&checkpoints),
+                )
             })
             .boxed()
             .buffered(CONCURRENT_TABLES)
@@ -522,9 +567,7 @@ impl DeltaSink {
             schema,
             committed: HashMap::new(),
             failed: false,
-            writer: WriterProperties::builder()
-                .set_compression(Compression::ZSTD(ZstdLevel::default()))
-                .build(),
+            writer: lake_writer(),
             published_tip: Arc::new(AtomicU64::new(0)),
             maintenance: None,
             ledger: None,
@@ -614,8 +657,9 @@ impl DeltaSink {
 
     /// The newest [`LEDGER_WINDOW`] accepted blocks, oldest first.
     ///
-    /// Read from the ledger's newest two partitions alone, which hold far more blocks
-    /// than the window, so a restart does not scan every file the ledger ever wrote.
+    /// Read from the ledger's newest two partitions alone, which hold at least the window
+    /// (a partition is never narrower), so a restart does not scan every file the
+    /// ledger ever wrote.
     async fn read_ledger(&self) -> Result<Vec<BlockMeta>, StoreError> {
         let lake = self.lake(Table::AcceptedBlock);
         let newest = lake.newest_partition()?;
@@ -688,7 +732,9 @@ impl DeltaSink {
                     let batches = lake
                         .read(|frame| {
                             let frame = match floor {
-                                Some(floor) => frame.filter(at_or_above(number, floor))?,
+                                Some(floor) => {
+                                    frame.filter(at_or_above(number, floor, lake.width))?
+                                }
                                 None => frame,
                             };
                             frame.select(texts_of(&[hash]))?.distinct()
@@ -730,7 +776,7 @@ impl DeltaSink {
             let Some(columns) = lake.block_columns() else {
                 continue;
             };
-            let predicate = of_blocks(columns, &stray, floor);
+            let predicate = of_blocks(columns, &stray, floor, lake.width);
             lake.delete(&self.writer, predicate).await?;
         }
         if contracts_repaired {
@@ -1006,9 +1052,10 @@ impl DeltaSink {
                 if chunk.is_empty() {
                     break;
                 }
-                let (arrow, def) = (Arc::clone(&lake.arrow), Arc::clone(&lake.def));
+                let (arrow, def, width) =
+                    (Arc::clone(&lake.arrow), Arc::clone(&lake.def), lake.width);
                 let build = tokio::spawn(async move {
-                    arrow::record_batch(&arrow, &def, &chunk.iter().collect::<Vec<_>>())
+                    arrow::record_batch(&arrow, &def, width, &chunk.iter().collect::<Vec<_>>())
                         .map_err(StoreError::engine(Operation::Append, Some(&def.name)))
                 });
                 builds.push((position, build));
@@ -1113,7 +1160,14 @@ impl DeltaSink {
     /// Deletes the orphaned blocks `hashes`, none below `floor`: out of the ledger first,
     /// so it never names a block whose rows are going, then out of every other table.
     async fn retract(&mut self, floor: u64, hashes: &[String]) -> Result<(), StoreError> {
-        let of = |lake: &Lake| Some(of_blocks(lake.block_columns()?, hashes, Some(floor)));
+        let of = |lake: &Lake| {
+            Some(of_blocks(
+                lake.block_columns()?,
+                hashes,
+                Some(floor),
+                lake.width,
+            ))
+        };
         self.delete_from_the_ledger_then_the_rest(of).await
     }
 
@@ -1121,7 +1175,7 @@ impl DeltaSink {
     async fn delete_above(&mut self, height: u64) -> Result<(), StoreError> {
         let above = |lake: &Lake| {
             let (_, number) = lake.block_columns()?;
-            Some(at_or_above(number, height.saturating_add(1)))
+            Some(at_or_above(number, height.saturating_add(1), lake.width))
         };
         self.delete_from_the_ledger_then_the_rest(above).await
     }
@@ -1285,6 +1339,13 @@ impl Storage {
     }
 }
 
+/// How every file of the lake is written: Zstandard-compressed Parquet.
+fn lake_writer() -> WriterProperties {
+    WriterProperties::builder()
+        .set_compression(Compression::ZSTD(ZstdLevel::default()))
+        .build()
+}
+
 /// How every commit to the lake is made, by the store and by `maintenance` alike: without
 /// delta-rs's cleanup of expired log entries, and without its checkpoints.
 ///
@@ -1299,12 +1360,14 @@ fn commit_properties() -> CommitProperties {
         .with_create_checkpoint(false)
 }
 
-/// Opens the table of `def` at `uri`, creating it when it does not exist, checks an
-/// existing one against its definition, and starts its checkpoint if one is due.
+/// Opens the table of `def` at `uri`, creating it `width` heights to a partition when it
+/// does not exist, checks an existing one against its definition and `width`, and
+/// starts its checkpoint if one is due.
 async fn open_table(
     storage: &Storage,
     uri: String,
     def: &Arc<TableDef>,
+    width: u64,
     checkpoints: Arc<Semaphore>,
 ) -> Result<Lake, StoreError> {
     let name = def.name.as_str();
@@ -1320,18 +1383,30 @@ async fn open_table(
         .table(&uri)
         .await
         .map_err(StoreError::engine(Operation::Open, Some(name)))?;
+    let partitioned = arrow::partitioned(def).is_some();
     let checkpointed = if table.version().is_none() {
-        let partitions = arrow::partitioned(def).map(|_| PARTITION.to_owned());
+        let partitions = partitioned.then(|| PARTITION.to_owned());
+        let mut recorded = vec![(STATS_COLUMNS.to_owned(), Some(stats_columns(def)))];
+        if partitioned {
+            recorded.push((arrow::PARTITION_BLOCKS.to_owned(), Some(width.to_string())));
+        }
         table = table
             .create()
             .with_table_name(name)
             .with_columns(expected.fields().cloned())
             .with_partition_columns(partitions)
+            // The width is the indexer's own property, which delta-rs does not know.
+            .with_raise_if_key_not_exists(false)
+            .with_configuration(recorded)
             .await
             .map_err(StoreError::engine(Operation::Create, Some(name)))?;
         0
     } else {
         check(&table, &expected, name)?;
+        if partitioned {
+            check_width(&table, width, name)?;
+        }
+        keep_stats(&mut table, def).await?;
         // Only a hint: without it the next checkpoint comes early, which is no reason to
         // stop the run.
         match last_checkpoint(&table).await {
@@ -1348,12 +1423,104 @@ async fn open_table(
         def: Arc::clone(def),
         arrow,
         table,
+        width,
         checkpointed,
         checkpoints,
         reopened: Arc::default(),
     };
     lake.checkpoint_if_due();
     Ok(lake)
+}
+
+/// How many heights one partition of the table `name` covers, as its
+/// [`PARTITION_BLOCKS`](arrow::PARTITION_BLOCKS) property records it: the default for a
+/// table that records none, as every table written before the width was a setting.
+fn partition_width(table: &DeltaTable, name: &str) -> Result<u64, StoreError> {
+    let snapshot = table
+        .snapshot()
+        .map_err(StoreError::engine(Operation::Open, Some(name)))?;
+    let Some(recorded) = snapshot
+        .metadata()
+        .configuration()
+        .get(arrow::PARTITION_BLOCKS)
+    else {
+        return Ok(arrow::DEFAULT_PARTITION_BLOCKS);
+    };
+    recorded.parse().map_err(|_| StoreError::Drift {
+        table: name.to_owned(),
+        difference: format!("its partition width is recorded as `{recorded}`, not a number"),
+    })
+}
+
+/// Fails when the table `name` is not `width` heights a partition.
+fn check_width(table: &DeltaTable, width: u64, name: &str) -> Result<(), StoreError> {
+    let stored = partition_width(table, name)?;
+    if stored == width {
+        return Ok(());
+    }
+    Err(StoreError::Drift {
+        table: name.to_owned(),
+        difference: format!(
+            "its partitions are {stored} heights wide, not {width}; a table keeps the width \
+             it was written with"
+        ),
+    })
+}
+
+/// The table property naming the columns each file keeps statistics on.
+/// Delta's own, so every reader and writer follows it.
+const STATS_COLUMNS: &str = "delta.dataSkippingStatsColumns";
+
+/// The columns every file of `def`'s table keeps statistics on, comma-separated: its
+/// block height and its timestamps, the columns a file's rows fall in a narrow range of,
+/// so a read filtering on them skips the files outside it.
+///
+/// Delta's default is the first 32 columns, which left the widest tables, such as
+/// `transactions`, with none on their block height, and spent the rest on hashes and
+/// addresses whose range in any file is nearly everything. Every file's statistics are
+/// held in its table's file list, so they are kept to the columns that pay for it.
+fn stats_columns(def: &TableDef) -> String {
+    let reorgs = def.id == TableId::Dataset(Table::Reorg);
+    let height = def
+        .block_number
+        .as_deref()
+        .or_else(|| reorgs.then_some(REORG_COLUMNS[0]));
+    let timestamps = def
+        .columns
+        .iter()
+        .filter(|column| column.kind == ColumnType::Timestamp)
+        .map(|column| column.name.as_ref());
+    height
+        .into_iter()
+        .chain(timestamps)
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// Records [`stats_columns`] on `table` when it names others, as a table written before
+/// they were chosen does: the files written from then on keep statistics on them, and
+/// those already written keep what they have.
+async fn keep_stats(table: &mut DeltaTable, def: &TableDef) -> Result<(), StoreError> {
+    let wanted = stats_columns(def);
+    let stored = table
+        .snapshot()
+        .map_err(StoreError::engine(Operation::Open, Some(&def.name)))?
+        .metadata()
+        .configuration()
+        .get(STATS_COLUMNS)
+        .cloned();
+    if stored.as_deref() == Some(wanted.as_str()) {
+        return Ok(());
+    }
+    *table = table
+        .clone()
+        .set_tbl_properties()
+        .with_properties([(STATS_COLUMNS.to_owned(), wanted.clone())].into())
+        .with_commit_properties(commit_properties())
+        .await
+        .map_err(StoreError::engine(Operation::Open, Some(&def.name)))?;
+    info!(table = %def.name, columns = %wanted, "lake table keeps statistics on new columns");
+    Ok(())
 }
 
 /// The version of `table`'s newest checkpoint, as its log's `_last_checkpoint` names it;
@@ -1438,20 +1605,25 @@ fn require(def: &TableDef, columns: &[&str]) -> Result<(), TableError> {
     Ok(())
 }
 
-/// `column >= height`, with the partition column bounding it too, so a scan or delete
-/// skips every older partition without opening a file.
-fn at_or_above(column: &str, height: u64) -> Expr {
+/// `column >= height`, with the partition column bounding it too, `width` heights to a
+/// partition, so a scan or delete skips every older partition without opening a file.
+fn at_or_above(column: &str, height: u64, width: u64) -> Expr {
     ident(PARTITION)
-        .gt_eq(lit(arrow::partition_of(height)))
+        .gt_eq(lit(arrow::partition_of(height, width)))
         .and(ident(column).gt_eq(uint(height)))
 }
 
 /// The rows of the blocks `hashes`, by a table's `(hash, height)` columns, none of them
-/// below `floor` when there is one.
-fn of_blocks((hash, height): (&str, &str), hashes: &[String], floor: Option<u64>) -> Expr {
+/// below `floor` when there is one, `width` heights to a partition.
+fn of_blocks(
+    (hash, height): (&str, &str),
+    hashes: &[String],
+    floor: Option<u64>,
+    width: u64,
+) -> Expr {
     let blocks = in_texts(hash, hashes);
     match floor {
-        Some(floor) => at_or_above(height, floor).and(blocks),
+        Some(floor) => at_or_above(height, floor, width).and(blocks),
         None => blocks,
     }
 }
