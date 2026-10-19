@@ -63,6 +63,54 @@ Never run the deterministic simulation (`sim::simulate`, `SIM_SEED`/`SIM_SEEDS`,
 `--ignore-default-filter`) unless the user asks for it. The default nextest profile
 skips it.
 
+## Production
+
+The runbook is `../infra/docs/production.md` §6. Read it before touching
+production. The VM size, container memory caps, alerts and dashboards live in
+`../infra`, not here.
+
+- One Hetzner VM runs a systemd unit `indexer-prod@<chain>` per chain
+  (`ethereum`, `bsc`, `robinhood`), each with settings from `indexer.<chain>.toml`.
+- Look at production yourself instead of asking the user to paste logs:
+
+  ```sh
+  ssh root@indexer-prod   # over Tailscale
+  journalctl -u indexer-prod@ethereum -n 200 --no-pager -o cat
+  journalctl -u indexer-prod-sync -n 50 --no-pager -o cat
+  docker stats --no-stream
+  journalctl -k | grep -iE 'oom|killed process'
+  ```
+
+  SSH goes over Tailscale, so it needs Tailscale running on this machine. If it
+  fails, say so once and use Grafana Cloud logs
+  (`{unit=~"indexer-prod@.+"}`) instead of retrying.
+- Deploy with `gh workflow run deploy.yml --ref main -f action=deploy -f chains=<chains>`,
+  then `gh run watch`. Use `-f action=stop` to stop a chain. A deploy restarts
+  the chain, so tell the user before running one.
+- Secrets are in the Infisical project `indexer` (`prod` and `dev`). Run commands
+  under `infisical run --env=<env> --`. Never print secret values.
+
+Rules:
+
+- Never point a local run, test or benchmark at production Postgres or the
+  `s3://blockchain-data` lake. A second writer duplicates rows. Use `dev` and a
+  local Postgres, or a `_dev`/`_benchmark` prefix in R2 the user has agreed to.
+- Before changing memory buffers, batch sizes, concurrency or the VM size,
+  measure the change locally under a container memory cap
+  (`docker run --memory=<cap>`) and report the numbers. Change one setting per
+  deploy so the effect can be attributed.
+
+## Working Alongside Other Sessions
+
+- Other agent sessions may be working in this checkout at the same time. Commit
+  only the files this task changed; never `git add -A` or `git add .`.
+- For work that spans many files or several commits, suggest a worktree before
+  starting on `main`.
+- End every task by stating what is committed, what is pushed, and what is left
+  uncommitted.
+- When a task pauses partway, end with the open items and the decisions already
+  made, so a new session can resume without re-asking.
+
 ## Communication
 
 - Never open with filler phrases like "Great question", "Of course", or "Certainly". Start with the answer or action.
