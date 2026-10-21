@@ -36,6 +36,8 @@ finality_depth = 128
 tables = ["contract_events", "metric_v1_swaps", "metric_v1_bin_fills", "metric_v1_liquidity", "metric_v1_pool_bins"]
 connection_string = { env = "INDEXER_POSTGRES_URL" }
 batch_records = 10000
+# Let a tip block wait up to a second for the next ones to share its commit.
+commit_wait_ms = 1000
 
 # Everything, as Delta tables on Cloudflare R2 under s3://blockchain-data/<chain>/: `*`
 # matches every dataset, decoded event table, and derived table, including ones added
