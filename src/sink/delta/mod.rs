@@ -563,7 +563,9 @@ impl DeltaSink {
             schema,
             committed: HashMap::new(),
             failed: false,
-            writer: lake_writer(),
+            writer: WriterProperties::builder()
+                .set_compression(Compression::ZSTD(ZstdLevel::default()))
+                .build(),
             published_tip: Arc::new(AtomicU64::new(0)),
             maintenance: None,
             ledger: None,
@@ -1333,13 +1335,6 @@ impl Storage {
             Err(error) => Err(error),
         }
     }
-}
-
-/// How every file of the lake is written: Zstandard-compressed Parquet.
-fn lake_writer() -> WriterProperties {
-    WriterProperties::builder()
-        .set_compression(Compression::ZSTD(ZstdLevel::default()))
-        .build()
 }
 
 /// How every commit to the lake is made, by the store and by `maintenance` alike: without
