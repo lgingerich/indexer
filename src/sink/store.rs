@@ -8,11 +8,16 @@
 //! # A flush
 //!
 //! One transaction: delete the rows of every block a buffered `reorg` orphaned, then for
-//! each table with rows, create a staging table, bulk-load the rows into it, and merge it
-//! with `INSERT … ON CONFLICT DO UPDATE` on `(chain, dedupe_key)`. Deleting first is what
-//! makes a block that returns — orphaned, then canonical again in a later `reorg` — end up
-//! stored. On failure the transaction rolls back and the whole batch stays buffered for a
-//! retry, which deletes nothing it already deleted and upserts onto itself.
+//! each table with rows, bulk-load the rows into its staging table and merge it with
+//! `INSERT … ON CONFLICT DO UPDATE` on `(chain, dedupe_key)`, then drop the ledger rows
+//! below the window a restart reads back. Deleting first is what makes a block that
+//! returns — orphaned, then canonical again in a later `reorg` — end up stored. On failure
+//! the transaction rolls back and the whole batch stays buffered for a retry, which
+//! deletes nothing it already deleted and upserts onto itself.
+//!
+//! The staging tables are created once a session, not once a flush: a table created and
+//! dropped every commit churns the database's catalog, which at the tip costs more than
+//! the few rows it stages.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -74,7 +79,7 @@ struct Prepared {
     staging: String,
     create_staging: String,
     merge: String,
-    drop_staging: Option<String>,
+    clear_staging: Option<String>,
     delete: Option<String>,
     /// What a rewind runs: every block above a height, in one statement.
     delete_above: Option<String>,
@@ -86,7 +91,7 @@ impl Prepared {
         Self {
             create_staging: D::create_staging(def, &staging),
             merge: sql::upsert::<D>(def, &staging),
-            drop_staging: D::drop_staging(&staging),
+            clear_staging: D::clear_staging(&staging),
             delete: sql::delete_blocks::<D>(def),
             delete_above: sql::delete_above(def, ledger),
             staging,
@@ -95,11 +100,12 @@ impl Prepared {
     }
 }
 
-/// The startup reads, rendered once.
+/// The startup reads, and the ledger's prune, rendered once.
 #[derive(Debug)]
 struct Reads {
     contracts: String,
     ledger: String,
+    /// Run by every flush that accepts a block.
     prune_ledger: String,
 }
 
@@ -190,7 +196,7 @@ impl<E: Engine> SqlStore<E> {
         for def in schema.tables() {
             check::<E::Dialect>(def, stored.get(&def.name).map_or(&[], Vec::as_slice))?;
         }
-        Ok(Self {
+        let mut store = Self {
             engine,
             chain: ChainId::new(chain),
             tables: schema
@@ -203,7 +209,24 @@ impl<E: Engine> SqlStore<E> {
                 .collect(),
             reads: Reads::new(&schema)?,
             batch: Batch::new(schema),
-        })
+        };
+        store.create_staging().await?;
+        Ok(store)
+    }
+
+    /// Creates every table's staging table, in one batch: once when the store opens, and
+    /// again on each connection the engine restores, since they last only a session.
+    async fn create_staging(&mut self) -> Result<(), StoreError> {
+        let create = self
+            .tables
+            .iter()
+            .map(|table| table.create_staging.as_str())
+            .collect::<Vec<_>>()
+            .join(";\n");
+        self.engine
+            .execute(&create, &[])
+            .await
+            .map_err(StoreError::engine(Operation::Stage, None))
     }
 
     /// The contracts discovered on `chain` that this store holds. One created in a block a
@@ -237,19 +260,18 @@ impl<E: Engine> SqlStore<E> {
             .collect()
     }
 
-    /// The newest `limit` accepted blocks on `chain`, oldest first, after dropping every
-    /// older row. An orphaned block's row was deleted by its `reorg`, so these are
-    /// canonical.
+    /// The newest `limit` accepted blocks on `chain`, oldest first. An orphaned block's
+    /// row was deleted by its `reorg`, so these are canonical.
     ///
     /// Read by [`restore`](Store::restore), before the first write: the result is the
-    /// undo window a restart resumes from. Rows below the oldest one returned can never be read again,
-    /// so they are deleted here, which is what keeps the ledger from growing without
-    /// bound across restarts. Contiguity is not checked; the pipeline does that.
+    /// undo window a restart resumes from. Each flush drops the rows below that window
+    /// (see [`prune_ledger`](Self::prune_ledger)), so this reads a table of about
+    /// [`LEDGER_WINDOW`] rows. Contiguity is not checked; the pipeline does that.
     ///
     /// # Errors
     ///
-    /// Returns [`StoreError::Engine`] when the query or the delete fails and
-    /// [`StoreError::Restore`] when a stored value does not parse.
+    /// Returns [`StoreError::Engine`] when the query fails and [`StoreError::Restore`]
+    /// when a stored value does not parse.
     pub(crate) async fn ledger(
         &mut self,
         chain: &ChainId,
@@ -274,15 +296,6 @@ impl<E: Engine> SqlStore<E> {
             })
             .collect::<Result<Vec<_>, StoreError>>()?;
         ledger.reverse();
-        if let Some(oldest) = ledger.first() {
-            self.engine
-                .execute(
-                    &self.reads.prune_ledger,
-                    &[chain_param(chain), Value::Uint(oldest.height)],
-                )
-                .await
-                .map_err(read())?;
-        }
         Ok(ledger)
     }
 
@@ -339,7 +352,33 @@ impl<E: Engine> SqlStore<E> {
         Ok(())
     }
 
-    /// The deletes, then each table's stage, load, and merge.
+    /// Deletes each chain's ledger rows more than [`LEDGER_WINDOW`] below the newest block
+    /// this flush accepts on it, as the lake keeps its window: no restart reads them, and
+    /// left in place they grow the table, and the cost of every write to it, a row a block.
+    ///
+    /// `tips` are the newest accepted heights by chain. Each is canonical — a buffered
+    /// `reorg` dropped the rows of the blocks it orphaned — and at or below the chain's tip,
+    /// so the window kept is never short.
+    async fn prune_ledger(&mut self, tips: HashMap<String, u64>) -> Result<(), StoreError> {
+        for (chain, tip) in tips {
+            let Some(floor) = tip.checked_sub(LEDGER_WINDOW as u64) else {
+                continue;
+            };
+            self.engine
+                .execute(
+                    &self.reads.prune_ledger,
+                    &[Value::Text(chain), Value::Uint(floor)],
+                )
+                .await
+                .map_err(StoreError::engine(
+                    Operation::Delete,
+                    Some("accepted_blocks"),
+                ))?;
+        }
+        Ok(())
+    }
+
+    /// The deletes, then each table's load, merge, and clear, then the ledger's prune.
     async fn write_tables(&mut self) -> Result<(), StoreError> {
         for table in &self.tables {
             let Some(delete) = &table.delete else {
@@ -358,16 +397,22 @@ impl<E: Engine> SqlStore<E> {
             }
         }
         let mut grouped = self.batch.by_table();
+        let mut tips: HashMap<String, u64> = HashMap::new();
+        for row in grouped
+            .get(&TableId::Dataset(Table::AcceptedBlock))
+            .into_iter()
+            .flatten()
+        {
+            if let Some(Value::Uint(height)) = row.value("height") {
+                let tip = tips.entry(row.chain().to_owned()).or_default();
+                *tip = (*tip).max(*height);
+            }
+        }
         for table in &self.tables {
             let Some(rows) = grouped.remove(&table.def.id) else {
                 continue;
             };
             let name = Some(table.def.name.as_str());
-            let stage = StoreError::engine(Operation::Stage, name);
-            self.engine
-                .execute(&table.create_staging, &[])
-                .await
-                .map_err(stage)?;
             self.engine
                 .load(&table.def, &table.staging, &rows)
                 .await
@@ -376,14 +421,14 @@ impl<E: Engine> SqlStore<E> {
                 .execute(&table.merge, &[])
                 .await
                 .map_err(StoreError::engine(Operation::Merge, name))?;
-            if let Some(drop) = &table.drop_staging {
+            if let Some(clear) = &table.clear_staging {
                 self.engine
-                    .execute(drop, &[])
+                    .execute(clear, &[])
                     .await
                     .map_err(StoreError::engine(Operation::Stage, name))?;
             }
         }
-        Ok(())
+        self.prune_ledger(tips).await
     }
 }
 
@@ -425,7 +470,8 @@ impl<E: Engine> EnvelopeSink for SqlStore<E> {
     /// A write that fails because the server closed the connection is written again once
     /// the engine [restores](Engine::recover) it: the batch stays buffered until a commit
     /// lands, and writing it again after a commit whose acknowledgement was lost upserts
-    /// onto itself (see the module docs).
+    /// onto itself (see the module docs). The restored connection is a new session, so
+    /// the staging tables are created on it first.
     async fn flush(&mut self) -> Result<(), SinkError> {
         let mut retries = 0;
         loop {
@@ -435,6 +481,7 @@ impl<E: Engine> EnvelopeSink for SqlStore<E> {
             if retries == RETRIES || !self.engine.recover().await? {
                 return Err(error.into());
             }
+            self.create_staging().await?;
             retries += 1;
         }
     }

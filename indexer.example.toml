@@ -94,6 +94,10 @@ tables = ["blocks", "transactions", "logs"]
 # The most records one commit may cover while storage is behind; at the tip a block
 # commits alone. Larger commits amortize each commit's fixed cost during a backfill.
 # batch_records = 20000
+# How long a block at the tip may wait, in milliseconds, so the blocks after it share its
+# commit: fewer commits on a fast chain, at up to this much more latency. 0 commits each
+# block as it arrives.
+# commit_wait_ms = 0
 
 # Delta Lake tables on object storage, one per table under `<uri>/<chain>/`: the cheap
 # raw-data lake. Requires the `delta` feature. Written at the tip; a reorg deletes the

@@ -21,8 +21,8 @@ pub trait Dialect {
     /// Makes `schema` the session's default, so later statements name tables unqualified.
     fn use_schema(schema: &str) -> String;
 
-    /// Creates `staging`, an empty table shaped like `table`, inside the flush's
-    /// transaction.
+    /// Creates `staging`, an empty table shaped like `table`, once a session: each flush
+    /// loads its rows of `table` into it, merges them, and leaves it empty again.
     fn create_staging(table: &TableDef, staging: &str) -> String;
 
     /// How a statement names `staging`.
@@ -31,8 +31,8 @@ pub trait Dialect {
         ident(staging)
     }
 
-    /// Drops `staging` after its merge, for an engine that does not drop it at commit.
-    fn drop_staging(staging: &str) -> Option<String>;
+    /// Empties `staging` after its merge, for an engine that does not empty it at commit.
+    fn clear_staging(staging: &str) -> Option<String>;
 
     /// Lists every table's columns in the session's schema, as table, name, and type
     /// rows in column order: one query for the startup check, not one a table.

@@ -397,7 +397,7 @@ impl<B: BlockSource + 'static> Pipeline<B> {
         #[cfg(feature = "postgres")]
         if let Some(postgres) = &settings.sink.postgres {
             let (settings, chain) = (postgres.clone(), chain.clone());
-            let batching = Batching::eager(postgres.batch_records);
+            let batching = postgres.batching();
             let opened = self.open_store(Backend::Postgres, batching, async move |schema| {
                 Ok(AnyStore::Postgres(
                     sink::PostgresSink::open(&settings, schema, &chain).await?,

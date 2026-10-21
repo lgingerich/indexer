@@ -180,7 +180,7 @@ impl Dialect for DuckDb {
     }
 
     // A temporary table is invisible to the appender, which looks up `main`, so staging
-    // is a table there, created and dropped inside the flush's transaction.
+    // is a table there, replaced when the store opens and emptied after each merge.
     fn create_staging(table: &TableDef, staging: &str) -> String {
         format!(
             "CREATE OR REPLACE TABLE {} AS SELECT * FROM {} WHERE false",
@@ -193,8 +193,8 @@ impl Dialect for DuckDb {
         format!("main.{}", ident(staging))
     }
 
-    fn drop_staging(staging: &str) -> Option<String> {
-        Some(format!("DROP TABLE {}", Self::staging(staging)))
+    fn clear_staging(staging: &str) -> Option<String> {
+        Some(format!("DELETE FROM {}", Self::staging(staging)))
     }
 }
 
@@ -350,6 +350,7 @@ mod tests {
     use duckdb::types::FromSql;
     use duckdb::{Connection, appender_params_from_iter};
 
+    use crate::ingest::pipeline::LEDGER_WINDOW;
     use crate::sink::table::{Schema, Table, TableId, Value};
     use crate::sink::{EnvelopeSink as _, Operation, SinkError, Store as _, StoreError};
     use crate::wire::envelope::{
@@ -684,7 +685,7 @@ mod tests {
             .execute_batch("DROP TABLE reorgs")
             .expect("remove a late table in the batch");
 
-        assert_failed(sink.flush().await, Operation::Stage, "reorgs");
+        assert_failed(sink.flush().await, Operation::Merge, "reorgs");
         assert_eq!(
             sink.buffered(),
             every_kind().len(),
@@ -957,7 +958,7 @@ mod tests {
             .connection
             .execute_batch("DROP TABLE reorgs")
             .expect("remove a table the batch writes");
-        assert_failed(sink.flush().await, Operation::Stage, "reorgs");
+        assert_failed(sink.flush().await, Operation::Merge, "reorgs");
         for (table, rows) in block_tables(&sink) {
             assert_eq!(
                 rows,
@@ -1039,9 +1040,9 @@ mod tests {
     }
 
     /// The ledger reads back the newest unorphaned accepted blocks of one chain, oldest
-    /// first, and drops that chain's rows below them.
+    /// first, and deletes nothing.
     #[tokio::test]
-    async fn the_ledger_reads_back_the_newest_canonical_window_and_prunes_below_it() {
+    async fn the_ledger_reads_back_the_newest_canonical_window() {
         let mut sink = sink().await;
         assert!(sink.ledger(&chain(), 3).await.expect("empty").is_empty());
         let mut envelopes: Vec<Envelope> = (1..=10)
@@ -1069,14 +1070,58 @@ mod tests {
                 &sink.engine.connection,
                 "SELECT height FROM accepted_blocks WHERE chain = 'base' ORDER BY height"
             ),
-            [7, 8, 9],
-            "the rows below the window and the orphaned row above were deleted"
+            [1, 2, 3, 4, 5, 6, 7, 8, 9],
+            "only the orphaned row was deleted"
         );
         assert_eq!(
             sink.ledger(&ChainId::new("ethereum"), 3)
                 .await
                 .expect("read back"),
             [accepted(1)],
+            "another chain's ledger is untouched"
+        );
+    }
+
+    /// A flush deletes a chain's ledger rows more than the window below the newest block it
+    /// accepts there, and leaves the other chains' rows and the window itself.
+    #[tokio::test]
+    async fn a_flush_prunes_the_ledger_below_the_window() {
+        let mut sink = sink().await;
+        let block = |height: u64| BlockMeta {
+            height,
+            hash: B256::from(U256::from(height)),
+            parent_hash: B256::from(U256::from(height - 1)),
+            timestamp: 1_700_000_000 + height,
+        };
+        let mut envelopes: Vec<Envelope> = (1..=3)
+            .map(|height| Envelope::new(chain(), Event::AcceptedBlock(block(height))))
+            .collect();
+        envelopes.push(Envelope::new(
+            ChainId::new("ethereum"),
+            Event::AcceptedBlock(block(1)),
+        ));
+        commit(&mut sink, envelopes).await;
+        let tip = LEDGER_WINDOW as u64 + 2;
+        commit(
+            &mut sink,
+            [Envelope::new(chain(), Event::AcceptedBlock(block(tip)))],
+        )
+        .await;
+
+        assert_eq!(
+            column::<u64>(
+                &sink.engine.connection,
+                "SELECT height FROM accepted_blocks WHERE chain = 'base' ORDER BY height"
+            ),
+            [2, 3, tip],
+            "the row more than the window below the tip was deleted"
+        );
+        assert_eq!(
+            column::<u64>(
+                &sink.engine.connection,
+                "SELECT height FROM accepted_blocks WHERE chain = 'ethereum'"
+            ),
+            [1],
             "another chain's ledger is untouched"
         );
     }

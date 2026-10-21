@@ -24,6 +24,7 @@ use tokio_postgres::types::{FromSql, IsNull, Kind, ToSql, Type, to_sql_checked};
 
 use crate::metrics;
 use crate::secret::Secret;
+use crate::sink::channel::Batching;
 use crate::sink::route::{Backend, Tables};
 use crate::sink::sql::{self, Dialect, ident};
 use crate::sink::store::{Engine, SqlStore};
@@ -42,6 +43,22 @@ pub struct PostgresSettings {
     /// Maximum records folded from queued blocks into one commit; blocks are never split.
     #[serde(default = "default_batch_records")]
     pub batch_records: usize,
+    /// How long, in milliseconds, a block at the tip may wait for its commit so the blocks
+    /// after it share that commit. Zero, the default, commits each block as it arrives.
+    #[serde(default)]
+    pub commit_wait_ms: u64,
+}
+
+impl PostgresSettings {
+    /// When the store commits: up to [`batch_records`](Self::batch_records) records, as
+    /// soon as they are gathered or once the oldest block has waited
+    /// [`commit_wait_ms`](Self::commit_wait_ms).
+    pub(crate) const fn batching(&self) -> Batching {
+        Batching {
+            wait: Duration::from_millis(self.commit_wait_ms),
+            ..Batching::eager(self.batch_records)
+        }
+    }
 }
 
 /// Twenty thousand: a backlog then commits in batches that take about half a second,
@@ -350,13 +367,14 @@ impl Dialect for Postgres {
 
     fn create_staging(table: &TableDef, staging: &str) -> String {
         format!(
-            "CREATE TEMP TABLE {} (LIKE {} INCLUDING DEFAULTS) ON COMMIT DROP",
+            "CREATE TEMP TABLE {} (LIKE {} INCLUDING DEFAULTS) ON COMMIT DELETE ROWS",
             ident(staging),
             ident(&table.name)
         )
     }
 
-    fn drop_staging(_: &str) -> Option<String> {
+    /// The commit empties it, in place, so the catalog is left as it was.
+    fn clear_staging(_: &str) -> Option<String> {
         None
     }
 }
@@ -955,10 +973,10 @@ mod tests {
     }
 
     /// The ledger reads back the newest unorphaned accepted blocks of one chain, oldest
-    /// first, and drops that chain's rows below them.
+    /// first, and deletes nothing.
     #[tokio::test]
     #[ignore = "requires INDEXER_TEST_POSTGRES_URL pointing to PostgreSQL 18"]
-    async fn the_ledger_reads_back_the_newest_canonical_window_and_prunes_below_it() {
+    async fn the_ledger_reads_back_the_newest_canonical_window() {
         use crate::wire::envelope::BlockMeta;
 
         let (client, scratch) = Scratch::create("ledger").await;
@@ -1004,14 +1022,81 @@ mod tests {
         );
         assert_eq!(
             count(&sink, Table::AcceptedBlock).await,
-            4,
-            "7 through 9 on base, and ethereum's row; 10 was deleted"
+            10,
+            "1 through 9 on base, and ethereum's row; only the orphaned 10 was deleted"
         );
         assert_eq!(
             sink.ledger(&ChainId::new("ethereum"), 3)
                 .await
                 .expect("read back"),
             [accepted(1)]
+        );
+
+        scratch.remove(sink).await;
+    }
+
+    /// A flush deletes a chain's ledger rows more than the window below the newest block it
+    /// accepts there, and leaves the other chains' rows and the window itself.
+    #[tokio::test]
+    #[ignore = "requires INDEXER_TEST_POSTGRES_URL pointing to PostgreSQL 18"]
+    async fn a_flush_prunes_the_ledger_below_the_window() {
+        use crate::ingest::pipeline::LEDGER_WINDOW;
+        use crate::wire::envelope::BlockMeta;
+
+        let (client, scratch) = Scratch::create("ledger_prune").await;
+        let schema = &scratch.schema;
+        let mut sink = dataset_sink(client, schema).await;
+        let block = |height: u64| BlockMeta {
+            height,
+            hash: B256::from(U256::from(height)),
+            parent_hash: B256::from(U256::from(height - 1)),
+            timestamp: 1_700_000_000 + height,
+        };
+        for height in 1..=3 {
+            sink.publish(Envelope::new(
+                ChainId::new("base"),
+                Event::AcceptedBlock(block(height)),
+            ))
+            .await
+            .expect("publish");
+        }
+        sink.publish(Envelope::new(
+            ChainId::new("ethereum"),
+            Event::AcceptedBlock(block(1)),
+        ))
+        .await
+        .expect("publish");
+        sink.flush().await.expect("commit");
+        let tip = LEDGER_WINDOW as u64 + 2;
+        sink.publish(Envelope::new(
+            ChainId::new("base"),
+            Event::AcceptedBlock(block(tip)),
+        ))
+        .await
+        .expect("publish");
+        sink.flush().await.expect("commit");
+
+        let heights = async |chain: &str| {
+            db(&sink)
+                .query(
+                    "SELECT height::BIGINT FROM accepted_blocks WHERE chain = $1 ORDER BY height",
+                    &[&chain],
+                )
+                .await
+                .expect("read back")
+                .iter()
+                .map(|row| row.get::<_, i64>(0))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            heights("base").await,
+            [2, 3, i64::try_from(tip).expect("small")],
+            "the row more than the window below the tip was deleted"
+        );
+        assert_eq!(
+            heights("ethereum").await,
+            [1],
+            "another chain's ledger is untouched"
         );
 
         scratch.remove(sink).await;
