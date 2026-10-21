@@ -15,17 +15,6 @@
 //! ```bash
 //! cargo run --release -- indexer.toml
 //! ```
-//!
-//! # Repartitioning the lake
-//!
-//! Temporary, until Ethereum's lake is rewritten: `indexer repartition <settings>` rewrites the lake the settings name to their
-//! `[sink.delta] partition_blocks`, and exits; a run whose width differs from the lake's
-//! refuses to start. Stop the run that writes the lake first. A rewrite that stops is
-//! carried on by running it again.
-//!
-//! ```bash
-//! cargo run --release --features delta -- repartition indexer.ethereum.toml
-//! ```
 
 use std::process::ExitCode;
 
@@ -57,20 +46,11 @@ const DEFAULT_LOG_LEVEL: LevelFilter = if cfg!(debug_assertions) {
     LevelFilter::ERROR
 };
 
-/// What the command line asks for: a run, or a repartition of the lake, each with its
-/// settings file's path, [`DEFAULT_SETTINGS`] when none is given.
-enum Command {
-    Run(String),
-    Repartition(String),
-}
-
-fn command() -> Command {
-    let mut args = std::env::args().skip(1);
-    let path = |path: Option<String>| path.unwrap_or_else(|| DEFAULT_SETTINGS.to_owned());
-    match args.next() {
-        Some(first) if first == "repartition" => Command::Repartition(path(args.next())),
-        first => Command::Run(path(first)),
-    }
+/// The settings file's path as given on the command line, or [`DEFAULT_SETTINGS`].
+fn settings_path() -> String {
+    std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| DEFAULT_SETTINGS.to_owned())
 }
 
 // Ingest's runtime: each store runs on one of its own (`sink::store_runtime`), which
@@ -87,21 +67,9 @@ async fn main() -> ExitCode {
         )
         .init();
 
-    let (path, ran) = match command() {
-        // Boxed: the whole run's state is one future, too large to keep on the stack.
-        Command::Run(path) => {
-            let ran = Box::pin(indexer::runtime::run(&path)).await;
-            (path, ran)
-        }
-        Command::Repartition(path) => {
-            #[cfg(feature = "delta")]
-            let ran = Box::pin(indexer::runtime::repartition(&path)).await;
-            #[cfg(not(feature = "delta"))]
-            let ran = no_lake(&path);
-            (path, ran)
-        }
-    };
-    match ran {
+    let path = settings_path();
+    // Boxed: the whole run's state is one future, too large to keep on the stack.
+    match Box::pin(indexer::runtime::run(&path)).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             // Display, not Debug: every variant in the chain prints its cause — `{source}`
@@ -118,13 +86,6 @@ async fn main() -> ExitCode {
             }
         }
     }
-}
-
-/// A repartition without the lake built in: no settings name one.
-#[cfg(not(feature = "delta"))]
-fn no_lake(path: &str) -> Result<(), indexer::runtime::RuntimeError> {
-    indexer::config::Settings::from_file(path)?;
-    Err(indexer::runtime::RuntimeError::NoLake)
 }
 
 #[cfg(test)]

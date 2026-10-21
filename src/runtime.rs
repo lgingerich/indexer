@@ -175,15 +175,6 @@ pub enum RuntimeError {
     /// The Prometheus endpoint could not be served: its address is taken or invalid.
     #[error("metrics endpoint could not be served: {0}")]
     Metrics(#[from] metrics_exporter_prometheus::BuildError),
-    /// A repartition was asked of settings that name no lake. Temporary, with
-    /// `repartition`.
-    #[error("the settings name no [sink.delta] to repartition")]
-    NoLake,
-    /// The lake could not be rewritten to its settings' partition width. Temporary, with
-    /// `repartition`.
-    #[cfg(feature = "delta")]
-    #[error("the lake could not be repartitioned: {0}")]
-    Repartition(sink::StoreError),
 }
 
 impl RuntimeError {
@@ -203,9 +194,6 @@ impl RuntimeError {
     pub fn is_config(&self) -> bool {
         match self {
             Self::Settings(_) | Self::Catalog(_) | Self::Route { .. } => true,
-            Self::NoLake => true,
-            #[cfg(feature = "delta")]
-            Self::Repartition(error) => error.is_permanent(),
             #[cfg(feature = "store")]
             Self::OpenStore { source, .. } => source.is_permanent(),
             #[cfg(feature = "store")]
@@ -642,38 +630,6 @@ pub async fn run(path: &str) -> Result<(), RuntimeError> {
         info!("stopped on request");
     }
     ran
-}
-
-/// Temporary, until Ethereum's lake is rewritten; deleted with `sink::delta::repartition`.
-///
-/// Rewrites the lake the settings at `path` name to their
-/// [`partition_blocks`](sink::DeltaSettings::partition_blocks): every table the run
-/// routes to `[sink.delta]`, as `indexer repartition <settings>` asks (see
-/// `sink::delta::repartition`). The lake's writer must be stopped first.
-///
-/// # Errors
-///
-/// Returns [`RuntimeError::NoLake`] when the settings name no lake, and
-/// [`RuntimeError::Repartition`] when a table cannot be rewritten; one already rewritten
-/// stays so, and a rerun carries on from the rest.
-#[cfg(feature = "delta")]
-pub async fn repartition(path: &str) -> Result<(), RuntimeError> {
-    let settings = Settings::from_file(path)?;
-    let Some(lake) = &settings.sink.delta else {
-        return Err(RuntimeError::NoLake);
-    };
-    let (schema, _) = Pipeline::from_settings(&settings)?.route(Backend::Delta);
-    info!(
-        settings = path,
-        chain = %settings.ingest.chain,
-        width = lake.partition_blocks,
-        "repartitioning the lake"
-    );
-    sink::delta::repartition(lake, &schema, &settings.ingest.chain)
-        .await
-        .map_err(RuntimeError::Repartition)?;
-    info!("lake repartitioned");
-    Ok(())
 }
 
 /// Waits for the first signal that asks the process to stop: `SIGTERM`, which `docker
