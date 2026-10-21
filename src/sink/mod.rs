@@ -284,7 +284,7 @@ pub(crate) mod fixtures {
 
         let mut schema = catalog("base").schema().clone();
         schema
-            .add_derived("test_rows", &[("amount", ColumnType::BigInt)])
+            .add_derived("test_rows", &[("amount", ColumnType::BigInt)], &[])
             .expect("a new table");
         let row = Derived {
             table: "test_rows".to_owned(),

@@ -347,6 +347,7 @@ impl Catalog {
                 signatures,
                 table,
                 columns,
+                indexes,
                 ..
             } = derivation;
             let Some(entry) = self.entry(protocol, contract) else {
@@ -364,7 +365,7 @@ impl Catalog {
                 continue;
             }
             self.schema
-                .add_derived(table, columns)
+                .add_derived(table, columns, indexes)
                 .map_err(|source| CatalogError::Table {
                     contract: self.label(entry),
                     source,

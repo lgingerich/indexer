@@ -90,7 +90,7 @@ impl Schema {
             .into_iter()
             .zip(params)
             .map(|(column, param)| Column::new(column, param.kind, param.nullable));
-        let table = self.add_log_table(TableId::Event(self.events.len()), name, own)?;
+        let table = self.add_log_table(TableId::Event(self.events.len()), name, own, &[])?;
         self.events
             .insert((protocol.to_owned(), contract.to_owned(), event_id), table);
         Ok(())
@@ -103,12 +103,14 @@ impl Schema {
     ///
     /// Returns [`TableError::DuplicateTable`], adding nothing, when a table is already
     /// named `name`, [`TableError::LongName`] when `name` would not fit a `PostgreSQL`
-    /// identifier, and [`TableError::DuplicateColumn`] when a column repeats one of the
-    /// log's, the block's, or the key's.
+    /// identifier, [`TableError::DuplicateColumn`] when a column repeats one of the
+    /// log's, the block's, or the key's, and [`TableError::UnknownColumn`] when one of
+    /// `indexes`, each its columns in order, names a column the table does not have.
     pub fn add_derived(
         &mut self,
         name: &str,
         columns: &[(&'static str, ColumnType)],
+        indexes: &[&[&'static str]],
     ) -> Result<TableId, TableError> {
         let id = TableId::Derived(self.derived.len());
         let own = TRANSACTION
@@ -119,18 +121,19 @@ impl Schema {
                     .iter()
                     .map(|&(column, kind)| Column::new(column, kind, false)),
             );
-        let table = self.add_log_table(id, name.to_owned(), own)?;
+        let table = self.add_log_table(id, name.to_owned(), own, indexes)?;
         self.derived.insert(name.to_owned(), table);
         Ok(id)
     }
 
     /// Adds a table anchored to one log, written: the log's columns, `own`, then the
-    /// block's, reorged by the block.
+    /// block's, reorged by the block, and indexed on `indexes` beside the block.
     fn add_log_table(
         &mut self,
         id: TableId,
         name: String,
         own: impl IntoIterator<Item = Column>,
+        indexes: &[&[&'static str]],
     ) -> Result<Arc<TableDef>, TableError> {
         if self.tables.iter().any(|table| table.name == name) {
             return Err(TableError::DuplicateTable { table: name });
@@ -148,7 +151,11 @@ impl Schema {
         {
             table = table.column(column);
         }
-        let table = Arc::new(table.reorg_by("block_hash", "block_number").build()?);
+        let table = indexes.iter().fold(
+            table.reorg_by("block_hash", "block_number"),
+            |table, columns| table.index(columns),
+        );
+        let table = Arc::new(table.build()?);
         self.written.insert(id);
         self.tables.push(Arc::clone(&table));
         Ok(table)
@@ -741,7 +748,9 @@ mod tests {
 
     fn derived_schema() -> Schema {
         let mut schema = Schema::new().expect("the dataset tables");
-        let id = schema.add_derived("p_rows", &COLUMNS).expect("a new table");
+        let id = schema
+            .add_derived("p_rows", &COLUMNS, &[])
+            .expect("a new table");
         assert_eq!(id, TableId::Derived(0));
         schema
     }
@@ -801,12 +810,12 @@ mod tests {
         assert_eq!(table.block_number.as_deref(), Some("block_number"));
         let long = "p".repeat(MAX_IDENTIFIER + 1);
         assert!(matches!(
-            schema.add_derived(&long, &COLUMNS),
+            schema.add_derived(&long, &COLUMNS, &[]),
             Err(TableError::LongName { table }) if table == long
         ));
         assert_eq!(
             schema
-                .add_derived(&"p".repeat(MAX_IDENTIFIER), &COLUMNS)
+                .add_derived(&"p".repeat(MAX_IDENTIFIER), &COLUMNS, &[])
                 .expect("a name at the limit"),
             TableId::Derived(1)
         );

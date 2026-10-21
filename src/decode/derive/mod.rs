@@ -70,6 +70,9 @@ pub(super) struct Derivation {
     pub(super) table: &'static str,
     /// The table's own columns, in order: what follows the log's columns.
     pub(super) columns: &'static [(&'static str, ColumnType)],
+    /// The indexes the app's reads need, each its columns in order, beside the ones every
+    /// table has by block.
+    pub(super) indexes: &'static [&'static [&'static str]],
     /// One record's rows, each a value per column in order. A record may derive none.
     pub(super) derive: fn(&Decoded) -> Result<Vec<Vec<TypedValue>>, DeriveError>,
 }

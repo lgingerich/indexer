@@ -669,7 +669,7 @@ impl<'a> FromSql<'a> for Value {
 mod tests {
     use alloy_primitives::B256;
 
-    use crate::sink::table::Table;
+    use crate::sink::table::{Table, TableId};
     use crate::sink::{EnvelopeSink as _, SinkError};
     use crate::wire::envelope::{ChainId, Envelope, Event, Reorg, StoredContract};
 
@@ -766,9 +766,10 @@ mod tests {
                 .map(|column| format!(" (\"chain\", \"{column}\")"))
                 .collect();
             let indexes = sql::create_indexes::<Postgres>(table);
-            assert_eq!(
-                indexes.len(),
-                by_block.len(),
+            // A derived table adds the indexes its reads need after the block's.
+            let derived = matches!(table.id, TableId::Derived(_));
+            assert!(
+                indexes.len() == by_block.len() || derived && indexes.len() > by_block.len(),
                 "{label} is indexed by block exactly when a reorg deletes from it: {indexes:?}"
             );
             for (index, columns) in indexes.iter().zip(&by_block) {
@@ -793,6 +794,47 @@ mod tests {
                 );
                 assert!(ddl.contains(&definition), "{definition} missing from {ddl}");
             }
+        }
+    }
+
+    /// The derived tables the app reads by pool or account carry the indexes those reads
+    /// use, after the block's.
+    #[test]
+    fn the_metric_tables_are_indexed_for_the_apps_reads() {
+        let schema = crate::sink::fixtures::schema();
+        for (table, expected) in [
+            (
+                "metric_v1_swaps",
+                &[r#"("chain", "address", "block_number", "log_index")"#][..],
+            ),
+            (
+                "metric_v1_bin_fills",
+                &[r#"("chain", "address", "block_number")"#],
+            ),
+            (
+                "metric_v1_liquidity",
+                &[
+                    r#"("chain", "owner")"#,
+                    r#"("chain", "transaction_from_address")"#,
+                    r#"("chain", "address", "owner")"#,
+                ],
+            ),
+            (
+                "metric_v1_pool_bins",
+                &[r#"("chain", "pool", "transaction_from_address")"#],
+            ),
+        ] {
+            let def = schema
+                .derived_table(table)
+                .unwrap_or_else(|| panic!("the shipped catalog declares {table}"));
+            let indexes = sql::create_indexes::<Postgres>(def);
+            let added: Vec<&str> = indexes
+                .iter()
+                .skip(2)
+                .map(|index| index.rsplit_once(" ON ").map_or("", |(_, on)| on))
+                .map(|on| on.trim_start_matches(&format!("\"{table}\" ")))
+                .collect();
+            assert_eq!(added, expected, "{table}: {indexes:?}");
         }
     }
 

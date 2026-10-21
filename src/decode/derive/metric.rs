@@ -76,6 +76,8 @@ pub(super) const SWAPS: Derivation = Derivation {
         ("platform_spread_fee_scaled", ColumnType::BigInt),
         ("platform_notional_fee_scaled", ColumnType::BigInt),
     ],
+    // A pool's swaps, paged in log order.
+    indexes: &[&["chain", "address", "block_number", "log_index"]],
     derive: swap,
 };
 
@@ -118,6 +120,8 @@ pub(super) const BIN_FILLS: Derivation = Derivation {
         ("lp_fee_scaled", ColumnType::BigInt),
         ("platform_fee_scaled", ColumnType::BigInt),
     ],
+    // A pool's fills, by block.
+    indexes: &[&["chain", "address", "block_number"]],
     derive: bin_fill,
 };
 
@@ -152,6 +156,13 @@ pub(super) const LIQUIDITY: Derivation = Derivation {
         ("delta0_scaled", ColumnType::BigInt),
         ("delta1_scaled", ColumnType::BigInt),
         ("shares", ColumnType::BigInt),
+    ],
+    // An account's positions: the rows it owns or sent, then every row of those
+    // positions.
+    indexes: &[
+        &["chain", "owner"],
+        &["chain", "transaction_from_address"],
+        &["chain", "address", "owner"],
     ],
     derive: liquidity,
 };
@@ -252,6 +263,8 @@ pub(super) const POOL_BINS: Derivation = Derivation {
         ("lower_e6", ColumnType::Int),
         ("upper_e6", ColumnType::Int),
     ],
+    // A pool's deployer, read from the index alone.
+    indexes: &[&["chain", "pool", "transaction_from_address"]],
     derive: pool_bins,
 };
 
