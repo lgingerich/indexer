@@ -59,8 +59,8 @@ commit_interval_secs = 150
 # How many heights one partition covers: about a day of Ethereum. A restart reads the
 # newest one or two partitions, and the tip's small files pile up in the newest until
 # compaction closes it, so the default 100,000 (two weeks) made opening take most of an
-# hour. The lake's tables record their width and refuse another; changing this means
-# rewriting them with `indexer repartition indexer.ethereum.toml`.
+# hour. The lake's tables record their width and refuse another, so changing this means
+# rewriting them.
 partition_blocks = 7200
 
 [sink.delta.storage]

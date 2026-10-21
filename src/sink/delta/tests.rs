@@ -1340,6 +1340,3 @@ async fn opening_an_older_table_gives_it_the_statistics_columns() {
             .into()]
     );
 }
-
-// Temporary, deleted with `super::repartition`.
-mod repartition;

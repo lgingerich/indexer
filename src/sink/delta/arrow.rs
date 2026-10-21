@@ -39,8 +39,8 @@ pub(super) const PARTITION: &str = "block_range";
 
 /// The table property that records how many block heights one of the table's partitions
 /// covers. Rows stay in the partition they were written to, so the width is the table's,
-/// not the run's: a run whose settings name another one is refused at open, and only a
-/// [repartition](super::repartition) changes it.
+/// not the run's: a run whose settings name another one is refused at open, and only
+/// rewriting the table changes it.
 pub(super) const PARTITION_BLOCKS: &str = "indexer.partition_blocks";
 
 /// The partition width of a table that records none: every table written before the

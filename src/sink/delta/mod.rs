@@ -66,9 +66,6 @@
 
 mod arrow;
 mod maintenance;
-// Temporary: the one-off rewrite of a lake to another width, deleted once Ethereum's is
-// rewritten. Nothing outside it and the `repartition` subcommand uses it.
-mod repartition;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -110,7 +107,6 @@ use crate::wire::envelope::{BlockMeta, ChainId, Envelope, StoredContract};
 
 use self::arrow::{PARTITION, UINT_PRECISION};
 use self::maintenance::Maintenance;
-pub use self::repartition::repartition;
 
 /// How many tables an open, a repair, or a delete across the lake works on at once:
 /// enough to hide the store's latency, few enough not to flood it with requests.
