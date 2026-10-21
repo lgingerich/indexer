@@ -136,8 +136,8 @@ pub(crate) fn upsert<D: Dialect>(table: &TableDef, staging: &str) -> String {
 /// Deletes chain `$1`'s rows of the blocks listed in `$3`, all at height `$2` or above,
 /// for a table whose rows belong to a block: one statement for every block a reorg
 /// orphans, so a remote database pays one round trip a table rather than one a block.
-/// The height bound lets `DuckDB`, which keeps no index on the hash, skip the row groups
-/// below the reorg.
+/// The height bound is what finds them: `PostgreSQL` reads the block index from the reorg
+/// on, and `DuckDB`, which keeps no index, skips the row groups below it.
 pub(crate) fn delete_blocks<D: Dialect>(table: &TableDef) -> Option<String> {
     let (hash, number) = table.block_hash.as_ref().zip(table.block_number.as_ref())?;
     Some(format!(
@@ -152,10 +152,10 @@ pub(crate) fn delete_blocks<D: Dialect>(table: &TableDef) -> Option<String> {
 /// whose rows belong to a block: one statement for the whole rewind, so a remote database
 /// pays one round trip a table rather than one a block.
 ///
-/// The blocks are named by hash from the ledger, so the hash index serves the delete; a
-/// delete by height alone would scan. The height bound lets `DuckDB`, which keeps no index
-/// on the hash, skip the row groups below. Run against the ledger last: its rows are what
-/// the others are found by.
+/// The height bound finds the rows: `PostgreSQL` reads the block index above it, and
+/// `DuckDB`, which keeps no index, skips the row groups below. The hashes, from the
+/// ledger, keep the delete to blocks it accepted. Run against the ledger last: its rows
+/// are what the others are found by.
 pub(crate) fn delete_above(table: &TableDef, ledger: &TableDef) -> Option<String> {
     let (hash, number) = table.block_hash.as_ref().zip(table.block_number.as_ref())?;
     let (ledger_hash, ledger_number) = ledger

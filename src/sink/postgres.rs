@@ -762,8 +762,7 @@ mod tests {
             );
             let by_block: Vec<String> = block
                 .into_iter()
-                .flat_map(|(hash, number)| [hash, number])
-                .map(|column| format!(" (\"chain\", \"{column}\")"))
+                .map(|(_, number)| format!(" (\"chain\", \"{number}\")"))
                 .collect();
             let indexes = sql::create_indexes::<Postgres>(table);
             // A derived table adds the indexes its reads need after the block's.
@@ -830,7 +829,7 @@ mod tests {
             let indexes = sql::create_indexes::<Postgres>(def);
             let added: Vec<&str> = indexes
                 .iter()
-                .skip(2)
+                .skip(1)
                 .map(|index| index.rsplit_once(" ON ").map_or("", |(_, on)| on))
                 .map(|on| on.trim_start_matches(&format!("\"{table}\" ")))
                 .collect();
