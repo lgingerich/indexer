@@ -365,17 +365,22 @@ impl Dialect for Postgres {
         format!("SET search_path TO {}", ident(schema))
     }
 
+    /// A temp table emptied by a `DELETE` after its merge, not `ON COMMIT DELETE ROWS`: a
+    /// commit that touched any temp table truncates every such table in the session,
+    /// rebuilding each one's toast index and dropping its cached catalog entry, which the
+    /// next use reads back from `pg_class`, `pg_attribute`, and `pg_index`.
     fn create_staging(table: &TableDef, staging: &str) -> String {
         format!(
-            "CREATE TEMP TABLE {} (LIKE {} INCLUDING DEFAULTS) ON COMMIT DELETE ROWS",
+            "CREATE TEMP TABLE {} (LIKE {} INCLUDING DEFAULTS)",
             ident(staging),
             ident(&table.name)
         )
     }
 
-    /// The commit empties it, in place, so the catalog is left as it was.
-    fn clear_staging(_: &str) -> Option<String> {
-        None
+    /// Autovacuum never visits a temp table, so the session reclaims what its deletes left.
+    fn vacuum_staging(staging: &[&str]) -> Option<String> {
+        let tables = staging.iter().map(|name| ident(name)).collect::<Vec<_>>();
+        Some(format!("VACUUM {}", tables.join(", ")))
     }
 }
 
@@ -1564,5 +1569,49 @@ mod tests {
             .await
             .expect("connection task")
             .expect("connection closes");
+    }
+
+    /// A flush leaves its staging tables' deleted rows in place until they have taken
+    /// twenty thousand rows, then vacuums them back to empty files.
+    #[tokio::test]
+    #[ignore = "requires INDEXER_TEST_POSTGRES_URL pointing to PostgreSQL 18"]
+    async fn staging_tables_are_vacuumed_once_they_take_enough_rows() {
+        async fn staged_bytes(sink: &PostgresSink) -> i64 {
+            db(sink)
+                .query_one(
+                    "SELECT sum(pg_relation_size(oid))::BIGINT FROM pg_class \
+                     WHERE relpersistence = 't' AND relname LIKE 'staging\\_%'",
+                    &[],
+                )
+                .await
+                .expect("staging size")
+                .get(0)
+        }
+
+        let (client, scratch) = Scratch::create("vacuum").await;
+        let mut sink = dataset_sink(client, &scratch.schema).await;
+        let chain = ChainId::new("base");
+        let publish = async |sink: &mut PostgresSink, heads: std::ops::Range<u64>| {
+            for head in heads {
+                let reorg = Reorg {
+                    height: head,
+                    new_head_hash: B256::from(U256::from(head)),
+                    orphaned_hashes: vec![B256::ZERO],
+                };
+                sink.publish(Envelope::new(chain.clone(), Event::Reorg(reorg)))
+                    .await
+                    .expect("publish");
+            }
+            sink.flush().await.expect("commit");
+        };
+        publish(&mut sink, 0..100).await;
+        assert!(
+            staged_bytes(&sink).await > 0,
+            "a delete leaves the table's pages"
+        );
+        publish(&mut sink, 100..20_000).await;
+        assert_eq!(count(&sink, Table::Reorg).await, 20_000);
+        assert_eq!(staged_bytes(&sink).await, 0, "the vacuum empties the files");
+        scratch.remove(sink).await;
     }
 }

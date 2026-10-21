@@ -31,8 +31,19 @@ pub trait Dialect {
         ident(staging)
     }
 
-    /// Empties `staging` after its merge, for an engine that does not empty it at commit.
-    fn clear_staging(staging: &str) -> Option<String>;
+    /// Empties `staging` after its merge, in the flush's transaction.
+    #[must_use]
+    fn clear_staging(staging: &str) -> String {
+        format!("DELETE FROM {}", Self::staging(staging))
+    }
+
+    /// Reclaims the space the deletes of [`clear_staging`](Self::clear_staging) left in
+    /// the staging tables `staging`, run between transactions; `None` for an engine that
+    /// needs no such step.
+    #[must_use]
+    fn vacuum_staging(_staging: &[&str]) -> Option<String> {
+        None
+    }
 
     /// Lists every table's columns in the session's schema, as table, name, and type
     /// rows in column order: one query for the startup check, not one a table.

@@ -17,7 +17,9 @@
 //!
 //! The staging tables are created once a session, not once a flush: a table created and
 //! dropped every commit churns the database's catalog, which at the tip costs more than
-//! the few rows it stages.
+//! the few rows it stages. A flush empties the ones it loaded with a `DELETE`, and once
+//! a table has staged twenty thousand rows since it was last vacuumed, the store vacuums
+//! it after the commit, on an engine that needs it.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -70,6 +72,11 @@ pub trait Engine: Send {
 /// stands, so a connection that keeps failing as soon as it is restored stops the store.
 const RETRIES: usize = 3;
 
+/// How many rows a staging table takes before the store vacuums it: about one backlog
+/// commit, which leaves it some ten megabytes of dead rows, and at the tip one vacuum in
+/// hundreds of commits. Vacuuming that many takes milliseconds.
+const VACUUM_ROWS: usize = 20_000;
+
 /// One table, with every statement a flush runs against it rendered once.
 #[derive(Debug)]
 struct Prepared {
@@ -79,7 +86,9 @@ struct Prepared {
     staging: String,
     create_staging: String,
     merge: String,
-    clear_staging: Option<String>,
+    clear_staging: String,
+    /// Rows loaded into the staging table since it was created or last vacuumed.
+    staged: usize,
     delete: Option<String>,
     /// What a rewind runs: every block above a height, in one statement.
     delete_above: Option<String>,
@@ -92,6 +101,7 @@ impl Prepared {
             create_staging: D::create_staging(def, &staging),
             merge: sql::upsert::<D>(def, &staging),
             clear_staging: D::clear_staging(&staging),
+            staged: 0,
             delete: sql::delete_blocks::<D>(def),
             delete_above: sql::delete_above(def, ledger),
             staging,
@@ -226,7 +236,37 @@ impl<E: Engine> SqlStore<E> {
         self.engine
             .execute(&create, &[])
             .await
-            .map_err(StoreError::engine(Operation::Stage, None))
+            .map_err(StoreError::engine(Operation::Stage, None))?;
+        for table in &mut self.tables {
+            table.staged = 0;
+        }
+        Ok(())
+    }
+
+    /// Vacuums, in one statement, every staging table that has taken [`VACUUM_ROWS`]
+    /// since it was last vacuumed. Runs between transactions, as a vacuum must.
+    async fn vacuum_staging(&mut self) -> Result<(), StoreError> {
+        let full = self
+            .tables
+            .iter()
+            .filter(|table| table.staged >= VACUUM_ROWS)
+            .map(|table| table.staging.as_str())
+            .collect::<Vec<_>>();
+        if full.is_empty() {
+            return Ok(());
+        }
+        if let Some(vacuum) = E::Dialect::vacuum_staging(&full) {
+            self.engine
+                .execute(&vacuum, &[])
+                .await
+                .map_err(StoreError::engine(Operation::Stage, None))?;
+        }
+        for table in &mut self.tables {
+            if table.staged >= VACUUM_ROWS {
+                table.staged = 0;
+            }
+        }
+        Ok(())
     }
 
     /// The contracts discovered on `chain` that this store holds. One created in a block a
@@ -305,7 +345,8 @@ impl<E: Engine> SqlStore<E> {
         self.batch.rows.len()
     }
 
-    /// Writes the batch in one transaction, then clears it.
+    /// Writes the batch in one transaction, clears it, then vacuums the staging tables that
+    /// are due. A vacuum that fails fails the flush, though its batch is committed.
     async fn write_batch(&mut self) -> Result<(), StoreError> {
         if self.batch.is_empty() {
             return Ok(());
@@ -325,7 +366,7 @@ impl<E: Engine> SqlStore<E> {
             .await
             .map_err(StoreError::engine(Operation::Commit, None))?;
         self.batch.clear();
-        Ok(())
+        self.vacuum_staging().await
     }
 
     /// Deletes every block above `height` from each table whose rows belong to one.
@@ -408,10 +449,12 @@ impl<E: Engine> SqlStore<E> {
                 *tip = (*tip).max(*height);
             }
         }
-        for table in &self.tables {
+        for table in &mut self.tables {
             let Some(rows) = grouped.remove(&table.def.id) else {
                 continue;
             };
+            // Counted before the load, since rows a failed transaction loaded are dead too.
+            table.staged += rows.len();
             let name = Some(table.def.name.as_str());
             self.engine
                 .load(&table.def, &table.staging, &rows)
@@ -421,12 +464,10 @@ impl<E: Engine> SqlStore<E> {
                 .execute(&table.merge, &[])
                 .await
                 .map_err(StoreError::engine(Operation::Merge, name))?;
-            if let Some(clear) = &table.clear_staging {
-                self.engine
-                    .execute(clear, &[])
-                    .await
-                    .map_err(StoreError::engine(Operation::Stage, name))?;
-            }
+            self.engine
+                .execute(&table.clear_staging, &[])
+                .await
+                .map_err(StoreError::engine(Operation::Stage, name))?;
         }
         self.prune_ledger(tips).await
     }

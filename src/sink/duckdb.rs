@@ -192,10 +192,6 @@ impl Dialect for DuckDb {
     fn staging(staging: &str) -> String {
         format!("main.{}", ident(staging))
     }
-
-    fn clear_staging(staging: &str) -> Option<String> {
-        Some(format!("DELETE FROM {}", Self::staging(staging)))
-    }
 }
 
 impl Engine for DuckDb {
