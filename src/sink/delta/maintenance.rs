@@ -42,8 +42,8 @@ use tokio::task::JoinHandle;
 use tokio::time::{Instant, MissedTickBehavior};
 use tracing::{info, warn};
 
-use super::arrow::{PARTITION, PARTITION_BLOCKS};
-use super::commit_properties;
+use super::arrow::PARTITION;
+use super::{commit_properties, partition_width};
 use crate::ingest::pipeline::MAX_UNFINALIZED_BLOCKS;
 use crate::metrics;
 
@@ -140,6 +140,8 @@ pub(super) async fn compact(
     writer: &WriterProperties,
 ) -> Result<usize, DeltaTableError> {
     table.update_state().await?;
+    let width = partition_width(table, name)
+        .map_err(|error| DeltaTableError::Generic(error.to_string()))?;
     let mut small: BTreeMap<i64, usize> = BTreeMap::new();
     for file in table.snapshot()?.snapshot().try_log_data()?.iter() {
         let Some(Some(partition)) = file.partition_values_map().remove(PARTITION) else {
@@ -148,7 +150,7 @@ pub(super) async fn compact(
         let Ok(partition) = partition.parse::<i64>() else {
             continue;
         };
-        if file.size() < SMALL_FILE_BYTES && finished(partition, tip) {
+        if file.size() < SMALL_FILE_BYTES && finished(partition, width, tip) {
             *small.entry(partition).or_default() += 1;
         }
     }
@@ -179,14 +181,15 @@ pub(super) async fn compact(
     Ok(compacted)
 }
 
-/// Whether nothing at `tip` or after can still write to `partition`: the tip is past its
-/// last height by more than the deepest reorg the pipeline retracts.
-fn finished(partition: i64, tip: u64) -> bool {
+/// Whether nothing at `tip` or after can still write to `partition`, `width` heights
+/// wide: the tip is past its last height by more than the deepest reorg the pipeline
+/// retracts.
+fn finished(partition: i64, width: u64, tip: u64) -> bool {
     let Ok(partition) = u64::try_from(partition) else {
         return false;
     };
     (partition + 1)
-        .saturating_mul(PARTITION_BLOCKS)
+        .saturating_mul(width)
         .saturating_add(MAX_UNFINALIZED_BLOCKS as u64)
         <= tip
 }

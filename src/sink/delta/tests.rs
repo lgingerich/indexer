@@ -48,7 +48,16 @@ impl Dir {
             max_buffer_bytes: usize::MAX,
             maintenance: false,
             vacuum_retention_hours: 168,
+            partition_blocks: 100_000,
             storage: std::collections::BTreeMap::new(),
+        }
+    }
+
+    /// [`settings`](Self::settings), `width` heights a partition.
+    fn settings_at(&self, width: u64) -> DeltaSettings {
+        DeltaSettings {
+            partition_blocks: width,
+            ..self.settings()
         }
     }
 
@@ -65,13 +74,17 @@ impl Drop for Dir {
 }
 
 async fn open(dir: &Dir) -> DeltaSink {
+    open_at(dir, 100_000).await.expect("the lake opens")
+}
+
+/// Opens the lake in `dir`, `width` heights a partition.
+async fn open_at(dir: &Dir, width: u64) -> Result<DeltaSink, StoreError> {
     DeltaSink::open(
-        &dir.settings(),
+        &dir.settings_at(width),
         Arc::new(Schema::new().expect("the dataset tables")),
         CHAIN,
     )
     .await
-    .expect("the lake opens")
 }
 
 /// The block at `height` on `branch`: 0 is the canonical chain, anything else a fork.
@@ -1184,3 +1197,149 @@ async fn opening_hands_on_contracts_as_repaired() {
         "the stray contract is gone"
     );
 }
+
+/// A lake written at one width is refused by a run at another, which names the way out,
+/// and a new lake records its width so the next open is checked against it.
+#[tokio::test]
+async fn a_lake_at_another_width_is_refused() {
+    let dir = Dir::new();
+    drop(
+        open_at(&dir, 50_000)
+            .await
+            .expect("a new lake opens at any width"),
+    );
+
+    let error = open_at(&dir, 100_000)
+        .await
+        .expect_err("the width is the lake's");
+    assert!(
+        matches!(&error, StoreError::Drift { difference, .. }
+            if difference.contains("50000 heights wide, not 100000")),
+        "{error:?}"
+    );
+    open_at(&dir, 50_000)
+        .await
+        .expect("the lake's own width opens");
+}
+
+/// A partition narrower than the ledger window is refused: the newest two would not
+/// always hold all of it.
+#[test]
+fn a_partition_narrower_than_the_ledger_window_is_refused() {
+    let settings = |width: u64| {
+        toml::from_str::<DeltaSettings>(&format!(
+            "tables = [\"blocks\"]\nuri = \"/tmp/lake\"\npartition_blocks = {width}"
+        ))
+    };
+    let window = crate::ingest::pipeline::LEDGER_WINDOW as u64;
+    let error = settings(window - 1).expect_err("too narrow");
+    assert!(error.to_string().contains("at least 4097"), "{error}");
+    assert_eq!(
+        settings(window).expect("wide enough").partition_blocks,
+        window
+    );
+    assert_eq!(
+        toml::from_str::<DeltaSettings>("tables = [\"blocks\"]\nuri = \"/tmp/lake\"")
+            .expect("parses")
+            .partition_blocks,
+        100_000
+    );
+}
+
+/// The columns each of `table`'s files records a minimum of, as its log entry holds it.
+fn stats_kept(sink: &DeltaSink, table: Table) -> Vec<BTreeSet<String>> {
+    sink.lake(table)
+        .table
+        .snapshot()
+        .expect("a snapshot")
+        .snapshot()
+        .try_log_data()
+        .expect("the file list")
+        .iter()
+        .map(|file| {
+            let stats: serde_json::Value =
+                serde_json::from_str(&file.stats().expect("the file's statistics"))
+                    .expect("statistics are JSON");
+            stats["minValues"]
+                .as_object()
+                .expect("minimums")
+                .iter()
+                .filter(|(_, minimum)| !minimum.is_null())
+                .map(|(column, _)| column.clone())
+                .collect()
+        })
+        .collect()
+}
+
+/// Makes `table` in `dir` keep statistics on `columns` alone, as a table written
+/// before the store chose its own did.
+async fn keep_stats_on(dir: &Dir, table: Table, columns: &str) {
+    let schema = Schema::new().expect("the dataset tables");
+    let url = ensure_table_uri(dir.table(&schema.dataset(table).name)).expect("a table url");
+    deltalake::open_table(url)
+        .await
+        .expect("the table")
+        .set_tbl_properties()
+        .with_properties([(super::STATS_COLUMNS.to_owned(), columns.to_owned())].into())
+        .await
+        .expect("set");
+}
+
+/// Each table's files keep statistics on its block height and timestamps, wherever in
+/// the table they fall: `transactions` holds them past its 32nd column, Delta's default
+/// reach.
+#[tokio::test]
+async fn every_file_keeps_statistics_on_its_height_and_timestamps() {
+    assert_eq!(
+        super::STATS_COLUMNS,
+        deltalake::TableProperty::DataSkippingStatsColumns.as_ref()
+    );
+    let dir = Dir::new();
+    let mut sink = open(&dir).await;
+    publish(&mut sink, block(1, 0)).await;
+    publish(&mut sink, block(2, 0)).await;
+    let mut replaced = vec![reorg(2..=2, 1)];
+    replaced.extend(block(2, 1));
+    publish(&mut sink, replaced).await;
+    let set = |columns: &[&str]| -> BTreeSet<String> {
+        columns.iter().map(|column| (*column).to_owned()).collect()
+    };
+    for (table, columns) in [
+        (Table::Block, set(&["number", "timestamp"])),
+        (
+            Table::Transaction,
+            set(&["block_number", "block_timestamp"]),
+        ),
+        (Table::Log, set(&["block_number", "block_timestamp"])),
+        (Table::AcceptedBlock, set(&["height", "timestamp"])),
+        (Table::Reorg, set(&["height"])),
+    ] {
+        let kept = stats_kept(&sink, table);
+        assert!(!kept.is_empty(), "{table:?} has files");
+        assert!(
+            kept.iter().all(|kept| *kept == columns),
+            "{table:?}: {kept:?}"
+        );
+    }
+}
+
+/// A table that names other statistics columns, as one written before the store chose
+/// its own does, is given the store's at open, and the files written from then on keep
+/// them.
+#[tokio::test]
+async fn opening_an_older_table_gives_it_the_statistics_columns() {
+    let dir = Dir::new();
+    drop(open(&dir).await);
+    keep_stats_on(&dir, Table::Transaction, "hash").await;
+    let mut sink = open(&dir).await;
+    publish(&mut sink, block(1, 0)).await;
+    assert_eq!(
+        stats_kept(&sink, Table::Transaction),
+        [["block_number", "block_timestamp"]
+            .map(str::to_owned)
+            .into()]
+    );
+}
+
+// Temporary, deleted with `super::repartition`.
+mod repartition;

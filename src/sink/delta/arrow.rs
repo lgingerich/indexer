@@ -16,7 +16,8 @@
 //! | `List` | `array` | Of the element's type. |
 //!
 //! A table whose rows belong to a block also gets a [`PARTITION`] column: the block
-//! height divided by [`PARTITION_BLOCKS`]. It is what a reorg's delete is bounded by.
+//! height divided by the table's partition width (see [`PARTITION_BLOCKS`]). It is what
+//! a reorg's delete is bounded by.
 
 use std::sync::Arc;
 
@@ -36,10 +37,15 @@ use crate::sink::table::{ColumnType, Row, TableDef, Value};
 /// The partition column of every table whose rows belong to a block.
 pub(super) const PARTITION: &str = "block_range";
 
-/// How many block heights one partition covers: about 2.3 days of Base, two weeks of
-/// Ethereum. A constant, not a setting, because rows stay in the partition they were
-/// written to: a table whose width changed could no longer bound a delete by it.
-pub(super) const PARTITION_BLOCKS: u64 = 100_000;
+/// The table property that records how many block heights one of the table's partitions
+/// covers. Rows stay in the partition they were written to, so the width is the table's,
+/// not the run's: a run whose settings name another one is refused at open, and only a
+/// [repartition](super::repartition) changes it.
+pub(super) const PARTITION_BLOCKS: &str = "indexer.partition_blocks";
+
+/// The partition width of a table that records none: every table written before the
+/// width was a setting, and the setting's default.
+pub(super) const DEFAULT_PARTITION_BLOCKS: u64 = 100_000;
 
 /// Digits of a `Uint` column: `u64::MAX` has 20.
 pub(super) const UINT_PRECISION: u8 = 20;
@@ -94,7 +100,7 @@ pub(super) fn partitioned(def: &TableDef) -> Option<&str> {
 }
 
 /// `rows` of one table as a batch of `schema`, each row in the partition its block height
-/// falls in.
+/// falls in, `width` heights to a partition.
 ///
 /// # Errors
 ///
@@ -103,6 +109,7 @@ pub(super) fn partitioned(def: &TableDef) -> Option<&str> {
 pub(super) fn record_batch(
     schema: &Arc<ArrowSchema>,
     def: &TableDef,
+    width: u64,
     rows: &[&Row],
 ) -> Result<RecordBatch, ArrowError> {
     let mut columns: Vec<ArrayRef> = Vec::with_capacity(schema.fields().len());
@@ -120,7 +127,7 @@ pub(super) fn record_batch(
             .iter()
             .map(|row| {
                 row.block_number()
-                    .map(partition_of)
+                    .map(|height| partition_of(height, width))
                     .ok_or_else(|| invalid(&def.name, height))
             })
             .collect::<Result<Int64Array, _>>()?;
@@ -129,10 +136,11 @@ pub(super) fn record_batch(
     RecordBatch::try_new(Arc::clone(schema), columns)
 }
 
-/// The partition a block at `height` falls in.
-pub(super) fn partition_of(height: u64) -> i64 {
-    // `u64::MAX` divided by the width is far inside `i64`, so this never saturates.
-    i64::try_from(height / PARTITION_BLOCKS).unwrap_or(i64::MAX)
+/// The partition a block at `height` falls in, `width` heights to a partition.
+pub(super) fn partition_of(height: u64, width: u64) -> i64 {
+    // `u64::MAX` divided by any width the settings allow is far inside `i64`, so this
+    // never saturates.
+    i64::try_from(height / width.max(1)).unwrap_or(i64::MAX)
 }
 
 /// One column's array: `values` as `kind`, typed as `field` says.
