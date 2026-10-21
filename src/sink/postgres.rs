@@ -22,8 +22,9 @@ use tokio_postgres::Client;
 use tokio_postgres::binary_copy::BinaryCopyInWriter;
 use tokio_postgres::types::{FromSql, IsNull, Kind, ToSql, Type, to_sql_checked};
 
+use crate::metrics;
 use crate::secret::Secret;
-use crate::sink::route::Tables;
+use crate::sink::route::{Backend, Tables};
 use crate::sink::sql::{self, Dialect, ident};
 use crate::sink::store::{Engine, SqlStore};
 use crate::sink::store_error::{EngineError, Operation, StoreError};
@@ -62,11 +63,41 @@ const SESSION_SETTINGS: &str = "SET tcp_keepalives_idle = 30; \
 /// A store in `PostgreSQL`.
 pub type PostgresSink = SqlStore<Postgres>;
 
+/// How long a store keeps trying to connect again once the server closes the
+/// connection: longer than the server's keepalives take to end a session whose client
+/// vanished and so release the writer lock it held (see [`SESSION_SETTINGS`]). Then the
+/// error stands and the process stops, as it would have.
+const RECONNECT_FOR: Duration = Duration::from_mins(2);
+
+/// The first wait between attempts to connect again, doubled after each failed one up to
+/// [`MAX_RECONNECT_DELAY`].
+const RECONNECT_DELAY: Duration = Duration::from_secs(1);
+
+/// The longest wait between attempts to connect again.
+const MAX_RECONNECT_DELAY: Duration = Duration::from_secs(15);
+
+/// How long a failed statement waits for its connection to end before the failure is
+/// taken for one of the statement's own. The driver fails the statement as the
+/// connection breaks, a moment before the connection's task ends.
+const CLOSE_WAIT: Duration = Duration::from_secs(1);
+
 /// A connected client, and the task driving its connection.
 #[derive(Debug)]
 pub struct Postgres {
     pub(crate) client: Client,
     connection_task: Option<tokio::task::JoinHandle<()>>,
+    /// How to connect again when the server closes the connection; `None` for a client
+    /// the caller connected, which it alone can replace. Boxed: the parsed settings are
+    /// most of the store's size, and read only on a reconnect.
+    reconnect: Option<Box<Reconnect>>,
+}
+
+/// What connecting again needs: the parsed connection settings, and the chain whose
+/// database schema the store writes and whose writer lock it holds.
+#[derive(Debug)]
+struct Reconnect {
+    config: tokio_postgres::Config,
+    chain: String,
 }
 
 impl Drop for Postgres {
@@ -90,54 +121,25 @@ impl PostgresSink {
         schema: Arc<Schema>,
         chain: &str,
     ) -> Result<Self, StoreError> {
-        let connector = MakeTlsConnector::new(
-            native_tls::TlsConnector::new().map_err(StoreError::engine(Operation::Open, None))?,
-        );
         let mut config: tokio_postgres::Config = settings
             .connection_string
             .expose()
             .parse()
-            .map_err(StoreError::engine(Operation::Open, None))?;
+            .map_err(opening)?;
         // Probe an idle connection after 30 seconds, every 10, and drop it after 3
-        // misses, so a dead server fails this process in about a minute, not two hours.
+        // misses, so a dead server fails this connection in about a minute, not two hours.
         config
             .keepalives_idle(Duration::from_secs(30))
             .keepalives_interval(Duration::from_secs(10))
             .keepalives_retries(3);
-        let (client, connection) = config
-            .connect(connector)
-            .await
-            .map_err(StoreError::engine(Operation::Open, None))?;
-        let task = tokio::spawn(async move {
-            if let Err(error) = connection.await {
-                tracing::error!(%error, "PostgreSQL connection stopped");
-            }
-        });
-        // The same probes from the server's side, so a session whose process was killed
-        // ends within a minute and releases the writer lock below. A statement stuck
-        // behind such a session's locks fails after five minutes rather than hanging.
-        client
-            .batch_execute(SESSION_SETTINGS)
-            .await
-            .map_err(StoreError::engine(Operation::Open, None))?;
-        // One writer per database schema, held for the life of this connection.
-        let locked: bool = client
-            .query_one(
-                "SELECT pg_try_advisory_lock(hashtext('indexer'), hashtext($1))",
-                &[&chain],
-            )
-            .await
-            .and_then(|row| row.try_get(0))
-            .map_err(StoreError::engine(Operation::Open, None))?;
-        if !locked {
-            task.abort();
-            return Err(StoreError::Locked {
-                schema: chain.to_owned(),
-            });
-        }
+        let (client, task) = connect_as_writer(&config, chain).await?;
         let engine = Postgres {
             client,
             connection_task: Some(task),
+            reconnect: Some(Box::new(Reconnect {
+                config,
+                chain: chain.to_owned(),
+            })),
         };
         let store = SqlStore::new(engine, schema, chain).await?;
         tracing::info!("PostgreSQL storage opened");
@@ -158,9 +160,147 @@ impl PostgresSink {
         let engine = Postgres {
             client,
             connection_task: None,
+            reconnect: None,
         };
         SqlStore::new(engine, schema, chain).await
     }
+}
+
+/// Connects with `config` and takes the writer lock on the database schema named for
+/// `chain`, returning the client and the task driving its connection. The lock is the
+/// session's, so every new session takes it here, before it can write.
+///
+/// The connection uses platform TLS and [`SESSION_SETTINGS`].
+///
+/// # Errors
+///
+/// Returns [`StoreError::Engine`] when TLS, the connection, or a setting fails, and
+/// [`StoreError::Locked`] when another session holds the lock.
+async fn connect_as_writer(
+    config: &tokio_postgres::Config,
+    chain: &str,
+) -> Result<(Client, tokio::task::JoinHandle<()>), StoreError> {
+    let connector = MakeTlsConnector::new(
+        native_tls::TlsConnector::new().map_err(StoreError::engine(Operation::Open, None))?,
+    );
+    let (client, connection) = config.connect(connector).await.map_err(opening)?;
+    let task = tokio::spawn(async move {
+        if let Err(error) = connection.await {
+            // The driver shows a server's error as `db error` alone; what the server said,
+            // such as a FATAL `57P01` for a shutdown, is in its fields.
+            if let Some(db) = error.as_db_error() {
+                tracing::error!(
+                    code = db.code().code(),
+                    severity = db.severity(),
+                    message = db.message(),
+                    "PostgreSQL connection stopped"
+                );
+            } else {
+                tracing::error!(error = %PgError(error), "PostgreSQL connection stopped");
+            }
+        }
+    });
+    // The same probes from the server's side, so a session whose process was killed
+    // ends within a minute and releases the writer lock below. A statement stuck
+    // behind such a session's locks fails after five minutes rather than hanging.
+    if let Err(error) = client.batch_execute(SESSION_SETTINGS).await {
+        task.abort();
+        return Err(opening(error));
+    }
+    // One writer per database schema, held for the life of this connection.
+    let locked: Result<bool, _> = client
+        .query_one(
+            "SELECT pg_try_advisory_lock(hashtext('indexer'), hashtext($1))",
+            &[&chain],
+        )
+        .await
+        .and_then(|row| row.try_get(0));
+    match locked {
+        Ok(true) => Ok((client, task)),
+        Ok(false) => {
+            task.abort();
+            Err(StoreError::Locked {
+                schema: chain.to_owned(),
+            })
+        }
+        Err(error) => {
+            task.abort();
+            Err(opening(error))
+        }
+    }
+}
+
+impl Postgres {
+    /// Connects again with `reconnect`, takes the writer lock again, and makes the chain's
+    /// database schema the session's default, as opening the store did. The tables are
+    /// already there.
+    async fn reconnect(&mut self) -> Result<(), StoreError> {
+        let Some(reconnect) = &self.reconnect else {
+            return Ok(());
+        };
+        let Reconnect { config, chain } = &**reconnect;
+        let (client, task) = connect_as_writer(config, chain).await?;
+        if let Err(error) = client.batch_execute(&Self::use_schema(chain)).await {
+            task.abort();
+            return Err(opening(error));
+        }
+        self.client = client;
+        if let Some(stopped) = self.connection_task.replace(task) {
+            stopped.abort();
+        }
+        Ok(())
+    }
+
+    /// Whether the connection ended, waiting up to [`CLOSE_WAIT`] for it to.
+    async fn closed(&self) -> bool {
+        let deadline = tokio::time::Instant::now() + CLOSE_WAIT;
+        while !self.client.is_closed() {
+            if tokio::time::Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        true
+    }
+}
+
+/// A `tokio-postgres` error, shown with its cause. The driver's own `Display` names only
+/// the kind — `db error`, `error communicating with the server` — and leaves what the
+/// server said, or the I/O error, to its source.
+#[derive(Debug)]
+struct PgError(tokio_postgres::Error);
+
+impl std::fmt::Display for PgError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)?;
+        if let Some(db) = self.0.as_db_error() {
+            write!(
+                f,
+                ": {} {}: {}",
+                db.severity(),
+                db.code().code(),
+                db.message()
+            )
+        } else if let Some(source) = self.0.source() {
+            write!(f, ": {source}")
+        } else {
+            Ok(())
+        }
+    }
+}
+
+// No `source`: `Display` already shows it, and a caller printing the chain would show it
+// twice.
+impl Error for PgError {}
+
+/// A driver error while opening the store or connecting again.
+fn opening(error: tokio_postgres::Error) -> StoreError {
+    StoreError::engine(Operation::Open, None)(pg(error))
+}
+
+/// A driver error as an engine error that shows its cause.
+fn pg(error: tokio_postgres::Error) -> EngineError {
+    Box::new(PgError(error))
 }
 
 impl Dialect for Postgres {
@@ -255,19 +395,22 @@ impl Engine for Postgres {
 
     async fn execute(&mut self, sql: &str, values: &[Value]) -> Result<(), EngineError> {
         if values.is_empty() {
-            self.client.batch_execute(sql).await?;
+            self.client.batch_execute(sql).await.map_err(pg)?;
         } else {
-            self.client.execute(sql, &params(values)).await?;
+            self.client
+                .execute(sql, &params(values))
+                .await
+                .map_err(pg)?;
         }
         Ok(())
     }
 
     async fn query(&mut self, sql: &str, values: &[Value]) -> Result<Vec<Vec<Value>>, EngineError> {
-        let rows = self.client.query(sql, &params(values)).await?;
+        let rows = self.client.query(sql, &params(values)).await.map_err(pg)?;
         rows.iter()
             .map(|row| {
                 (0..row.len())
-                    .map(|index| Ok(row.try_get(index)?))
+                    .map(|index| row.try_get(index).map_err(pg))
                     .collect()
             })
             .collect()
@@ -289,13 +432,45 @@ impl Engine for Postgres {
             .iter()
             .map(|column| pg_type(column.kind))
             .collect();
-        let writer = BinaryCopyInWriter::new(self.client.copy_in(&statement).await?, &types);
+        let sink = self.client.copy_in(&statement).await.map_err(pg)?;
+        let writer = BinaryCopyInWriter::new(sink, &types);
         pin_mut!(writer);
         for row in rows {
-            writer.as_mut().write_raw(row.values()).await?;
+            writer.as_mut().write_raw(row.values()).await.map_err(pg)?;
         }
-        writer.as_mut().finish().await?;
+        writer.as_mut().finish().await.map_err(pg)?;
         Ok(())
+    }
+
+    /// When the server closed the connection — a restart, a failover, an operator ending
+    /// the session — connects again, retrying for about two minutes (see
+    /// `RECONNECT_FOR`). The failed transaction ended with the session, so the store
+    /// is as its last commit left it, and the batch it kept can be written again.
+    async fn recover(&mut self) -> Result<bool, StoreError> {
+        if self.reconnect.is_none() || !self.closed().await {
+            return Ok(false);
+        }
+        tracing::warn!("PostgreSQL connection lost; connecting again");
+        let deadline = tokio::time::Instant::now() + RECONNECT_FOR;
+        let mut delay = RECONNECT_DELAY;
+        loop {
+            match self.reconnect().await {
+                Ok(()) => {
+                    metrics::store_reconnected(Backend::Postgres.name());
+                    tracing::info!("PostgreSQL connection restored; retrying the commit");
+                    return Ok(true);
+                }
+                Err(error) => {
+                    if tokio::time::Instant::now() + delay > deadline {
+                        return Err(error);
+                    }
+                    tracing::warn!(%error, retry_in_ms = delay.as_millis(),
+                        "PostgreSQL could not connect again");
+                    tokio::time::sleep(delay).await;
+                    delay = (delay * 2).min(MAX_RECONNECT_DELAY);
+                }
+            }
+        }
     }
 }
 
@@ -672,6 +847,15 @@ mod tests {
             drop(sink);
             self.connection.abort();
         }
+    }
+
+    /// The server process behind `sink`'s session.
+    async fn pid(sink: &PostgresSink) -> i32 {
+        db(sink)
+            .query_one("SELECT pg_backend_pid()", &[])
+            .await
+            .expect("pid")
+            .get(0)
     }
 
     async fn count(sink: &PostgresSink, table: Table) -> i64 {
@@ -1107,6 +1291,56 @@ mod tests {
         assert_eq!(remaining, 0, "the reorg deleted the typed row");
 
         scratch.remove(sink).await;
+    }
+
+    /// A flush on a connection the server ended connects again, takes the writer lock
+    /// again, and commits the batch it kept to the chain's database schema.
+    #[tokio::test]
+    #[ignore = "requires INDEXER_TEST_POSTGRES_URL pointing to PostgreSQL 18"]
+    async fn a_flush_after_the_server_ends_the_session_connects_again() {
+        let url = std::env::var("INDEXER_TEST_POSTGRES_URL").expect("test database URL");
+        let settings: PostgresSettings =
+            toml::from_str(&format!("tables = ['logs']\nconnection_string = '{url}'"))
+                .expect("settings");
+        let schema = format!("reconnect_test_{}", std::process::id());
+        let mut sink = PostgresSink::open(&settings, datasets(), &schema)
+            .await
+            .expect("open");
+        let (admin, connection) = tokio_postgres::connect(&url, tokio_postgres::NoTls)
+            .await
+            .expect("connect");
+        let connection = tokio::spawn(connection);
+        let ended = pid(&sink).await;
+        let reorg = Event::Reorg(Reorg {
+            height: 7,
+            new_head_hash: B256::ZERO,
+            orphaned_hashes: vec![B256::ZERO],
+        });
+        sink.publish(Envelope::new(ChainId::new("base"), reorg))
+            .await
+            .expect("publish");
+        admin
+            .query_one("SELECT pg_terminate_backend($1)", &[&ended])
+            .await
+            .expect("end the session");
+
+        sink.flush().await.expect("the flush connects again");
+        assert_eq!(sink.buffered(), 0);
+        assert_ne!(pid(&sink).await, ended, "a new session");
+        assert_eq!(count(&sink, Table::Reorg).await, 1, "in the chain's schema");
+        assert!(
+            matches!(
+                PostgresSink::open(&settings, datasets(), &schema).await,
+                Err(StoreError::Locked { .. })
+            ),
+            "the new session holds the writer lock"
+        );
+        admin
+            .batch_execute(&format!("DROP SCHEMA \"{schema}\" CASCADE"))
+            .await
+            .expect("drop test schema");
+        drop(admin);
+        connection.abort();
     }
 
     /// Run against an isolated `PostgreSQL` 18 database with `INDEXER_TEST_POSTGRES_URL`.

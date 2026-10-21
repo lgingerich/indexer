@@ -22,6 +22,7 @@
 //! | `indexer_store_blocks_total` | counter | Blocks a store committed |
 //! | `indexer_store_rows_total` | counter | Records a store committed |
 //! | `indexer_store_commit_duration_seconds` | histogram | How long a store's commits take |
+//! | `indexer_store_reconnects_total` | counter | Connections a store restored after the server closed one |
 //! | `indexer_logs_decoded_total` | counter | Logs decoded against a contract's ABI |
 //! | `indexer_decode_failures_total` | counter | Logs from a known contract that did not decode |
 //! | `indexer_derive_failures_total` | counter | Decoded records a derived `table` could not use |
@@ -66,6 +67,8 @@ const STORE_LAST_COMMIT: &str = "indexer_store_last_commit_timestamp_seconds";
 const STORE_BLOCKS: &str = "indexer_store_blocks_total";
 #[cfg(any(feature = "store", test))]
 const STORE_ROWS: &str = "indexer_store_rows_total";
+#[cfg(any(feature = "postgres", test))]
+const STORE_RECONNECTS: &str = "indexer_store_reconnects_total";
 const STORE_COMMIT_DURATION: &str = "indexer_store_commit_duration_seconds";
 const LOGS_DECODED: &str = "indexer_logs_decoded_total";
 const DECODE_FAILURES: &str = "indexer_decode_failures_total";
@@ -187,6 +190,12 @@ pub(crate) fn lake_maintenance_failed(operation: &'static str) {
     counter!(LAKE_MAINTENANCE_FAILURES, "operation" => operation).increment(1);
 }
 
+/// `store` connected again after the server closed its connection, and carries on.
+#[cfg(any(feature = "postgres", test))]
+pub(crate) fn store_reconnected(store: &'static str) {
+    counter!(STORE_RECONNECTS, "store" => store).increment(1);
+}
+
 /// A height or a count as a sample value. Prometheus samples are `f64`, which holds every
 /// integer below 2^53 exactly: block heights and lags are far under it.
 #[expect(
@@ -231,6 +240,7 @@ mod tests {
             chain_head(110);
             committed("postgres", 100, 3, 42, Duration::from_millis(30), Some(110));
             derive_failed("metric_v1_swaps");
+            store_reconnected("postgres");
         });
         let scraped = handle.render();
         for line in [
@@ -240,6 +250,7 @@ mod tests {
             r#"indexer_store_rows_total{chain="bsc",store="postgres"} 42"#,
             r#"indexer_store_commit_duration_seconds_bucket{chain="bsc",store="postgres",le="0.05"} 1"#,
             r#"indexer_derive_failures_total{chain="bsc",table="metric_v1_swaps"} 1"#,
+            r#"indexer_store_reconnects_total{chain="bsc",store="postgres"} 1"#,
         ] {
             assert!(scraped.contains(line), "missing {line} in:\n{scraped}");
         }

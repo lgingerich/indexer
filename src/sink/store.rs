@@ -52,7 +52,18 @@ pub trait Engine: Send {
         staging: &str,
         rows: &[&Row],
     ) -> impl Future<Output = Result<(), EngineError>> + Send;
+
+    /// After a failed write, restores the engine's connection if the server closed it,
+    /// returning whether it did, so the write can be retried on the new one. An engine
+    /// with no connection to lose has nothing to restore.
+    fn recover(&mut self) -> impl Future<Output = Result<bool, StoreError>> + Send {
+        std::future::ready(Ok(false))
+    }
 }
+
+/// How many times one flush is written again on a restored connection before its error
+/// stands, so a connection that keeps failing as soon as it is restored stops the store.
+const RETRIES: usize = 3;
 
 /// One table, with every statement a flush runs against it rendered once.
 #[derive(Debug)]
@@ -411,9 +422,21 @@ impl<E: Engine> EnvelopeSink for SqlStore<E> {
         self.batch.push(&envelope)
     }
 
+    /// A write that fails because the server closed the connection is written again once
+    /// the engine [restores](Engine::recover) it: the batch stays buffered until a commit
+    /// lands, and writing it again after a commit whose acknowledgement was lost upserts
+    /// onto itself (see the module docs).
     async fn flush(&mut self) -> Result<(), SinkError> {
-        self.write_batch().await?;
-        Ok(())
+        let mut retries = 0;
+        loop {
+            let Err(error) = self.write_batch().await else {
+                return Ok(());
+            };
+            if retries == RETRIES || !self.engine.recover().await? {
+                return Err(error.into());
+            }
+            retries += 1;
+        }
     }
 }
 
