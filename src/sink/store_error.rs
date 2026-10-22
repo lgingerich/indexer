@@ -7,6 +7,7 @@
 //! itself detects, typed here once.
 
 use std::fmt;
+use std::time::Duration;
 
 use thiserror::Error;
 
@@ -96,6 +97,14 @@ pub enum StoreError {
     /// failed batch is gone, and only reopening the store repairs what it left behind.
     #[error("an earlier commit failed; the store must be reopened")]
     Failed,
+    /// A write did not finish within its deadline, so the store gave up on it rather than
+    /// wait on a request that may never complete. Like a failed commit, it refuses every
+    /// later write, and only reopening the store repairs what it left behind.
+    #[error("a write did not finish within {}s; the store must be reopened", after.as_secs())]
+    Stalled {
+        /// The deadline it missed.
+        after: Duration,
+    },
     /// A batch accepts a block the store already committed, without a `reorg` orphaning
     /// it first. A store that appends rather than upserts would write it twice.
     #[error("block {block} is already committed")]
@@ -126,9 +135,11 @@ impl StoreError {
     pub fn is_permanent(&self) -> bool {
         match self {
             Self::Drift { .. } | Self::Reserved { .. } | Self::Table(_) | Self::Restore(_) => true,
-            Self::Engine { .. } | Self::Locked { .. } | Self::Failed | Self::Replayed { .. } => {
-                false
-            }
+            Self::Engine { .. }
+            | Self::Locked { .. }
+            | Self::Failed
+            | Self::Stalled { .. }
+            | Self::Replayed { .. } => false,
         }
     }
 

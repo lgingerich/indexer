@@ -88,6 +88,12 @@ pub struct DeltaSettings {
     /// `access_key_id`; the `aws_`-prefixed spellings work too. Every value is a
     /// [`Secret`], so keys can be named by environment variable and none is logged.
     /// Credentials may also come from the standard `AWS_*` environment variables.
+    ///
+    /// Every request is bounded by the object store client's own defaults: `timeout`,
+    /// 30 s for a whole request, `connect_timeout`, 5 s, and retries up to `max_retries`,
+    /// 10, within `retry_timeout`, 3 minutes. Each can be set here, as `timeout = "60s"`.
+    /// The store bounds each whole write as well, at ten minutes (see `COMMIT_DEADLINE`),
+    /// for a request that hangs past all of these.
     #[serde(default)]
     pub storage: BTreeMap<String, Secret>,
 }

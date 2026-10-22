@@ -111,6 +111,22 @@ const CONCURRENT_TABLES: usize = 16;
 /// on several threads at once. They are still written to the table as one commit.
 const ROWS_PER_BATCH: usize = 1 << 16;
 
+/// The longest one write to the lake may take before the store gives up on it: a commit,
+/// with its wait for the last commit's ledger append, a rewind, or the last wait for the
+/// ledger at the end of the stream.
+///
+/// A lake that hangs without failing, on an object store request that never completes,
+/// would otherwise stall the whole process: the lake's channel fills, ingest blocks on
+/// the send, and the real-time `PostgreSQL` path stops with it. A missed deadline fails
+/// the store instead, so the process exits, its supervisor restarts it, and opening
+/// repairs what the cut write left behind, as it does after any stop.
+///
+/// Ten minutes is far past any write that is still coming back: the commit-duration
+/// histogram's buckets top out at 60 s for a large backfill commit, and every object
+/// store request is bounded well below this by its client's own timeout and retries
+/// (see [`DeltaSettings::storage`]).
+const COMMIT_DEADLINE: Duration = Duration::from_mins(10);
+
 /// The store: one Delta table per table of the run's schema.
 #[derive(Debug)]
 pub struct DeltaSink {
@@ -134,6 +150,8 @@ pub struct DeltaSink {
     maintenance: Option<Maintenance>,
     /// The last commit's ledger append, while it runs on beside the next commit.
     ledger: PendingLedger,
+    /// How long one write may take: [`COMMIT_DEADLINE`], which a test shortens.
+    deadline: Duration,
     /// What opening read back, for the first [`restore`](Store::restore) to hand on
     /// rather than read again: the ledger and the contracts take tens of seconds on a
     /// large lake. Dropped once anything is written or rewound.
@@ -207,6 +225,7 @@ impl DeltaSink {
             published_tip: Arc::new(AtomicU64::new(0)),
             maintenance: None,
             ledger: PendingLedger::default(),
+            deadline: COMMIT_DEADLINE,
             opened: None,
         };
         let read = Instant::now();
@@ -305,9 +324,10 @@ impl DeltaSink {
     /// 4. the new blocks into the ledger, once their rows are all present, running on
     ///    while the next commit's rows are appended (see [`PendingLedger`]).
     ///
-    /// A failure part-way leaves the lake as the next open repairs it. The batch is not
-    /// kept for a retry: the store refuses every later write with
-    /// [`StoreError::Failed`], and a restart resumes from the ledger.
+    /// A failure part-way, or a write cut off at [`COMMIT_DEADLINE`], leaves the lake as
+    /// the next open repairs it. The batch is not kept for a retry: the store refuses
+    /// every later write with [`StoreError::Failed`], and a restart resumes from the
+    /// ledger.
     async fn commit(&mut self) -> Result<(), StoreError> {
         self.guarded(async |sink| {
             if sink.batch.is_empty() {
@@ -321,12 +341,20 @@ impl DeltaSink {
     /// Runs `step`, a write to the lake, unless an earlier one failed, and refuses every
     /// later one if this one fails: a write that stopped part-way leaves what only a
     /// reopen repairs.
+    ///
+    /// A step still running at the [`deadline`](Self::deadline) fails with
+    /// [`StoreError::Stalled`]. It is dropped where it stands, which stops the tasks it
+    /// was waiting on (see [`join_every`]); what it had committed by then is what a stop
+    /// at that moment would have left.
     async fn guarded<T>(
         &mut self,
         step: impl AsyncFnOnce(&mut Self) -> Result<T, StoreError>,
     ) -> Result<T, StoreError> {
         self.refuse_if_failed()?;
-        let result = step(self).await;
+        let deadline = self.deadline;
+        let result = tokio::time::timeout(deadline, step(self))
+            .await
+            .unwrap_or(Err(StoreError::Stalled { after: deadline }));
         self.failed = result.is_err();
         result
     }

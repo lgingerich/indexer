@@ -15,7 +15,15 @@ use alloy_primitives::{B256, U256};
 use deltalake::arrow::util::display::{ArrayFormatter, FormatOptions};
 use deltalake::datafusion::prelude::ident;
 use deltalake::kernel::{DataType, StructField};
-use deltalake::{DeltaTable, ensure_table_uri};
+use deltalake::logstore::object_store::local::LocalFileSystem;
+use deltalake::logstore::object_store::path::Path as ObjectPath;
+use deltalake::logstore::object_store::{
+    CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
+    PutMultipartOptions, PutOptions, PutPayload, PutResult, Result as ObjectResult,
+};
+use deltalake::{DeltaTable, DeltaTableBuilder, ensure_table_uri};
+use futures_util::future::BoxFuture;
+use futures_util::stream::BoxStream;
 
 use super::expr::{in_texts, texts, texts_of};
 use super::{DeltaSettings, DeltaSink, maintenance};
@@ -479,6 +487,153 @@ async fn a_failed_commit_refuses_every_later_write() {
     ));
     assert!(matches!(
         sink.publish(block(2, 0).remove(0)).await,
+        Err(SinkError::Store(StoreError::Failed))
+    ));
+    drop(sink);
+
+    let mut sink = open(&dir).await;
+    assert_eq!(blocks(&sink).await, expected(&[(1, 0)]));
+    assert_eq!(ledger_heights(&mut sink).await, [1]);
+}
+
+/// The local filesystem, except that no write ever completes: an object store whose
+/// requests hang without failing.
+#[derive(Debug)]
+struct Hanging(LocalFileSystem);
+
+impl std::fmt::Display for Hanging {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Hanging({})", self.0)
+    }
+}
+
+// `ObjectStore` is declared with `async_trait`, whose signatures are spelled out here
+// rather than taking the macro on as a dependency for one fake.
+impl ObjectStore for Hanging {
+    fn put_opts<'life0, 'life1, 'async_trait>(
+        &'life0 self,
+        _: &'life1 ObjectPath,
+        _: PutPayload,
+        _: PutOptions,
+    ) -> BoxFuture<'async_trait, ObjectResult<PutResult>>
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        Self: 'async_trait,
+    {
+        Box::pin(std::future::pending())
+    }
+
+    fn put_multipart_opts<'life0, 'life1, 'async_trait>(
+        &'life0 self,
+        _: &'life1 ObjectPath,
+        _: PutMultipartOptions,
+    ) -> BoxFuture<'async_trait, ObjectResult<Box<dyn MultipartUpload>>>
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        Self: 'async_trait,
+    {
+        Box::pin(std::future::pending())
+    }
+
+    fn get_opts<'life0, 'life1, 'async_trait>(
+        &'life0 self,
+        location: &'life1 ObjectPath,
+        options: GetOptions,
+    ) -> BoxFuture<'async_trait, ObjectResult<GetResult>>
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        Self: 'async_trait,
+    {
+        self.0.get_opts(location, options)
+    }
+
+    fn delete_stream(
+        &self,
+        locations: BoxStream<'static, ObjectResult<ObjectPath>>,
+    ) -> BoxStream<'static, ObjectResult<ObjectPath>> {
+        self.0.delete_stream(locations)
+    }
+
+    fn list(&self, prefix: Option<&ObjectPath>) -> BoxStream<'static, ObjectResult<ObjectMeta>> {
+        self.0.list(prefix)
+    }
+
+    fn list_with_delimiter<'life0, 'life1, 'async_trait>(
+        &'life0 self,
+        prefix: Option<&'life1 ObjectPath>,
+    ) -> BoxFuture<'async_trait, ObjectResult<ListResult>>
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        Self: 'async_trait,
+    {
+        self.0.list_with_delimiter(prefix)
+    }
+
+    fn copy_opts<'life0, 'life1, 'life2, 'async_trait>(
+        &'life0 self,
+        _: &'life1 ObjectPath,
+        _: &'life2 ObjectPath,
+        _: CopyOptions,
+    ) -> BoxFuture<'async_trait, ObjectResult<()>>
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        'life2: 'async_trait,
+        Self: 'async_trait,
+    {
+        Box::pin(std::future::pending())
+    }
+}
+
+/// Makes every write to `table` of the lake in `dir` hang (see [`Hanging`]), while
+/// reads still go through.
+async fn hang(dir: &Dir, sink: &mut DeltaSink, table: Table) {
+    let store = Arc::new(Hanging(LocalFileSystem::new()));
+    let position = sink.positions[&TableId::Dataset(table)];
+    let url = ensure_table_uri(dir.table(&sink.lakes[position].def.name)).expect("a table url");
+    let mut hanging = DeltaTableBuilder::from_url(url.clone())
+        .expect("a table builder")
+        .with_storage_backend(store, url)
+        .build()
+        .expect("the table builds");
+    hanging.load().await.expect("the table loads");
+    sink.lakes[position].table = hanging;
+}
+
+/// A write that hangs without failing fails the store at its deadline rather than
+/// stalling it, and the next open repairs what the cut commits left behind: here the
+/// ledger's append hangs, so the commit after it is cut while it waits.
+#[tokio::test]
+async fn a_write_past_its_deadline_fails_the_store_and_the_reopen_repairs_it() {
+    let dir = Dir::new();
+    let mut sink = open(&dir).await;
+    publish(&mut sink, block(1, 0)).await;
+    hang(&dir, &mut sink, Table::AcceptedBlock).await;
+    // Its rows commit, and its ledger append starts and never lands.
+    buffer(&mut sink, block(2, 0)).await;
+    sink.flush()
+        .await
+        .expect("the commit before the ledger hangs");
+
+    sink.deadline = std::time::Duration::from_millis(500);
+    buffer(&mut sink, block(3, 0)).await;
+    let error = sink
+        .flush()
+        .await
+        .expect_err("the commit misses its deadline");
+    assert!(
+        matches!(
+            error,
+            SinkError::Store(StoreError::Stalled { after }) if after == sink.deadline
+        ),
+        "{error:?}"
+    );
+    assert!(matches!(
+        sink.publish(block(4, 0).remove(0)).await,
         Err(SinkError::Store(StoreError::Failed))
     ));
     drop(sink);
