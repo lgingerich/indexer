@@ -264,9 +264,9 @@ knows nothing about `ingest`, so it cannot reach into the pipeline's ordering an
 state machine.
 
 The layers are modules, so their one-way dependency direction is a convention a
-reviewer checks rather than one the compiler or CI enforces. At this size, one owner
-reads all of it, and each module documents the direction it may depend in. The one that
-matters most is that `decode` must not depend on `ingest`.
+reviewer checks rather than one the compiler enforces. At this size, one owner reads all
+of it, and each module documents the direction it may depend in. The one that matters
+most, that `decode` and `ingest` do not depend on each other, CI checks with a grep.
 
 ## What works
 

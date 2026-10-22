@@ -25,6 +25,7 @@
 //! layer may record into [`metrics`]. [`runtime`] sits above them all. The layers are
 //! modules rather than crates, so that direction is a convention a reviewer checks rather
 //! than one the compiler enforces; each module documents the direction it may depend in.
+//! CI checks the one between [`decode`] and [`ingest`] with a grep.
 //!
 //! # What works
 //!

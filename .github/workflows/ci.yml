@@ -34,6 +34,15 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: taiki-e/install-action@19c7190d8e0bc0aa6ec705040b2021eaf1c28bbd # nextest
       - run: cargo fmt --check
+      # The layers are modules, so the compiler allows any path between them. Fail if
+      # code (not a comment) in `decode` or `ingest` names the other; see `src/lib.rs`.
+      - name: decode and ingest do not depend on each other
+        run: |
+          if grep -rnE 'crate::ingest\b' src/decode --include='*.rs' | grep -vE '^[^:]+:[0-9]+:\s*//' \
+            || grep -rnE 'crate::decode\b' src/ingest --include='*.rs' | grep -vE '^[^:]+:[0-9]+:\s*//'; then
+            echo "decode and ingest must not depend on each other" >&2
+            exit 1
+          fi
       - run: cargo clippy --all-targets --all-features -- -D warnings
       - run: cargo doc --no-deps --all-features
         env:
