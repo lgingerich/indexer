@@ -294,16 +294,14 @@ impl ChannelReceiver {
                 () = stop.wait() => break,
                 next = recv_until(&mut self.receiver, deadline) => next,
             };
-            let next = match next {
-                Received::Block(next) => next,
+            let block = match next {
+                Received::Block(block) => block,
+                Received::Closed => break,
                 Received::Due => {
                     stored += self.flush(sink, &mut pending).await?;
                     deadline = None;
                     continue;
                 }
-            };
-            let Some(block) = next else {
-                break;
             };
             // The first block gathered is the oldest: the channel is in order.
             let due = *deadline.get_or_insert_with(|| block.sent + batching.wait);
@@ -406,20 +404,24 @@ impl ChannelReceiver {
 
 /// What waiting on the channel ended with.
 enum Received {
-    /// The next block, or `None` once the sending half is dropped.
-    Block(Option<Parcel>),
+    /// The next block.
+    Block(Parcel),
+    /// The sending half was dropped, and every block it sent was taken.
+    Closed,
     /// The oldest gathered block's deadline passed first.
     Due,
 }
 
 /// The next block from `receiver`, waiting no later than `deadline` when there is one.
 async fn recv_until(receiver: &mut mpsc::Receiver<Parcel>, deadline: Option<Instant>) -> Received {
-    match deadline {
-        None => Received::Block(receiver.recv().await),
-        Some(at) => tokio::time::timeout_at(at, receiver.recv())
-            .await
-            .map_or(Received::Due, Received::Block),
-    }
+    let next = match deadline {
+        None => receiver.recv().await,
+        Some(at) => match tokio::time::timeout_at(at, receiver.recv()).await {
+            Ok(next) => next,
+            Err(_) => return Received::Due,
+        },
+    };
+    next.map_or(Received::Closed, Received::Block)
 }
 
 /// Whether what is gathered has reached a limit of `batching`.
