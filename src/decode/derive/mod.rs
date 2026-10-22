@@ -17,8 +17,9 @@
 //! store listing it fails at startup. It reads each argument by position and name, so one
 //! that moved under an unchanged signature is caught at its first record. A record a
 //! derivation cannot read derives nothing and is logged; the decoded record still
-//! commits. A row that does not fit its table is a bug in the derivation, and the store
-//! refuses it, which stops the run.
+//! commits. A row that does not fit its table is a bug in the derivation, and stops the
+//! run: one with a value too many or too few is refused here, and one whose value does not
+//! fit its column by the store.
 //!
 //! # Removing it
 //!
@@ -85,49 +86,54 @@ impl Derivation {
             && self.signatures.contains(&decoded.signature.as_str())
     }
 
-    /// The rows `decoded` derives, numbered in order.
-    ///
-    /// Each value is named for its column in order. A value past the last column gets an
-    /// empty name rather than being dropped, so the store refuses the row instead of
-    /// storing it short of what the derivation computed.
+    /// The rows `decoded` derives, numbered in order, each value named for its column.
     ///
     /// # Errors
     ///
     /// Returns [`DeriveError::Argument`] when an argument is missing, misnamed, of another
-    /// type, or out of the range the contract keeps it in.
+    /// type, or out of the range the contract keeps it in, and [`DeriveError::Width`] when
+    /// a row has more or fewer values than the table has columns.
     fn rows(&self, decoded: &Decoded, sent: Sent) -> Result<Vec<Derived>, DeriveError> {
-        Ok((self.derive)(decoded)?
+        (self.derive)(decoded)?
             .into_iter()
             .zip(0..)
-            .map(|(values, row)| Derived {
-                table: self.table.to_owned(),
-                address: decoded.address,
-                transaction_hash: decoded.transaction_hash,
-                transaction_index: decoded.transaction_index,
-                log_index: decoded.log_index,
-                row,
-                transaction_from_address: sent.map(|(from, _)| from),
-                transaction_to_address: sent.and_then(|(_, to)| to),
-                fields: values
-                    .into_iter()
-                    .enumerate()
-                    .map(|(position, value)| DerivedField {
-                        name: self
-                            .columns
-                            .get(position)
-                            .map_or_else(String::new, |&(name, _)| name.to_owned()),
-                        value,
-                    })
-                    .collect(),
-                block_number: decoded.block_number,
-                block_hash: decoded.block_hash,
-                block_timestamp: decoded.block_timestamp,
+            .map(|(values, row)| {
+                if values.len() != self.columns.len() {
+                    return Err(DeriveError::Width {
+                        table: self.table,
+                        values: values.len(),
+                        columns: self.columns.len(),
+                    });
+                }
+                Ok(Derived {
+                    table: self.table.to_owned(),
+                    address: decoded.address,
+                    transaction_hash: decoded.transaction_hash,
+                    transaction_index: decoded.transaction_index,
+                    log_index: decoded.log_index,
+                    row,
+                    transaction_from_address: sent.map(|(from, _)| from),
+                    transaction_to_address: sent.and_then(|(_, to)| to),
+                    fields: self
+                        .columns
+                        .iter()
+                        .zip(values)
+                        .map(|(&(name, _), value)| DerivedField {
+                            name: name.to_owned(),
+                            value,
+                        })
+                        .collect(),
+                    block_number: decoded.block_number,
+                    block_hash: decoded.block_hash,
+                    block_timestamp: decoded.block_timestamp,
+                })
             })
-            .collect())
+            .collect()
     }
 }
 
-/// Why a decoded record derived no row: the derivation could not read it.
+/// Why a decoded record derived no row: the derivation could not read it, or computed a
+/// row that does not match its own table.
 #[derive(Debug, thiserror::Error)]
 pub(super) enum DeriveError {
     /// The record has no argument `name` at `position` of the type the derivation reads.
@@ -140,6 +146,17 @@ pub(super) enum DeriveError {
         /// The type the derivation reads there.
         expected: &'static str,
     },
+    /// A row has a different number of values than its table has columns: a bug in the
+    /// derivation, which stops the run rather than storing a row short or shifted.
+    #[error("a {table} row has {values} values for {columns} columns")]
+    Width {
+        /// The table.
+        table: &'static str,
+        /// How many values the row has.
+        values: usize,
+        /// How many columns the derivation declares.
+        columns: usize,
+    },
 }
 
 /// The sender and recipient of the transaction a log came from, or `None` when the
@@ -150,29 +167,36 @@ pub(super) type Sent = Option<(Address, Option<Address>)>;
 /// the transaction's sender and recipient.
 ///
 /// A record a derivation cannot read is logged and derives nothing from it.
+///
+/// # Errors
+///
+/// Returns [`DeriveError::Width`] when a derivation computes a row that does not match
+/// its table, a bug in it that stops the run.
 pub(super) fn rows(
     derivations: &[Derivation],
     chain: &ChainId,
     decoded: &Decoded,
     sent: Sent,
-) -> Vec<Derived> {
-    derivations
+) -> Result<Vec<Derived>, DeriveError> {
+    let mut derived = Vec::new();
+    for derivation in derivations
         .iter()
         .filter(|derivation| derivation.reads(decoded))
-        .flat_map(|derivation| {
-            derivation
-                .rows(decoded, sent)
-                .inspect_err(|error| {
-                    metrics::derive_failed(derivation.table);
-                    warn!(%chain, table = derivation.table, address = %decoded.address,
-                        block = decoded.block_number, block_hash = %decoded.block_hash,
-                        transaction = %decoded.transaction_hash,
-                        log_index = decoded.log_index, %error,
-                        "derivation failed; keeping the decoded record");
-                })
-                .unwrap_or_default()
-        })
-        .collect()
+    {
+        match derivation.rows(decoded, sent) {
+            Ok(rows) => derived.extend(rows),
+            Err(error @ DeriveError::Width { .. }) => return Err(error),
+            Err(error @ DeriveError::Argument { .. }) => {
+                metrics::derive_failed(derivation.table);
+                warn!(%chain, table = derivation.table, address = %decoded.address,
+                    block = decoded.block_number, block_hash = %decoded.block_hash,
+                    transaction = %decoded.transaction_hash,
+                    log_index = decoded.log_index, %error,
+                    "derivation failed; keeping the decoded record");
+            }
+        }
+    }
+    Ok(derived)
 }
 
 /// Argument `position` of `decoded`, among all its inputs, when it is named `name`.
@@ -248,13 +272,14 @@ fn array<'a>(
 }
 
 #[cfg(test)]
+#[expect(clippy::expect_used)]
 mod tests {
     use alloy_primitives::U256;
 
-    use crate::wire::envelope::{ChainId, TypedValue};
+    use crate::wire::envelope::{ChainId, Decoded, TypedValue};
 
     use super::metric::{SWAPS, fixtures};
-    use super::{DERIVATIONS, rows};
+    use super::{DERIVATIONS, Derivation, DeriveError, rows};
 
     /// Every derivation's pinned signature is declared in the shipped protocols, so the
     /// catalog declares its table: an ABI edit that changes the event fails here, not at
@@ -277,8 +302,59 @@ mod tests {
     fn an_unreadable_record_derives_nothing() {
         let chain = ChainId::new("base");
         let mut swap = fixtures::swap(U256::ZERO, U256::ZERO, U256::ZERO);
-        assert_eq!(rows(&[SWAPS], &chain, &swap, None).len(), 1);
+        assert_eq!(rows(&[SWAPS], &chain, &swap, None).expect("rows").len(), 1);
         swap.body[0].value = TypedValue::Bool { value: true };
-        assert!(rows(&[SWAPS], &chain, &swap, None).is_empty());
+        assert!(
+            rows(&[SWAPS], &chain, &swap, None)
+                .expect("rows")
+                .is_empty()
+        );
+    }
+
+    /// A row with more or fewer values than its table has columns is refused as a bug in
+    /// the derivation, rather than stored short or with a value past the last column.
+    #[test]
+    fn a_row_of_the_wrong_width_is_an_error() {
+        fn short(decoded: &Decoded) -> Result<Vec<Vec<TypedValue>>, DeriveError> {
+            let mut rows = (SWAPS.derive)(decoded)?;
+            for row in &mut rows {
+                row.pop();
+            }
+            Ok(rows)
+        }
+        let chain = ChainId::new("base");
+        let swap = fixtures::swap(U256::ZERO, U256::ZERO, U256::ZERO);
+        let columns = SWAPS.columns.len();
+        for (case, derivation, expected) in [
+            (
+                "a surplus value",
+                Derivation {
+                    columns: &SWAPS.columns[1..],
+                    ..SWAPS
+                },
+                (columns, columns - 1),
+            ),
+            (
+                "a missing value",
+                Derivation {
+                    derive: short,
+                    ..SWAPS
+                },
+                (columns - 1, columns),
+            ),
+        ] {
+            match rows(&[derivation], &chain, &swap, None) {
+                Err(DeriveError::Width {
+                    table,
+                    values,
+                    columns,
+                }) => assert_eq!(
+                    (table, (values, columns)),
+                    (SWAPS.table, expected),
+                    "{case}"
+                ),
+                other => panic!("{case}: {other:?}"),
+            }
+        }
     }
 }

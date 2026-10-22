@@ -650,7 +650,7 @@ mod tests {
                 name: named,
                 expected: wanted,
             }) => assert_eq!((at, named, wanted), (position, name, expected)),
-            Ok(rows) => panic!("expected {name} refused, derived {rows:?}"),
+            other => panic!("expected {name} refused, got {other:?}"),
         }
     }
     /// The boundaries `Packed.t.sol` pins: both int128 extremes in either half, a

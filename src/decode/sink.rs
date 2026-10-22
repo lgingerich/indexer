@@ -68,7 +68,8 @@ impl<K: EnvelopeSink> DecodingSink<K> {
                     .filter(|&(hash, ..)| hash == log.transaction_hash)
                     .map(|(_, from, to)| (from, to));
                 let derived =
-                    derive::rows(self.decoder.derivations(), chain, &decoding.decoded, sent);
+                    derive::rows(self.decoder.derivations(), chain, &decoding.decoded, sent)
+                        .map_err(|error| SinkError::Decode(Box::new(error)))?;
                 let mut events = Vec::with_capacity(1 + derived.len() + decoding.discovered.len());
                 events.push(Event::Decoded(Box::new(decoding.decoded)));
                 events.extend(derived.into_iter().map(|row| Event::Derived(Box::new(row))));
