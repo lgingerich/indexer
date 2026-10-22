@@ -3,15 +3,17 @@
 //! [`Event`] is the union of everything the indexer publishes, and it holds three
 //! kinds of thing:
 //!
-//! - **Datasets** ([`Event::Block`], [`Event::Transaction`], [`Event::Log`]): durable on-chain records, re-exported from [`crate::wire::datasets`].
-//!   Each carries its own identity fields and dedupe key. Their shape is per-chain,
-//!   so the EVM records live in [`crate::wire::datasets::evm`]; Solana's would be a sibling
-//!   module and a variant here.
+//! - **Datasets** ([`Event::Block`], [`Event::Transaction`], [`Event::Log`]): durable
+//!   on-chain records, defined in [`crate::wire::datasets`]. Each carries its own
+//!   identity fields and dedupe key. Their shape is per-chain, so the EVM records live in
+//!   [`crate::wire::datasets::evm`]; Solana's would be a sibling module and a variant here.
 //! - **Produced from a log** ([`Event::Decoded`], [`Event::Contract`],
 //!   [`Event::Derived`]): records the decode stage produces from a log — its typed
 //!   arguments under their ABI names, or the contract a factory's creation event names —
 //!   and rows its derivations compute from one decoded record. They are datasets, not
-//!   control signals, and each always follows the record it came from.
+//!   control signals, and each always follows the record it came from. They are as
+//!   EVM-shaped as the log they extend, so they live beside it in
+//!   [`crate::wire::datasets::evm`].
 //! - **Control** ([`Reorg`], [`Event::AcceptedBlock`]): signals about the indexer's own state,
 //!   not records of a chain. They carry no verbatim payload and exist to drive a
 //!   consumer's state machine, so they are defined here.
@@ -46,7 +48,7 @@
 //!
 //! # Identity types
 //!
-//! Dataset identity uses [`B256`] and [`TxHash`] from
+//! Dataset identity uses [`B256`] and [`TxHash`](alloy_primitives::TxHash) from
 //! `alloy-primitives`. They are
 //! not hand-rolled here because alloy already models exactly this: a fixed 32-byte
 //! identity whose JSON form is lowercase `0x` hex. The encoding is a wire contract,
@@ -55,10 +57,12 @@
 
 use std::fmt;
 
-use alloy_primitives::{Address, B256, TxHash};
+use alloy_primitives::{Address, B256};
 use serde::{Deserialize, Serialize};
 
-pub use crate::wire::datasets::evm::{Block, DecodedArg, Log, Transaction, log_key};
+pub use crate::wire::datasets::evm::{
+    Block, Contract, Decoded, DecodedArg, Derived, DerivedField, Log, Transaction, log_key,
+};
 pub use crate::wire::typed::{AbiComponent, AbiType, TypedValue};
 
 /// The version of the envelope's wire shape.
@@ -141,228 +145,6 @@ pub struct BlockMeta {
     pub timestamp: u64,
 }
 
-/// One log decoded against a contract ABI, as typed arguments.
-///
-/// Produced by the decode layer, not ingest: nothing in the ingest path knows an ABI,
-/// so this record is only ever added after the raw log it came from. It is a *dataset*
-/// rather than a control signal — a durable on-chain record a consumer can store —
-/// and it carries everything needed to identify the row it becomes without a second
-/// lookup.
-///
-/// The raw log it came from is referenced by [`Log::dedupe_key`], not embedded:
-/// the stored raw log is the archive, so re-decoding with a later ABI is a replay of
-/// that record rather than a re-fetch from a node.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Decoded {
-    /// The identity of the event definition this log was decoded with: a hash of the
-    /// event's name, parameter names, types, and indexed flags.
-    ///
-    /// Scoped to the one event, not the ABI file it came from, so editing an unrelated
-    /// event in the same file leaves every existing row's key alone. A changed definition
-    /// of *this* event produces a separate append-only decoded row even when the raw log
-    /// and event selector are unchanged.
-    pub event_id: B256,
-    /// The event name from the ABI, for example `Transfer`.
-    pub name: String,
-    /// The contract that emitted the log.
-    pub address: Address,
-    /// What the contract is, from its protocol manifest, for example `uniswap_v3`.
-    ///
-    /// Not derivable from the ABI: an ABI is a list of signatures and says nothing
-    /// about which protocol an address implements. It comes from the manifest that
-    /// listed or discovered the address, so a consumer can group a record by protocol
-    /// without knowing any address.
-    ///
-    /// Deliberately *not* accompanied by a dataset name. Which table an event's rows
-    /// belong to depends on context this stage does not have — which token a pool
-    /// trades, how many decimals it has — and on modeling choices that change for
-    /// reasons the decoder should not care about. The decoder supplies the protocol as
-    /// a fact; the projection supplies the dataset.
-    pub protocol: String,
-    /// Which of the protocol's contracts emitted it, from its manifest, for example
-    /// `UniswapV3Pool`.
-    ///
-    /// With the protocol and the event, this names the one typed table the record is
-    /// also stored in: two contracts of a protocol may emit the same event, and each
-    /// gets its own table.
-    pub contract: String,
-    /// The event selector, `keccak256` of its signature.
-    ///
-    /// [`B256::ZERO`] for an anonymous event, which has no selector in `topic0`. A
-    /// zero selector is not a valid `keccak256` of a signature, so it cannot collide
-    /// with a real one.
-    pub selector: B256,
-    /// The event's human-readable signature, for example
-    /// `Transfer(address,address,uint256)`.
-    ///
-    /// Carried because a selector alone is not a readable name, and a consumer
-    /// debugging a decode should not have to compute one back from the selector.
-    pub signature: String,
-    /// Whether the ABI declares this event anonymous.
-    ///
-    /// An anonymous event's `topic0` is its first indexed argument rather than a
-    /// selector, so a consumer that wants to reconstruct the log's topics needs to
-    /// know not to prefix them with [`selector`](Self::selector).
-    pub anonymous: bool,
-    /// The transaction that emitted the log.
-    pub transaction_hash: TxHash,
-    /// The emitting transaction's position in its block.
-    #[serde(with = "alloy_serde::quantity")]
-    pub transaction_index: u64,
-    /// The log's position in its block.
-    #[serde(with = "alloy_serde::quantity")]
-    pub log_index: u64,
-    /// The indexed arguments, in ABI order, with original positions and declared types.
-    pub indexed: Vec<DecodedArg>,
-    /// The non-indexed arguments, in ABI order, with original positions and declared types.
-    pub body: Vec<DecodedArg>,
-    /// Height of the block containing this log.
-    #[serde(with = "alloy_serde::quantity")]
-    pub block_number: u64,
-    /// Hash of the block containing this log.
-    pub block_hash: B256,
-    /// Timestamp of the block containing this log, denormalized from its header.
-    #[serde(with = "alloy_serde::quantity")]
-    pub block_timestamp: u64,
-}
-
-impl Decoded {
-    /// Argument `position` among all the event's inputs, whether indexed or in the body.
-    #[must_use]
-    pub fn argument(&self, position: usize) -> Option<&DecodedArg> {
-        self.indexed
-            .iter()
-            .chain(&self.body)
-            .find(|argument| argument.position == position)
-    }
-
-    /// A key that is stable across redelivery and unique per decoded record.
-    ///
-    /// Built from the raw log's natural key, event selector, and event identity:
-    /// `block_hash:transaction_hash:log_index:selector:event_id:decoded`.
-    /// Redelivery of the same interpretation deduplicates, while a changed event
-    /// definition yields a separate append-only interpretation. The block hash also keeps an orphaned
-    /// log's interpretation separate from its replacement's.
-    #[must_use]
-    pub fn dedupe_key(&self) -> String {
-        format!(
-            "{}:{}:{}:decoded",
-            log_key(self.block_hash, self.transaction_hash, self.log_index),
-            self.selector,
-            self.event_id
-        )
-    }
-}
-
-/// A contract the decode stage discovered from its creation event.
-///
-/// Modeled on the provenance columns of Allium's `dex.pools`: the contract, the
-/// factory that created it, and the creation log's position. A factory names each child
-/// in an event — Uniswap V3's `PoolCreated.pool` — and a protocol manifest says which
-/// argument; see [`crate::decode`]. Contracts listed by address in a manifest are seeds
-/// and are not published here.
-///
-/// Natural key is `(block_hash, transaction_hash, log_index, address)`: the creation log
-/// plus the child, so a creation in an orphaned block and its replay in the replacement
-/// are different rows, and a `reorg` deletes the orphaned one like any other row.
-/// The store holding these rows is how discovered contracts survive a restart.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Contract {
-    /// The protocol the contract belongs to, from its manifest, for example `uniswap_v3`.
-    pub protocol: String,
-    /// The contract's name within its protocol, from its ABI file, for example
-    /// `UniswapV3Pool`.
-    pub name: String,
-    /// The discovered contract.
-    pub address: Address,
-    /// The contract that emitted the creation event.
-    pub factory_address: Address,
-    /// The transaction that emitted the creation event.
-    pub transaction_hash: TxHash,
-    /// The creating transaction's position in its block.
-    #[serde(with = "alloy_serde::quantity")]
-    pub transaction_index: u64,
-    /// The creation log's position in its block.
-    #[serde(with = "alloy_serde::quantity")]
-    pub log_index: u64,
-    /// Height of the block containing the creation log.
-    #[serde(with = "alloy_serde::quantity")]
-    pub block_number: u64,
-    /// Hash of the block containing the creation log.
-    pub block_hash: B256,
-    /// Timestamp of the block containing the creation log, denormalized from its header.
-    #[serde(with = "alloy_serde::quantity")]
-    pub block_timestamp: u64,
-}
-
-/// One row a derivation computed from a single decoded log.
-///
-/// Produced by the decode stage's derivations, after the decoded record it came from. A derivation
-/// names its table, and the record carries that table's values beside the log's own
-/// identity, so a store renders it like an event table's row and a `reorg` deletes it by
-/// its block like any other.
-///
-/// Natural key is `(block_hash, transaction_hash, log_index, table, row)`: a derivation may
-/// compute several rows from one log, numbered in the order it computes them, and the
-/// block hash keeps an orphaned log's rows apart from its replacement's.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Derived {
-    /// The derived table, for example `metric_v1_swaps`.
-    pub table: String,
-    /// The contract that emitted the log.
-    pub address: Address,
-    /// The transaction that emitted the log.
-    pub transaction_hash: TxHash,
-    /// The emitting transaction's position in its block.
-    #[serde(with = "alloy_serde::quantity")]
-    pub transaction_index: u64,
-    /// The log's position in its block.
-    #[serde(with = "alloy_serde::quantity")]
-    pub log_index: u64,
-    /// This row's position among the rows its derivation computed from the log, from 0.
-    #[serde(with = "alloy_serde::quantity")]
-    pub row: u64,
-    /// The account that sent the transaction, denormalized from it as Allium's
-    /// `dex.trades` carries it. `None` only when the transaction was not fetched.
-    pub transaction_from_address: Option<Address>,
-    /// The transaction's recipient. `None` when it deployed a contract, or was not
-    /// fetched.
-    pub transaction_to_address: Option<Address>,
-    /// The table's own values, in its column order.
-    pub fields: Vec<DerivedField>,
-    /// Height of the block containing the log.
-    #[serde(with = "alloy_serde::quantity")]
-    pub block_number: u64,
-    /// Hash of the block containing the log.
-    pub block_hash: B256,
-    /// Timestamp of the block containing the log, denormalized from its header.
-    #[serde(with = "alloy_serde::quantity")]
-    pub block_timestamp: u64,
-}
-
-impl Derived {
-    /// A key that is stable across redelivery and unique per derived row:
-    /// `block_hash:transaction_hash:log_index:table:row`.
-    #[must_use]
-    pub fn dedupe_key(&self) -> String {
-        format!(
-            "{}:{}:{}",
-            log_key(self.block_hash, self.transaction_hash, self.log_index),
-            self.table,
-            self.row
-        )
-    }
-}
-
-/// One value of a [`Derived`] row, under its column's name.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DerivedField {
-    /// The column, for example `amount0_raw`.
-    pub name: String,
-    /// The value, typed as the decoded arguments are.
-    pub value: TypedValue,
-}
-
 /// A contract a previous run discovered, as a store reads it back: only what decode
 /// needs to decode it again. Not published.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -381,21 +163,6 @@ pub struct StoredContract {
     /// The creation log's index in its block. With the height, it orders discoveries as
     /// a run made them, so a restore keeps the claim on an address that the run kept.
     pub log_index: u64,
-}
-
-impl Contract {
-    /// A key that is stable across redelivery and unique per discovery:
-    /// `block_hash:transaction_hash:log_index:address:contract`.
-    #[must_use]
-    pub fn dedupe_key(&self) -> String {
-        // `{:#x}`, not `Display`: an address displays checksummed, and every key is
-        // lowercase hex like the node's own encoding.
-        format!(
-            "{}:{:#x}:contract",
-            log_key(self.block_hash, self.transaction_hash, self.log_index),
-            self.address
-        )
-    }
 }
 
 /// Everything the indexer publishes, tagged by `type` on the wire.
