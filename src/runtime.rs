@@ -53,12 +53,25 @@
 //! the cause and a failed send the symptom.
 //!
 //! `SIGTERM` or `SIGINT` — a deploy's `docker stop`, or Ctrl-C — stops the run as
-//! asked rather than killing it: ingest stops at once, every store finishes the commit
-//! it has under way, commits what it has gathered if that fits a deadline under the
+//! asked rather than killing it: ingest stops at once, every store lets the commit it
+//! has under way run on, commits what it has gathered if that fits a deadline under the
 //! host's stop timeout, and drops the blocks still queued (see `crate::sink::channel`),
-//! and the process exits 0. Before ingest starts, the stores are being opened and brought
-//! to one block, which a restart repeats, so a stop there ends the run without waiting.
-//! A second signal does nothing more; the supervisor's own timeout is the backstop.
+//! and the process exits 0. Before ingest starts, the stores are being opened and
+//! brought to one block, which a restart repeats, so a stop there ends the run without
+//! waiting. A second signal does nothing more; the supervisor's own timeout is the
+//! backstop.
+//!
+//! The indexer never cuts a commit short, but the host does: `docker stop -t 30` kills
+//! the process 30 seconds after the signal, and a lake commit of a full buffer while
+//! catching up can take about a minute. A stop then ends as a crash does, which every
+//! store survives — nothing a commit wrote counts until its ledger entry does — and the
+//! next start fetches those blocks again from the ledger's tip. A stop at the tip, where
+//! a commit takes seconds, finishes in time.
+//!
+//! Exiting 0 means a supervisor that restarts only on failure (systemd's
+//! `Restart=on-failure`) leaves the run stopped. That is the point for a deploy's stop,
+//! but a `SIGTERM` from anything else, such as an operator's `docker stop`, also leaves
+//! the chain down until something starts it again.
 
 use std::collections::HashSet;
 use std::sync::Arc;
