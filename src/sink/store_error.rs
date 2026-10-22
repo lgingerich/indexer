@@ -28,7 +28,7 @@ pub enum Operation {
     Begin,
     /// Deleting the rows of orphaned blocks, or of blocks a stopped commit left behind.
     Delete,
-    /// Creating, loading, or dropping a staging table.
+    /// Creating, loading, emptying, or vacuuming a staging table.
     Stage,
     /// Merging staged rows into their table.
     Merge,

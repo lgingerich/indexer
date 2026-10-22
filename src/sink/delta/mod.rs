@@ -1628,12 +1628,12 @@ fn uint(value: u64) -> Expr {
     ))
 }
 
-/// A hash as the lake stores it: lowercase `0x` hex.
 /// A duration in whole milliseconds, for a log field.
 fn millis(duration: Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
+/// A hash as the lake stores it: lowercase `0x` hex.
 fn hex(hash: &B256) -> String {
     format!("{hash:#x}")
 }

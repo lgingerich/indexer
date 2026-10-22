@@ -73,7 +73,11 @@ derived fetch has no logs and the decoder has contracts. Small; do it next.
 
 - Reconciling a store that is ahead runs against DuckDB beside the lake in the
   two-store restart tests, but not against PostgreSQL: those tests need a live database
-  and are ignored by default. Neither does the SQL rewind, now only a fallback.
+  and are ignored by default.
+- **Done:** the SQL rewind, now only a fallback, is tested on both engines, including
+  a store far enough ahead that its ledger was pruned. It deletes by height, as the lake
+  does; it used to find blocks through the ledger, and missed those the prune had
+  dropped.
 - A store whose whole history lies above the slowest tip reconciles rather than being
   refused. That rule has unit tests in `resume.rs`, but no end-to-end restart test of its
   own.
@@ -108,8 +112,10 @@ From the code-quality review. None changes behavior.
   `write_batch`): extract one helper.
 - **Smaller:** `route.rs` mixes table selection (config) with the `Router` (hot path);
   `Opened` lives in `resume.rs` but its `batching` is only for the drain; `Sinks::tables`
-  names which sinks are set; `AnyStore` does not forward `observe_head`; a config test
-  asserts on error text rather than the variant.
+  names which sinks are set; a config test asserts on error text rather than the
+  variant. (`AnyStore` not forwarding `observe_head` is not a gap: no store implements
+  it. The storage channel takes each sampled head, for its progress line and the
+  store's lag metric, before anything reaches a store.)
 
 ## Stores further apart than the ledger window cannot resume together
 
