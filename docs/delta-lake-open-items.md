@@ -33,24 +33,22 @@ out of the ledger too.
 **Recommendation.** Do both the commit number and the merge if anything starts reading
 `reorgs` as authoritative history. Until then, accept.
 
-## Concurrent table writes in a commit
+## Concurrent table writes in a commit (done)
 
-**What.** A commit writes table by table. Its time is roughly, per table touched, one
-Parquet upload and one log commit: an estimated 100–300 ms each on S3, not measured. At
-the tip, 10–20 tables every 30 s is a few seconds, which the 32-block channel absorbs.
-Catching up, commits are large and the drain waits on each.
+A commit's middle step, every table's rows, appends all the tables at once
+(`append_all`), and the new blocks' ledger append runs on beside the next commit. The
+order the ledger rule needs stays fixed: retractions first, the ledger's delete first
+among the deletes, the ledger's append last. One table failing while others succeed is
+the partial commit the next open already repairs.
 
-**Options.** Sequential (current); every table at once; or a few at a time.
+## A hung write (done)
 
-**Considerations.** The order the ledger rule needs stays fixed: retractions first, the
-ledger's delete first among the deletes, the ledger's append last. Only the middle step
-(other tables' deletes and appends) can run concurrently. Concurrency builds every
-table's Arrow batch at once, so a commit's peak memory approaches twice the buffer
-rather than the buffer plus one table. One table failing while others succeed is the
-partial commit the next open already repairs.
-
-**Recommendation.** Measure commit time against real S3 first. If catching up is too
-slow, run the middle step about four tables at a time.
+A lake write that hangs without failing, on an object store request that never
+completes, used to stall the whole process: the lake's channel filled, ingest blocked
+on the send, and the PostgreSQL path stopped with it. Every commit, rewind, and final
+ledger wait now runs under a ten-minute deadline (`COMMIT_DEADLINE`); a missed one fails
+the store with `StoreError::Stalled`, the process exits, and the restart's open repairs
+what the cut write left behind.
 
 ## `StoreError::Reserved`
 
