@@ -250,7 +250,7 @@ impl PreparedEvent {
         let mut indexed = Vec::new();
         let mut body = Vec::new();
         for (position, param) in event.inputs.iter().enumerate() {
-            let ty = param.resolve()?;
+            let ty = plain(param.resolve()?);
             let argument = Argument {
                 name: param.name.clone(),
                 position,
@@ -265,8 +265,15 @@ impl PreparedEvent {
         }
         let layout = DynSolEvent::new(
             resolved.topic_0(),
-            resolved.indexed().iter().map(decoding_type).collect(),
-            DynSolType::Tuple(resolved.body().iter().map(decoding_type).collect()),
+            indexed
+                .iter()
+                .map(|argument| decoding_type(&argument.ty))
+                .collect(),
+            DynSolType::Tuple(
+                body.iter()
+                    .map(|argument| decoding_type(&argument.ty))
+                    .collect(),
+            ),
         )
         .ok_or_else(|| alloy_dyn_abi::Error::custom("prepared event layout is invalid"))?;
         Ok(Self {
@@ -277,6 +284,27 @@ impl PreparedEvent {
             indexed,
             body,
         })
+    }
+}
+
+/// `ty` with every struct a plain tuple.
+///
+/// With alloy's `eip712` feature on, which any crate in the build can enable, a tuple
+/// argument whose `internalType` names a struct resolves to `CustomStruct` rather than
+/// `Tuple`. Both encode alike, so the decoder treats them alike rather than meeting a
+/// variant it does not match. `as_custom_struct` exists with or without the feature,
+/// which is what lets this compile either way.
+fn plain(ty: DynSolType) -> DynSolType {
+    if let Some((_, _, tuple)) = ty.as_custom_struct() {
+        return DynSolType::Tuple(tuple.iter().cloned().map(plain).collect());
+    }
+    match ty {
+        DynSolType::Array(inner) => DynSolType::Array(Box::new(plain(*inner))),
+        DynSolType::FixedArray(inner, size) => {
+            DynSolType::FixedArray(Box::new(plain(*inner)), size)
+        }
+        DynSolType::Tuple(types) => DynSolType::Tuple(types.into_iter().map(plain).collect()),
+        ty => ty,
     }
 }
 
@@ -584,6 +612,49 @@ mod tests {
             TypedValue::IndexedHash { value: hash }
         );
         assert_eq!(result.indexed[0].abi_type.kind, "string");
+    }
+
+    /// A tuple argument whose `internalType` names a struct decodes as a tuple, in the
+    /// body, indexed, and in an array. With alloy's `eip712` feature on, such an argument
+    /// resolves to a `CustomStruct`, which must not reach the decoder as a shape it does
+    /// not match.
+    #[test]
+    fn struct_arguments_decode_as_tuples() {
+        let key = |name: &str, kind: &str, indexed: bool| {
+            format!(
+                r#"{{"name":"{name}","type":"tuple{kind}","internalType":"struct Pool.Key{kind}",
+                    "indexed":{indexed},"components":[
+                    {{"name":"owner","type":"address","internalType":"address"}}]}}"#
+            )
+        };
+        let abi = format!(
+            r#"[{{"type":"event","name":"Keyed","anonymous":false,"inputs":[{},{},{}]}}]"#,
+            key("hashed", "", true),
+            key("key", "", false),
+            key("keys", "[]", false),
+        );
+        let owner = DynSolValue::Tuple(vec![DynSolValue::Address(alloy_primitives::Address::ZERO)]);
+        let result = decode(
+            &abi,
+            &[owner.clone(), DynSolValue::Array(vec![owner])],
+            Some(B256::repeat_byte(1)),
+        );
+        let tuple = TypedValue::Tuple {
+            value: vec![TypedValue::Address {
+                value: alloy_primitives::Address::ZERO,
+            }],
+        };
+        assert_eq!(
+            result.indexed[0].value,
+            TypedValue::IndexedHash {
+                value: B256::repeat_byte(1)
+            }
+        );
+        assert_eq!(result.body[0].value, tuple);
+        assert_eq!(
+            result.body[1].value,
+            TypedValue::Array { value: vec![tuple] }
+        );
     }
 
     #[test]
