@@ -101,7 +101,8 @@ tables = ["blocks", "transactions", "logs"]
 
 # Delta Lake tables on object storage, one per table under `<uri>/<chain>/`: the cheap
 # raw-data lake. Requires the `delta` feature. Written at the tip; a reorg deletes the
-# orphaned rows. `uri` is an `s3://` URL (any S3-compatible store) or a local directory.
+# orphaned rows. `uri` is an `s3://` URL (any S3-compatible store) or a local directory,
+# which a relative path names from this file's directory.
 # Run one indexer per chain and `uri`: unlike the databases, nothing locks out a second.
 # [sink.delta]
 # tables = ["blocks", "transactions", "logs", "decoded_logs"]

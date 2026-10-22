@@ -484,6 +484,15 @@ impl Settings {
         {
             duckdb.path = settings.dir.join(&duckdb.path);
         }
+        // A lake in a local directory resolves the same way. A URL — `s3://`, `file://` —
+        // names its own location and is left as written; it would otherwise read as a
+        // relative path, which is what `Path` makes of `s3://bucket`.
+        #[cfg(feature = "delta")]
+        if let Some(delta) = &mut settings.sink.delta
+            && !delta.uri.contains("://")
+        {
+            delta.uri = settings.dir.join(&delta.uri).display().to_string();
+        }
         Ok(settings)
     }
 
@@ -629,6 +638,32 @@ tables = ["blocks"]
             let settings = Settings::from_file(&path, unset).expect("settings load");
             let duckdb = settings.sink.duckdb.expect("a DuckDB sink");
             assert_eq!(duckdb.path, resolved);
+        }
+        std::fs::remove_dir_all(&dir).expect("clean up");
+    }
+
+    /// A local lake's directory resolves against the settings file's directory too, and a
+    /// URL is left as written.
+    #[cfg(feature = "delta")]
+    #[test]
+    fn a_local_delta_uri_resolves_against_the_settings_file() {
+        let dir = std::env::temp_dir().join(format!("indexer-delta-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let path = dir.join("indexer.toml");
+        for (written, resolved) in [
+            ("lake", dir.join("lake").display().to_string()),
+            ("/srv/lake", "/srv/lake".to_owned()),
+            ("s3://bucket/prefix", "s3://bucket/prefix".to_owned()),
+            ("file:///srv/lake", "file:///srv/lake".to_owned()),
+        ] {
+            let text = minimal().replace(
+                "[sink.stdout]",
+                &format!("[sink.delta]\nuri = \"{written}\""),
+            );
+            std::fs::write(&path, text).expect("write settings");
+            let settings = Settings::from_file(&path, unset).expect("settings load");
+            let delta = settings.sink.delta.expect("a Delta sink");
+            assert_eq!(delta.uri, resolved, "{written}");
         }
         std::fs::remove_dir_all(&dir).expect("clean up");
     }
