@@ -27,6 +27,10 @@ COPY . .
 RUN cargo chef prepare --recipe-path recipe.json
 
 FROM chef AS build
+# `Cargo.toml` builds release incrementally, which pays off in a checkout that keeps
+# `target/`. Here nothing keeps the incremental cache past the build, so it would only
+# split the crate into more codegen units and optimize it less.
+ENV CARGO_PROFILE_RELEASE_INCREMENTAL=false
 COPY --from=plan /src/recipe.json recipe.json
 RUN cargo chef cook --release --locked --bin indexer --features postgres,delta \
     --recipe-path recipe.json
