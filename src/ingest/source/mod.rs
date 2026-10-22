@@ -41,9 +41,10 @@ pub use any_source::AnySource;
 pub use datasets::Datasets;
 pub use evm::EvmSource;
 pub use hypersync::{HyperSyncRanges, HyperSyncSource};
+pub use retry::NetworkError;
 // The simulation builds its client the way `evm::http_client` does, over its own node.
 #[cfg(all(test, feature = "duckdb"))]
-pub(crate) use retry::{NetworkError, RetryLayer};
+pub(crate) use retry::RetryLayer;
 
 use crate::wire::envelope::{BlockMeta, ChainId, Event};
 
@@ -74,8 +75,12 @@ pub const METHOD_NOT_FOUND: i64 = -32601;
 #[derive(Debug, Error)]
 pub enum SourceError {
     /// The HTTP client failed: it could not be built, or a request did not complete.
+    ///
+    /// Holds a [`NetworkError`] rather than the client's own error, which carries the
+    /// request URL and so, usually, the provider's API key. `?` on a `reqwest::Error`
+    /// converts through [`NetworkError`], which strips it.
     #[error("http client failure: {0}")]
-    Http(#[from] reqwest::Error),
+    Http(#[from] NetworkError),
     /// Alloy's typed RPC, decoding, or transport error at the named boundary.
     #[error("{context} failed: {source}")]
     Transport {
@@ -85,7 +90,10 @@ pub enum SourceError {
         #[source]
         source: alloy_transport::TransportError,
     },
-    /// A subscription notification could not be decoded.
+    /// A notification or response body is not the JSON it should be.
+    ///
+    /// The same failure as [`Self::Malformed`] to a caller, kept apart only so the
+    /// decoder's typed error survives rather than being flattened into a message.
     #[error("malformed data from {context}: {source}")]
     Json {
         /// What was being parsed.
@@ -123,6 +131,14 @@ pub enum SourceError {
         /// Which answers disagreed.
         detail: String,
     },
+}
+
+/// Every HTTP client error becomes a [`SourceError::Http`] through [`NetworkError`], so
+/// a `?` cannot carry the request URL into a logged error.
+impl From<reqwest::Error> for SourceError {
+    fn from(error: reqwest::Error) -> Self {
+        Self::Http(error.into())
+    }
 }
 
 /// A source invariant failed: the response at `context` cannot be right, so asking again

@@ -61,7 +61,7 @@ use tracing::warn;
 use super::assemble::{
     BlockRows, check_height, check_log_order, check_logs_present, check_no_leftovers,
 };
-use super::retry::{RetryLayer, os_seed};
+use super::retry::{NetworkError, RetryLayer, os_seed};
 use super::{
     BlockSource, Datasets, FetchedBlock, HeadStream, METHOD_NOT_FOUND, SourceError, inconsistent,
     malformed,
@@ -230,7 +230,6 @@ impl FetchPlan {
 ///
 /// A deployment reads over HTTP ([`http_client`]) and subscribes over WebSocket
 /// ([`ws_connect`]); a simulation passes in-memory ones instead.
-#[derive(Debug)]
 pub struct EvmSource<C = WsConnect> {
     chain: ChainId,
     heads: C,
@@ -346,8 +345,6 @@ fn invalid_json(context: &'static str, source: serde_json::Error) -> SourceError
     SourceError::Json { context, source }
 }
 
-/// The error for a failed call at `context`, without the request URL a reqwest error
-/// carries: a provider's URL usually holds its API key, and these errors are logged.
 /// [`transport`], for a read of a block, header, receipt, or log at a height, except that an
 /// error response saying the node has not reached that height is [`inconsistent`]: it
 /// is a `null` answer in other words, from a backend behind the one that announced the
@@ -376,17 +373,15 @@ fn not_reached(message: &str) -> bool {
     .any(|phrase| message.contains(phrase))
 }
 
+/// The error for a failed call at `context`, with any HTTP client error in it a
+/// [`NetworkError`], which carries no request URL: a provider's URL usually holds its
+/// API key, and these errors are logged. The retry layer has converted those already;
+/// this covers a client built without it.
 fn transport(context: &'static str, source: TransportError) -> SourceError {
-    let source = match source {
-        RpcError::Transport(TransportErrorKind::Custom(error)) => RpcError::Transport(
-            TransportErrorKind::Custom(match error.downcast::<reqwest::Error>() {
-                Ok(error) => Box::new(error.without_url()),
-                Err(error) => error,
-            }),
-        ),
-        other => other,
-    };
-    SourceError::Transport { context, source }
+    SourceError::Transport {
+        context,
+        source: NetworkError::from_transport(source),
+    }
 }
 
 /// The results one batched block request carries, still in alloy's RPC types
@@ -1210,6 +1205,21 @@ impl<C> EvmSource<C> {
             None => None,
         };
         split_range(from, &blocks, logs.as_deref(), self.plan)
+    }
+}
+
+/// Leaves out the subscription connection and the HTTP provider: both hold the node's
+/// URL, which usually carries its API key, and a WebSocket connection can hold an
+/// authorization header too.
+impl<C> fmt::Debug for EvmSource<C> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("EvmSource")
+            .field("chain", &self.chain)
+            .field("plan", &self.plan)
+            .field("span", &self.span)
+            .field("concurrency", &self.concurrency)
+            .field("finality_depth", &self.finality_depth)
+            .finish_non_exhaustive()
     }
 }
 
@@ -2422,6 +2432,22 @@ mod tests {
         );
         let printed = format!("{error} {error:?}");
         assert!(!printed.contains("secret-api-key"), "{printed}");
+    }
+
+    /// A source is logged with `{:?}`, and its endpoints' URLs, which hold the API key,
+    /// are not in it.
+    #[test]
+    fn a_source_does_not_print_its_endpoint_urls() {
+        let source = from_urls(
+            "ethereum",
+            "https://rpc.example/v2/secret-http-key",
+            "wss://ws.example/v2/secret-ws-key",
+            Datasets::all(),
+        )
+        .expect("source");
+        let printed = format!("{source:?}");
+        assert!(!printed.contains("secret"), "{printed}");
+        assert!(printed.contains("ethereum"), "{printed}");
     }
 
     /// An OP-stack block carrying a deposit transaction (`type: 0x7e`), which

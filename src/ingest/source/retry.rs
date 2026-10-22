@@ -148,54 +148,95 @@ impl Jitter {
     }
 }
 
-/// A request that never got an answer: the connection failed, or no response arrived in
-/// time. Always transient, except as the [module docs](self) say for a ranged log query.
+/// A request the HTTP client failed, rather than one the provider answered with an
+/// error. Transient unless the request could not be sent as built; a timeout is
+/// transient too, except for a log query over several heights, which goes back to be
+/// fetched smaller.
 ///
-/// Its message carries no request URL, since a provider's URL usually holds its API key
-/// and these errors are logged.
+/// Every HTTP client error either source sees becomes one of these, through its
+/// `From<reqwest::Error>`, the one place a request URL is stripped: a provider's URL
+/// usually holds its API key, and these errors are logged. It keeps only the message,
+/// so a URL cannot come back through it.
 #[derive(Debug, Error)]
 #[error("{detail}")]
-pub(crate) struct NetworkError {
-    timeout: bool,
+pub struct NetworkError {
+    failure: Failure,
     detail: String,
 }
 
+/// How a [`NetworkError`]'s request failed, which decides whether to send it again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Failure {
+    /// No answer arrived in time.
+    Timeout,
+    /// The request was sent and no whole answer came back: the connection was refused
+    /// or reset, its TLS handshake failed, or it closed mid-response.
+    Connection,
+    /// The request could not be sent as built — a header its token cannot form, a
+    /// redirect loop — so sending it again fails the same way.
+    Request,
+}
+
 impl NetworkError {
-    /// The provider did not answer in time.
+    /// The provider did not answer in time: what the simulation's node fails with, as a
+    /// real client's timeout becomes through `From<reqwest::Error>`.
+    #[cfg(all(test, feature = "duckdb"))]
     pub(crate) fn timeout(detail: impl Into<String>) -> Self {
         Self {
-            timeout: true,
+            failure: Failure::Timeout,
             detail: detail.into(),
         }
     }
 
-    /// The connection failed: refused, reset, or closed mid-response.
-    pub(crate) fn connection(detail: impl Into<String>) -> Self {
-        Self {
-            timeout: false,
-            detail: detail.into(),
-        }
+    /// Whether sending the request again can succeed: anything but a request that could
+    /// not be sent as built.
+    pub(crate) fn transient(&self) -> bool {
+        self.failure != Failure::Request
     }
 
-    /// The HTTP client's error as a [`NetworkError`], or the error unchanged when it
-    /// came from anywhere else.
-    fn from_transport(error: TransportError) -> TransportError {
+    /// Whether the request ran out of time.
+    fn timed_out(&self) -> bool {
+        self.failure == Failure::Timeout
+    }
+
+    /// The HTTP client's error inside a transport error as a [`NetworkError`], or the
+    /// error unchanged when it came from anywhere else.
+    pub(crate) fn from_transport(error: TransportError) -> TransportError {
         let RpcError::Transport(TransportErrorKind::Custom(error)) = error else {
             return error;
         };
         let error = match error.downcast::<reqwest::Error>() {
-            Ok(error) => {
-                let error = error.without_url();
-                let detail = error.to_string();
-                Box::new(if error.is_timeout() {
-                    Self::timeout(detail)
-                } else {
-                    Self::connection(detail)
-                })
-            }
+            Ok(error) => Box::new(Self::from(*error)),
             Err(error) => error,
         };
         RpcError::Transport(TransportErrorKind::Custom(error))
+    }
+}
+
+/// Strips the request URL, and keeps the message with every cause under it, which is
+/// what says a connection was refused rather than only that sending failed.
+///
+/// reqwest reports a connection that closes while the body is read as a decode error,
+/// since `bytes()` decodes the body; it is a connection failure like any other dropped
+/// connection. Only a builder or redirect error is a request that could not be sent.
+impl From<reqwest::Error> for NetworkError {
+    fn from(error: reqwest::Error) -> Self {
+        let error = error.without_url();
+        let failure = if error.is_timeout() {
+            Failure::Timeout
+        } else if error.is_builder() || error.is_redirect() {
+            Failure::Request
+        } else {
+            Failure::Connection
+        };
+        let mut detail = error.to_string();
+        let mut cause = std::error::Error::source(&error);
+        while let Some(source) = cause {
+            detail.push_str(": ");
+            detail.push_str(&source.to_string());
+            cause = source.source();
+        }
+        Self { failure, detail }
     }
 }
 
@@ -399,7 +440,9 @@ fn transient(
             Some("batch response missing a call".to_owned())
         }
         Err(RpcError::Transport(TransportErrorKind::Custom(error)))
-            if error.is::<NetworkError>() =>
+            if error
+                .downcast_ref::<NetworkError>()
+                .is_some_and(NetworkError::transient) =>
         {
             Some(format!("network error: {error}"))
         }
@@ -412,7 +455,7 @@ fn timed_out(result: &Result<ResponsePacket, TransportError>) -> bool {
     matches!(
         result,
         Err(RpcError::Transport(TransportErrorKind::Custom(error)))
-            if error.downcast_ref::<NetworkError>().is_some_and(|error| error.timeout)
+            if error.downcast_ref::<NetworkError>().is_some_and(NetworkError::timed_out)
     )
 }
 
@@ -443,7 +486,7 @@ mod tests {
     use serde_json::{Value, json};
     use tower::{Layer as _, ServiceExt as _};
 
-    use super::{MAX_RETRIES, MIN_DELAY_MS, Pacing, RetryLayer, timed_out};
+    use super::{MAX_RETRIES, MIN_DELAY_MS, NetworkError, Pacing, RetryLayer, timed_out};
 
     fn response(body: &str) -> ResponsePacket {
         serde_json::from_str(body).expect("response")
@@ -626,6 +669,37 @@ mod tests {
             let answer = result.expect(method);
             assert_eq!(answer.first_error_code(), code, "{method} {filter}");
             assert_eq!(calls, expected, "{method} {filter}");
+        }
+    }
+
+    /// An HTTP client error loses its URL, which holds the API key, and keeps the cause
+    /// under it. A refused connection is worth sending again; a request that cannot be
+    /// built is not.
+    #[tokio::test]
+    async fn a_client_error_drops_its_url_and_is_transient_only_if_sent() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let address = listener.local_addr().expect("address");
+        drop(listener);
+        let client = reqwest::Client::new();
+        let refused = client
+            .get(format!("http://{address}/secret-key"))
+            .send()
+            .await
+            .expect_err("nothing listens");
+        let unbuildable = client
+            .get(format!("http://{address}/secret-key"))
+            .header("authorization", "Bearer secret-key\n")
+            .send()
+            .await
+            .expect_err("an invalid header");
+        for (case, error, transient) in [
+            ("refused", refused, true),
+            ("unbuildable", unbuildable, false),
+        ] {
+            let error = NetworkError::from(error);
+            let printed = format!("{error} {error:?}");
+            assert!(!printed.contains("secret-key"), "{case}: {printed}");
+            assert_eq!(error.transient(), transient, "{case}: {printed}");
         }
     }
 

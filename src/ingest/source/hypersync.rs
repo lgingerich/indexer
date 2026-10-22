@@ -352,15 +352,12 @@ impl HyperSyncSource {
         &self,
         request: &impl Fn(&reqwest::Client) -> reqwest::RequestBuilder,
     ) -> Result<T, SourceError> {
-        // Without the URL, as every logged error is.
-        let failed = |error: reqwest::Error| SourceError::Http(error.without_url());
         let response = request(&self.client)
             .bearer_auth(&self.token)
             .send()
-            .await
-            .map_err(failed)?;
+            .await?;
         let status = response.status();
-        let body = response.bytes().await.map_err(failed)?;
+        let body = response.bytes().await?;
         if !status.is_success() {
             return Err(SourceError::Status {
                 context: CONTEXT,
@@ -385,19 +382,19 @@ impl HyperSyncSource {
     }
 }
 
-/// Why `result` is worth sending again — a transient status, or a request that timed out
-/// or lost its connection — or `None` when it succeeded or failed for good.
+/// Why `result` is worth sending again, or `None` when it succeeded or failed for good.
+///
+/// The same rule the RPC source's retry layer applies: a transient status, or a request
+/// the HTTP client failed in flight — a timeout, a refused or reset connection, one that
+/// closed mid-body — is sent again. A request that could not be sent as built, a status
+/// such as a refused token, and an answer that does not decode are not: asking again
+/// gets the same answer. Every query is a read, so a retry cannot apply anything twice.
 fn transient<T>(result: &Result<T, SourceError>) -> Option<String> {
     match result {
         Err(error @ SourceError::Status { status, .. }) if transient_status(*status) => {
             Some(error.to_string())
         }
-        Err(SourceError::Http(error))
-            if error.is_timeout()
-                || error.is_connect()
-                || error.is_request()
-                || error.is_body() =>
-        {
+        Err(SourceError::Http(error)) if error.transient() => {
             Some(format!("network error: {error}"))
         }
         _ => None,
