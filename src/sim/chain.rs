@@ -14,7 +14,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use alloy_primitives::{Address, B256, Bloom, Bytes};
+use alloy_consensus::{SignableTransaction as _, Transaction as _, TxEnvelope, TxLegacy};
+use alloy_primitives::{Address, B256, Bloom, Bytes, Signature, TxKind, U256};
 use tokio::sync::{Notify, broadcast};
 
 use super::Rng;
@@ -53,6 +54,9 @@ pub(super) struct Profile {
     /// Each store's own faults, by its position in the plan: a database and a lake fail
     /// apart.
     pub(super) stores: [StoreFaults; 2],
+    /// Whether the node serves `eth_getBlockReceipts`; without it, receipts are fetched
+    /// a transaction at a time, as on some L2s.
+    pub(super) block_receipts: bool,
 }
 
 /// How often one store's statements fail, per mille.
@@ -100,6 +104,7 @@ impl Profile {
             skip_head: rate(rng, 200),
             stale_head: rate(rng, 150),
             stores: [StoreFaults::draw(rng), StoreFaults::draw(rng)],
+            block_receipts: !rng.chance(20),
         }
     }
 }
@@ -113,10 +118,70 @@ pub(super) struct SimLog {
     pub(super) transaction_hash: B256,
 }
 
-/// One block: its header, its logs in block order, and the view it first appeared in.
+/// One transaction: a signed legacy envelope, so its hash is the real one a node would
+/// report, and the sender the node recovered.
+#[derive(Debug, Clone)]
+pub(super) struct SimTransaction {
+    pub(super) envelope: TxEnvelope,
+    pub(super) from: Address,
+}
+
+impl SimTransaction {
+    pub(super) fn hash(&self) -> B256 {
+        *self.envelope.tx_hash()
+    }
+
+    /// The recipient: every simulated transaction is a call.
+    pub(super) fn to(&self) -> Option<Address> {
+        self.envelope.to()
+    }
+
+    pub(super) fn nonce(&self) -> u64 {
+        self.envelope.nonce()
+    }
+
+    pub(super) fn input(&self) -> &Bytes {
+        self.envelope.input()
+    }
+
+    pub(super) fn gas_price(&self) -> u128 {
+        self.envelope.gas_price().unwrap_or_default()
+    }
+
+    /// A transaction from one of a few senders to one of a few contracts.
+    fn draw(rng: &mut Rng) -> Self {
+        let pick = |rng: &mut Rng, base: u8| {
+            Address::repeat_byte(base + u8::try_from(rng.below(4)).unwrap_or(0))
+        };
+        let from = pick(rng, 0x10);
+        let length = usize::try_from(rng.below(33)).unwrap_or(0);
+        let transaction = TxLegacy {
+            chain_id: Some(1),
+            nonce: rng.below(1000),
+            gas_price: u128::from(1 + rng.below(100)) * 1_000_000_000,
+            gas_limit: 21_000 + rng.below(100_000),
+            to: TxKind::Call(pick(rng, 0x20)),
+            value: U256::from(rng.below(1_000_000)),
+            input: Bytes::copy_from_slice(&rng.b256()[..length]),
+        };
+        let signature = Signature::new(
+            U256::from_be_bytes(rng.b256().0),
+            U256::from_be_bytes(rng.b256().0),
+            rng.chance(50),
+        );
+        Self {
+            envelope: TxEnvelope::Legacy(transaction.into_signed(signature)),
+            from,
+        }
+    }
+}
+
+/// One block: its header, its transactions and its logs in block order, and the view it
+/// first appeared in.
 #[derive(Debug, Clone)]
 pub(super) struct SimBlock {
     pub(super) header: alloy_rpc_types_eth::Header,
+    pub(super) transactions: Vec<SimTransaction>,
     pub(super) logs: Vec<SimLog>,
     view: usize,
 }
@@ -130,15 +195,17 @@ impl SimBlock {
         self.header.inner.number
     }
 
-    /// The block's transaction hashes, each once, in order.
+    /// The block's transaction hashes, in order.
     pub(super) fn transactions(&self) -> Vec<B256> {
-        let mut hashes: Vec<B256> = Vec::new();
-        for log in &self.logs {
-            if hashes.last() != Some(&log.transaction_hash) {
-                hashes.push(log.transaction_hash);
-            }
-        }
-        hashes
+        self.transactions.iter().map(SimTransaction::hash).collect()
+    }
+
+    /// The logs of the transaction at `index`, each with its index in the block.
+    pub(super) fn logs_of(&self, index: usize) -> impl Iterator<Item = (u64, &SimLog)> {
+        let hash = self.transactions.get(index).map(SimTransaction::hash);
+        (0_u64..)
+            .zip(&self.logs)
+            .filter(move |(_, log)| Some(log.transaction_hash) == hash)
     }
 }
 
@@ -363,13 +430,25 @@ impl World {
                 )
             });
         let mut logs: Vec<SimLog> = Vec::new();
+        let mut transactions: Vec<SimTransaction> = Vec::new();
         let mut bloom = Bloom::ZERO;
         if number > 0 {
-            for _ in 0..self.rng.below(5) {
-                let transaction_hash = match logs.last() {
-                    Some(last) if self.rng.chance(50) => last.transaction_hash,
-                    _ => self.rng.b256(),
-                };
+            for _ in 0..self.rng.below(4) {
+                transactions.push(SimTransaction::draw(&mut self.rng));
+            }
+            // Logs in block order are in transaction order; some transactions log nothing,
+            // and a block without transactions has no logs.
+            let mut sender = 0;
+            let count = if transactions.is_empty() {
+                0
+            } else {
+                self.rng.below(5)
+            };
+            for _ in 0..count {
+                if sender + 1 < transactions.len() && self.rng.chance(50) {
+                    sender += 1 + self.index_below(transactions.len() - sender - 1);
+                }
+                let transaction_hash = transactions[sender].hash();
                 let log = super::protocol::log(&mut self.rng, transaction_hash)
                     .unwrap_or_else(|| self.noise(transaction_hash));
                 bloom.accrue_raw_log(log.address, &log.topics);
@@ -388,7 +467,15 @@ impl World {
         let hash = header.hash;
         self.trace.push(format!("block {number} {hash}"));
         let view = self.views.len();
-        self.blocks.insert(hash, SimBlock { header, logs, view });
+        self.blocks.insert(
+            hash,
+            SimBlock {
+                header,
+                transactions,
+                logs,
+                view,
+            },
+        );
         hash
     }
 }

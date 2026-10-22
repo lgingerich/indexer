@@ -44,6 +44,13 @@ const TABLES: &[(&str, &str, usize)] = &[
         13,
     ),
     (
+        "transactions",
+        "SELECT block_hash, hash, transaction_index::VARCHAR, from_address, to_address, \
+         nonce::VARCHAR, input, receipt_status::VARCHAR, log_count::VARCHAR, \
+         block_number::VARCHAR FROM sim.transactions",
+        10,
+    ),
+    (
         "decoded_logs",
         "SELECT block_hash, log_index::VARCHAR, address, transaction_hash, protocol, \
          contract, name FROM sim.decoded_logs",
@@ -70,8 +77,9 @@ const TABLES: &[(&str, &str, usize)] = &[
     (
         "metric_v1_swaps",
         "SELECT block_hash, log_index::VARCHAR, address, transaction_hash, sender, \
-         recipient FROM sim.metric_v1_swaps",
-        6,
+         recipient, coalesce(transaction_from_address, '-'), \
+         coalesce(transaction_to_address, '-') FROM sim.metric_v1_swaps",
+        8,
     ),
 ];
 
@@ -105,7 +113,7 @@ pub(super) fn expected(
     // the start, though a store holds rows only from its first.
     let mut pools: BTreeSet<Address> = BTreeSet::new();
     for block in branch {
-        let decoded = decode(block, &mut pools);
+        let decoded = decode(block, &mut pools, plan.datasets.transactions);
         if block.number() < first {
             continue;
         }
@@ -118,6 +126,9 @@ pub(super) fn expected(
         }
         if plan.datasets.logs && store.raw {
             add("logs", log_rows(block));
+        }
+        if plan.datasets.transactions && store.raw {
+            add("transactions", transaction_rows(block));
         }
         for (table, row) in decoded {
             if table == "contracts" || store.decoded {
@@ -194,7 +205,14 @@ pub(super) fn ends(stored: &Stored) -> Option<(B256, u64)> {
 /// which it adds the block's creations to: a pool decodes from the log after the one
 /// that created it, in the same block too, and a swap from an address not yet created
 /// decodes nothing.
-fn decode(block: &SimBlock, pools: &mut BTreeSet<Address>) -> Vec<(&'static str, Vec<String>)> {
+///
+/// A derived row carries its transaction's sender and recipient when transactions are
+/// fetched, and nothing in their place when they are not.
+fn decode(
+    block: &SimBlock,
+    pools: &mut BTreeSet<Address>,
+    transactions: bool,
+) -> Vec<(&'static str, Vec<String>)> {
     let mut rows = Vec::new();
     let text = |address: &Address| format!("{address:#x}");
     for (log, index) in block.logs.iter().zip(0_u64..) {
@@ -239,13 +257,51 @@ fn decode(block: &SimBlock, pools: &mut BTreeSet<Address>) -> Vec<(&'static str,
                 "metric_v1_pool_swap",
                 vec![text(&sender), text(&recipient)],
             ));
+            let sent = block
+                .transactions
+                .iter()
+                .find(|transaction| transaction.hash() == log.transaction_hash)
+                .filter(|_| transactions);
+            let (from, to) = sent.map_or_else(
+                || ("-".to_owned(), "-".to_owned()),
+                |sent| {
+                    (
+                        text(&sent.from),
+                        sent.to().map_or_else(|| "-".to_owned(), |to| text(&to)),
+                    )
+                },
+            );
             rows.push(hash(
                 "metric_v1_swaps",
-                vec![text(&sender), text(&recipient)],
+                vec![text(&sender), text(&recipient), from, to],
             ));
         }
     }
     rows
+}
+
+fn transaction_rows(block: &SimBlock) -> Vec<Vec<String>> {
+    block
+        .transactions
+        .iter()
+        .enumerate()
+        .map(|(index, transaction)| {
+            vec![
+                format!("{:#x}", block.hash()),
+                format!("{:#x}", transaction.hash()),
+                index.to_string(),
+                format!("{:#x}", transaction.from),
+                transaction
+                    .to()
+                    .map_or_else(String::new, |to| format!("{to:#x}")),
+                transaction.nonce().to_string(),
+                transaction.input().to_string(),
+                "true".to_owned(),
+                block.logs_of(index).count().to_string(),
+                block.number().to_string(),
+            ]
+        })
+        .collect()
 }
 
 fn ledger_row(block: &SimBlock) -> Vec<String> {

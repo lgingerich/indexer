@@ -16,15 +16,19 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
+use alloy_consensus::{
+    Eip658Value, Receipt, ReceiptEnvelope, ReceiptWithBloom, transaction::Recovered,
+};
 use alloy_json_rpc::{PubSubItem, RequestPacket, ResponsePacket, SerializedRequest};
+use alloy_primitives::{B256, Bloom};
 use alloy_pubsub::{ConnectionHandle, ConnectionInterface, PubSubConnect};
-use alloy_rpc_types_eth::{Block, BlockTransactions, Log};
+use alloy_rpc_types_eth::{Block, BlockTransactions, Log, TransactionReceipt};
 use alloy_transport::{TransportError, TransportErrorKind, TransportFut, TransportResult};
 use serde_json::{Value, json};
 use tokio::sync::broadcast;
 use tower::Service;
 
-use super::chain::{Shared, SimBlock, View, World, lock};
+use super::chain::{Shared, SimBlock, SimLog, View, World, lock};
 use crate::ingest::source::NetworkError;
 
 /// The HTTP client's request timeout, which a request that never answers costs.
@@ -107,10 +111,21 @@ fn respond(world: &mut World, view: usize, request: &SerializedRequest) -> Value
     {
         world.reached("logs fetched over a range");
     }
+    match request.method() {
+        "eth_getBlockByNumber" if params[1] == Value::Bool(true) => {
+            world.reached("full block fetched");
+        }
+        "eth_getBlockReceipts" => world.reached("block receipts fetched"),
+        "eth_getTransactionReceipt" => world.reached("receipt fetched by transaction"),
+        _ => {}
+    }
+    let block_receipts = world.profile.block_receipts;
     let view = world.view(view);
     let answer = match request.method() {
         "eth_getBlockByNumber" => block_by_number(&view, &params),
         "eth_getLogs" => logs(&view, &params),
+        "eth_getBlockReceipts" if block_receipts => block_receipts_at(&view, &params),
+        "eth_getTransactionReceipt" => transaction_receipt(&view, &params),
         _ => Err((-32601, "method not found")),
     };
     let id = request.id();
@@ -124,17 +139,50 @@ fn respond(world: &mut World, view: usize, request: &SerializedRequest) -> Value
 
 type Answer = Result<Value, (i64, &'static str)>;
 
-/// A hashes-only block, or `null` past the backend's tip.
-fn block_by_number(view: &View<'_>, params: &Value) -> Answer {
-    if params[1] != Value::Bool(false) {
-        return Err((-32602, "the simulated node serves hashes-only blocks"));
-    }
-    let height = match params[0].as_str() {
+/// The block at a tag, or `None` past the backend's tip.
+fn at_tag<'a>(view: &View<'a>, tag: &Value) -> Result<Option<&'a SimBlock>, (i64, &'static str)> {
+    let height = match tag.as_str() {
         Some("latest") => view.tip(),
         Some(tag) => quantity(tag).ok_or((-32602, "bad block tag"))?,
         None => return Err((-32602, "missing block tag")),
     };
-    Ok(view.at(height).map_or(Value::Null, render_block))
+    Ok(view.at(height))
+}
+
+/// A block, hashes-only or with full transactions as asked, or `null` past the
+/// backend's tip.
+fn block_by_number(view: &View<'_>, params: &Value) -> Answer {
+    let Some(full) = params[1].as_bool() else {
+        return Err((-32602, "missing hydration flag"));
+    };
+    Ok(at_tag(view, &params[0])?.map_or(Value::Null, |block| render_block(block, full)))
+}
+
+/// A block's receipts, or `null` past the backend's tip.
+fn block_receipts_at(view: &View<'_>, params: &Value) -> Answer {
+    Ok(at_tag(view, &params[0])?.map_or(Value::Null, |block| {
+        Value::Array(
+            (0..block.transactions.len())
+                .map(|index| render_receipt(block, index))
+                .collect(),
+        )
+    }))
+}
+
+/// A transaction's receipt from the backend's canonical chain, or `null` when it holds
+/// no such transaction: the fallback for a node without `eth_getBlockReceipts`.
+fn transaction_receipt(view: &View<'_>, params: &Value) -> Answer {
+    let hash: B256 = params[0]
+        .as_str()
+        .and_then(|hash| hash.parse().ok())
+        .ok_or((-32602, "bad transaction hash"))?;
+    Ok((0..=view.tip())
+        .filter_map(|height| view.at(height))
+        .find_map(|block| {
+            let index = block.transactions().iter().position(|tx| *tx == hash)?;
+            Some(render_receipt(block, index))
+        })
+        .unwrap_or(Value::Null))
 }
 
 /// Logs for one block by hash, or for a range of the backend's canonical heights.
@@ -164,42 +212,98 @@ fn quantity(tag: &str) -> Option<u64> {
     u64::from_str_radix(tag.strip_prefix("0x")?, 16).ok()
 }
 
-fn render_block(block: &SimBlock) -> Value {
-    let body = Block::<alloy_rpc_types_eth::Transaction>::new(
-        block.header.clone(),
-        BlockTransactions::Hashes(block.transactions()),
-    );
+fn render_block(block: &SimBlock, full: bool) -> Value {
+    let transactions = if full {
+        BlockTransactions::Full(
+            block
+                .transactions
+                .iter()
+                .zip(0_u64..)
+                .map(|(transaction, index)| alloy_rpc_types_eth::Transaction {
+                    inner: Recovered::new_unchecked(transaction.envelope.clone(), transaction.from),
+                    block_hash: Some(block.hash()),
+                    block_number: Some(block.number()),
+                    transaction_index: Some(index),
+                    effective_gas_price: Some(transaction.gas_price()),
+                    block_timestamp: Some(block.header.inner.timestamp),
+                })
+                .collect(),
+        )
+    } else {
+        BlockTransactions::Hashes(block.transactions())
+    };
+    let body = Block::<alloy_rpc_types_eth::Transaction>::new(block.header.clone(), transactions);
     serde_json::to_value(body).unwrap_or(Value::Null)
+}
+
+/// The receipt of the block's transaction at `index`, its logs nested.
+fn render_receipt(block: &SimBlock, index: usize) -> Value {
+    let Some(transaction) = block.transactions.get(index) else {
+        return Value::Null;
+    };
+    let logs: Vec<Log> = block
+        .logs_of(index)
+        .map(|(log_index, log)| rpc_log(block, log, log_index))
+        .collect();
+    let mut bloom = Bloom::ZERO;
+    for log in &logs {
+        bloom.accrue_log(&log.inner);
+    }
+    let gas_used = 21_000 + 1_000 * logs.len() as u64;
+    let receipt = TransactionReceipt {
+        inner: ReceiptEnvelope::Legacy(ReceiptWithBloom {
+            receipt: Receipt {
+                status: Eip658Value::Eip658(true),
+                cumulative_gas_used: gas_used * (index as u64 + 1),
+                logs,
+            },
+            logs_bloom: bloom,
+        }),
+        transaction_hash: transaction.hash(),
+        transaction_index: Some(index as u64),
+        block_hash: Some(block.hash()),
+        block_number: Some(block.number()),
+        gas_used,
+        effective_gas_price: transaction.gas_price(),
+        blob_gas_used: None,
+        blob_gas_price: None,
+        from: transaction.from,
+        to: transaction.to(),
+        contract_address: None,
+    };
+    serde_json::to_value(receipt).unwrap_or(Value::Null)
+}
+
+/// One of the block's logs, at `index` in the block, as the node reports it.
+fn rpc_log(block: &SimBlock, log: &SimLog, index: u64) -> Log {
+    let transaction_index = block
+        .transactions()
+        .iter()
+        .position(|hash| *hash == log.transaction_hash)
+        .map(|index| index as u64);
+    Log {
+        inner: alloy_primitives::Log::new_unchecked(
+            log.address,
+            log.topics.clone(),
+            log.data.clone(),
+        ),
+        block_hash: Some(block.hash()),
+        block_number: Some(block.number()),
+        block_timestamp: Some(block.header.inner.timestamp),
+        transaction_hash: Some(log.transaction_hash),
+        transaction_index,
+        log_index: Some(index),
+        removed: false,
+    }
 }
 
 /// The block's logs as `eth_getLogs` returns them.
 pub(super) fn render_logs(block: &SimBlock) -> Vec<Value> {
-    let transactions = block.transactions();
     block
         .logs
         .iter()
         .zip(0_u64..)
-        .map(|(log, index)| {
-            let transaction_index = transactions
-                .iter()
-                .position(|hash| *hash == log.transaction_hash)
-                .map(|index| index as u64);
-            let log = Log {
-                inner: alloy_primitives::Log::new_unchecked(
-                    log.address,
-                    log.topics.clone(),
-                    log.data.clone(),
-                ),
-                block_hash: Some(block.hash()),
-                block_number: Some(block.number()),
-                block_timestamp: Some(block.header.inner.timestamp),
-                transaction_hash: Some(log.transaction_hash),
-                transaction_index,
-                log_index: Some(index),
-                removed: false,
-            };
-            serde_json::to_value(log).unwrap_or(Value::Null)
-        })
+        .map(|(log, index)| serde_json::to_value(rpc_log(block, log, index)).unwrap_or(Value::Null))
         .collect()
 }
 
@@ -227,7 +331,7 @@ impl PubSubConnect for SimHeads {
 async fn serve_heads(
     world: Shared,
     mut interface: ConnectionInterface,
-    mut heads: broadcast::Receiver<alloy_primitives::B256>,
+    mut heads: broadcast::Receiver<B256>,
 ) {
     const SUBSCRIPTION: &str = "0x1";
     let mut subscribed = false;
@@ -298,7 +402,7 @@ async fn serve_heads(
 }
 
 /// The tip of a view a few steps old: possibly a block a reorg has since replaced.
-fn stale(world: &mut World) -> Option<alloy_primitives::B256> {
+fn stale(world: &mut World) -> Option<B256> {
     let index = world.newest().saturating_sub(1 + world.index_below(6));
     let view = world.view(index);
     view.at(view.tip()).map(SimBlock::hash)

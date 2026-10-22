@@ -267,10 +267,13 @@ enum End {
 fn run(seed: u64, dir: &Path) -> Outcome {
     let mut rng = Rng::new(seed);
     let length = 10 + rng.below(40);
-    let datasets = if rng.chance(50) {
-        r#"["logs"]"#
-    } else {
-        r#"["blocks", "logs"]"#
+    // Without transactions, backfill fetches ranges of headers and logs; with them, full
+    // blocks and their receipts a height at a time.
+    let datasets = match rng.below(4) {
+        0 => r#"["logs"]"#,
+        1 => r#"["blocks", "logs"]"#,
+        2 => r#"["transactions", "logs"]"#,
+        _ => r#"["blocks", "transactions", "logs"]"#,
     };
     let mut roles = vec![StorePlan::database(&mut rng)];
     let plan = Plan {
