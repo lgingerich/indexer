@@ -606,15 +606,24 @@ impl<S: BlockSource + 'static, K: EnvelopeSink> Machine<S, K> {
     /// behind the one that announced the head, as a load-balanced provider's often is,
     /// catches up within seconds, and stopping the run for it cost a restart. Accepted
     /// history matches what was delivered, so the next attempt resumes from the tip.
-    /// After [`STARTUP_ATTEMPTS`] attempts the error stops the run as any other does.
+    /// After [`STARTUP_ATTEMPTS`] attempts in a row that accept nothing, the error stops
+    /// the run as any other does. An attempt that moved the tip starts the count over: a
+    /// long backfill on a provider that lags now and then meets many such answers, each
+    /// soon past, and counting them all stopped it after the thirtieth.
     async fn sync_settled(
         &mut self,
         start: Option<u64>,
         stop: Option<u64>,
     ) -> Result<Option<u64>, PipelineError> {
         let mut attempt = 1;
+        let mut reached = self.ring.tip();
         loop {
-            match self.sync(start, stop).await {
+            let result = self.sync(start, stop).await;
+            if self.ring.tip() != reached {
+                reached = self.ring.tip();
+                attempt = 1;
+            }
+            match result {
                 Err(
                     error @ (PipelineError::UnstableSource
                     | PipelineError::Source(SourceError::Inconsistent { .. })),
@@ -1258,8 +1267,8 @@ mod tests {
         finality: u64,
         /// Whether each `fetch_block` waits a moment, so fetches made ahead overlap.
         slow_blocks: bool,
-        /// Answer the next block fetch inconsistently, once.
-        inconsistent_once: AtomicBool,
+        /// How many more times the block at each height is answered inconsistently.
+        inconsistent: std::sync::Mutex<HashMap<u64, u32>>,
         /// `fetch_block` calls in flight now, and the most there ever were.
         blocks_in_flight: AtomicUsize,
         blocks_peak: AtomicUsize,
@@ -1288,7 +1297,7 @@ mod tests {
                     follows: true,
                     finality: MAX_UNFINALIZED_BLOCKS as u64,
                     slow_blocks: false,
-                    inconsistent_once: AtomicBool::new(false),
+                    inconsistent: std::sync::Mutex::default(),
                     blocks_in_flight: AtomicUsize::new(0),
                     blocks_peak: AtomicUsize::new(0),
                 },
@@ -1392,7 +1401,14 @@ mod tests {
                 tokio::time::sleep(std::time::Duration::from_millis(5)).await;
                 data.blocks_in_flight.fetch_sub(1, Ordering::Relaxed);
             }
-            if data.inconsistent_once.swap(false, Ordering::Relaxed) {
+            if let Some(left) = data
+                .inconsistent
+                .lock()
+                .expect("inconsistent")
+                .get_mut(&height)
+                .filter(|left| **left > 0)
+            {
+                *left -= 1;
                 return Err(SourceError::Inconsistent {
                     context: "test".into(),
                     detail: "a backend behind the head".into(),
@@ -2026,7 +2042,12 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn startup_asks_an_inconsistent_source_again() {
         let source = Source::linear(6);
-        source.data.inconsistent_once.store(true, Ordering::Relaxed);
+        source
+            .data
+            .inconsistent
+            .lock()
+            .expect("inconsistent")
+            .insert(3, 1);
         let mut machine = Machine::new(source, Sink::default(), ledger(0..=2));
         assert_eq!(
             machine
@@ -2040,6 +2061,53 @@ mod tests {
             reads(&machine),
             (2, 5),
             "the head is sampled again, and only the failed height fetched twice"
+        );
+    }
+
+    /// Startup gives up on an inconsistent source only after that many attempts in a row
+    /// accept nothing: a long backfill whose provider lags at many heights, each soon
+    /// caught up, runs through, and one stuck at a height still stops the run.
+    #[tokio::test(start_paused = true)]
+    async fn startup_gives_up_only_after_attempts_in_a_row_without_progress() {
+        let attempts = u64::from(STARTUP_ATTEMPTS);
+        let head = 2 * attempts;
+        let source = Source::linear(head);
+        source
+            .data
+            .inconsistent
+            .lock()
+            .expect("inconsistent")
+            .extend((1..=head).map(|height| (height, 1)));
+        let mut machine = Machine::new(source, Sink::default(), ledger(0..=0));
+        machine
+            .sync_settled(None, Some(head))
+            .await
+            .expect("every lagging height is caught up");
+        assert_eq!(heights(&machine), (1..=head).collect::<Vec<_>>());
+
+        let source = Source::linear(6);
+        source
+            .data
+            .inconsistent
+            .lock()
+            .expect("inconsistent")
+            .insert(3, u32::MAX);
+        let mut machine = Machine::new(source, Sink::default(), ledger(0..=2));
+        let error = machine
+            .sync_settled(None, Some(6))
+            .await
+            .expect_err("a height that never settles stops the run");
+        assert!(
+            matches!(
+                error,
+                PipelineError::Source(SourceError::Inconsistent { .. })
+            ),
+            "{error:?}"
+        );
+        assert_eq!(
+            reads(&machine).1,
+            usize::try_from(attempts).expect("count"),
+            "the stuck height is asked once per attempt"
         );
     }
 
