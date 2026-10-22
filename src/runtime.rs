@@ -939,11 +939,13 @@ tables = ["blocks", "transactions", "logs", "decoded_logs", "contract_events"]
             ],
             [1, 1]
         );
-        // The decoded rows key back to the raw logs they came from.
+        // The decoded rows key back to the raw logs they came from. Joined on the
+        // columns: a key prefix would also match log 3 to the decodes of log 30.
         let orphans: i64 = reader
             .query_row(
                 "SELECT count(*) FROM base.decoded_logs d WHERE NOT EXISTS \
-                 (SELECT 1 FROM base.logs l WHERE starts_with(d.dedupe_key, l.dedupe_key))",
+                 (SELECT 1 FROM base.logs l WHERE l.block_hash = d.block_hash \
+                 AND l.transaction_hash = d.transaction_hash AND l.log_index = d.log_index)",
                 [],
                 |row| row.get(0),
             )
