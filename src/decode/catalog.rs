@@ -76,7 +76,7 @@ use serde::Deserialize;
 use tracing::warn;
 
 use super::abi::{Abi, AbiError, AddressSlot, EventKey, InputSpec};
-use super::derive::{DERIVATIONS, Derivation};
+use super::derive::{DERIVATIONS, Derivation, Derivations};
 use crate::sink::table::{Column, ColumnType, MAX_IDENTIFIER, Schema, TableError, snake_case};
 use crate::wire::envelope::ChainId;
 
@@ -153,8 +153,9 @@ pub(crate) struct Rule {
 pub struct Catalog {
     pub(crate) entries: Vec<Entry>,
     pub(crate) seeds: Vec<(Address, EntryId)>,
-    /// The derivations whose event a manifest declares; see [`super::derive`].
-    pub(super) derivations: Vec<Derivation>,
+    /// The derivations whose events a manifest declares, bound to them; see
+    /// [`super::derive`]. A [`DecodingSink`](super::DecodingSink) runs its own copy.
+    pub(super) derivations: Derivations,
     schema: Schema,
 }
 
@@ -168,7 +169,7 @@ impl Catalog {
         Ok(Self {
             entries: Vec::new(),
             seeds: Vec::new(),
-            derivations: Vec::new(),
+            derivations: Derivations::default(),
             schema: Schema::new().map_err(|source| CatalogError::Table {
                 contract: "the dataset tables".to_owned(),
                 source,
@@ -346,13 +347,14 @@ impl Catalog {
             .position(|entry| entry.protocol == protocol && entry.name == name)
     }
 
-    /// Declares the table of every derivation whose events a manifest declares, and keeps
-    /// those derivations. One whose contract is not loaded, as when the setting names a
-    /// subtree without its protocol, or is declared without one of its events, because
-    /// the contract's ABI changed under it, is skipped with a warning. Neither is an error
-    /// here: a store that lists the skipped table fails at startup for want of it.
+    /// Declares the table of every derivation whose events a manifest declares, and binds
+    /// those derivations to their contract's entry and events. One whose contract is not
+    /// loaded, as when the setting names a subtree without its protocol, or is declared
+    /// without one of its events, because the contract's ABI changed under it, is skipped
+    /// with a warning. Neither is an error here: a store that lists the skipped table fails
+    /// at startup for want of it.
     fn add_derivations(&mut self) -> Result<(), CatalogError> {
-        for derivation in DERIVATIONS {
+        'derivations: for derivation in DERIVATIONS {
             let Derivation {
                 protocol,
                 contract,
@@ -369,16 +371,20 @@ impl Catalog {
                 );
                 continue;
             };
-            let abi = &self.entries[entry].abi;
-            if let Some(missing) = signatures.iter().find(|&&event| !abi.declares(event)) {
-                warn!(
-                    table,
-                    protocol,
-                    contract,
-                    signature = missing,
-                    "the manifest does not declare an event this table derives from"
-                );
-                continue;
+            let mut events = Vec::with_capacity(signatures.len());
+            for &signature in signatures {
+                let keys = self.entries[entry].abi.keys(signature);
+                if keys.is_empty() {
+                    warn!(
+                        table,
+                        protocol,
+                        contract,
+                        signature,
+                        "the manifest does not declare an event this table derives from"
+                    );
+                    continue 'derivations;
+                }
+                events.extend(keys);
             }
             self.schema
                 .add_derived(table, columns, indexes)
@@ -386,7 +392,7 @@ impl Catalog {
                     contract: self.label(entry),
                     source,
                 })?;
-            self.derivations.push(derivation);
+            self.derivations.bind(derivation, entry, events);
         }
         Ok(())
     }

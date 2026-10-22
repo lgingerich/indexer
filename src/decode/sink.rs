@@ -2,11 +2,10 @@
 
 use tracing::{info, warn};
 
-use crate::decode::{Decoder, derive};
+use super::Decoder;
+use super::derive::{Derivations, Sent};
 use crate::metrics;
 use crate::sink::{EnvelopeSink, SinkError};
-use alloy_primitives::{Address, TxHash};
-
 use crate::wire::envelope::{ChainId, Envelope, Event, Log};
 
 /// Forwards every raw record and adds decoded logs, their derived rows, and discovered
@@ -21,8 +20,10 @@ use crate::wire::envelope::{ChainId, Envelope, Event, Log};
 /// log whose transaction was not fetched derives rows without them.
 pub struct DecodingSink<K> {
     decoder: Decoder,
-    /// The hash, sender, and recipient of the last transaction forwarded.
-    transaction: Option<(TxHash, Address, Option<Address>)>,
+    /// The derivations the catalog bound, run on every record decoded.
+    derivations: Derivations,
+    /// The last transaction forwarded.
+    transaction: Option<Sent>,
     /// Logs decoded since the last flush, recorded once a block rather than per log, so
     /// the ingest task pays no metric call per envelope.
     decoded: u64,
@@ -45,6 +46,7 @@ impl<K: EnvelopeSink> DecodingSink<K> {
             warn!("no contracts registered; no log will decode");
         }
         Self {
+            derivations: decoder.catalog().derivations.clone(),
             decoder,
             transaction: None,
             decoded: 0,
@@ -69,10 +71,14 @@ impl<K: EnvelopeSink> DecodingSink<K> {
                 self.decoded += 1;
                 let sent = self
                     .transaction
-                    .filter(|&(hash, ..)| hash == log.transaction_hash)
-                    .map(|(_, from, to)| (from, to));
-                let derived = derive::rows(self.decoder.derivations(), chain, &decoded, sent)
-                    .map_err(|error| SinkError::Decode(Box::new(error)))?;
+                    .filter(|sent| sent.hash == log.transaction_hash);
+                let derived = match decoding.event {
+                    Some(event) => self
+                        .derivations
+                        .rows(chain, event, &decoded, sent)
+                        .map_err(|error| SinkError::Decode(Box::new(error)))?,
+                    None => Vec::new(),
+                };
                 events.push(Event::Decoded(Box::new(decoded)));
                 events.extend(derived.into_iter().map(|row| Event::Derived(Box::new(row))));
             }
@@ -102,7 +108,11 @@ impl<K: EnvelopeSink> EnvelopeSink for DecodingSink<K> {
     async fn publish(&mut self, envelope: Envelope) -> Result<(), SinkError> {
         let added = match &envelope.event {
             Event::Transaction(transaction) => {
-                self.transaction = Some((transaction.hash, transaction.from, transaction.to));
+                self.transaction = Some(Sent {
+                    hash: transaction.hash,
+                    from: transaction.from,
+                    to: transaction.to,
+                });
                 Vec::new()
             }
             Event::Log(log) => self.decode(&envelope.chain, log)?,

@@ -16,9 +16,8 @@ use std::collections::hash_map::Entry;
 use alloy_primitives::{Address, B256};
 use tracing::warn;
 
-use super::abi::{DecodeError, event_key};
+use super::abi::{DecodeError, EventKey, event_key};
 use super::catalog::{Catalog, EntryId};
-use super::derive::Derivation;
 use crate::wire::envelope::{Contract, Decoded, Log, StoredContract};
 
 /// What one log produced: its decoded record, and any contracts its event created.
@@ -29,6 +28,9 @@ pub struct Decoding {
     pub decoded: Result<Decoded, DecodeError>,
     /// The contracts this log created, in rule order.
     pub discovered: Vec<Contract>,
+    /// The catalog entry and event the record decoded as, which its derivations are bound
+    /// to; `None` when it did not decode.
+    pub(crate) event: Option<(EntryId, EventKey)>,
 }
 
 /// One address in the contract set.
@@ -93,9 +95,9 @@ impl Decoder {
         self.contracts.len() - before
     }
 
-    /// The derivations the catalog feeds, which run on every record decoded.
-    pub(super) fn derivations(&self) -> &[Derivation] {
-        &self.catalog.derivations
+    /// The catalog it decodes with.
+    pub(super) const fn catalog(&self) -> &Catalog {
+        &self.catalog
     }
 
     /// How many addresses decode: seeds plus discovered contracts.
@@ -120,10 +122,11 @@ impl Decoder {
     /// A child's logs from before its creation log, such as those its constructor emits,
     /// are never decoded: the child joins the set only once that log is seen, after them.
     pub fn decode(&mut self, log: &Log) -> Option<Decoding> {
-        let member = self.contracts.get(&log.address)?;
-        let entry = &self.catalog.entries[member.entry];
+        let id = self.contracts.get(&log.address)?.entry;
+        let entry = &self.catalog.entries[id];
         let decoded = entry.abi.decode_log(log).transpose()?;
-        let mut children: Vec<(EntryId, Address)> = event_key(log)
+        let key = event_key(log);
+        let mut children: Vec<(EntryId, Address)> = key
             .and_then(|key| entry.rules.get(&key))
             .into_iter()
             .flatten()
@@ -170,6 +173,7 @@ impl Decoder {
             })
             .collect();
         Some(Decoding {
+            event: key.filter(|_| decoded.is_ok()).map(|key| (id, key)),
             decoded,
             discovered,
         })

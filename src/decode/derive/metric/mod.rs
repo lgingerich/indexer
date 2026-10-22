@@ -31,7 +31,7 @@ fn bin_index(value: I256, position: usize, name: &'static str) -> Result<TypedVa
 #[cfg(test)]
 #[expect(clippy::expect_used)]
 mod tests {
-    use alloy_primitives::{Address, I256, U256};
+    use alloy_primitives::{Address, I256, TxHash, U256};
 
     use crate::decode::fixtures::metric::{
         bin_swapped, details, int128s, ladder, liquidity, pool_created, swap, uint128s,
@@ -77,7 +77,11 @@ mod tests {
             ),
         ];
         for (derivation, decoded, expected) in cases {
-            let sent: Sent = Some((Address::repeat_byte(0xf0), Some(Address::repeat_byte(0xf1))));
+            let sent = Some(Sent {
+                hash: TxHash::ZERO,
+                from: Address::repeat_byte(0xf0),
+                to: Some(Address::repeat_byte(0xf1)),
+            });
             let rows = derivation.rows(&decoded, sent).expect("derives");
             assert_eq!(rows.len(), expected, "{}", derivation.table);
             for (row, number) in rows.iter().zip(0..) {

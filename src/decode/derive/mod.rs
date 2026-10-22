@@ -34,11 +34,12 @@
 //! hooks in `decode`:
 //!
 //! - `mod derive` in `decode/mod.rs`.
-//! - `Catalog::add_derivations`, which declares their tables, its call in
-//!   `Catalog::load`, and the `Catalog::derivations` field, in `catalog.rs`.
-//! - `Decoder::derivations`, in `decoder.rs`.
-//! - The `derive::rows` call in `DecodingSink::decode`, the last transaction it keeps
-//!   for a row's sender and recipient, and the test of a derived row, in `sink.rs`.
+//! - `Catalog::add_derivations`, which declares their tables and binds them, its call
+//!   in `Catalog::load`, and the `Catalog::derivations` field, in `catalog.rs`.
+//! - `Decoding::event`, which names the event a record decoded as, in `decoder.rs`.
+//! - The `derivations` field of `DecodingSink` and its `rows` call, the last
+//!   transaction it keeps for a row's sender and recipient, and the test of a derived
+//!   row, in `sink.rs`.
 //! - `fixtures::metric`, in `fixtures.rs`.
 //! - `metrics::derive_failed`.
 //!
@@ -52,9 +53,11 @@
 pub(super) mod metric;
 mod value;
 
-use alloy_primitives::Address;
+use alloy_primitives::{Address, TxHash};
 use tracing::warn;
 
+use super::abi::EventKey;
+use super::catalog::EntryId;
 use crate::metrics;
 use crate::sink::table::ColumnType;
 use crate::wire::envelope::{ChainId, Decoded, Derived, DerivedField, TypedValue};
@@ -94,13 +97,6 @@ pub(super) struct Derivation {
 pub(super) type Row = Vec<(&'static str, TypedValue)>;
 
 impl Derivation {
-    /// Whether `decoded` is a record of an event this reads.
-    fn reads(&self, decoded: &Decoded) -> bool {
-        decoded.protocol == self.protocol
-            && decoded.contract == self.contract
-            && self.signatures.contains(&decoded.signature.as_str())
-    }
-
     /// The rows `decoded` derives, numbered in order.
     ///
     /// # Errors
@@ -108,7 +104,7 @@ impl Derivation {
     /// Returns [`DeriveError::Argument`] when an argument is missing, misnamed, of another
     /// type, or out of the range the contract keeps it in, and [`DeriveError::Columns`]
     /// when a row does not name the table's columns in order.
-    fn rows(&self, decoded: &Decoded, sent: Sent) -> Result<Vec<Derived>, DeriveError> {
+    fn rows(&self, decoded: &Decoded, sent: Option<Sent>) -> Result<Vec<Derived>, DeriveError> {
         (self.derive)(decoded)?
             .into_iter()
             .zip(0..)
@@ -127,8 +123,8 @@ impl Derivation {
                     transaction_index: decoded.transaction_index,
                     log_index: decoded.log_index,
                     row,
-                    transaction_from_address: sent.map(|(from, _)| from),
-                    transaction_to_address: sent.and_then(|(_, to)| to),
+                    transaction_from_address: sent.map(|sent| sent.from),
+                    transaction_to_address: sent.and_then(|sent| sent.to),
                     fields: values
                         .into_iter()
                         .map(|(name, value)| DerivedField {
@@ -171,44 +167,87 @@ pub(super) enum DeriveError {
     },
 }
 
-/// The sender and recipient of the transaction a log came from, or `None` when the
-/// transaction was not fetched. The recipient is `None` for a contract deployment.
-pub(super) type Sent = Option<(Address, Option<Address>)>;
+/// The transaction a log came from, as ingest forwarded it just before its logs: whose
+/// sender and recipient every derived row carries.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct Sent {
+    /// The transaction.
+    pub(super) hash: TxHash,
+    /// The account that sent it.
+    pub(super) from: Address,
+    /// Its recipient, `None` for a contract deployment.
+    pub(super) to: Option<Address>,
+}
 
-/// The rows `decoded` derives, from every derivation that reads its event, each carrying
-/// the transaction's sender and recipient.
-///
-/// A record a derivation cannot read is logged and derives nothing from it.
-///
-/// # Errors
-///
-/// Returns [`DeriveError::Columns`] when a derivation computes a row that does not match
-/// its table, a bug in it that stops the run.
-pub(super) fn rows(
-    derivations: &[Derivation],
-    chain: &ChainId,
-    decoded: &Decoded,
-    sent: Sent,
-) -> Result<Vec<Derived>, DeriveError> {
-    let mut derived = Vec::new();
-    for derivation in derivations
-        .iter()
-        .filter(|derivation| derivation.reads(decoded))
-    {
-        match derivation.rows(decoded, sent) {
-            Ok(rows) => derived.extend(rows),
-            Err(error @ DeriveError::Columns { .. }) => return Err(error),
-            Err(error @ DeriveError::Argument { .. }) => {
-                metrics::derive_failed(derivation.table);
-                warn!(%chain, table = derivation.table, address = %decoded.address,
-                    block = decoded.block_number, block_hash = %decoded.block_hash,
-                    transaction = %decoded.transaction_hash,
-                    log_index = decoded.log_index, %error,
-                    "derivation failed; keeping the decoded record");
+/// The derivations a catalog declares, each bound at load to the catalog entry and the
+/// events it reads, so a decoded record finds its derivations by the event it decoded
+/// as rather than by comparing names.
+#[derive(Debug, Clone, Default)]
+pub(super) struct Derivations {
+    bound: Vec<Bound>,
+}
+
+/// One derivation, bound to one event of one catalog entry.
+#[derive(Debug, Clone, Copy)]
+struct Bound {
+    entry: EntryId,
+    event: EventKey,
+    derivation: Derivation,
+}
+
+impl Derivations {
+    /// Runs `derivation` on every record of `entry` decoded as one of `events`.
+    pub(super) fn bind(
+        &mut self,
+        derivation: Derivation,
+        entry: EntryId,
+        events: impl IntoIterator<Item = EventKey>,
+    ) {
+        self.bound.extend(events.into_iter().map(|event| Bound {
+            entry,
+            event,
+            derivation,
+        }));
+    }
+
+    /// The rows `decoded`, a record of `entry` decoded as `event`, derives from every
+    /// derivation bound to that event, each carrying `sent`'s sender and recipient, or
+    /// neither when the transaction was not fetched.
+    ///
+    /// A record a derivation cannot read is logged and derives nothing from it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DeriveError::Columns`] when a derivation computes a row that does not
+    /// match its table, a bug in it that stops the run.
+    pub(super) fn rows(
+        &self,
+        chain: &ChainId,
+        (entry, event): (EntryId, EventKey),
+        decoded: &Decoded,
+        sent: Option<Sent>,
+    ) -> Result<Vec<Derived>, DeriveError> {
+        let mut derived = Vec::new();
+        for Bound { derivation, .. } in self
+            .bound
+            .iter()
+            .filter(|bound| bound.entry == entry && bound.event == event)
+        {
+            match derivation.rows(decoded, sent) {
+                Ok(rows) => derived.extend(rows),
+                Err(error @ DeriveError::Columns { .. }) => return Err(error),
+                Err(error @ DeriveError::Argument { .. }) => {
+                    metrics::derive_failed(derivation.table);
+                    warn!(%chain, table = derivation.table, address = %decoded.address,
+                        block = decoded.block_number, block_hash = %decoded.block_hash,
+                        transaction = %decoded.transaction_hash,
+                        log_index = decoded.log_index, %error,
+                        "derivation failed; keeping the decoded record");
+                }
             }
         }
+        Ok(derived)
     }
-    Ok(derived)
 }
 
 #[cfg(test)]
@@ -221,7 +260,7 @@ mod tests {
     use crate::wire::envelope::{ChainId, Decoded, TypedValue};
 
     use super::metric::SWAPS;
-    use super::{DERIVATIONS, Derivation, DeriveError, Row, rows};
+    use super::{DERIVATIONS, Derivation, Derivations, DeriveError, Row};
 
     /// Every derivation's pinned signature is declared in the shipped protocols, so the
     /// catalog declares its table: an ABI edit that changes the event fails here, not at
@@ -238,19 +277,53 @@ mod tests {
         }
     }
 
+    /// The shipped catalog binds a pool `Swap` to its derivation by the pool's entry and
+    /// the event's key: the record derives its row as that event, and nothing as another
+    /// event or another contract's.
+    #[test]
+    fn a_record_derives_from_the_derivations_bound_to_its_event() {
+        let catalog = shipped("robinhood");
+        let chain = ChainId::new("robinhood");
+        let pool = catalog
+            .entry("metric_v1", "MetricOmmPool")
+            .expect("the pool");
+        let factory = catalog
+            .entry("metric_v1", "MetricOmmPoolFactory")
+            .expect("the factory");
+        let swap = swap(U256::ZERO, U256::ZERO, U256::ZERO);
+        let rows = |event| {
+            catalog
+                .derivations
+                .rows(&chain, event, &swap, None)
+                .expect("rows")
+                .into_iter()
+                .map(|row| row.table)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(rows((pool, (swap.selector, 3))), [SWAPS.table]);
+        assert!(
+            rows((pool, (swap.selector, 2))).is_empty(),
+            "another topic count"
+        );
+        assert!(
+            rows((factory, (swap.selector, 3))).is_empty(),
+            "another contract"
+        );
+    }
+
     /// A record whose arguments the derivation cannot read derives nothing, rather than
     /// failing or guessing.
     #[test]
     fn an_unreadable_record_derives_nothing() {
         let chain = ChainId::new("base");
         let mut swap = swap(U256::ZERO, U256::ZERO, U256::ZERO);
-        assert_eq!(rows(&[SWAPS], &chain, &swap, None).expect("rows").len(), 1);
+        let event = (0, (swap.selector, 3));
+        let mut derivations = Derivations::default();
+        derivations.bind(SWAPS, event.0, [event.1]);
+        let rows = |swap: &Decoded| derivations.rows(&chain, event, swap, None).expect("rows");
+        assert_eq!(rows(&swap).len(), 1);
         swap.body[0].value = TypedValue::Bool { value: true };
-        assert!(
-            rows(&[SWAPS], &chain, &swap, None)
-                .expect("rows")
-                .is_empty()
-        );
+        assert!(rows(&swap).is_empty());
     }
 
     /// A row that does not name its table's columns in order is refused as a bug in the
@@ -303,7 +376,10 @@ mod tests {
                 exchanged,
             ),
         ] {
-            match rows(&[derivation], &chain, &swap, None) {
+            let event = (0, (swap.selector, 3));
+            let mut derivations = Derivations::default();
+            derivations.bind(derivation, event.0, [event.1]);
+            match derivations.rows(&chain, event, &swap, None) {
                 Err(DeriveError::Columns { table, names }) => {
                     assert_eq!((table, names), (SWAPS.table, expected), "{case}");
                 }
