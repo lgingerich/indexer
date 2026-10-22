@@ -838,11 +838,50 @@ impl<S: BlockSource + 'static, K: EnvelopeSink> Machine<S, K> {
         if head.height > tip.height {
             return self.catch_up(tip, head).await;
         }
+        // Below every remembered block, the window cannot match the head, but the head
+        // may still be an ancestor of what was accepted: a node behind the store, as a
+        // load-balanced provider's often is, rather than a fork.
+        if self.is_ancestor_below_window(head).await? {
+            return Ok(());
+        }
         // The head is at or below the tip: a same-height or deeper fork.
         if self.header(head.height).await? != head {
             return Err(PipelineError::UnstableSource);
         }
         self.handle_reorg(head).await
+    }
+
+    /// Whether `head`, below the oldest remembered block, is that block's ancestor on
+    /// the source as it stands: the headers from just under the oldest block down to
+    /// `head` link to it, each the parent the one above names, and the one at `head`'s
+    /// height is `head`. Then the source is only behind, and there is nothing to do.
+    ///
+    /// Without this, such a head went to the fork walk, which found no remembered block
+    /// below the window and stopped the run with
+    /// [`PipelineError::UndoWindowExceeded`], although nothing had forked. A head inside
+    /// the window, or one that does not link, is left to the fork walk as before. The
+    /// walk is bounded by [`MAX_UNFINALIZED_BLOCKS`] headers; a head further below is too.
+    async fn is_ancestor_below_window(&mut self, head: BlockMeta) -> Result<bool, PipelineError> {
+        let Some(oldest) = self.ring.oldest() else {
+            return Ok(false);
+        };
+        if head.height >= oldest.height
+            || oldest.height - head.height > MAX_UNFINALIZED_BLOCKS as u64
+        {
+            return Ok(false);
+        }
+        let mut expected = oldest.parent_hash;
+        for height in (head.height..oldest.height).rev() {
+            let header = self.header(height).await?;
+            if header.hash != expected {
+                return Ok(false);
+            }
+            expected = header.parent_hash;
+            if height == head.height {
+                return Ok(header == head);
+            }
+        }
+        Ok(false)
     }
 
     /// Fetches consecutive heights from `tip` to the observed `target`.
@@ -1492,6 +1531,39 @@ mod tests {
             .skip(1)
             .collect();
         assert_eq!(replayed, (tip..=tip + 10).collect::<Vec<_>>());
+    }
+
+    /// A restart whose node is behind the store, below every block the store handed
+    /// back, is not a fork when that head is the oldest block's ancestor: nothing is
+    /// retracted or published, and the run carries on. DST-002: found by the simulation
+    /// as a stop with `UndoWindowExceeded` on seed 236; see `docs/dst-changelog.md`.
+    #[tokio::test]
+    async fn a_head_behind_the_store_below_the_window_is_not_a_fork() {
+        let mut source = Source::linear(13);
+        // A fresh run stored 12 and 13; the node now reports 11 as its head.
+        source.data.head = 11;
+        let mut machine = Machine::new(source, Sink::default(), ledger(12..=13));
+        machine
+            .sync(None, None)
+            .await
+            .expect("a lagging head is not a fork");
+        assert!(machine.sink.events.is_empty());
+        assert_eq!(machine.tip().expect("tip").height, 13);
+    }
+
+    /// A head below the window that does not lead to the oldest remembered block is a
+    /// fork the window cannot reach, and still stops the run.
+    #[tokio::test]
+    async fn a_forked_head_below_the_window_still_stops() {
+        let mut source = Source::linear(13);
+        source.data.head = 11;
+        source.data.blocks.insert(11, (hash(111), hash(10)));
+        let mut machine = Machine::new(source, Sink::default(), ledger(12..=13));
+        assert!(matches!(
+            machine.sync(None, None).await,
+            Err(PipelineError::UndoWindowExceeded { .. })
+        ));
+        assert!(machine.sink.events.is_empty());
     }
 
     #[tokio::test]
