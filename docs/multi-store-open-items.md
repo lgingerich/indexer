@@ -106,8 +106,6 @@ From the code-quality review. None changes behavior.
   `DuckDbSettings` and `PostgresSettings` a `batching()` like `DeltaSettings`.
 - **`Datasets` leftovers.** Its `Default` (all three) and settings-file docs predate the
   derived fetch; `route::datasets` belongs on the type.
-- **A third hand-rolled transaction** in `SqlStore` (`rewind` beside `new` and
-  `write_batch`): extract one helper.
 - **Smaller:** `route.rs` mixes table selection (config) with the `Router` (hot path);
   `Opened` lives in `resume.rs` but its `batching` is only for the drain; `Sinks::tables`
   names which sinks are set; a config test asserts on error text rather than the

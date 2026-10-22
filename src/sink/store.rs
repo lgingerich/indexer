@@ -192,10 +192,7 @@ impl<E: Engine> SqlStore<E> {
                 .await
                 .map_err(StoreError::engine(Operation::Create, Some(chain)))?;
         }
-        engine
-            .execute("BEGIN", &[])
-            .await
-            .map_err(StoreError::engine(Operation::Begin, None))?;
+        begin(&mut engine).await?;
         // Every table and index in one batch, so a remote database pays one round trip for
         // the schema rather than one a statement. Each is `IF NOT EXISTS`, so a rerun
         // creates only what is missing. A failure rolls back, so the session is not left in
@@ -209,14 +206,11 @@ impl<E: Engine> SqlStore<E> {
             }))
             .collect::<Vec<_>>()
             .join(";\n");
-        if let Err(error) = engine.execute(&create, &[]).await {
-            let _ = engine.execute("ROLLBACK", &[]).await;
-            return Err(StoreError::engine(Operation::Create, Some(chain))(error));
-        }
-        engine
-            .execute("COMMIT", &[])
+        let created = engine
+            .execute(&create, &[])
             .await
-            .map_err(StoreError::engine(Operation::Commit, None))?;
+            .map_err(StoreError::engine(Operation::Create, Some(chain)));
+        end(&mut engine, created).await?;
         let stored = describe(&mut engine).await?;
         for def in schema.tables() {
             check::<E::Dialect>(def, stored.get(&def.name).map_or(&[], Vec::as_slice))?;
@@ -366,20 +360,10 @@ impl<E: Engine> SqlStore<E> {
         if self.batch.is_empty() {
             return Ok(());
         }
-        self.engine
-            .execute("BEGIN", &[])
-            .await
-            .map_err(StoreError::engine(Operation::Begin, None))?;
-        if let Err(error) = self.write_tables().await {
-            // The rollback's own failure says nothing the write's does not; the batch stays
-            // buffered either way.
-            let _ = self.engine.execute("ROLLBACK", &[]).await;
-            return Err(error);
-        }
-        self.engine
-            .execute("COMMIT", &[])
-            .await
-            .map_err(StoreError::engine(Operation::Commit, None))?;
+        begin(&mut self.engine).await?;
+        // A failed write leaves the batch buffered, for the retry.
+        let written = self.write_tables().await;
+        end(&mut self.engine, written).await?;
         self.batch.clear();
         self.vacuum_staging().await
     }
@@ -495,18 +479,9 @@ impl<E: Engine + 'static> Store for SqlStore<E> {
 
     /// One transaction, so a stop part-way leaves the store as it was.
     async fn rewind(&mut self, height: u64) -> Result<(), StoreError> {
-        self.engine
-            .execute("BEGIN", &[])
-            .await
-            .map_err(StoreError::engine(Operation::Begin, None))?;
-        if let Err(error) = self.delete_above(height).await {
-            let _ = self.engine.execute("ROLLBACK", &[]).await;
-            return Err(error);
-        }
-        self.engine
-            .execute("COMMIT", &[])
-            .await
-            .map_err(StoreError::engine(Operation::Commit, None))
+        begin(&mut self.engine).await?;
+        let deleted = self.delete_above(height).await;
+        end(&mut self.engine, deleted).await
     }
 }
 
@@ -537,6 +512,31 @@ impl<E: Engine> EnvelopeSink for SqlStore<E> {
             retries += 1;
         }
     }
+}
+
+/// Starts a transaction on `engine`, which [`end`] ends.
+async fn begin<E: Engine>(engine: &mut E) -> Result<(), StoreError> {
+    engine
+        .execute("BEGIN", &[])
+        .await
+        .map_err(StoreError::engine(Operation::Begin, None))
+}
+
+/// Ends the transaction [`begin`] started on `engine`, given what ran in it: commits it
+/// when `work` succeeded, and otherwise rolls it back and returns `work`'s error. The
+/// rollback's own failure says nothing the work's does not.
+///
+/// The commit is the statement `COMMIT`, sent through [`Engine::execute`]: the
+/// simulation's faulty engine recognizes a commit by it.
+async fn end<E: Engine>(engine: &mut E, work: Result<(), StoreError>) -> Result<(), StoreError> {
+    if let Err(error) = work {
+        let _ = engine.execute("ROLLBACK", &[]).await;
+        return Err(error);
+    }
+    engine
+        .execute("COMMIT", &[])
+        .await
+        .map_err(StoreError::engine(Operation::Commit, None))
 }
 
 /// Every table's stored columns in the session's schema, as name and type in column
