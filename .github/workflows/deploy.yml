@@ -40,12 +40,34 @@ on:
 permissions:
   contents: read
   packages: write
+  # To read CI's runs for the commit.
+  actions: read
+
+# One deploy or stop at a time, queued rather than cancelled: two at once could leave a
+# `prod-<chain>` tag on either one's commit, and a cancelled one could leave it half moved.
+concurrency:
+  group: deploy
+  cancel-in-progress: false
 
 jobs:
   deploy:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
+      # Only a commit CI passed on is deployed: the image builds whatever ref it is
+      # given, and a commit that fails to parse a chain's settings or its tests would
+      # otherwise reach the host. CI must have finished, so a commit pushed a minute ago
+      # waits for it. A stop deploys no code and is never held back.
+      - name: Require CI to have passed
+        if: inputs.action == 'deploy'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          passed=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/runs?head_sha=$GITHUB_SHA&status=success" --jq '.total_count')
+          if [ "$passed" -eq 0 ]; then
+            echo "::error::CI has not passed on $GITHUB_SHA; wait for it, or deploy a commit it passed on"
+            exit 1
+          fi
       # Every chain named must have a settings file in the image, so a typo fails here
       # instead of pushing a tag the host would run. Block overrides are heights of one
       # chain, so they take exactly one.

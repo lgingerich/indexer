@@ -3,10 +3,10 @@ name = "indexer"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.95.0"
-authors = ["TODO"]
+authors = ["Landon Gingerich"]
 description = "A low-latency, chain-agnostic blockchain indexer."
 readme = "README.md"
-repository = "TODO"
+repository = "https://github.com/lgingerich/indexer"
 license = "MIT OR Apache-2.0"
 
 [[bin]]
