@@ -20,9 +20,14 @@
 //!
 //! ```json
 //! {"type":"uint","value":"0xde0b6b3a7640000","bits":256}
+//! {"type":"int","value":"-2017000","bits":24}
 //! {"type":"address","value":"0x0000000000000000000000000000000000000001"}
 //! {"type":"tuple","value":[{"type":"bool","value":true}]}
 //! ```
+//!
+//! The two integer kinds are written differently, each as its `alloy-primitives` type
+//! serializes: an unsigned integer as a `0x` hex string, and a signed one as a decimal
+//! string with its sign.
 //!
 //! `bits` and `size` are plain JSON numbers rather than quantity-encoded, because
 //! they are our own metadata and not a chain field — the same treatment
@@ -97,14 +102,15 @@ pub enum TypedValue {
     },
     /// A signed integer of `bits` width, for example `int256`.
     Int {
-        /// The value, as a two's-complement signed integer of `bits` width.
+        /// The value, as a two's-complement signed integer of `bits` width, written as
+        /// a decimal string such as `"-1"`.
         value: I256,
         /// The declared width in bits, `8..=256` and a multiple of 8.
         bits: u16,
     },
     /// An unsigned integer of `bits` width, for example `uint256`.
     Uint {
-        /// The value.
+        /// The value, written as a `0x` hex string.
         value: U256,
         /// The declared width in bits, `8..=256` and a multiple of 8.
         bits: u16,

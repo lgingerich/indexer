@@ -1,7 +1,9 @@
 //! EVM dataset records.
 //!
 //! Each struct is one normalized dataset table with a natural key, so a row maps
-//! to a persistence row without further flattening:
+//! to a persistence row without further flattening. Either source fills them: an RPC
+//! node, or `HyperSync`'s blocks, transactions, and logs tables for a backfill, which
+//! carry the same fields (see `ingest::source`). The RPC source reads:
 //!
 //! | Dataset | RPC source | Natural key |
 //! | --- | --- | --- |
@@ -9,7 +11,16 @@
 //! | [`Transaction`] | the block's `transactions` array, joined to its receipt | `(block_hash, hash)` |
 //! | [`Log`] | a receipt's `logs` array | `(block_hash, transaction_hash, log_index)` |
 //!
-//! Every key is the hashes that identify the row plus a dataset tag. The block's
+//! Every key is the natural key's fields joined by `:`. A block's and a transaction's
+//! end in a dataset tag (`:block`, `:tx`). A log's has none, deliberately: the records
+//! produced from a log extend its key as a prefix — a decoded record with
+//! `:selector:event_id:decoded`, a discovered contract with `:address:contract`, and a
+//! derived row with `:table:row`, which has no tag either — so a child's key starts with
+//! its log's. That prefix is not a join on its own, because log 3's key is also a prefix
+//! of log 30's; join on the columns, or on the log's key followed by `:`. The keys are
+//! persisted primary keys, so their shapes do not change.
+//!
+//! Every key carries the block's
 //! **hash**, not its number: a height says where a block sat, the hash says *which*
 //! block sat there, and only the second tells two rows apart. A reorg replaces the block
 //! at a height with a different one. A transaction re-included there keeps its signed
@@ -52,7 +63,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::wire::typed::{AbiType, TypedValue};
 
-/// Block header and metadata, from `eth_getBlockByNumber`.
+/// Block header and metadata, from `eth_getBlockByNumber` or `HyperSync`'s blocks table.
 ///
 /// Natural key is `hash`: the hash pins which block held a number, so a reorg yields a
 /// new row at the same number. `transaction_hashes` is the block's transactions in
@@ -144,7 +155,8 @@ impl Block {
     }
 }
 
-/// One transaction, from its block's `transactions` array, joined to its receipt.
+/// One transaction, from its block's `transactions` array or `HyperSync`'s transactions
+/// table, joined to its receipt.
 ///
 /// A receipt is the transaction's execution result, exactly one per inclusion and keyed
 /// the same way, so it is not a table of its own: its fields are carried here with
@@ -177,7 +189,7 @@ pub struct Transaction {
     pub gas: u64,
     /// The gas price the node reported, in wei.
     ///
-    /// Whatever `eth_getBlockByNumber` returned in `gasPrice`, which is `Some` for every
+    /// Whatever the source returned in `gasPrice`, which is `Some` for every
     /// transaction type — for an EIP-1559 transaction a node reports the price actually
     /// paid, so this is that transaction's `effective_gas_price` and not the ceiling it
     /// was signed with. Deliberately the node's own field rather than the consensus
@@ -285,7 +297,7 @@ impl Transaction {
     }
 }
 
-/// One log, from a receipt's `logs` array.
+/// One log, from a receipt's `logs` array or `HyperSync`'s logs table.
 ///
 /// Natural key is `(block_hash, transaction_hash, log_index)`. Topics are flattened into
 /// `topic0`..`topic3` so a row is fixed-shape; `topic0` is the event signature.

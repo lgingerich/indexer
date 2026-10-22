@@ -10,9 +10,8 @@
 //! `examples/fixtures/datasets.ndjson`. Read the file to see exactly what a consumer
 //! receives.
 //!
-//! The line each envelope gets is the same bytes the `stdout` sink prints and the
-//! `DuckDB` sink keeps in its `envelope` column, so this fixture is what a consumer
-//! actually parses — not a prettified approximation of it.
+//! The line each envelope gets is the same bytes the `stdout` sink prints, so this
+//! fixture is what a consumer actually parses — not a prettified approximation of it.
 //!
 //! # What to look for
 //!

@@ -927,10 +927,10 @@ a network.
 `schema_version` is the wire shape's version. It is a field on the envelope rather than a transport
 header because one of the sinks is a local database: a header survives no hop into
 `DuckDB`, a file, or a pipe, so a consumer reading those could not tell two shapes
-apart. It is bumped only for a breaking change — a field's type or meaning changing,
-or a field or variant being removed. Adding an optional field or a new event variant
-does not bump it, which is why consumers must skip an unknown `type` and ignore
-unknown fields.
+apart. It is bumped for a breaking change — a field's type or meaning changing, a
+field or variant being removed — and for a new event variant, which a strict reader
+rejects as an unknown `type`. Adding an optional field does not bump it, which is why
+consumers must ignore unknown fields.
 
 Events fall into three kinds. **Datasets** — `block`, `transaction`, `log` — are durable on-chain records, defined per chain in `src/wire/datasets/evm.rs`. Each
 is a normalized table with a natural key and fully deconstructed fields, the same
@@ -1035,8 +1035,8 @@ The default nextest profile skips the deterministic simulation (`src/sim/`); run
 ## Compatibility policy
 
 The published shape is versioned by `wire::envelope::SCHEMA_VERSION`, stamped on
-every line as `schema_version`. It is bumped only for a **breaking** change — a field's type or
-meaning changing, or a field or variant being removed. Adding an optional field or a
-new event variant does not bump it, so a consumer must skip an unknown `type` and
-ignore unknown fields. A breaking change needs a coexistence window in the store,
+every line as `schema_version`. It is bumped for a **breaking** change — a field's
+type or meaning changing, or a field or variant being removed — and for a new event
+variant, which a strict reader rejects as an unknown `type`. Adding an optional field
+does not bump it, so a consumer must ignore unknown fields. A breaking change needs a coexistence window in the store,
 because a reader reading across the change sees both shapes interleaved.

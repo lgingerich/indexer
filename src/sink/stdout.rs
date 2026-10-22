@@ -39,8 +39,8 @@ impl StdoutJsonSink {
 
 impl EnvelopeSink for StdoutJsonSink {
     async fn publish(&mut self, envelope: Envelope) -> Result<(), SinkError> {
-        // The same encoding the store keeps as its `envelope` column, so a consumer of
-        // the pipe and a reader of the store see the same bytes.
+        // Compact, one envelope per line: the encoding the wire contract pins in
+        // `crate::wire::envelope`.
         let mut line = serde_json::to_string(&envelope)?;
         line.push('\n');
         let mut stdout = tokio::io::stdout();

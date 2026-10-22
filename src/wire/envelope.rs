@@ -1,6 +1,6 @@
 //! The chain-agnostic event payload, which is the wire contract consumers depend on.
 //!
-//! [`Event`] is the union of everything the indexer publishes, and it holds two
+//! [`Event`] is the union of everything the indexer publishes, and it holds three
 //! kinds of thing:
 //!
 //! - **Datasets** ([`Event::Block`], [`Event::Transaction`], [`Event::Log`]): durable on-chain records, re-exported from [`crate::wire::datasets`].
@@ -29,11 +29,12 @@
 //!
 //! # Compatibility policy
 //!
-//! [`SCHEMA_VERSION`] is bumped only for a **breaking** change: a field's type or
-//! meaning changing, a field or variant being removed, or a required field being
-//! added. **Additive** changes — a new optional field, a new [`Event`] variant —
-//! do not bump it; consumers must skip an unknown `type` and ignore unknown fields,
-//! which is what keeps an additive change safe without a version bump.
+//! [`SCHEMA_VERSION`] is bumped for a **breaking** change: a field's type or meaning
+//! changing, a field or variant being removed, a required field being added — or a new
+//! [`Event`] variant. A reader built on this crate fails on a `type` it does not know
+//! (`unknown variant`), so a new variant breaks it like any other change it cannot
+//! read. A new optional field is **additive** and does not bump it: a reader ignores
+//! unknown fields, and a missing one reads as absent.
 //!
 //! A breaking change needs a coexistence window in the store, because a reader
 //! reading across the change sees both shapes interleaved. That is the point of
@@ -66,8 +67,8 @@ pub use crate::wire::typed::{AbiComponent, AbiType, TypedValue};
 /// which shape it is reading without out-of-band knowledge. Bumped only for a breaking
 /// change; see the compatibility policy in the module docs.
 ///
-/// It is 1 because no shape has been published yet, so a consumer's first number is
-/// the first shape it can read.
+/// It is 1, the first shape stdout and the lake published, so a consumer's first
+/// number is the first shape it can read.
 pub const SCHEMA_VERSION: u16 = 1;
 
 /// Identifies the chain an event came from, for example `ethereum` or `solana`.
@@ -407,7 +408,7 @@ impl Contract {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Event {
-    /// A block, from `eth_getBlockByNumber`.
+    /// A block, from `eth_getBlockByNumber` or `HyperSync`'s blocks table.
     Block(Box<Block>),
     /// A transaction, from its block's `transactions` array, joined to its receipt.
     Transaction(Box<Transaction>),
@@ -447,8 +448,7 @@ impl Event {
     /// raw datasets the key is the record's on-chain identity; decoded records also
     /// include the ABI interpretation identity. For control signals it is
     /// the identity of the change they announce. It is scoped to the stream, so it
-    /// excludes the chain, and it deliberately excludes `sequence`, which changes if
-    /// the indexer restarts and replays from a different point.
+    /// excludes the chain.
     ///
     /// A later copy of a key supersedes an earlier one: the stores upsert, keeping the
     /// last row a batch holds for a key. A consumer that deduplicates by dropping repeats
