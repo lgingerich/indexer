@@ -44,7 +44,9 @@
 //!
 //! Only one chain is loaded: a process indexes one chain, so the other chains' addresses
 //! are parsed and then dropped. Event, parameter, and parent names are validated against
-//! the ABIs at load, so a typo is a startup error rather than a rule that never fires.
+//! the ABIs at load, so a typo is a startup error rather than a rule that never fires. So
+//! are the chains `addresses` names, against [`CHAINS`], so `bnb` for `bsc` is an error
+//! rather than a chain that silently has no seeds.
 //!
 //! # Event tables
 //!
@@ -80,6 +82,11 @@ use crate::wire::envelope::ChainId;
 
 /// The file each protocol directory must hold.
 const MANIFEST: &str = "protocol.toml";
+
+/// Every chain a manifest's `addresses` may name: the chains the indexer is run on. A
+/// chain is free text everywhere else, so this is the one list a manifest is checked
+/// against; add a chain here when first listing addresses on it.
+const CHAINS: [&str; 4] = ["base", "bsc", "ethereum", "robinhood"];
 
 /// One protocol's manifest, as written.
 #[derive(Debug, Deserialize)]
@@ -175,7 +182,8 @@ impl Catalog {
     /// Rejects an unreadable directory, a tree with no manifest in it, a malformed
     /// manifest or ABI, a contract without an ABI, duplicate protocol or contract
     /// names, unknown or ambiguous rule references, a rule parameter that is not an
-    /// `address`, and an address listed twice on `chain`.
+    /// `address`, addresses listed under a chain the indexer does not know, and an address listed
+    /// twice on `chain`.
     ///
     /// `dir` and every directory below it holding a `protocol.toml` is a protocol, so
     /// `dir` may be the whole catalog, a group such as `uniswap/`, or one protocol.
@@ -278,10 +286,11 @@ impl Catalog {
                     .add_event(key, table.clone(), params)
                     .map_err(|source| event_table_error(source, table, contract()))?;
             }
-            if let Some(addresses) = spec.addresses.get(chain.as_str()) {
-                self.seeds
-                    .extend(addresses.iter().map(|&address| (address, id)));
-            }
+            let seeds = chain_addresses(&spec.addresses, chain, || {
+                format!("{}.{name}", manifest.protocol)
+            })?;
+            self.seeds
+                .extend(seeds.iter().map(|&address| (address, id)));
             rules.extend(spec.created_by.into_iter().map(|rule| (id, rule)));
             self.entries.push(Entry {
                 protocol: manifest.protocol.clone(),
@@ -382,6 +391,25 @@ impl Catalog {
             self.entries[entry].protocol, self.entries[entry].name
         )
     }
+}
+
+/// The addresses a contract, `contract` for messages, lists on `chain`, after checking
+/// that every chain it lists addresses on is one of [`CHAINS`].
+fn chain_addresses<'a>(
+    addresses: &'a BTreeMap<String, Vec<Address>>,
+    chain: &ChainId,
+    contract: impl FnOnce() -> String,
+) -> Result<&'a [Address], CatalogError> {
+    if let Some(unknown) = addresses
+        .keys()
+        .find(|listed| !CHAINS.contains(&listed.as_str()))
+    {
+        return Err(CatalogError::UnknownChain {
+            contract: contract(),
+            chain: unknown.clone(),
+        });
+    }
+    Ok(addresses.get(chain.as_str()).map_or(&[], Vec::as_slice))
 }
 
 /// Adds `dir` to `protocols` when it holds a manifest, then searches its subdirectories.
@@ -518,6 +546,15 @@ pub enum CatalogError {
         protocol: String,
         /// The contract's name.
         name: String,
+    },
+    /// A contract lists addresses under a chain the indexer does not know: a typo, which
+    /// would otherwise leave that chain without the contract's seeds.
+    #[error("{contract} lists addresses on unknown chain {chain:?}; known chains are {CHAINS:?}")]
+    UnknownChain {
+        /// The contract, as `protocol.name`.
+        contract: String,
+        /// The chain as written.
+        chain: String,
     },
     /// One address is listed under two contracts on the loaded chain.
     #[error("{address} is listed as both {first} and {second}")]
@@ -822,6 +859,19 @@ addresses = { base = ["0x33128a8fC17869897dcE68Ed026d694621f6FDfD"], ethereum = 
         .to_vec();
         listed.sort_unstable();
         assert_eq!(seeded, listed);
+    }
+
+    /// A chain name in `addresses` that no chain has is a startup error, not a chain with
+    /// no seeds.
+    #[test]
+    fn an_unknown_chain_in_addresses_is_a_startup_error() {
+        match single(&FACTORY.replace("ethereum = ", "bnb = ")) {
+            Err(CatalogError::UnknownChain { contract, chain }) => assert_eq!(
+                (contract.as_str(), chain.as_str()),
+                ("uniswap_v3.UniswapV3Factory", "bnb")
+            ),
+            other => panic!("expected an unknown chain, got {other:?}"),
+        }
     }
 
     /// A contract is named after its first ABI file, and a rule resolves its parameter's
