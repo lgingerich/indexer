@@ -124,11 +124,8 @@ struct Plan {
 }
 
 impl Plan {
-    /// # Errors
-    ///
-    /// Returns [`SourceError::Malformed`] when a row's columns cannot be read from its
-    /// struct; see [`columns`].
-    fn new(datasets: Datasets) -> Result<Self, SourceError> {
+    /// The plan for `datasets`.
+    fn new(datasets: Datasets) -> Self {
         let Datasets {
             blocks,
             transactions,
@@ -138,31 +135,31 @@ impl Plan {
         let reads_logs = logs || transactions;
         let fields = FieldSelection {
             block: if blocks {
-                columns::<RawBlock>()?
+                columns::<RawBlock>()
             } else {
                 IDENTITY_FIELDS
             },
             transaction: if transactions {
-                columns::<RawTransaction>()?
+                columns::<RawTransaction>()
             } else if reads_transactions {
                 TRANSACTION_POSITION_FIELDS
             } else {
                 &[]
             },
             log: if logs {
-                columns::<RawLog>()?
+                columns::<RawLog>()
             } else if reads_logs {
                 LOG_POSITION_FIELDS
             } else {
                 &[]
             },
         };
-        Ok(Self {
+        Self {
             datasets,
             fields,
             reads_transactions,
             reads_logs,
-        })
+        }
     }
 
     /// A header read: each block's identity, and no rows.
@@ -188,12 +185,10 @@ impl Plan {
 /// the one list of the columns a full selection asks for, so a field added to it is
 /// selected, and none is selected that it lacks.
 ///
-/// # Errors
-///
-/// Returns [`SourceError::Malformed`] when `T` does not deserialize as a plain struct
-/// with fields, so a change to a row's shape fails the source's construction rather
-/// than selecting no columns.
-fn columns<T: DeserializeOwned>() -> Result<&'static [&'static str], SourceError> {
+/// None for a `T` that does not deserialize as a struct with fields. The rows are fixed
+/// at compile time, so whether each has columns is one answer for every run, and a test
+/// checks it rather than every source's construction.
+fn columns<T: DeserializeOwned>() -> &'static [&'static str] {
     /// Answers nothing, and records the field names a struct asks it for.
     struct Columns<'a>(&'a mut &'static [&'static str]);
 
@@ -227,16 +222,7 @@ fn columns<T: DeserializeOwned>() -> Result<&'static [&'static str], SourceError
     let mut fields: &'static [&'static str] = &[];
     // Always an error: the deserializer only records what it is asked for.
     drop(T::deserialize(Columns(&mut fields)));
-    if fields.is_empty() {
-        return Err(malformed(
-            "HyperSync columns",
-            format!(
-                "{} does not deserialize as a struct with fields",
-                std::any::type_name::<T>()
-            ),
-        ));
-    }
-    Ok(fields)
+    fields
 }
 
 /// A source that backfills one EVM chain from a `HyperSync` endpoint.
@@ -275,8 +261,7 @@ impl HyperSyncSource {
     ///
     /// # Errors
     ///
-    /// Returns a typed error when `url` is not a URL, the HTTP client cannot be built, or
-    /// a row's columns cannot be read from its struct.
+    /// Returns a typed error when `url` is not a URL, or the HTTP client cannot be built.
     pub fn new(
         chain: impl Into<ChainId>,
         url: &str,
@@ -309,7 +294,7 @@ impl HyperSyncSource {
             query_url: endpoint("query")?,
             height_url: endpoint("height")?,
             token: token.to_owned(),
-            plan: Plan::new(datasets)?,
+            plan: Plan::new(datasets),
             backoff: Backoff::new(os_seed()),
         })
     }
@@ -689,13 +674,14 @@ mod tests {
     }
 
     /// A full selection asks for every field of a row's struct, by its wire name, and the
-    /// partial ones only for fields the structs have. A type that is not a struct with
-    /// fields is refused, rather than selecting nothing.
+    /// partial ones only for fields the structs have, so none of them is empty. This is
+    /// the check that a row still deserializes as a struct with fields, which a type that
+    /// does not would fail: it has no columns.
     #[test]
     fn a_full_selection_is_every_field_of_the_row() {
-        let blocks = columns::<RawBlock>().expect("blocks");
-        let transactions = columns::<RawTransaction>().expect("transactions");
-        let logs = columns::<RawLog>().expect("logs");
+        let blocks = columns::<RawBlock>();
+        let transactions = columns::<RawTransaction>();
+        let logs = columns::<RawLog>();
         assert!(
             transactions.contains(&"type"),
             "the renamed field's wire name"
@@ -709,12 +695,6 @@ mod tests {
                 assert!(full.contains(field), "{field}");
             }
         }
-        assert_eq!(
-            columns::<u64>().err().map(|error| error.to_string()),
-            Some(
-                "malformed data from HyperSync columns: u64 does not deserialize as a struct with fields"
-                    .to_owned()
-            )
-        );
+        assert!(columns::<u64>().is_empty(), "not a struct, so no columns");
     }
 }

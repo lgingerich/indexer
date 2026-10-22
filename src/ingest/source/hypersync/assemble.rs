@@ -299,8 +299,7 @@ mod tests {
             &[block(10, true, 0), block(11, false, 0), block(12, true, 0)],
             &[log(10, 0, 0), log(10, 1, 1), log(12, 0, 0)],
         );
-        let blocks =
-            assemble(10, 20, response, Plan::new(logs_only()).expect("plan")).expect("assembles");
+        let blocks = assemble(10, 20, response, Plan::new(logs_only())).expect("assembles");
         let shape: Vec<_> = blocks
             .iter()
             .map(|block| (block.meta.height, block.events.len()))
@@ -376,7 +375,7 @@ mod tests {
                     .to_owned(),
             ),
         ] {
-            let error = assemble(10, to, response, Plan::new(logs_only()).expect("plan"))
+            let error = assemble(10, to, response, Plan::new(logs_only()))
                 .expect_err(case);
             assert_eq!(error.to_string(), expected, "{case}");
         }
@@ -413,23 +412,13 @@ mod tests {
             .expect("response")
         };
         let whole = [transaction(0, 21_000), transaction(1, 42_000)];
-        let blocks = assemble(
-            10,
-            10,
-            response(&whole),
-            Plan::new(transactions).expect("plan"),
-        )
-        .expect("assembles");
+        let blocks =
+            assemble(10, 10, response(&whole), Plan::new(transactions)).expect("assembles");
         let kinds: Vec<&str> = blocks[0].events.iter().map(Event::kind).collect();
         assert_eq!(kinds, ["transaction", "transaction"]);
         let dropped = "inconsistent data from hypersync: block 10 used 42000 gas, but its receipts add to 21000";
-        let error = assemble(
-            10,
-            10,
-            response(&whole[..1]),
-            Plan::new(transactions).expect("plan"),
-        )
-        .expect_err("transactions");
+        let error = assemble(10, 10, response(&whole[..1]), Plan::new(transactions))
+            .expect_err("transactions");
         assert_eq!(error.to_string(), dropped);
 
         // `blocks` alone reads only the transactions' positions, and checks them the same.
@@ -448,13 +437,8 @@ mod tests {
             transactions: false,
             logs: false,
         };
-        let error = assemble(
-            10,
-            10,
-            response(&positions[..1]),
-            Plan::new(blocks_only).expect("plan"),
-        )
-        .expect_err("blocks");
+        let error = assemble(10, 10, response(&positions[..1]), Plan::new(blocks_only))
+            .expect_err("blocks");
         assert_eq!(error.to_string(), dropped);
     }
 }
