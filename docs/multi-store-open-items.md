@@ -4,7 +4,8 @@ Known gaps in running several stores from one ingest (`src/sink/route.rs`,
 `src/sink/resume.rs`), decided against or not yet done. Each says what it costs, the
 options, and what to do if it starts to matter. Only one can leave a store without
 blocks it should hold — a store that never committed on a fresh deployment — and none
-duplicates data. Structural cleanups from the review of this change are listed last.
+duplicates data. Structural cleanups from the review of this change come after them,
+each with its current status, and what has since been resolved is listed last.
 
 ## A rewound store can miss a `reorgs` row
 
@@ -59,6 +60,8 @@ height it starts from; refuse to start in that state unless the operator acknowl
 
 **Recommendation.** At least the `warn!`, so the gap is visible. Do it next.
 
+**Status.** Open: `resume.rs` still logs it at `info`.
+
 ## No warning when protocols are loaded but nothing decoded is written
 
 **What.** Before multi-store routing, the run warned "`logs` dataset is not selected;
@@ -69,49 +72,8 @@ and `contracts` stays empty — silently.
 **Recommendation.** Restore a one-line `warn!` in `Pipeline::from_settings` when the
 derived fetch has no logs and the decoder has contracts. Small; do it next.
 
-## Not yet verified
-
-- Reconciling a store that is ahead runs against DuckDB beside the lake in the
-  two-store restart tests, but not against PostgreSQL: those tests need a live database
-  and are ignored by default.
-- **Done:** the SQL rewind, now only a fallback, is tested on both engines, including
-  a store far enough ahead that its ledger was pruned. It deletes by height, as the lake
-  does; it used to find blocks through the ledger, and missed those the prune had
-  dropped.
-- A store whose whole history lies above the slowest tip reconciles rather than being
-  refused. That rule has unit tests in `resume.rs`, but no end-to-end restart test of its
-  own.
-- The deterministic simulation compiles against the new runtime but has not been run,
-  and models one store. Extending it to two stores that fail independently is the best
-  test of reconciliation.
-
-## Structural cleanups
-
-From the code-quality review. None changes behavior.
-
-- **One carrier for what a store writes.** It is held twice: the store's selected
-  `Schema` and the router's `HashSet<TableId>` (`Opened.tables`, `Pipeline.routes`).
-  `Pipeline::route` falls back to an empty set with `unwrap_or_default`, and
-  `Pipeline::new` leaves `routes` empty. Make the selected `Arc<Schema>` the only one and
-  have the router ask `schema.writes(id)`; that also removes the `everywhere` case in
-  `Router::publish`, since the bookkeeping tables are always in a selected schema.
-- **Printing versus storing as a type.** `Backend::Stdout` can reach store-only places
-  (`Opened`, `ResumeError`, `RuntimeError::OpenStore`), and `run` rescans the routes for
-  it. Split a store-only backend enum, resolve the settings once into "print these
-  tables" or "these stores", and `run` stops taking `&Settings` (which also closes the
-  README's "`Pipeline::run` reads the settings twice").
-- **Adding a backend touches five `cfg`-gated lists** — `Sinks`, `Sinks::tables`,
-  `AnyStore`, its `each!` macro, and `Pipeline::open`, which repeats one open block per
-  backend. Open stores through `AnyStore` from a typed view of their settings, and give
-  `DuckDbSettings` and `PostgresSettings` a `batching()` like `DeltaSettings`.
-- **`Datasets` leftovers.** Its `Default` (all three) and settings-file docs predate the
-  derived fetch; `route::datasets` belongs on the type.
-- **Smaller:** `route.rs` mixes table selection (config) with the `Router` (hot path);
-  `Opened` lives in `resume.rs` but its `batching` is only for the drain; `Sinks::tables`
-  names which sinks are set; a config test asserts on error text rather than the
-  variant. (`AnyStore` not forwarding `observe_head` is not a gap: no store implements
-  it. The storage channel takes each sampled head, for its progress line and the
-  store's lag metric, before anything reaches a store.)
+**Status.** Open: the only warning left is `DecodingSink`'s "no contracts registered",
+which is the opposite case.
 
 ## Stores further apart than the ledger window cannot resume together
 
@@ -138,3 +100,57 @@ table, decode still runs on every log, and the router drops what it produces. Th
 discovered contracts are still written.
 
 **Recommendation.** Skip decoding in that case if the CPU shows up in a profile.
+
+## Not yet verified
+
+- Reconciling a store that is ahead runs against DuckDB beside the lake in the
+  two-store restart tests, but not against PostgreSQL: those tests need a live database
+  and are ignored by default. Still open.
+- A store whose whole history lies above the slowest tip reconciles rather than being
+  refused. That rule has unit tests in `resume.rs`, but no end-to-end restart test of its
+  own. Still open.
+- The deterministic simulation compiles against the new runtime but models one store.
+  Extending it to two stores that fail independently is the best test of
+  reconciliation. Still open.
+
+## Structural cleanups
+
+From the code-quality review. None changes behavior.
+
+- **One carrier for what a store writes.** It is held twice: the store's selected
+  `Schema` and the router's `HashSet<TableId>` (`Opened.tables`, `StoreRoute.tables`).
+  Make the selected `Arc<Schema>` the only one and have the router ask
+  `schema.writes(id)`; that also removes the `everywhere` case in `Router::publish`,
+  since the bookkeeping tables are always in a selected schema. Status: open; the
+  `unwrap_or_default` lookup and the empty routes of `Pipeline::new` are gone, since the
+  runtime now carries each store's tables in its own `StoreRoute`.
+- **Adding a backend still touches several `cfg`-gated lists**: the `Sinks` fields,
+  `Sinks::tables` and `Sinks::stores`, the `StoreSettings` enum and its matches, and
+  `AnyStore` with its `each!` macro and `open`. Status: partly done; the runtime opens
+  every store in one loop through `AnyStore::open`, and every store's settings have a
+  `batching()`.
+- **`Datasets` leftovers.** Its `Default` (all three) and settings-file docs predate the
+  derived fetch; `route::datasets` belongs on the type. Status: open.
+- **Smaller:** `route.rs` mixes table selection (config) with the `Router` (hot path);
+  `Opened` lives in `resume.rs` but its `batching` is only for the drain; `Sinks::tables`
+  names which sinks are set, beside `Sinks::destination`, which resolves them; config
+  tests assert on `toml`'s parse error text, which has no variant to match. Status:
+  open. (`AnyStore` not forwarding `observe_head` is not a gap: no store implements it.
+  The storage channel takes each sampled head, for its progress line and the store's
+  lag metric, before anything reaches a store.)
+
+## Resolved
+
+- **The SQL rewind** deletes by height, as the lake does, and is tested on both engines,
+  including a store far enough ahead that its ledger was pruned (`93c3833`).
+- **Printing versus storing as a type.** `Sinks::destination` resolves the settings once
+  into the tables to print or the stores to open; everything past it that only a store
+  does takes a `StoreBackend`, which has no stdout, and `Pipeline::run` no longer takes
+  the settings.
+- **One store, one chain.** A store's `Batch` knows its chain and refuses another's
+  envelope, so its orphans, the SQL ledger prune, and the startup reads are no longer
+  per-chain maps or arguments, and the SQL store and the lake agree about a batch.
+- **The stores' startup read-back** shares its columns (`sink::table`), its drift check
+  (`store_error::check_columns`), and its parse, hash, and millisecond helpers.
+- **The SQL store contract suite** is split by area under `sink/store/contract/`, one
+  macro run by both engines.
