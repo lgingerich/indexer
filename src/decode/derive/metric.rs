@@ -604,9 +604,9 @@ pub(in crate::decode) mod fixtures {
     fn decode(log: &Log) -> Decoded {
         decoder()
             .decode(log)
-            .expect("decodes")
             .expect("a known pool's event")
             .decoded
+            .expect("decodes")
     }
 }
 

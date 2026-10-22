@@ -75,7 +75,7 @@ use alloy_primitives::Address;
 use serde::Deserialize;
 use tracing::warn;
 
-use super::abi::{Abi, AbiError, EventKey, InputSpec};
+use super::abi::{Abi, AbiError, AddressSlot, EventKey, InputSpec};
 use super::derive::{DERIVATIONS, Derivation};
 use crate::sink::table::{Column, ColumnType, MAX_IDENTIFIER, Schema, TableError, snake_case};
 use crate::wire::envelope::ChainId;
@@ -140,8 +140,9 @@ pub(crate) struct Entry {
 /// A discovery rule, held by its parent's entry.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Rule {
-    /// The position of the `address` argument naming the child.
-    pub(crate) position: usize,
+    /// Where the `address` argument naming the child sits in the creation log, so the
+    /// child is discovered from that argument alone.
+    pub(crate) slot: AddressSlot,
     /// The child's entry.
     pub(crate) child: EntryId,
 }
@@ -316,7 +317,7 @@ impl Catalog {
                     found: events.len(),
                 });
             };
-            let Some(position) = self.entries[parent].abi.address_input(event, &rule.param) else {
+            let Some(slot) = self.entries[parent].abi.address_input(event, &rule.param) else {
                 return Err(CatalogError::Param {
                     contract: label(),
                     event: rule.event,
@@ -327,7 +328,7 @@ impl Catalog {
                 .rules
                 .entry(event)
                 .or_default()
-                .push(Rule { position, child });
+                .push(Rule { slot, child });
         }
         Ok(())
     }
@@ -630,7 +631,7 @@ pub enum CatalogError {
 mod tests {
     use std::path::{Path, PathBuf};
 
-    use super::{Catalog, CatalogError};
+    use super::{AddressSlot, Catalog, CatalogError};
     use crate::sink::table::{ColumnType, TableId};
     use crate::wire::envelope::ChainId;
 
@@ -837,12 +838,12 @@ addresses = { base = ["0x33128a8fC17869897dcE68Ed026d694621f6FDfD"], ethereum = 
             .rules
             .values()
             .flatten()
-            .map(|rule| (rule.position, rule.child))
+            .map(|rule| (rule.slot, rule.child))
             .collect();
         assert_eq!(
             rules,
-            [(4, pool)],
-            "PoolCreated's fifth input names the pool"
+            [(AddressSlot::Word(32), pool)],
+            "PoolCreated's fifth input, the second word of its data, names the pool"
         );
         let mut seeded: Vec<_> = catalog
             .seeds
@@ -874,8 +875,8 @@ addresses = { base = ["0x33128a8fC17869897dcE68Ed026d694621f6FDfD"], ethereum = 
         }
     }
 
-    /// A contract is named after its first ABI file, and a rule resolves its parameter's
-    /// position from the parent's ABI.
+    /// A contract is named after its first ABI file, and a rule resolves where its
+    /// parameter sits from the parent's ABI.
     #[test]
     fn contracts_are_named_by_their_abi_file_and_rules_resolve_against_the_parent() {
         let catalog = single(&format!(
@@ -887,13 +888,14 @@ addresses = { base = ["0x33128a8fC17869897dcE68Ed026d694621f6FDfD"], ethereum = 
             .expect("factory");
         let pool = catalog.entry("uniswap_v3", "UniswapV3Pool").expect("pool");
         let rules: Vec<_> = catalog.entries[factory].rules.values().flatten().collect();
-        // `pool` is PoolCreated's fifth input, after token0, token1, fee, tickSpacing.
+        // `pool` is PoolCreated's fifth input, after three indexed ones and tickSpacing,
+        // the first word of the data.
         assert_eq!(
             rules
                 .iter()
-                .map(|rule| (rule.position, rule.child))
+                .map(|rule| (rule.slot, rule.child))
                 .collect::<Vec<_>>(),
-            [(4, pool)]
+            [(AddressSlot::Word(32), pool)]
         );
         assert_eq!(catalog.seeds.len(), 1, "only the loaded chain's addresses");
     }

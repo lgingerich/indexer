@@ -1015,7 +1015,7 @@ tables = ["blocks", "transactions", "logs", "decoded_logs", "contract_events"]
         let Event::Log(log) = swap(pool).event else {
             panic!("log");
         };
-        assert!(restarted.decode(&log).expect("decode").is_some());
+        assert!(restarted.decode(&log).is_some());
 
         // The creating block is orphaned: the stored row is deleted, so nothing restores.
         store

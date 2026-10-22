@@ -323,9 +323,9 @@ pub(crate) mod fixtures {
         };
         Decoder::new(catalog("base"))
             .decode(&log)
-            .expect("decodes")
             .expect("a seeded pool's swap")
             .decoded
+            .expect("decodes")
     }
 
     /// A Metric `PoolCreated` carrying a real Base pool's arguments, decoded against the
@@ -385,8 +385,8 @@ pub(crate) mod fixtures {
         };
         Decoder::new(catalog("robinhood"))
             .decode(&log)
-            .expect("decodes")
             .expect("the seeded factory's event")
             .decoded
+            .expect("decodes")
     }
 }

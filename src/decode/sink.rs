@@ -54,35 +54,29 @@ impl<K: EnvelopeSink> DecodingSink<K> {
 
     /// Decodes one log into the records to publish after it.
     ///
-    /// Ordinary decode failures are logged and skipped, leaving the raw log; an internal
-    /// invariant failure stops the run.
+    /// Ordinary decode failures are logged and skipped, leaving the raw log and any
+    /// contract the log still discovered; an internal invariant failure stops the run.
     fn decode(&mut self, chain: &ChainId, log: &Log) -> Result<Vec<Event>, SinkError> {
-        match self.decoder.decode(log) {
-            Ok(Some(decoding)) => {
+        let Some(decoding) = self.decoder.decode(log) else {
+            return Ok(Vec::new());
+        };
+        if !decoding.discovered.is_empty() {
+            metrics::contracts_discovered(decoding.discovered.len());
+        }
+        let mut events = Vec::with_capacity(2 + decoding.discovered.len());
+        match decoding.decoded {
+            Ok(decoded) => {
                 self.decoded += 1;
-                if !decoding.discovered.is_empty() {
-                    metrics::contracts_discovered(decoding.discovered.len());
-                }
                 let sent = self
                     .transaction
                     .filter(|&(hash, ..)| hash == log.transaction_hash)
                     .map(|(_, from, to)| (from, to));
-                let derived =
-                    derive::rows(self.decoder.derivations(), chain, &decoding.decoded, sent)
-                        .map_err(|error| SinkError::Decode(Box::new(error)))?;
-                let mut events = Vec::with_capacity(1 + derived.len() + decoding.discovered.len());
-                events.push(Event::Decoded(Box::new(decoding.decoded)));
+                let derived = derive::rows(self.decoder.derivations(), chain, &decoded, sent)
+                    .map_err(|error| SinkError::Decode(Box::new(error)))?;
+                events.push(Event::Decoded(Box::new(decoded)));
                 events.extend(derived.into_iter().map(|row| Event::Derived(Box::new(row))));
-                events.extend(
-                    decoding
-                        .discovered
-                        .into_iter()
-                        .map(|contract| Event::Contract(Box::new(contract))),
-                );
-                Ok(events)
             }
-            Ok(None) => Ok(Vec::new()),
-            Err(error @ DecodeError::Shape) => Err(SinkError::Decode(Box::new(error))),
+            Err(error @ DecodeError::Shape) => return Err(SinkError::Decode(Box::new(error))),
             Err(error) => {
                 metrics::decode_failed();
                 warn!(%chain, address = %log.address,
@@ -90,9 +84,15 @@ impl<K: EnvelopeSink> DecodingSink<K> {
                     transaction = %log.transaction_hash, log_index = log.log_index,
                     event_id = ?self.decoder.event_id(log), selector = ?log.topic0,
                     error = ?error, "log decode failed; preserving raw record");
-                Ok(Vec::new())
             }
         }
+        events.extend(
+            decoding
+                .discovered
+                .into_iter()
+                .map(|contract| Event::Contract(Box::new(contract))),
+        );
+        Ok(events)
     }
 }
 

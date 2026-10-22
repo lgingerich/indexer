@@ -85,20 +85,20 @@ fn main() -> ExitCode {
         let indexer::wire::envelope::Event::Log(log) = &envelope.event else {
             continue;
         };
-        match decoder.decode(log) {
-            Ok(Some(decoding)) => {
+        match decoder.decode(log).map(|decoding| decoding.decoded) {
+            Some(Ok(record)) => {
                 decoded_count += 1;
                 let out = Envelope::new(
                     envelope.chain,
-                    indexer::wire::envelope::Event::Decoded(Box::new(decoding.decoded)),
+                    indexer::wire::envelope::Event::Decoded(Box::new(record)),
                 );
                 println!(
                     "{}",
                     serde_json::to_string(&out).expect("envelope serializes")
                 );
             }
-            Ok(None) => eprintln!("line {}: no registered event", number + 1),
-            Err(error) => eprintln!("line {}: {error}", number + 1),
+            None => eprintln!("line {}: no registered event", number + 1),
+            Some(Err(error)) => eprintln!("line {}: {error}", number + 1),
         }
     }
 

@@ -2,10 +2,13 @@
 //!
 //! The decoder holds the catalog and the *contract set*: every address it decodes, mapped
 //! to its catalog entry. Seeds come from the manifests; discovered contracts join the set the
-//! moment their creation log decodes, so a child that emits later in the same block —
+//! moment their creation log is seen, so a child that emits later in the same block —
 //! even the same transaction, as a pool's `Initialize` follows its `PoolCreated` — is
 //! decoded too. A reorg retracts the children created in orphaned blocks; the replacement
 //! block's creation log re-adds them.
+//!
+//! A child is read from its creation log's address argument alone, so an unrelated
+//! argument that fails to decode still discovers it, and only that log's record is lost.
 
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
@@ -13,16 +16,17 @@ use std::collections::hash_map::Entry;
 use alloy_primitives::{Address, B256};
 use tracing::warn;
 
-use super::abi::DecodeError;
+use super::abi::{DecodeError, event_key};
 use super::catalog::{Catalog, EntryId};
 use super::derive::Derivation;
-use crate::wire::envelope::{Contract, Decoded, Log, StoredContract, TypedValue};
+use crate::wire::envelope::{Contract, Decoded, Log, StoredContract};
 
 /// What one log produced: its decoded record, and any contracts its event created.
 #[derive(Debug)]
 pub struct Decoding {
-    /// The decoded record.
-    pub decoded: Decoded,
+    /// The decoded record, or why the log did not decode. A caller may skip a bad log and
+    /// keep its raw record, but must stop on an internal invariant failure.
+    pub decoded: Result<Decoded, DecodeError>,
     /// The contracts this log created, in rule order.
     pub discovered: Vec<Contract>,
 }
@@ -109,36 +113,23 @@ impl Decoder {
 
     /// Decodes a log from a contract in the set, adding any contract it creates.
     ///
-    /// `None` means the address is not in the set or its ABI has no matching event.
+    /// `None` means the address is not in the set or its ABI has no matching event. A
+    /// log that matches an event but does not decode still discovers the contracts it
+    /// names, since each is read from its own argument.
     ///
-    /// # Errors
-    /// Returns the concrete decoding or schema invariant failure. Callers may skip bad
-    /// logs while preserving raw records, but must stop on internal invariant failures.
-    pub fn decode(&mut self, log: &Log) -> Result<Option<Decoding>, DecodeError> {
-        let Some(member) = self.contracts.get(&log.address) else {
-            return Ok(None);
-        };
+    /// A child's logs from before its creation log, such as those its constructor emits,
+    /// are never decoded: the child joins the set only once that log is seen, after them.
+    pub fn decode(&mut self, log: &Log) -> Option<Decoding> {
+        let member = self.contracts.get(&log.address)?;
         let entry = &self.catalog.entries[member.entry];
-        let Some(event) = entry.abi.decode_log(log)? else {
-            return Ok(None);
-        };
-        let mut children = Vec::new();
-        if let Some(rules) = entry.rules.get(&(event.selector, event.indexed.len() + 1)) {
-            for rule in rules {
-                let address = event
-                    .indexed
-                    .iter()
-                    .chain(&event.body)
-                    .find(|argument| argument.position == rule.position)
-                    .and_then(|argument| match argument.value {
-                        TypedValue::Address { value } => Some(value),
-                        _ => None,
-                    })
-                    .ok_or(DecodeError::Shape)?;
-                children.push((rule.child, address));
-            }
-        }
-        let decoded = Decoded {
+        let decoded = entry.abi.decode_log(log).transpose()?;
+        let mut children: Vec<(EntryId, Address)> = event_key(log)
+            .and_then(|key| entry.rules.get(&key))
+            .into_iter()
+            .flatten()
+            .filter_map(|rule| Some((rule.child, rule.slot.read(log)?)))
+            .collect();
+        let decoded = decoded.map(|event| Decoded {
             name: event.name,
             address: log.address,
             protocol: entry.protocol.clone(),
@@ -155,7 +146,7 @@ impl Decoder {
             block_number: log.block_number,
             block_hash: log.block_hash,
             block_timestamp: log.block_timestamp,
-        };
+        });
         // Only a claim the set records is published: one naming a seed, or an address
         // already registered as another contract, or named twice by this log, would be a
         // row restoring nothing, or a second row under one key.
@@ -178,10 +169,10 @@ impl Decoder {
                 }
             })
             .collect();
-        Ok(Some(Decoding {
+        Some(Decoding {
             decoded,
             discovered,
-        }))
+        })
     }
 
     /// Forgets creations in `orphaned` blocks, dropping contracts left with none, and
@@ -245,6 +236,7 @@ mod tests {
 
     use super::Decoder;
     use crate::decode::Catalog;
+    use crate::decode::DecodeError;
     use crate::wire::envelope::StoredContract;
     use crate::wire::envelope::{ChainId, Envelope, Event, Log};
 
@@ -362,10 +354,7 @@ mod tests {
     fn only_a_recorded_claim_is_published() {
         let mut decoder = claims();
         let child = Address::repeat_byte(0xc0);
-        let created = decoder
-            .decode(&made(child))
-            .expect("decode")
-            .expect("the parent is a seed");
+        let created = decoder.decode(&made(child)).expect("the parent is a seed");
         let published: Vec<_> = created
             .discovered
             .iter()
@@ -373,10 +362,7 @@ mod tests {
             .collect();
         assert_eq!(published, [(child, "Child")]);
 
-        let seed = decoder
-            .decode(&made(SEEDED))
-            .expect("decode")
-            .expect("the parent is a seed");
+        let seed = decoder.decode(&made(SEEDED)).expect("the parent is a seed");
         assert!(seed.discovered.is_empty(), "{:?}", seed.discovered);
     }
 
@@ -408,13 +394,15 @@ mod tests {
     fn a_creation_event_discovers_its_child_immediately() {
         let mut decoder = decoder();
         let pool = Address::from([0xd0; 20]);
-        assert!(decoder.decode(&swap(pool)).expect("decode").is_none());
+        assert!(decoder.decode(&swap(pool)).is_none());
 
         let created = decoder
             .decode(&pool_created(pool, B256::with_last_byte(1)))
-            .expect("decode")
             .expect("the factory is a seed");
-        assert_eq!(created.decoded.name, "PoolCreated");
+        assert_eq!(
+            created.decoded.as_ref().expect("decodes").name,
+            "PoolCreated"
+        );
         let [contract] = &created.discovered[..] else {
             panic!("one child");
         };
@@ -428,15 +416,43 @@ mod tests {
         );
         assert_eq!((contract.block_number, contract.log_index), (10, 4));
 
-        let swap = decoder
-            .decode(&swap(pool))
-            .expect("decode")
-            .expect("now known");
+        let swap = decoder.decode(&swap(pool)).expect("now known");
+        let record = swap.decoded.as_ref().expect("decodes");
         assert_eq!(
-            (swap.decoded.name.as_str(), swap.decoded.protocol.as_str()),
+            (record.name.as_str(), record.protocol.as_str()),
             ("Swap", "uniswap_v3")
         );
         assert!(swap.discovered.is_empty());
+    }
+
+    /// A creation log whose unrelated argument fails validation still discovers its
+    /// child, read from the address argument alone; only the log's own record is lost.
+    #[test]
+    fn a_creation_log_that_does_not_decode_still_discovers_its_child() {
+        let mut decoder = decoder();
+        let pool = Address::from([0xd0; 20]);
+        let mut created = pool_created(pool, B256::with_last_byte(1));
+        // `tickSpacing`, an `int24`, holding a word past 24 bits.
+        created.data = DynSolValue::Tuple(vec![
+            DynSolValue::Int(alloy_primitives::I256::MAX, 256),
+            DynSolValue::Address(pool),
+        ])
+        .abi_encode_params()
+        .into();
+        let decoding = decoder.decode(&created).expect("the factory is a seed");
+        assert!(
+            matches!(decoding.decoded, Err(DecodeError::Value { .. })),
+            "{:?}",
+            decoding.decoded
+        );
+        let [contract] = &decoding.discovered[..] else {
+            panic!("one child: {:?}", decoding.discovered);
+        };
+        assert_eq!(contract.address, pool);
+        assert!(
+            decoder.decode(&swap(pool)).is_some(),
+            "the pool now decodes"
+        );
     }
 
     /// A reorg drops children created only in orphaned blocks; seeds and children also
@@ -460,14 +476,10 @@ mod tests {
                 ..stored(restored_orphan)
             },
         ]);
-        decoder
-            .decode(&pool_created(kept, canonical))
-            .expect("decode");
-        decoder
-            .decode(&pool_created(dropped, orphaned))
-            .expect("decode");
+        decoder.decode(&pool_created(kept, canonical));
+        decoder.decode(&pool_created(dropped, orphaned));
         for block in [orphaned, canonical] {
-            decoder.decode(&pool_created(twice, block)).expect("decode");
+            decoder.decode(&pool_created(twice, block));
         }
         let before = decoder.contracts();
 
@@ -480,11 +492,7 @@ mod tests {
             ("restored from an orphaned block", restored_orphan, false),
             ("created in both", twice, true),
         ] {
-            assert_eq!(
-                decoder.decode(&swap(pool)).expect("decode").is_some(),
-                decodes,
-                "{case}"
-            );
+            assert_eq!(decoder.decode(&swap(pool)).is_some(), decodes, "{case}");
         }
     }
 
@@ -499,7 +507,7 @@ mod tests {
             ..stored(pool)
         };
         assert_eq!(decoder.restore([stored(pool), retired]), 1);
-        assert!(decoder.decode(&swap(pool)).expect("decode").is_some());
+        assert!(decoder.decode(&swap(pool)).is_some());
         assert_eq!(decoder.restore([stored(pool)]), 0);
     }
 }

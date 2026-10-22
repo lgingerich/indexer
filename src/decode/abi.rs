@@ -164,15 +164,20 @@ impl Abi {
             .collect()
     }
 
-    /// The position of `event`'s `address` input called `param`.
-    pub(crate) fn address_input(&self, event: EventKey, param: &str) -> Option<usize> {
+    /// Where `event`'s `address` input called `param` sits in a log.
+    pub(crate) fn address_input(&self, event: EventKey, param: &str) -> Option<AddressSlot> {
         let event = self.events.get(&event)?;
-        event
-            .indexed
+        let named =
+            |argument: &&Argument| argument.name == param && argument.ty == DynSolType::Address;
+        if let Some(index) = event.indexed.iter().position(|argument| named(&argument)) {
+            return Some(AddressSlot::Topic(index + 1));
+        }
+        let index = event.body.iter().position(|argument| named(&argument))?;
+        let offset = event.body[..index]
             .iter()
-            .chain(&event.body)
-            .find(|argument| argument.name == param && argument.ty == DynSolType::Address)
-            .map(|argument| argument.position)
+            .map(|argument| head_words(&argument.ty) * 32)
+            .sum();
+        Some(AddressSlot::Word(offset))
     }
 
     /// The identity of the event a log would decode as, for diagnostics.
@@ -214,6 +219,58 @@ impl Abi {
             indexed: arguments(&event.indexed, &decoded.indexed, true)?,
             body: arguments(&event.body, &decoded.body, false)?,
         }))
+    }
+}
+
+/// Where an `address` argument sits in a log of its event, so it can be read without
+/// decoding the rest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AddressSlot {
+    /// Topic `n`, `topic0` being the selector.
+    Topic(usize),
+    /// The word at this byte offset of the data. An address is static, so its word is in
+    /// the head, after the head words of the body arguments before it.
+    Word(usize),
+}
+
+impl AddressSlot {
+    /// The address in `log`'s slot, or `None` when the log is too short for it or its
+    /// word holds more than 160 bits, which the decoder refuses as well.
+    pub(crate) fn read(self, log: &Log) -> Option<alloy_primitives::Address> {
+        let word = match self {
+            Self::Topic(index) => [log.topic1, log.topic2, log.topic3]
+                .get(index.checked_sub(1)?)
+                .copied()
+                .flatten()?,
+            Self::Word(offset) => B256::from_slice(log.data.get(offset..offset.checked_add(32)?)?),
+        };
+        word[..12]
+            .iter()
+            .all(|&byte| byte == 0)
+            .then(|| alloy_primitives::Address::from_word(word))
+    }
+}
+
+/// A log's lookup key, or `None` when it has no selector or a gap in its topics.
+pub(crate) fn event_key(log: &Log) -> Option<EventKey> {
+    let count = topic_count(log);
+    let present = [log.topic0, log.topic1, log.topic2, log.topic3]
+        .iter()
+        .filter(|topic| topic.is_some())
+        .count();
+    Some((log.topic0?, count)).filter(|_| present == count)
+}
+
+/// How many head words a body argument of type `ty` takes: one for a dynamic type, which
+/// the head holds as an offset, and its whole encoding for a static one.
+fn head_words(ty: &DynSolType) -> usize {
+    if ty.is_dynamic() {
+        return 1;
+    }
+    match ty {
+        DynSolType::Tuple(types) => types.iter().map(head_words).sum(),
+        DynSolType::FixedArray(inner, size) => head_words(inner) * size,
+        _ => 1,
     }
 }
 
@@ -790,6 +847,52 @@ mod tests {
             convert(&DynSolType::FixedBytes(32), &dirty).is_ok(),
             "bytes32 has no padding"
         );
+    }
+
+    /// An address argument is found where the encoder put it, past a dynamic argument's
+    /// one head word and a static tuple's and fixed array's full encodings, or in its
+    /// topic, and read from there without decoding the rest.
+    #[test]
+    fn an_address_argument_is_read_from_its_slot() {
+        let abi = Abi::from_json(
+            r#"[{"type":"event","name":"Made","anonymous":false,"inputs":[
+                {"name":"owner","type":"address","indexed":true},
+                {"name":"note","type":"bytes","indexed":false},
+                {"name":"pair","type":"tuple","indexed":false,"components":[
+                    {"name":"a","type":"uint256"},{"name":"b","type":"uint256"}]},
+                {"name":"two","type":"uint8[2]","indexed":false},
+                {"name":"child","type":"address","indexed":false}]}]"#,
+        )
+        .expect("valid ABI");
+        let (key, _) = abi.events.first_key_value().expect("event");
+        let child = alloy_primitives::Address::repeat_byte(0xc0);
+        let owner = alloy_primitives::Address::repeat_byte(0x0e);
+        let log = Log {
+            topic0: Some(key.0),
+            topic1: Some(owner.into_word()),
+            data: DynSolValue::Tuple(vec![
+                DynSolValue::Bytes(vec![1, 2, 3]),
+                DynSolValue::Tuple(vec![
+                    DynSolValue::Uint(U256::ZERO, 256),
+                    DynSolValue::Uint(U256::ZERO, 256),
+                ]),
+                DynSolValue::FixedArray(vec![
+                    DynSolValue::Uint(U256::ZERO, 8),
+                    DynSolValue::Uint(U256::ZERO, 8),
+                ]),
+                DynSolValue::Address(child),
+            ])
+            .abi_encode_params()
+            .into(),
+            ..Log::default()
+        };
+        let slot = abi.address_input(*key, "child").expect("an address input");
+        assert_eq!(slot, AddressSlot::Word(5 * 32));
+        assert_eq!(slot.read(&log), Some(child));
+        let slot = abi.address_input(*key, "owner").expect("an address input");
+        assert_eq!(slot, AddressSlot::Topic(1));
+        assert_eq!(slot.read(&log), Some(owner));
+        assert_eq!(abi.address_input(*key, "note"), None, "not an address");
     }
 
     const ERC20_TRANSFER: &str = r#"[{"type":"event","name":"Transfer","anonymous":false,"inputs":[{"name":"from","type":"address","indexed":true},{"name":"to","type":"address","indexed":true},{"name":"value","type":"uint256","indexed":false}]}]"#;
