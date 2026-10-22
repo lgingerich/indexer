@@ -13,10 +13,8 @@ use super::DeriveError;
 /// Argument `position` of `decoded`, among all its inputs, when it is named `name`.
 fn argument<'a>(decoded: &'a Decoded, position: usize, name: &str) -> Option<&'a TypedValue> {
     decoded
-        .indexed
-        .iter()
-        .chain(&decoded.body)
-        .find(|argument| argument.position == position && argument.name == name)
+        .argument(position)
+        .filter(|argument| argument.name == name)
         .map(|argument| &argument.value)
 }
 

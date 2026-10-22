@@ -19,8 +19,8 @@ pub struct DecodedEvent {
     pub id: B256,
     /// ABI event name.
     pub name: String,
-    /// Event signature hash.
-    pub selector: B256,
+    /// The event's key in its [`Abi`]: its selector and topic count.
+    pub key: EventKey,
     /// Canonical event signature.
     pub signature: String,
     /// Indexed arguments with their original positions and declared schemas.
@@ -125,25 +125,17 @@ impl Abi {
     /// Every event, with its inputs in declaration order: what an event table is
     /// generated from.
     pub(crate) fn events(&self) -> impl Iterator<Item = EventSpec<'_>> {
-        self.events.values().map(|event| {
-            let mut inputs: Vec<InputSpec<'_>> = event
-                .indexed
-                .iter()
-                .map(|argument| (argument, true))
-                .chain(event.body.iter().map(|argument| (argument, false)))
+        self.events.values().map(|event| EventSpec {
+            id: event.id,
+            name: &event.name,
+            inputs: event
+                .inputs()
                 .map(|(argument, indexed)| InputSpec {
                     name: &argument.name,
-                    position: argument.position,
                     ty: &argument.ty,
                     indexed,
                 })
-                .collect();
-            inputs.sort_by_key(|input| input.position);
-            EventSpec {
-                id: event.id,
-                name: &event.name,
-                inputs,
-            }
+                .collect(),
         })
     }
 
@@ -170,14 +162,18 @@ impl Abi {
     /// Where `event`'s `address` input called `param` sits in a log.
     pub(crate) fn address_input(&self, event: EventKey, param: &str) -> Option<AddressSlot> {
         let event = self.events.get(&event)?;
-        let named =
-            |argument: &&Argument| argument.name == param && argument.ty == DynSolType::Address;
-        if let Some(index) = event.indexed.iter().position(|argument| named(&argument)) {
-            return Some(AddressSlot::Topic(index + 1));
+        let (found, indexed) = event
+            .inputs()
+            .find(|(argument, _)| argument.name == param && argument.ty == DynSolType::Address)?;
+        let before = |argument: &&Argument| argument.position < found.position;
+        if indexed {
+            let topic = 1 + event.indexed.iter().filter(before).count();
+            return Some(AddressSlot::Topic(topic));
         }
-        let index = event.body.iter().position(|argument| named(&argument))?;
-        let offset = event.body[..index]
+        let offset = event
+            .body
             .iter()
+            .filter(before)
             .map(|argument| head_words(&argument.ty) * 32)
             .sum();
         Some(AddressSlot::Word(offset))
@@ -207,7 +203,8 @@ impl Abi {
         let Some(selector) = topics.first() else {
             return Ok(None);
         };
-        let Some(event) = self.events.get(&(*selector, topics.len())) else {
+        let key = (*selector, topics.len());
+        let Some(event) = self.events.get(&key) else {
             return Ok(None);
         };
         let decoded = event
@@ -217,7 +214,7 @@ impl Abi {
         Ok(Some(DecodedEvent {
             id: event.id,
             name: event.name.clone(),
-            selector: *selector,
+            key,
             signature: event.signature.clone(),
             indexed: arguments(&event.indexed, &decoded.indexed, true)?,
             body: arguments(&event.body, &decoded.body, false)?,
@@ -301,8 +298,6 @@ pub(crate) struct EventSpec<'a> {
 pub(crate) struct InputSpec<'a> {
     /// The input name; may be empty.
     pub(crate) name: &'a str,
-    /// The position among all inputs.
-    pub(crate) position: usize,
     /// The resolved type.
     pub(crate) ty: &'a DynSolType,
     /// Whether it is a topic.
@@ -350,6 +345,21 @@ impl PreparedEvent {
             body,
         })
     }
+
+    /// Input `position` among all the event's inputs, and whether it is indexed.
+    fn argument(&self, position: usize) -> Option<(&Argument, bool)> {
+        let at = |argument: &&Argument| argument.position == position;
+        self.indexed
+            .iter()
+            .find(at)
+            .map(|argument| (argument, true))
+            .or_else(|| self.body.iter().find(at).map(|argument| (argument, false)))
+    }
+
+    /// Every input in declaration order, and whether it is indexed.
+    fn inputs(&self) -> impl Iterator<Item = (&Argument, bool)> {
+        (0..self.indexed.len() + self.body.len()).filter_map(|position| self.argument(position))
+    }
 }
 
 /// `ty` with every struct a plain tuple.
@@ -391,7 +401,10 @@ fn decoding_type(ty: &DynSolType) -> DynSolType {
     }
 }
 
-fn hashed(ty: &DynSolType) -> bool {
+/// Whether an indexed argument of type `ty` is only its topic hash: a string, bytes, array,
+/// or tuple, whose value an event cannot fit in one topic. Decoding and the event table's
+/// column follow this one rule.
+pub(crate) const fn topic_hashed(ty: &DynSolType) -> bool {
     matches!(
         ty,
         DynSolType::String
@@ -414,7 +427,7 @@ fn arguments(
         .iter()
         .zip(values)
         .map(|(param, value)| {
-            let value = if indexed && hashed(&param.ty) {
+            let value = if indexed && topic_hashed(&param.ty) {
                 let DynSolValue::FixedBytes(value, 32) = value else {
                     return Err(DecodeError::Shape);
                 };

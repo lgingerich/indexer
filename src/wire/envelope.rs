@@ -227,6 +227,15 @@ pub struct Decoded {
 }
 
 impl Decoded {
+    /// Argument `position` among all the event's inputs, whether indexed or in the body.
+    #[must_use]
+    pub fn argument(&self, position: usize) -> Option<&DecodedArg> {
+        self.indexed
+            .iter()
+            .chain(&self.body)
+            .find(|argument| argument.position == position)
+    }
+
     /// A key that is stable across redelivery and unique per decoded record.
     ///
     /// Built from the raw log's natural key, event selector, and event identity:

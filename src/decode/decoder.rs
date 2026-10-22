@@ -125,8 +125,10 @@ impl Decoder {
         let id = self.contracts.get(&log.address)?.entry;
         let entry = &self.catalog.entries[id];
         let decoded = entry.abi.decode_log(log).transpose()?;
-        let key = event_key(log);
-        let mut children: Vec<(EntryId, Address)> = key
+        let event = decoded.as_ref().ok().map(|event| (id, event.key));
+        // The rules' key is the log's own, not the decoded event's, so a log that does not
+        // decode still discovers its children.
+        let mut children: Vec<(EntryId, Address)> = event_key(log)
             .and_then(|key| entry.rules.get(&key))
             .into_iter()
             .flatten()
@@ -138,7 +140,7 @@ impl Decoder {
             protocol: entry.protocol.clone(),
             contract: entry.name.clone(),
             event_id: event.id,
-            selector: event.selector,
+            selector: event.key.0,
             signature: event.signature,
             anonymous: false,
             transaction_hash: log.transaction_hash,
@@ -173,9 +175,9 @@ impl Decoder {
             })
             .collect();
         Some(Decoding {
-            event: key.filter(|_| decoded.is_ok()).map(|key| (id, key)),
             decoded,
             discovered,
+            event,
         })
     }
 

@@ -75,7 +75,7 @@ use alloy_primitives::Address;
 use serde::Deserialize;
 use tracing::warn;
 
-use super::abi::{Abi, AbiError, AddressSlot, EventKey, InputSpec};
+use super::abi::{Abi, AbiError, AddressSlot, EventKey, InputSpec, topic_hashed};
 use super::derive::{DERIVATIONS, Derivation, Derivations};
 use crate::sink::table::{Column, ColumnType, MAX_IDENTIFIER, Schema, TableError, snake_case};
 use crate::wire::envelope::ChainId;
@@ -460,16 +460,7 @@ fn event_table_error(source: TableError, table: String, contract: String) -> Cat
 /// or an array of tuples or arrays, is one document, so a tuple's components stay together.
 fn param(input: &InputSpec<'_>) -> Column {
     let (kind, required) = match input.ty {
-        // An indexed string, bytes, array, or tuple is only its topic hash.
-        DynSolType::String
-        | DynSolType::Bytes
-        | DynSolType::Array(_)
-        | DynSolType::FixedArray(..)
-        | DynSolType::Tuple(_)
-            if input.indexed =>
-        {
-            (ColumnType::Text, true)
-        }
+        ty if input.indexed && topic_hashed(ty) => (ColumnType::Text, true),
         DynSolType::Array(element) | DynSolType::FixedArray(element, _) => scalar(element)
             .and_then(|(element, _)| ColumnType::list(element))
             .map_or((ColumnType::Document, true), |list| (list, true)),
