@@ -29,9 +29,14 @@ delta = ["store", "dep:chrono", "dep:deltalake"]
 store = []
 
 [dependencies]
-alloy-consensus = "2.5.0"
+# The alloy 2.x crates are released together, from one repository, and pass each other's
+# types across their APIs, so they are pinned to one release together. With a caret on
+# some and `=` on others, a `cargo update` would move only the caret ones to the next
+# release and mix two. `alloy-primitives` and the ABI crates are alloy's core, released
+# on their own, and stay on caret.
+alloy-consensus = "=2.5.0"
 # Typed RPC errors preserve the node's error payload and method-not-found code.
-alloy-json-rpc = "2.5.0"
+alloy-json-rpc = "=2.5.0"
 # The subscription connector a source takes, so heads can come from any `PubSubConnect`.
 alloy-pubsub = "=2.5.0"
 alloy-provider = { version = "=2.5.0", default-features = false, features = ["reqwest", "reqwest-native-tls", "ws"] }
@@ -40,14 +45,14 @@ alloy-rpc-client = { version = "=2.5.0", default-features = false, features = ["
 # `any` types (`AnyRpcBlock`/`AnyRpcTransaction`) are alloy's catch-all for networks
 # whose transaction types fall outside Ethereum's 0-4: an OP-stack deposit (`0x7e`)
 # or Arbitrum retry (`0x6a`) otherwise fails the whole block. See `ingest::source`.
-alloy-network = "2.5.0"
+alloy-network = "=2.5.0"
 alloy-primitives = { version = "1.7.3", default-features = false, features = ["serde", "std"] }
-alloy-rpc-types-eth = { version = "2.5.0", default-features = false, features = ["serde", "std"] }
+alloy-rpc-types-eth = { version = "=2.5.0", default-features = false, features = ["serde", "std"] }
 # alloy's own serde helpers. `quantity` renders integers as the Ethereum JSON-RPC
 # "quantity" format (`0x` hex), which is the canonical wire form for these fields
 # and, unlike serde's native integer encoding, survives `#[serde(flatten)]` for
 # `u128` (see `wire::envelope::Envelope`).
-alloy-serde = { version = "2.5.0", default-features = false, features = ["std"] }
+alloy-serde = { version = "=2.5.0", default-features = false, features = ["std"] }
 # The dynamic decoder. Static `sol!` decoding cannot cover an open-ended set of
 # contracts, so the registry path is runtime-typed; see `decode::ContractRegistry`.
 alloy-dyn-abi = { version = "1.7.3", default-features = false }
