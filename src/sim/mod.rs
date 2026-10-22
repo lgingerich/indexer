@@ -624,7 +624,6 @@ fn unexpected(error: &RuntimeError, world: &World, faults: bool) -> Option<Strin
                 PipelineError::Source(
                     SourceError::Transport { .. } | SourceError::Status { .. },
                 ) if refused => true,
-                PipelineError::Source(error) if lagged && lagging_logs(error) => true,
                 PipelineError::Source(SourceError::Inconsistent { .. })
                 | PipelineError::UnstableSource => lagged,
                 PipelineError::SubscriptionClosed => fired("head subscription dropped"),
@@ -642,27 +641,6 @@ fn unexpected(error: &RuntimeError, world: &World, faults: bool) -> Option<Strin
             _ => false,
         };
     (!expected).then(|| format!("unexpected stop: {error:?}"))
-}
-
-/// Whether `error` is a lagging backend's answer to `eth_getLogs`: `unknown block` for
-/// a block hash it has not seen, or a range past its head.
-///
-/// TODO(DST): a bug in the source, forgiven here so the other seeds keep running. Both
-/// answers mean the backend has not reached the block, as `block_read` already treats
-/// `unknown block` for a header, but `fetch_logs` and `fetch_range` classify a logs
-/// error with `transport`, so it is permanent and stops ingest where it should be
-/// `Inconsistent` and asked again. Found on seed 7; remove this once the source
-/// classifies them.
-fn lagging_logs(error: &SourceError) -> bool {
-    let SourceError::Transport {
-        context: "eth_getLogs",
-        source: alloy_json_rpc::RpcError::ErrorResp(payload),
-    } = error
-    else {
-        return false;
-    };
-    payload.message == "unknown block"
-        || payload.message == "block range extends beyond current head block"
 }
 
 /// Why the stores, after the final lifetime, have not caught up: one store at least
