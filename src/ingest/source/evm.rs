@@ -429,8 +429,9 @@ pub struct RpcBatch {
 ///
 /// # Errors
 ///
-/// Returns [`SourceError::Malformed`] when a body the rows read is absent, the
-/// receipts do not belong to the block, or they do not line up with its transactions.
+/// Returns [`SourceError::Malformed`] when a body the rows read is absent, or the
+/// receipts do not line up with its transactions, and [`SourceError::Inconsistent`]
+/// when the receipts belong to another block or are missing as a lagging node's are.
 pub fn decode_block(batch: RpcBatch) -> Result<FetchedBlock, SourceError> {
     let RpcBatch {
         meta,
@@ -538,28 +539,9 @@ fn append_body(
         .as_transactions()
         .ok_or_else(|| malformed(BLOCK, "block returned transaction hashes only"))?;
     let receipts = receipts.ok_or_else(|| malformed(RECEIPTS, "receipts were not fetched"))?;
-    if receipts.len() != transactions.len() {
-        return Err(malformed(
-            RECEIPTS,
-            format!(
-                "{} receipts for {} transactions",
-                receipts.len(),
-                transactions.len()
-            ),
-        ));
-    }
+    check_receipts_answer(receipts, transactions.len(), meta.hash)?;
     for (position, (transaction, receipt)) in transactions.iter().zip(receipts).enumerate() {
         let tx_index = position as u64;
-        let receipt_block = receipt.block_hash.unwrap_or_default();
-        if receipt_block != meta.hash {
-            return Err(inconsistent(
-                RECEIPTS,
-                format!(
-                    "receipt belongs to block {receipt_block}, not {}; the chain reorganised mid-request",
-                    meta.hash
-                ),
-            ));
-        }
         if receipt.transaction_index != Some(tx_index)
             || receipt.transaction_hash != transaction.tx_hash()
         {
@@ -589,6 +571,58 @@ fn append_body(
         rows.transactions.push((
             decode_transaction(transaction, receipt, tx_index, meta),
             own,
+        ));
+    }
+    Ok(())
+}
+
+/// Checks that `receipts` answer the block `hash` and its `transactions`, and says
+/// whether asking again can help when they do not.
+///
+/// - A receipt with no `blockHash` is [`malformed`]: a receipt of a mined block always
+///   has one, and a node that leaves it out will leave it out again. Asking again forever
+///   would only hide that.
+/// - A receipt from another block is [`inconsistent`]: the block and its receipts are
+///   separate calls, so the chain moved between them, or a load-balanced provider sent
+///   them to backends on different forks. This is checked before the count, since the
+///   other block's receipts need not number the same.
+/// - No receipts for a block with transactions is [`inconsistent`] too: a backend that
+///   has not processed the block answers `[]` as readily as `null` (see [`NOT_SERVED`]).
+/// - Any other count is [`malformed`]: a node that places receipts in this block and
+///   still answers short or long has the block, and has it wrong.
+fn check_receipts_answer(
+    receipts: &[AnyTransactionReceipt],
+    transactions: usize,
+    hash: B256,
+) -> Result<(), SourceError> {
+    for receipt in receipts {
+        let block = receipt
+            .block_hash
+            .ok_or_else(|| malformed(RECEIPTS, "receipt has no blockHash"))?;
+        if block != hash {
+            return Err(inconsistent(
+                RECEIPTS,
+                format!(
+                    "receipt belongs to block {block}, not {hash}; the chain reorganised mid-request"
+                ),
+            ));
+        }
+    }
+    if receipts.is_empty() && transactions > 0 {
+        return Err(inconsistent(
+            RECEIPTS,
+            format!(
+                "no receipts for {transactions} transactions: the node does not serve them yet"
+            ),
+        ));
+    }
+    if receipts.len() != transactions {
+        return Err(malformed(
+            RECEIPTS,
+            format!(
+                "{} receipts for {transactions} transactions",
+                receipts.len()
+            ),
         ));
     }
     Ok(())
@@ -2310,20 +2344,46 @@ mod tests {
         );
     }
 
-    /// Receipts that do not answer the block's transactions are refused: one from
-    /// another block means the chain moved mid-request, so asking again can help; a
-    /// missing or misplaced one cannot be right.
+    /// Receipts that do not answer the block's transactions are refused. One from
+    /// another block means the chain moved mid-request, however many there are, and none
+    /// at all is a node that has not processed the block: asking again can help. A
+    /// missing, misplaced, or unplaced one in a block's own answer cannot be right.
     #[test]
     fn receipts_that_do_not_match_the_block_are_rejected() {
-        let cases: [(&str, fn(&mut Value), String); 3] = [
+        let other_block = format!(
+            "inconsistent data from eth_getBlockReceipts: receipt belongs to block {}, not {}; the chain reorganised mid-request",
+            hash(0xcd),
+            hash(0xab)
+        );
+        let cases: [(&str, fn(&mut Value), String); 6] = [
             (
                 "a receipt from another block",
                 |receipts| receipts[1]["blockHash"] = json!(hash(0xcd)),
-                format!(
-                    "inconsistent data from eth_getBlockReceipts: receipt belongs to block {}, not {}; the chain reorganised mid-request",
-                    hash(0xcd),
-                    hash(0xab)
-                ),
+                other_block.clone(),
+            ),
+            (
+                "fewer receipts, from another block",
+                |receipts| {
+                    receipts.as_array_mut().expect("receipts").pop();
+                    receipts[0]["blockHash"] = json!(hash(0xcd));
+                },
+                other_block,
+            ),
+            (
+                "no receipts",
+                |receipts| *receipts = json!([]),
+                "inconsistent data from eth_getBlockReceipts: no receipts for 2 transactions: the node does not serve them yet"
+                    .to_owned(),
+            ),
+            (
+                "a receipt without a blockHash",
+                |receipts| {
+                    receipts[1]
+                        .as_object_mut()
+                        .expect("receipt")
+                        .remove("blockHash");
+                },
+                "malformed data from eth_getBlockReceipts: receipt has no blockHash".to_owned(),
             ),
             (
                 "a missing receipt",
