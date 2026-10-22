@@ -388,9 +388,9 @@ impl<B: BlockSource + 'static> Pipeline<B> {
             let (settings, chain) = (duckdb.clone(), chain.clone());
             let batching = Batching::eager(duckdb.batch_records);
             let opened = self.open_store(Backend::DuckDb, batching, async move |schema| {
-                Ok(AnyStore::DuckDb(
+                Ok(AnyStore::DuckDb(Box::new(
                     sink::DuckDbSink::open(&settings, schema, &chain).await?,
-                ))
+                )))
             });
             stores.push(opened.await?);
         }
@@ -399,9 +399,9 @@ impl<B: BlockSource + 'static> Pipeline<B> {
             let (settings, chain) = (postgres.clone(), chain.clone());
             let batching = postgres.batching();
             let opened = self.open_store(Backend::Postgres, batching, async move |schema| {
-                Ok(AnyStore::Postgres(
+                Ok(AnyStore::Postgres(Box::new(
                     sink::PostgresSink::open(&settings, schema, &chain).await?,
-                ))
+                )))
             });
             stores.push(opened.await?);
         }
@@ -1457,7 +1457,7 @@ tables = ["blocks", "transactions", "logs", "decoded_logs", "contract_events"]
         let stores = vec![
             own(every_table(
                 Backend::DuckDb,
-                AnyStore::DuckDb(database),
+                AnyStore::DuckDb(Box::new(database)),
                 Batching::eager(500),
             )),
             own(every_table(

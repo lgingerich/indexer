@@ -13,14 +13,19 @@ use crate::sink::{EnvelopeSink, Restored, SinkError, Store, StoreError};
 use crate::wire::envelope::{BlockMeta, Envelope};
 
 /// One opened store, of whichever backend the settings named.
+///
+/// Every variant is boxed: the stores differ in size by hundreds of bytes, so whichever
+/// is the largest in a build would otherwise set the size of all of them, and which one
+/// that is changes with the features. A store is opened once per run, so the box costs
+/// nothing that matters.
 #[derive(Debug)]
 pub(crate) enum AnyStore {
     /// An embedded `DuckDB` database.
     #[cfg(feature = "duckdb")]
-    DuckDb(DuckDbSink),
+    DuckDb(Box<DuckDbSink>),
     /// A remote `PostgreSQL` database.
     #[cfg(feature = "postgres")]
-    Postgres(PostgresSink),
+    Postgres(Box<PostgresSink>),
     /// Delta Lake tables on object storage.
     #[cfg(feature = "delta")]
     Delta(Box<DeltaSink>),
