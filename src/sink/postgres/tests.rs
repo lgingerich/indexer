@@ -74,12 +74,12 @@ impl Pg {
     }
 }
 
-impl Harness for Pg {
-    type Engine = Postgres;
-
-    async fn open(schema: Arc<Schema>) -> (PostgresSink, Self) {
+impl Pg {
+    /// As [`Harness::open`], for a chain, and so a database schema, whose name starts
+    /// with `prefix`.
+    async fn open_as(schema: Arc<Schema>, prefix: &str) -> (PostgresSink, Self) {
         let name = format!(
-            "store_{}_test_{}",
+            "{prefix}_{}_test_{}",
             OPENED.fetch_add(1, Ordering::Relaxed),
             std::process::id()
         );
@@ -102,6 +102,14 @@ impl Harness for Pg {
                 connection,
             },
         )
+    }
+}
+
+impl Harness for Pg {
+    type Engine = Postgres;
+
+    async fn open(schema: Arc<Schema>) -> (PostgresSink, Self) {
+        Self::open_as(schema, "store").await
     }
 
     fn chain(&self) -> ChainId {
@@ -366,7 +374,7 @@ async fn a_reorg_deletes_orphaned_blocks_under_a_publication() {
         ))
         .await
         .expect("publication");
-    let chain = ChainId::new("base");
+    let chain = harness.chain();
     let block = |byte: u8| {
         let hash = B256::with_last_byte(byte);
         [
@@ -457,7 +465,7 @@ async fn an_array_is_a_typed_array_and_a_tuple_one_object() {
     let (mut sink, harness) = Pg::open(crate::sink::fixtures::schema()).await;
     let created = crate::sink::fixtures::decoded_pool_created();
     sink.publish(Envelope::new(
-        ChainId::new("base"),
+        harness.chain(),
         Event::Decoded(Box::new(created)),
     ))
     .await
@@ -504,7 +512,7 @@ async fn a_wide_integer_multiplies_exactly() {
     let (mut sink, harness) = Pg::open(crate::sink::fixtures::schema()).await;
     let swap = crate::sink::fixtures::decoded_swap();
     sink.publish(Envelope::new(
-        ChainId::new("base"),
+        harness.chain(),
         Event::Decoded(Box::new(swap)),
     ))
     .await
@@ -536,7 +544,7 @@ async fn a_flush_after_the_server_ends_the_session_connects_again() {
         new_head_hash: B256::ZERO,
         orphaned_hashes: vec![B256::ZERO],
     });
-    sink.publish(Envelope::new(ChainId::new("base"), reorg))
+    sink.publish(Envelope::new(harness.chain(), reorg))
         .await
         .expect("publish");
     harness
@@ -573,7 +581,7 @@ async fn a_flush_after_the_server_ends_the_session_connects_again() {
 #[tokio::test]
 #[ignore = "requires INDEXER_TEST_POSTGRES_URL pointing to PostgreSQL 18"]
 async fn copy_is_atomic_retains_failed_batches_and_upserts_a_replay() {
-    let (mut sink, harness) = Pg::open(datasets()).await;
+    let (mut sink, harness) = Pg::open_as(datasets(), "tab\tnewline\nslash\\unicodeé").await;
     assert_eq!(
         harness
             .admin
@@ -587,7 +595,7 @@ async fn copy_is_atomic_retains_failed_batches_and_upserts_a_replay() {
         18
     );
     sink.flush().await.expect("empty flush");
-    let chain = ChainId::new("tab\tnewline\nslash\\unicodeé");
+    let chain = harness.chain();
     for height in [1, u64::MAX] {
         let reorg = Reorg {
             height,
@@ -683,7 +691,7 @@ async fn staging_tables_are_vacuumed_once_they_take_enough_rows() {
     }
 
     let (mut sink, harness) = Pg::open(datasets()).await;
-    let chain = ChainId::new("base");
+    let chain = harness.chain();
     let publish = async |sink: &mut PostgresSink, heads: std::ops::Range<u64>| {
         for head in heads {
             let reorg = Reorg {

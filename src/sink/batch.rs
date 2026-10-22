@@ -24,8 +24,8 @@ use std::sync::Arc;
 use alloy_primitives::B256;
 
 use crate::sink::table::{Row, Schema, TableId, Value};
-use crate::sink::{SinkError, hex};
-use crate::wire::envelope::{BlockMeta, Envelope, Event, Reorg};
+use crate::sink::{SinkError, StoreError, hex};
+use crate::wire::envelope::{BlockMeta, ChainId, Envelope, Event, Reorg};
 
 /// What a store has been handed since its last commit: the rows to write, and the
 /// blocks a buffered `reorg` retracted.
@@ -39,13 +39,18 @@ use crate::wire::envelope::{BlockMeta, Envelope, Event, Reorg};
 /// storage channel is FIFO, so an orphaned block can never arrive after its `reorg`.
 /// [`push`](Self::push) drops the buffered ones at once, and the store deletes the
 /// committed ones when it commits [`rows`](Self::rows), before writing them.
+///
+/// A store holds one chain, the one it was opened for, and so does its batch: an
+/// envelope of another chain is refused rather than written beside it.
 #[derive(Debug)]
 pub(super) struct Batch {
+    /// The chain the store was opened for.
+    chain: ChainId,
     /// Rows to write, in publish order.
     pub(super) rows: Vec<Row>,
-    /// Orphaned block hashes to delete from the store, as `0x` hex, by chain, with the
-    /// lowest buffered `reorg` height, which none of them is below.
-    pub(super) orphaned: BTreeMap<String, (u64, BTreeSet<String>)>,
+    /// The blocks buffered `reorg`s orphaned, to delete from the store at the commit;
+    /// `None` when no `reorg` is buffered that orphans any.
+    pub(super) orphaned: Option<Orphaned>,
     /// Roughly how many bytes `rows` hold in memory.
     bytes: usize,
     /// Where the rows of the block being buffered start in `rows`: every row from here
@@ -59,16 +64,32 @@ pub(super) struct Batch {
     schema: Arc<Schema>,
 }
 
+/// The blocks a batch's `reorg`s orphaned.
+#[derive(Debug)]
+pub(super) struct Orphaned {
+    /// The lowest buffered `reorg` height, which none of them is below.
+    pub(super) floor: u64,
+    /// Their hashes, as `0x` hex.
+    pub(super) hashes: BTreeSet<String>,
+}
+
 impl Batch {
-    pub(super) fn new(schema: Arc<Schema>) -> Self {
+    /// An empty batch of `schema`'s tables, for a store of `chain`.
+    pub(super) fn new(schema: Arc<Schema>, chain: ChainId) -> Self {
         Self {
+            chain,
             rows: Vec::new(),
-            orphaned: BTreeMap::new(),
+            orphaned: None,
             bytes: 0,
             block_start: 0,
             held: BTreeMap::new(),
             schema,
         }
+    }
+
+    /// The chain the store was opened for, and the only one its batch takes.
+    pub(super) const fn chain(&self) -> &ChainId {
+        &self.chain
     }
 
     /// Names the blocks the store already holds that ingest will hand it again: those
@@ -88,10 +109,18 @@ impl Batch {
     ///
     /// # Errors
     ///
-    /// Returns [`SinkError::Table`] for a decoded record no event table holds, which
+    /// Returns [`StoreError::OtherChain`] for an envelope of another chain than the
+    /// store's, and [`SinkError::Table`] for a decoded record no event table holds, which
     /// means it was decoded against a different catalog than the store opened with, and
     /// when a row cannot be built.
     pub(super) fn push(&mut self, envelope: &Envelope) -> Result<(), SinkError> {
+        if envelope.chain != self.chain {
+            return Err(StoreError::OtherChain {
+                store: self.chain.to_string(),
+                envelope: envelope.chain.to_string(),
+            }
+            .into());
+        }
         if let Event::AcceptedBlock(block) = &envelope.event
             && let Some(held) = self.held.remove(&block.height)
         {
@@ -139,19 +168,17 @@ impl Batch {
         if let Event::Reorg(reorg) = &envelope.event
             && !reorg.orphaned_hashes.is_empty()
         {
-            let chain = envelope.chain.as_str();
             let hashes: BTreeSet<String> = reorg.orphaned_hashes.iter().map(hex).collect();
-            self.rows.retain(|row| {
-                row.chain() != chain || !row.block_hash().is_some_and(|h| hashes.contains(h))
-            });
+            self.rows
+                .retain(|row| !row.block_hash().is_some_and(|h| hashes.contains(h)));
             self.block_start = self.block_start.min(self.rows.len());
             self.bytes = self.rows.iter().map(row_size).sum();
-            let (height, orphaned) = self
-                .orphaned
-                .entry(chain.to_owned())
-                .or_insert((reorg.height, BTreeSet::new()));
-            *height = (*height).min(reorg.height);
-            orphaned.extend(hashes);
+            let orphaned = self.orphaned.get_or_insert(Orphaned {
+                floor: reorg.height,
+                hashes: BTreeSet::new(),
+            });
+            orphaned.floor = orphaned.floor.min(reorg.height);
+            orphaned.hashes.extend(hashes);
         }
         // Only the rows of tables this store writes are rendered.
         let (table, typed) = self.schema.tables_for(&envelope.event)?;
@@ -173,8 +200,9 @@ impl Batch {
         self.rows.push(row);
     }
 
-    /// The rows each table should write: the last buffered copy of each
-    /// `(chain, dedupe_key)`, in publish order.
+    /// The rows each table should write: the last buffered copy of each `dedupe_key`, in
+    /// publish order. Every row is of the batch's one chain, so the key alone tells two
+    /// copies of a row apart.
     ///
     /// A merge must not see a key twice — both SQL engines refuse to update one conflict
     /// row twice in a statement — and "last" means last published, which only the buffer
@@ -207,20 +235,20 @@ impl Batch {
     /// to reconcile are kept: ingest has not reached them yet.
     pub(super) fn clear(&mut self) {
         self.rows.clear();
-        self.orphaned.clear();
+        self.orphaned = None;
         self.block_start = 0;
         self.bytes = 0;
     }
 }
 
-/// Whether each of `rows` is the last copy of its `(table, chain, dedupe_key)`, by
+/// Whether each of `rows` is the last copy of its `(table, dedupe_key)`, by
 /// position: what both [`Batch::by_table`] and [`Batch::take_tables`] keep.
 fn last_copies(rows: &[Row]) -> Vec<bool> {
     let mut last = vec![false; rows.len()];
     // Sized up front: growing a set of half a million keys rehashes it again and again.
     let mut seen = HashSet::with_capacity(rows.len());
     for (position, row) in rows.iter().enumerate().rev() {
-        last[position] = seen.insert((row.table().id, row.chain(), row.dedupe_key()));
+        last[position] = seen.insert((row.table().id, row.dedupe_key()));
     }
     last
 }
@@ -271,8 +299,8 @@ mod tests {
     use std::sync::Arc;
 
     use super::Batch;
-    use crate::sink::SinkError;
-    use crate::sink::table::{Table, TableError, TableId};
+    use crate::sink::table::{Schema, Table, TableError, TableId};
+    use crate::sink::{SinkError, StoreError};
     use crate::wire::datasets::evm::Block;
     use crate::wire::envelope::{BlockMeta, ChainId, Envelope, Event};
 
@@ -300,6 +328,11 @@ mod tests {
         }
     }
 
+    /// An empty batch of `schema`'s tables, for a store of `base`.
+    fn on_base(schema: Arc<Schema>) -> Batch {
+        Batch::new(schema, ChainId::new("base"))
+    }
+
     fn tables(batch: &Batch) -> Vec<TableId> {
         batch.rows.iter().map(|row| row.table().id).collect()
     }
@@ -308,11 +341,11 @@ mod tests {
     /// to write, and the block after it is written as usual.
     #[test]
     fn a_held_block_handed_again_is_not_written() {
-        let mut batch = Batch::new(crate::sink::fixtures::schema());
+        let mut batch = on_base(crate::sink::fixtures::schema());
         batch.reconcile(&[meta(5, 0xa0)]);
         block(&mut batch, meta(5, 0xa0));
         assert!(batch.is_empty(), "{:?}", tables(&batch));
-        assert!(batch.orphaned.is_empty());
+        assert!(batch.orphaned.is_none());
 
         block(&mut batch, meta(6, 0xa1));
         assert_eq!(
@@ -325,14 +358,13 @@ mod tests {
     /// and the old hash to delete at the commit, before the new block's rows.
     #[test]
     fn a_held_block_whose_hash_changed_is_retracted() {
-        let mut batch = Batch::new(crate::sink::fixtures::schema());
+        let mut batch = on_base(crate::sink::fixtures::schema());
         batch.reconcile(&[meta(5, 0xa0)]);
         block(&mut batch, meta(5, 0xb0));
-        assert_eq!(batch.orphaned.len(), 1, "only the block's own chain");
-        let (height, hashes) = &batch.orphaned["base"];
-        assert_eq!(*height, 5);
+        let orphaned = batch.orphaned.as_ref().expect("the old copy is orphaned");
+        assert_eq!(orphaned.floor, 5);
         assert_eq!(
-            hashes.iter().collect::<Vec<_>>(),
+            orphaned.hashes.iter().collect::<Vec<_>>(),
             [&format!("{:#x}", B256::repeat_byte(0xa0))]
         );
         assert_eq!(
@@ -357,7 +389,7 @@ mod tests {
             (HashSet::from([typed]), typed),
             (only_decoded, Table::Decoded.into()),
         ] {
-            let mut batch = Batch::new(Arc::new(schema.select(&written)));
+            let mut batch = on_base(Arc::new(schema.select(&written)));
             let envelope =
                 Envelope::new(ChainId::new("base"), Event::Decoded(Box::new(swap.clone())));
             batch.push(&envelope).expect("buffered");
@@ -377,12 +409,26 @@ mod tests {
     /// schedule, long before ingest reaches every held height.
     #[test]
     fn held_blocks_outlive_a_commit() {
-        let mut batch = Batch::new(crate::sink::fixtures::schema());
+        let mut batch = on_base(crate::sink::fixtures::schema());
         batch.reconcile(&[meta(5, 0xa0), meta(6, 0xa1)]);
         block(&mut batch, meta(5, 0xa0));
         batch.clear();
         block(&mut batch, meta(6, 0xa1));
         assert!(batch.is_empty(), "{:?}", tables(&batch));
-        assert!(batch.orphaned.is_empty());
+        assert!(batch.orphaned.is_none());
+    }
+
+    /// A store holds one chain: an envelope of another is refused, not written beside
+    /// the store's own, and nothing of it is buffered.
+    #[test]
+    fn an_envelope_of_another_chain_is_refused() {
+        let mut batch = on_base(crate::sink::fixtures::schema());
+        let other = Envelope::new(ChainId::new("ethereum"), Event::AcceptedBlock(meta(1, 1)));
+        assert!(matches!(
+            batch.push(&other),
+            Err(SinkError::Store(StoreError::OtherChain { store, envelope }))
+                if store == "base" && envelope == "ethereum"
+        ));
+        assert!(batch.is_empty());
     }
 }

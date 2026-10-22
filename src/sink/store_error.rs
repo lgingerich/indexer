@@ -112,6 +112,15 @@ pub enum StoreError {
         /// The block's hash, as `0x` hex.
         block: String,
     },
+    /// A store was handed an envelope of another chain than the one it was opened for.
+    /// A store holds one chain, so this never happens unless an invariant upstream broke.
+    #[error("a store of chain {store} was handed an envelope of chain {envelope}")]
+    OtherChain {
+        /// The chain the store was opened for.
+        store: String,
+        /// The envelope's chain.
+        envelope: String,
+    },
     /// An existing table does not match its definition. Tables are not migrated, so the
     /// store needs a fresh location or the table dropped.
     #[error("table {table} does not match its definition: {difference}")]
@@ -139,7 +148,8 @@ impl StoreError {
             | Self::Locked { .. }
             | Self::Failed
             | Self::Stalled { .. }
-            | Self::Replayed { .. } => false,
+            | Self::Replayed { .. }
+            | Self::OtherChain { .. } => false,
         }
     }
 

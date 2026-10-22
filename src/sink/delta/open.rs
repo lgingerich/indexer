@@ -88,10 +88,9 @@ impl DeltaSink {
             .map(|(position, lake)| (lake.def.id, position))
             .collect();
         let mut sink = Self {
-            chain: ChainId::new(chain),
             lakes,
             positions,
-            batch: Batch::new(Arc::clone(&schema)),
+            batch: Batch::new(Arc::clone(&schema), ChainId::new(chain)),
             schema,
             committed: HashMap::new(),
             failed: false,

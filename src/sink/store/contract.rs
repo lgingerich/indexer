@@ -102,11 +102,6 @@ fn hash(byte: u8) -> B256 {
     B256::from([byte; 32])
 }
 
-/// A chain other than the store's, whose rows a test expects left alone.
-fn other() -> ChainId {
-    ChainId::new("ethereum")
-}
-
 /// One envelope of every kind on `chain`, so a flush exercises every table at once.
 ///
 /// Values are distinct per field, so a column-order or column-name skew shows up as a
@@ -573,38 +568,20 @@ pub(crate) async fn a_reorg_deletes_a_committed_block_from_every_table<H: Harnes
     let (mut sink, mut harness) = H::open(datasets()).await;
     let chain = harness.chain();
     commit(&mut sink, every_kind(&chain)).await;
-    commit(&mut sink, every_kind(&other())).await;
 
     commit(&mut sink, [reorg(&chain, &[0x01])]).await;
 
     for (table, rows) in block_tables(&mut harness).await {
-        let chains = texts(&mut harness, &format!("SELECT chain FROM \"{table}\"")).await;
-        let expected = if table == Table::Decoded {
-            Vec::new()
-        } else {
-            vec![other().as_str().to_owned()]
-        };
-        assert_eq!(
-            chains, expected,
-            "{table} keeps nothing of the orphaned block, and the other chain's row"
-        );
-        assert_eq!(rows, one_unless_decoded(table), "{table}");
+        assert_eq!(rows, 0, "{table} keeps nothing of the orphaned block");
     }
     assert_eq!(
         texts(
             &mut harness,
-            &format!(
-                "SELECT new_head_hash FROM reorgs WHERE chain = '{chain}' ORDER BY new_head_hash"
-            )
+            "SELECT new_head_hash FROM reorgs ORDER BY new_head_hash"
         )
         .await,
         [format!("{:#x}", hash(0x55)), format!("{:#x}", hash(0x56))],
         "the fixture marker and this one"
-    );
-    assert_eq!(
-        row_count(&mut harness, "reorgs").await,
-        3,
-        "and the other chain's marker"
     );
     harness.remove().await;
 }
@@ -721,26 +698,23 @@ pub(crate) async fn a_failed_reorg_commit_keeps_its_deletes_for_the_retry<H: Har
 }
 
 /// A rewind deletes every block above the height from every table, the ledger included,
-/// and leaves the blocks at or below it and other chains' rows alone.
+/// and leaves the blocks at or below it.
 pub(crate) async fn a_rewind_deletes_every_block_above_the_height<H: Harness>() {
     let (mut sink, mut harness) = H::open(datasets()).await;
-    // A store rewinds the chain it was opened for.
     let chain = harness.chain();
-    for name in [&chain, &other()] {
-        for height in 1..=5 {
-            let meta = accepted(height);
-            for event in [
-                Event::Block(Box::new(Block {
-                    number: height,
-                    hash: meta.hash,
-                    ..Block::default()
-                })),
-                Event::AcceptedBlock(meta),
-            ] {
-                sink.publish(Envelope::new(name.clone(), event))
-                    .await
-                    .expect("buffer");
-            }
+    for height in 1..=5 {
+        let meta = accepted(height);
+        for event in [
+            Event::Block(Box::new(Block {
+                number: height,
+                hash: meta.hash,
+                ..Block::default()
+            })),
+            Event::AcceptedBlock(meta),
+        ] {
+            sink.publish(Envelope::new(chain.clone(), event))
+                .await
+                .expect("buffer");
         }
     }
     sink.flush().await.expect("flush");
@@ -748,19 +722,15 @@ pub(crate) async fn a_rewind_deletes_every_block_above_the_height<H: Harness>() 
     sink.rewind(3).await.expect("rewind");
 
     for (table, height) in [("blocks", "number"), ("accepted_blocks", "height")] {
-        for (name, expected) in [(&chain, &[1, 2, 3][..]), (&other(), &[1, 2, 3, 4, 5])] {
-            assert_eq!(
-                uints(
-                    &mut harness,
-                    &format!(
-                        "SELECT {height} FROM {table} WHERE chain = '{name}' ORDER BY {height}"
-                    )
-                )
-                .await,
-                expected,
-                "{table} on {name}"
-            );
-        }
+        assert_eq!(
+            uints(
+                &mut harness,
+                &format!("SELECT {height} FROM {table} ORDER BY {height}")
+            )
+            .await,
+            [1, 2, 3],
+            "{table}"
+        );
     }
     harness.remove().await;
 }
@@ -808,16 +778,15 @@ pub(crate) async fn a_rewind_deletes_blocks_whose_ledger_rows_were_pruned<H: Har
     harness.remove().await;
 }
 
-/// The ledger reads back the newest unorphaned accepted blocks of one chain, oldest first,
-/// and deletes nothing.
+/// The ledger reads back the newest unorphaned accepted blocks, oldest first, and deletes
+/// nothing.
 pub(crate) async fn the_ledger_reads_back_the_newest_canonical_window<H: Harness>() {
     let (mut sink, mut harness) = H::open(datasets()).await;
     let chain = harness.chain();
-    assert!(sink.ledger(&chain, 3).await.expect("empty").is_empty());
+    assert!(sink.ledger(3).await.expect("empty").is_empty());
     let mut envelopes: Vec<Envelope> = (1..=10)
         .map(|height| Envelope::new(chain.clone(), Event::AcceptedBlock(accepted(height))))
         .collect();
-    envelopes.push(Envelope::new(other(), Event::AcceptedBlock(accepted(1))));
     // Block 10 was orphaned and deleted, so the tip falls back to 9.
     envelopes.push(Envelope::new(
         chain.clone(),
@@ -829,27 +798,22 @@ pub(crate) async fn the_ledger_reads_back_the_newest_canonical_window<H: Harness
     ));
     commit(&mut sink, envelopes).await;
 
-    let ledger = sink.ledger(&chain, 3).await.expect("read back");
+    let ledger = sink.ledger(3).await.expect("read back");
     assert_eq!(ledger, [accepted(7), accepted(8), accepted(9)]);
     assert_eq!(
         uints(
             &mut harness,
-            &format!("SELECT height FROM accepted_blocks WHERE chain = '{chain}' ORDER BY height")
+            "SELECT height FROM accepted_blocks ORDER BY height"
         )
         .await,
         [1, 2, 3, 4, 5, 6, 7, 8, 9],
         "only the orphaned row was deleted"
     );
-    assert_eq!(
-        sink.ledger(&other(), 3).await.expect("read back"),
-        [accepted(1)],
-        "another chain's ledger is untouched"
-    );
     harness.remove().await;
 }
 
-/// A flush deletes a chain's ledger rows more than the window below the newest block it
-/// accepts there, and leaves the other chains' rows and the window itself.
+/// A flush deletes the ledger rows more than the window below the newest block it
+/// accepts, and leaves the window itself.
 pub(crate) async fn a_flush_prunes_the_ledger_below_the_window<H: Harness>() {
     let (mut sink, mut harness) = H::open(datasets()).await;
     let chain = harness.chain();
@@ -859,11 +823,11 @@ pub(crate) async fn a_flush_prunes_the_ledger_below_the_window<H: Harness>() {
         parent_hash: B256::from(U256::from(height - 1)),
         timestamp: 1_700_000_000 + height,
     };
-    let mut envelopes: Vec<Envelope> = (1..=3)
-        .map(|height| Envelope::new(chain.clone(), Event::AcceptedBlock(block(height))))
-        .collect();
-    envelopes.push(Envelope::new(other(), Event::AcceptedBlock(block(1))));
-    commit(&mut sink, envelopes).await;
+    commit(
+        &mut sink,
+        (1..=3).map(|height| Envelope::new(chain.clone(), Event::AcceptedBlock(block(height)))),
+    )
+    .await;
     let tip = LEDGER_WINDOW as u64 + 2;
     commit(
         &mut sink,
@@ -874,36 +838,33 @@ pub(crate) async fn a_flush_prunes_the_ledger_below_the_window<H: Harness>() {
     )
     .await;
 
-    let heights = |chain: &ChainId| {
-        format!("SELECT height FROM accepted_blocks WHERE chain = '{chain}' ORDER BY height")
-    };
     assert_eq!(
-        uints(&mut harness, &heights(&chain)).await,
+        uints(
+            &mut harness,
+            "SELECT height FROM accepted_blocks ORDER BY height"
+        )
+        .await,
         [2, 3, tip],
         "the row more than the window below the tip was deleted"
-    );
-    assert_eq!(
-        uints(&mut harness, &heights(&other())).await,
-        [1],
-        "another chain's ledger is untouched"
     );
     harness.remove().await;
 }
 
-/// A stored contract reads back scoped to its chain, and is deleted once a reorg orphans
-/// its creating block.
+/// A stored contract reads back, and is deleted once a reorg orphans its creating block.
 pub(crate) async fn stored_contracts_read_back_and_orphaned_ones_are_deleted<H: Harness>() {
     let (mut sink, mut harness) = H::open(datasets()).await;
     let chain = harness.chain();
     let contract = contract();
     commit(
         &mut sink,
-        [&chain, &other()]
-            .map(|name| Envelope::new(name.clone(), Event::Contract(Box::new(contract.clone())))),
+        [Envelope::new(
+            chain.clone(),
+            Event::Contract(Box::new(contract.clone())),
+        )],
     )
     .await;
     assert_eq!(
-        sink.contracts(&chain).await.expect("read back"),
+        sink.contracts().await.expect("read back"),
         [StoredContract {
             protocol: contract.protocol,
             name: contract.name,
@@ -915,12 +876,8 @@ pub(crate) async fn stored_contracts_read_back_and_orphaned_ones_are_deleted<H: 
     );
 
     commit(&mut sink, [reorg(&chain, &[0x01])]).await;
-    assert!(sink.contracts(&chain).await.expect("read back").is_empty());
-    assert_eq!(
-        row_count(&mut harness, "contracts").await,
-        1,
-        "the other chain's contract stays"
-    );
+    assert!(sink.contracts().await.expect("read back").is_empty());
+    assert_eq!(row_count(&mut harness, "contracts").await, 0);
     harness.remove().await;
 }
 

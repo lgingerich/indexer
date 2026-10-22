@@ -293,7 +293,7 @@ async fn a_discovered_contract_is_stored_and_survives_a_restart() {
 
     // A restart: a fresh decoder knows the pool once the store's rows are restored.
     let mut store = duckdb_store(reader.try_clone().expect("handle")).await;
-    let stored = store.contracts(&chain).await.expect("read back");
+    let stored = store.contracts().await.expect("read back");
     assert_eq!(stored, [stored_pool(pool, creating, 10)]);
     let mut restarted = decoder();
     assert_eq!(restarted.restore(stored), 1);
@@ -315,7 +315,7 @@ async fn a_discovered_contract_is_stored_and_survives_a_restart() {
         .await
         .expect("publish");
     store.flush().await.expect("flush");
-    assert!(store.contracts(&chain).await.expect("read back").is_empty());
+    assert!(store.contracts().await.expect("read back").is_empty());
     assert_eq!(count(&reader, "contracts"), 0);
 }
 

@@ -50,7 +50,8 @@
 //! # One writer
 //!
 //! A chain's tables are written by one process, and hold that chain alone: rows are not
-//! keyed by chain here, so a store is handed only the chain it was opened for. Within
+//! keyed by chain here, so a store takes only the chain it was opened for, and its batch
+//! refuses an envelope of any other (see `sink::batch`). Within
 //! the process, `maintenance` writes beside the store, to files the store no longer
 //! touches. Unlike `PostgreSQL`'s advisory lock or `DuckDB`'s file lock, nothing here
 //! enforces one process: a deployment runs one indexer per chain. A second writer on the same `uri` would append duplicate rows, and its open
@@ -91,7 +92,7 @@ use crate::sink::store_error::{Operation, StoreError};
 use crate::sink::table::{Row, Schema, Table, TableId};
 use crate::sink::{EnvelopeSink, Restored, SinkError, Store, millis};
 use crate::window::LEDGER_WINDOW;
-use crate::wire::envelope::{BlockMeta, ChainId, Envelope};
+use crate::wire::envelope::{BlockMeta, Envelope};
 
 use self::expr::{at_or_above, of_blocks};
 use self::lake::Lake;
@@ -125,7 +126,6 @@ const COMMIT_DEADLINE: Duration = Duration::from_mins(10);
 /// The store: one Delta table per table of the run's schema.
 #[derive(Debug)]
 pub struct DeltaSink {
-    chain: ChainId,
     schema: Arc<Schema>,
     /// Every table, in schema order.
     lakes: Vec<Lake>,
@@ -257,12 +257,13 @@ impl DeltaSink {
         self.refuse_replays()?;
         let started = Instant::now();
         // Taken out so the commit can take its rows while it writes, and put back cleared.
-        let mut batch = std::mem::replace(&mut self.batch, Batch::new(Arc::clone(&self.schema)));
+        let fresh = Batch::new(Arc::clone(&self.schema), self.batch.chain().clone());
+        let mut batch = std::mem::replace(&mut self.batch, fresh);
         let commit = self.take_apart(&mut batch)?;
         let summary = commit.summary;
         let timings = self.write_in_order(commit).await?;
         info!(
-            chain = %self.chain,
+            chain = %self.batch.chain(),
             rows = summary.rows,
             orphaned = summary.orphaned,
             from = ?summary.from,
@@ -481,8 +482,8 @@ impl DeltaSink {
                     && !self
                         .batch
                         .orphaned
-                        .values()
-                        .any(|(_, orphaned)| orphaned.contains(*hash))
+                        .as_ref()
+                        .is_some_and(|orphaned| orphaned.hashes.contains(*hash))
             });
         match replayed {
             Some(block) => Err(StoreError::Replayed {
@@ -495,15 +496,14 @@ impl DeltaSink {
     /// The committed blocks `batch` orphans, with the lowest height any of them is at.
     /// The others never left the buffer, which dropped them already.
     fn committed_orphans(&self, batch: &Batch) -> Option<(u64, Vec<String>)> {
-        let floor = batch.orphaned.values().map(|(height, _)| *height).min()?;
-        let hashes: Vec<String> = batch
-            .orphaned
-            .values()
-            .flat_map(|(_, hashes)| hashes)
+        let orphaned = batch.orphaned.as_ref()?;
+        let hashes: Vec<String> = orphaned
+            .hashes
+            .iter()
             .filter(|hash| self.committed.contains_key(*hash))
             .cloned()
             .collect();
-        (!hashes.is_empty()).then_some((floor, hashes))
+        (!hashes.is_empty()).then_some((orphaned.floor, hashes))
     }
 
     /// Deletes the orphaned blocks `hashes`, none below `floor`: out of the ledger first,

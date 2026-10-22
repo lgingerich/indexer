@@ -154,8 +154,6 @@ impl Reads {
 #[derive(Debug)]
 pub struct SqlStore<E> {
     engine: E,
-    /// The chain a [`restore`](Store::restore) reads back.
-    chain: ChainId,
     batch: Batch,
     tables: Vec<Prepared>,
     reads: Reads,
@@ -211,7 +209,6 @@ impl<E: Engine> SqlStore<E> {
         }
         let mut store = Self {
             engine,
-            chain: ChainId::new(chain),
             tables: schema
                 .tables()
                 .iter()
@@ -219,7 +216,7 @@ impl<E: Engine> SqlStore<E> {
                 .map(|(position, def)| Prepared::new::<E::Dialect>(position, def))
                 .collect(),
             reads: Reads::new(&schema)?,
-            batch: Batch::new(schema),
+            batch: Batch::new(schema, ChainId::new(chain)),
         };
         store.create_staging().await?;
         Ok(store)
@@ -270,8 +267,8 @@ impl<E: Engine> SqlStore<E> {
         Ok(())
     }
 
-    /// The contracts discovered on `chain` that this store holds. One created in a block a
-    /// `reorg` orphaned was deleted with that block, so every row here is canonical.
+    /// The contracts discovered on the store's chain that it holds. One created in a block
+    /// a `reorg` orphaned was deleted with that block, so every row here is canonical.
     ///
     /// Read by [`restore`](Store::restore), so a restart decodes every contract a
     /// previous run discovered.
@@ -280,13 +277,11 @@ impl<E: Engine> SqlStore<E> {
     ///
     /// Returns [`StoreError::Engine`] when the query fails and [`StoreError::Restore`]
     /// when a stored value does not parse.
-    pub(crate) async fn contracts(
-        &mut self,
-        chain: &ChainId,
-    ) -> Result<Vec<StoredContract>, StoreError> {
+    pub(crate) async fn contracts(&mut self) -> Result<Vec<StoredContract>, StoreError> {
+        let chain = self.chain_param();
         let rows = self
             .engine
-            .query(&self.reads.contracts, &[chain_param(chain)])
+            .query(&self.reads.contracts, &[chain])
             .await
             .map_err(StoreError::engine(Operation::Read, Some("contracts")))?;
         rows.iter()
@@ -303,8 +298,8 @@ impl<E: Engine> SqlStore<E> {
             .collect()
     }
 
-    /// The newest `limit` accepted blocks on `chain`, oldest first. An orphaned block's
-    /// row was deleted by its `reorg`, so these are canonical.
+    /// The newest `limit` accepted blocks on the store's chain, oldest first. An orphaned
+    /// block's row was deleted by its `reorg`, so these are canonical.
     ///
     /// Read by [`restore`](Store::restore), before the first write: the result is the
     /// undo window a restart resumes from. Each flush drops the rows below that window
@@ -315,16 +310,13 @@ impl<E: Engine> SqlStore<E> {
     ///
     /// Returns [`StoreError::Engine`] when the query fails and [`StoreError::Restore`]
     /// when a stored value does not parse.
-    pub(crate) async fn ledger(
-        &mut self,
-        chain: &ChainId,
-        limit: usize,
-    ) -> Result<Vec<BlockMeta>, StoreError> {
+    pub(crate) async fn ledger(&mut self, limit: usize) -> Result<Vec<BlockMeta>, StoreError> {
         let read = || StoreError::engine(Operation::Read, Some("accepted_blocks"));
         let limit = Value::Int(i64::try_from(limit).unwrap_or(i64::MAX));
+        let params = [self.chain_param(), limit];
         let rows = self
             .engine
-            .query(&self.reads.ledger, &[chain_param(chain), limit])
+            .query(&self.reads.ledger, &params)
             .await
             .map_err(read())?;
         let mut ledger = rows
@@ -365,7 +357,7 @@ impl<E: Engine> SqlStore<E> {
     /// Deletes every block above `height` from each table whose rows belong to one, the
     /// ledger included, by height (see [`sql::delete_above`]).
     async fn delete_above(&mut self, height: u64) -> Result<(), StoreError> {
-        let params = [chain_param(&self.chain), Value::Uint(height)];
+        let params = [self.chain_param(), Value::Uint(height)];
         for table in &self.tables {
             let Some(delete) = &table.delete_above else {
                 continue;
@@ -378,44 +370,39 @@ impl<E: Engine> SqlStore<E> {
         Ok(())
     }
 
-    /// Deletes each chain's ledger rows more than [`LEDGER_WINDOW`] below the newest block
-    /// this flush accepts on it, as the lake keeps its window: no restart reads them, and
-    /// left in place they grow the table, and the cost of every write to it, a row a block.
+    /// Deletes the ledger rows more than [`LEDGER_WINDOW`] below `tip`, the newest block
+    /// this flush accepts, as the lake keeps its window: no restart reads them, and left
+    /// in place they grow the table, and the cost of every write to it, a row a block.
     ///
-    /// `tips` are the newest accepted heights by chain. Each is canonical — a buffered
-    /// `reorg` dropped the rows of the blocks it orphaned — and at or below the chain's tip,
-    /// so the window kept is never short.
-    async fn prune_ledger(&mut self, tips: HashMap<String, u64>) -> Result<(), StoreError> {
-        for (chain, tip) in tips {
-            let Some(floor) = tip.checked_sub(LEDGER_WINDOW as u64) else {
-                continue;
-            };
-            self.engine
-                .execute(
-                    &self.reads.prune_ledger,
-                    &[Value::Text(chain), Value::Uint(floor)],
-                )
-                .await
-                .map_err(StoreError::engine(
-                    Operation::Delete,
-                    Some("accepted_blocks"),
-                ))?;
-        }
-        Ok(())
+    /// `tip` is canonical — a buffered `reorg` dropped the rows of the blocks it orphaned —
+    /// and at or below the chain's tip, so the window kept is never short. Nothing is
+    /// deleted for a flush that accepts no block, or one within the window of the start.
+    async fn prune_ledger(&mut self, tip: Option<u64>) -> Result<(), StoreError> {
+        let Some(floor) = tip.and_then(|tip| tip.checked_sub(LEDGER_WINDOW as u64)) else {
+            return Ok(());
+        };
+        let params = [self.chain_param(), Value::Uint(floor)];
+        self.engine
+            .execute(&self.reads.prune_ledger, &params)
+            .await
+            .map_err(StoreError::engine(
+                Operation::Delete,
+                Some("accepted_blocks"),
+            ))
     }
 
     /// The deletes, then each table's load, merge, and clear, then the ledger's prune.
     async fn write_tables(&mut self) -> Result<(), StoreError> {
-        for table in &self.tables {
-            let Some(delete) = &table.delete else {
-                continue;
-            };
-            for (chain, (height, hashes)) in &self.batch.orphaned {
-                let params = [
-                    Value::Text(chain.clone()),
-                    Value::Uint(*height),
-                    Value::List(hashes.iter().cloned().map(Value::Text).collect()),
-                ];
+        if let Some(orphaned) = &self.batch.orphaned {
+            let params = [
+                self.chain_param(),
+                Value::Uint(orphaned.floor),
+                Value::List(orphaned.hashes.iter().cloned().map(Value::Text).collect()),
+            ];
+            for table in &self.tables {
+                let Some(delete) = &table.delete else {
+                    continue;
+                };
                 self.engine
                     .execute(delete, &params)
                     .await
@@ -423,17 +410,15 @@ impl<E: Engine> SqlStore<E> {
             }
         }
         let mut grouped = self.batch.by_table();
-        let mut tips: HashMap<String, u64> = HashMap::new();
-        for row in grouped
+        let tip = grouped
             .get(&TableId::Dataset(Table::AcceptedBlock))
             .into_iter()
             .flatten()
-        {
-            if let Some(Value::Uint(height)) = row.value("height") {
-                let tip = tips.entry(row.chain().to_owned()).or_default();
-                *tip = (*tip).max(*height);
-            }
-        }
+            .filter_map(|row| match row.value("height") {
+                Some(Value::Uint(height)) => Some(*height),
+                _ => None,
+            })
+            .max();
         for table in &mut self.tables {
             let Some(rows) = grouped.remove(&table.def.id) else {
                 continue;
@@ -454,16 +439,20 @@ impl<E: Engine> SqlStore<E> {
                 .await
                 .map_err(StoreError::engine(Operation::Stage, name))?;
         }
-        self.prune_ledger(tips).await
+        self.prune_ledger(tip).await
+    }
+
+    /// The store's chain, as the parameter every chain-scoped statement takes first.
+    fn chain_param(&self) -> Value {
+        Value::Text(self.batch.chain().as_str().to_owned())
     }
 }
 
 impl<E: Engine + 'static> Store for SqlStore<E> {
     async fn restore(&mut self) -> Result<Restored, StoreError> {
-        let chain = self.chain.clone();
         Ok(Restored {
-            contracts: self.contracts(&chain).await?,
-            ledger: self.ledger(&chain, LEDGER_WINDOW).await?,
+            contracts: self.contracts().await?,
+            ledger: self.ledger(LEDGER_WINDOW).await?,
         })
     }
 
@@ -570,10 +559,6 @@ fn check<D: Dialect>(table: &TableDef, stored: &[(String, String)]) -> Result<()
             expected: expected.clone(),
         })
     })
-}
-
-fn chain_param(chain: &ChainId) -> Value {
-    Value::Text(chain.as_str().to_owned())
 }
 
 /// The value at `index` of a row read back, or `Null` when the row is shorter: a short
