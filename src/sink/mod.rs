@@ -145,7 +145,8 @@ pub trait EnvelopeSink: Send {
     /// Records the newest sampled canonical head, so a commit can report its lag.
     ///
     /// The default ignores it. The storage channel keeps the latest sample for its
-    /// progress line; a sink with no commit log has nothing to compare against.
+    /// progress line, and measures its store's lag against each one; a sink with no
+    /// commit log has nothing to compare against.
     fn observe_head(&mut self, height: u64) {
         let _ = height;
     }

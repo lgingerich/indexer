@@ -45,7 +45,8 @@ impl Progress {
     }
 
     /// `store`'s commit landed. Logs any reorg in it, records the commit's metrics, then
-    /// logs the progress line if one is due.
+    /// logs the progress line if one is due. Returns the newest block the commit holds;
+    /// `None` for one that holds no block.
     pub(crate) fn committed(
         &mut self,
         store: Backend,
@@ -53,16 +54,17 @@ impl Progress {
         elapsed: Duration,
         head: Option<u64>,
         now: Instant,
-    ) {
+    ) -> Option<u64> {
         let stats = std::mem::take(&mut self.open);
         log_reorgs(&stats);
         let elapsed_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
-        if let Some(commit) = stats.into_commit(rows, elapsed_ms) {
-            metrics::committed(store.name(), commit.to, commit.blocks, rows, elapsed, head);
-            for line in self.window.observe(commit, head, now).into_iter().flatten() {
-                line.log();
-            }
+        let commit = stats.into_commit(rows, elapsed_ms)?;
+        let height = commit.to;
+        metrics::committed(store.name(), height, commit.blocks, rows, elapsed, head);
+        for line in self.window.observe(commit, head, now).into_iter().flatten() {
+            line.log();
         }
+        Some(height)
     }
 
     /// Logs a catch-up summary still held when storage stops.

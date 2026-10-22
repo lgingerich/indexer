@@ -54,6 +54,7 @@ use tracing::{info, warn};
 
 use super::progress::{self, HEAD_UNKNOWN, Progress};
 use super::stop::Stop;
+use crate::metrics;
 use crate::sink::route::Backend;
 use crate::sink::{EnvelopeSink, SinkError};
 use crate::wire::envelope::Envelope;
@@ -151,7 +152,15 @@ pub(crate) struct ChannelSink {
     batch: Vec<Envelope>,
     /// Newest canonical head ingest has sampled. Storage reads it when a commit lands.
     head: Arc<AtomicU64>,
+    /// The store this sends to, as its lag is reported.
+    store: Backend,
+    /// The newest block the store has committed, or [`UNCOMMITTED`]: what a head sampled
+    /// between commits measures the store's lag against.
+    committed: Arc<AtomicU64>,
 }
+
+/// The store has committed no block since the channel was made.
+const UNCOMMITTED: u64 = u64::MAX;
 
 impl ChannelSink {
     /// Creates the channel: this sending half, which decode publishes into, and the
@@ -161,17 +170,21 @@ impl ChannelSink {
         let (sender, receiver) = mpsc::channel(CAPACITY);
         let room = Arc::new(Semaphore::new(ENVELOPES));
         let head = Arc::new(AtomicU64::new(HEAD_UNKNOWN));
+        let committed = Arc::new(AtomicU64::new(UNCOMMITTED));
         (
             Self {
                 sender,
                 room,
                 batch: Vec::new(),
                 head: Arc::clone(&head),
+                store,
+                committed: Arc::clone(&committed),
             },
             ChannelReceiver {
                 receiver,
                 store,
                 head,
+                committed,
                 progress: Progress::default(),
             },
         )
@@ -218,8 +231,15 @@ impl EnvelopeSink for ChannelSink {
         Ok(())
     }
 
+    /// Also reports the store's lag against the new head: a commit reports it too, but a
+    /// store that has stopped committing would otherwise go on showing its last, small,
+    /// lag. Ingest samples heads whether or not storage keeps up, until the channel fills.
     fn observe_head(&mut self, height: u64) {
         self.head.store(height, Ordering::Release);
+        let committed = self.committed.load(Ordering::Acquire);
+        if committed != UNCOMMITTED {
+            metrics::store_lag(self.store.name(), height.saturating_sub(committed));
+        }
     }
 }
 
@@ -230,6 +250,7 @@ pub(crate) struct ChannelReceiver {
     /// The store this drains into, as its commits are reported.
     store: Backend,
     head: Arc<AtomicU64>,
+    committed: Arc<AtomicU64>,
     progress: Progress,
 }
 
@@ -373,8 +394,12 @@ impl ChannelReceiver {
         let elapsed = started.elapsed();
         let head = progress::sampled_head(self.head.load(Ordering::Acquire));
         let records = std::mem::take(pending).envelopes as u64;
-        self.progress
-            .committed(self.store, records, elapsed, head, Instant::now());
+        if let Some(height) =
+            self.progress
+                .committed(self.store, records, elapsed, head, Instant::now())
+        {
+            self.committed.store(height, Ordering::Release);
+        }
         Ok(records)
     }
 }
@@ -762,6 +787,45 @@ mod tests {
             keys(1..=capacity),
             "every other block arrives, in order"
         );
+    }
+
+    /// A store's lag is measured against each head ingest samples, not only on commit, so
+    /// a store that stops committing reports a lag that grows.
+    #[tokio::test]
+    async fn a_store_that_stops_committing_reports_a_growing_lag() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let scrape = recorder.handle();
+        // Thread-local, and the test runtime runs the drain on this thread.
+        let _recorder = metrics::set_default_local_recorder(&recorder);
+        let lag = || {
+            scrape
+                .render()
+                .lines()
+                .find_map(|line| line.strip_prefix("indexer_store_lag_blocks{store=\"duckdb\"} "))
+                .map(str::to_owned)
+        };
+        let (mut sink, receiver) = ChannelSink::new(Backend::DuckDb);
+        sink.observe_head(10);
+        assert_eq!(lag(), None, "no lag before the store's first commit");
+
+        let storage = spawn_drain(receiver, Batching::eager(1), Stop::never());
+        send_block(&mut sink, 5..6).await;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while lag().is_none() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the block commits");
+        assert_eq!(lag().as_deref(), Some("5"), "the commit measures it");
+        sink.observe_head(30);
+        assert_eq!(
+            lag().as_deref(),
+            Some("25"),
+            "a head sampled with no commit since measures it"
+        );
+        drop(sink);
+        storage.await.expect("storage ends");
     }
 
     /// A store that has stopped is an error on the sender's next flush, not a silent

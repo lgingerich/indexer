@@ -17,7 +17,7 @@
 //! | `indexer_reorgs_total` | counter | Reorgs retracted |
 //! | `indexer_reorg_orphaned_blocks_total` | counter | Blocks those reorgs orphaned |
 //! | `indexer_store_height` | gauge | The newest block a store committed |
-//! | `indexer_store_lag_blocks` | gauge | How far that block is under the sampled head |
+//! | `indexer_store_lag_blocks` | gauge | How far that block is under the sampled head, as of the newest commit or head |
 //! | `indexer_store_last_commit_timestamp_seconds` | gauge | When a store last committed |
 //! | `indexer_store_blocks_total` | counter | Blocks a store committed |
 //! | `indexer_store_rows_total` | counter | Records a store committed |
@@ -31,9 +31,10 @@
 //! | `indexer_rpc_range_splits_total` | counter | Backfill ranges split after a failed fetch |
 //! | `indexer_lake_maintenance_failures_total` | counter | Failed Delta `operation`s: `load`, `compact`, `vacuum`, or `log_cleanup` |
 //!
-//! A stall is `time() - indexer_store_last_commit_timestamp_seconds`; a decode failure
-//! is any increase of the failure counters, since every one of them is a record the
-//! stores are missing.
+//! A stall is `time() - indexer_store_last_commit_timestamp_seconds`, and shows in a
+//! store's lag too: each head ingest samples measures it, not only each commit, until
+//! the store's channel fills and ingest waits on it. A decode failure is any increase of
+//! the failure counters, since every one of them is a record the stores are missing.
 
 use std::net::SocketAddr;
 #[cfg(any(feature = "store", test))]
@@ -145,12 +146,20 @@ pub(crate) fn committed(
 ) {
     gauge!(STORE_HEIGHT, "store" => store).set(as_value(height));
     if let Some(head) = head {
-        gauge!(STORE_LAG, "store" => store).set(as_value(head.saturating_sub(height)));
+        store_lag(store, head.saturating_sub(height));
     }
     gauge!(STORE_LAST_COMMIT, "store" => store).set(unix_seconds(SystemTime::now()));
     counter!(STORE_BLOCKS, "store" => store).increment(blocks);
     counter!(STORE_ROWS, "store" => store).increment(rows);
     histogram!(STORE_COMMIT_DURATION, "store" => store).record(took.as_secs_f64());
+}
+
+/// `store`'s newest committed block is `lag` blocks under the newest sampled head: set by
+/// each commit and by each head sampled between commits, so a store that stops
+/// committing shows a lag that grows.
+#[cfg(any(feature = "store", test))]
+pub(crate) fn store_lag(store: &'static str, lag: u64) {
+    gauge!(STORE_LAG, "store" => store).set(as_value(lag));
 }
 
 /// `count` logs decoded against their contracts' ABIs.
