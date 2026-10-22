@@ -525,7 +525,10 @@ fn judge(request: &RequestPacket, result: &Result<ResponsePacket, TransportError
 }
 
 /// Whether a node's error message says it has not reached the height asked for, in the
-/// words the providers this indexer runs on use.
+/// words the providers this indexer runs on use. Geth answers an `eth_getLogs` whose
+/// `toBlock` is past its head with `-32602` "block range extends beyond current head
+/// block", which on a load-balanced provider is a lagging backend, not a range too large:
+/// halving it would only ask the same backend for heights it lacks.
 pub(crate) fn not_reached(message: &str) -> bool {
     let message = message.to_ascii_lowercase();
     [
@@ -533,6 +536,7 @@ pub(crate) fn not_reached(message: &str) -> bool {
         "header not found",
         "block not found",
         "unknown block",
+        "beyond current head",
     ]
     .iter()
     .any(|phrase| message.contains(phrase))
@@ -589,7 +593,8 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        MAX_DELAY_MS, MAX_RETRIES, MIN_DELAY_MS, NetworkError, Pacing, RetryLayer, timed_out,
+        MAX_DELAY_MS, MAX_RETRIES, MIN_DELAY_MS, NetworkError, Pacing, RetryLayer, not_reached,
+        timed_out,
     };
 
     fn response(body: &str) -> ResponsePacket {
@@ -676,6 +681,30 @@ mod tests {
             assert!(result.expect(case).first_error_code().is_some(), "{case}");
             assert_eq!(calls, 1, "{case}");
             assert_eq!(layer.backoff.pacing.current(), MIN_DELAY_MS, "{case}");
+        }
+    }
+
+    /// Each provider's way of saying it has not reached a height is recognized, geth's
+    /// answer to a log range past its head among them, while the ways of saying a range
+    /// is too large are not: those go back to be split, not asked again as they are.
+    #[test]
+    fn not_reached_tells_a_lagging_node_from_a_range_too_large() {
+        for message in [
+            "Invalid params: requested block 18000000 is greater than latest block 17999999",
+            "header not found",
+            "block not found",
+            "unknown block",
+            "block range extends beyond current head block",
+        ] {
+            assert!(not_reached(message), "{message}");
+        }
+        for message in [
+            "exceed maximum block range 10000",
+            "query returned more than 10000 results",
+            "query exceeds the maximum range",
+            "execution aborted",
+        ] {
+            assert!(!not_reached(message), "{message}");
         }
     }
 
