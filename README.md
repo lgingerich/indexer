@@ -466,13 +466,6 @@ handled yet:
   another type returns a `DOUBLE`; cast first when precision matters. PostgreSQL's
   `NUMERIC` stays exact.
 
-### Runtime cleanups
-
-- **`Pipeline::run` reads the settings twice.** `Pipeline::from_settings` builds the
-  pipeline from `Settings`, then `Pipeline::run(settings)` takes the whole `Settings`
-  again, though it uses only `sink` and `ingest.chain`. `Pipeline` could keep the sink
-  choice itself, so `run` takes no settings.
-
 Also not built, and not on the path above: mempool ingestion and a Parquet archive.
 
 ## Run it
