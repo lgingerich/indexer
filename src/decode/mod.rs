@@ -17,6 +17,8 @@ mod abi;
 mod catalog;
 mod decoder;
 mod derive;
+#[cfg(test)]
+mod fixtures;
 mod sink;
 
 pub use abi::{Abi, AbiError, DecodeError, DecodedEvent};

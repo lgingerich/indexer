@@ -141,13 +141,11 @@ impl<K: EnvelopeSink> EnvelopeSink for DecodingSink<K> {
 #[cfg(test)]
 #[expect(clippy::expect_used)]
 mod tests {
-    use std::path::Path;
-
-    use alloy_dyn_abi::DynSolValue;
-    use alloy_primitives::{Address, B256, keccak256};
+    use alloy_primitives::{Address, B256};
 
     use super::*;
-    use crate::decode::Catalog;
+    use crate::decode::fixtures::uniswap_v3::{pool_created, swap};
+    use crate::decode::fixtures::{metric, shipped};
     use crate::wire::envelope::Reorg;
 
     #[derive(Default)]
@@ -171,49 +169,7 @@ mod tests {
     }
 
     fn sink() -> DecodingSink<Collect> {
-        let catalog = Catalog::load(
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("protocols"),
-            &chain(),
-        )
-        .expect("catalog");
-        DecodingSink::new(Decoder::new(catalog), Collect::default())
-    }
-
-    fn pool_created(pool: Address, block: B256) -> Log {
-        Log {
-            address: "0x33128a8fC17869897dcE68Ed026d694621f6FDfD"
-                .parse()
-                .expect("factory"),
-            topic0: Some(keccak256(
-                "PoolCreated(address,address,uint24,int24,address)",
-            )),
-            topic1: Some(B256::with_last_byte(1)),
-            topic2: Some(B256::with_last_byte(2)),
-            topic3: Some(B256::with_last_byte(3)),
-            data: DynSolValue::Tuple(vec![
-                DynSolValue::Int(alloy_primitives::I256::try_from(60).expect("int"), 24),
-                DynSolValue::Address(pool),
-            ])
-            .abi_encode_params()
-            .into(),
-            block_hash: block,
-            ..Log::default()
-        }
-    }
-
-    fn swap(pool: Address) -> Log {
-        let source: Envelope = serde_json::from_str(
-            include_str!("../../examples/fixtures/uniswap_v3_swaps.ndjson")
-                .lines()
-                .next()
-                .expect("line"),
-        )
-        .expect("fixture");
-        let Event::Log(mut log) = source.event else {
-            panic!("log");
-        };
-        log.address = pool;
-        *log
+        DecodingSink::new(Decoder::new(shipped("base")), Collect::default())
     }
 
     fn log(log: Log) -> Envelope {
@@ -287,11 +243,10 @@ mod tests {
     async fn a_derived_row_follows_its_decoded_record_with_its_transaction() {
         use alloy_primitives::{TxHash, U256};
 
-        use crate::decode::derive::fixtures;
         use crate::wire::envelope::Transaction;
 
-        let mut sink = DecodingSink::new(fixtures::decoder(), Collect::default());
-        let mut swap = fixtures::swap_log(U256::ZERO, U256::ZERO, U256::ZERO);
+        let mut sink = DecodingSink::new(metric::decoder(), Collect::default());
+        let mut swap = metric::swap_log(U256::ZERO, U256::ZERO, U256::ZERO);
         swap.transaction_hash = TxHash::repeat_byte(0x11);
         let transaction = Transaction {
             hash: swap.transaction_hash,

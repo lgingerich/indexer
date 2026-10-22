@@ -159,12 +159,12 @@ generic support for derived rows in `wire` and `sink`.
 
 ## Adding a derivation
 
-1. Add a `Derivation` constant in `src/decode/derive/<protocol>.rs`. Pin the event's
-   canonical signature, and read arguments by position and name with the helpers in
-   `src/decode/derive/mod.rs`.
+1. Add a `Derivation` constant in `src/decode/derive/<protocol>/<table>.rs`. Pin the
+   event's canonical signature, and read arguments by position and name, and packed
+   words by bit field, with the helpers in `src/decode/derive/value.rs`.
 2. List it in `DERIVATIONS`.
 3. Test the unpacking against the contract's own vectors, and the row against the
-   shipped catalog.
+   shipped catalog, with events built in `src/decode/fixtures.rs`.
 
 ## Later
 

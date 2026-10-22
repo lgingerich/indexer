@@ -229,66 +229,17 @@ impl Decoder {
 #[cfg(test)]
 #[expect(clippy::expect_used)]
 mod tests {
-    use std::path::Path;
-
     use alloy_dyn_abi::DynSolValue;
     use alloy_primitives::{Address, B256, keccak256};
 
     use super::Decoder;
-    use crate::decode::Catalog;
     use crate::decode::DecodeError;
-    use crate::wire::envelope::StoredContract;
-    use crate::wire::envelope::{ChainId, Envelope, Event, Log};
-
-    const FACTORY: &str = "0x33128a8fC17869897dcE68Ed026d694621f6FDfD";
+    use crate::decode::fixtures::uniswap_v3::{FACTORY, pool_created, swap};
+    use crate::decode::fixtures::{protocol, shipped};
+    use crate::wire::envelope::{Log, StoredContract};
 
     fn decoder() -> Decoder {
-        Decoder::new(
-            Catalog::load(
-                Path::new(env!("CARGO_MANIFEST_DIR")).join("protocols"),
-                &ChainId::new("base"),
-            )
-            .expect("shipped protocols load"),
-        )
-    }
-
-    /// A Uniswap V3 `PoolCreated` from the Base factory naming `pool`, in `block`.
-    fn pool_created(pool: Address, block: B256) -> Log {
-        Log {
-            address: FACTORY.parse().expect("factory"),
-            topic0: Some(keccak256(
-                "PoolCreated(address,address,uint24,int24,address)",
-            )),
-            topic1: Some(B256::with_last_byte(1)),
-            topic2: Some(B256::with_last_byte(2)),
-            topic3: Some(B256::left_padding_from(&[0x0b, 0xb8])),
-            data: DynSolValue::Tuple(vec![
-                DynSolValue::Int(alloy_primitives::I256::try_from(60).expect("int"), 24),
-                DynSolValue::Address(pool),
-            ])
-            .abi_encode_params()
-            .into(),
-            log_index: 4,
-            block_number: 10,
-            block_hash: block,
-            ..Log::default()
-        }
-    }
-
-    /// A real Uniswap V3 `Swap`, re-addressed to `pool`.
-    fn swap(pool: Address) -> Log {
-        let envelope: Envelope = serde_json::from_str(
-            include_str!("../../examples/fixtures/uniswap_v3_swaps.ndjson")
-                .lines()
-                .next()
-                .expect("fixture"),
-        )
-        .expect("envelope");
-        let Event::Log(mut log) = envelope.event else {
-            panic!("log");
-        };
-        log.address = pool;
-        *log
+        Decoder::new(shipped("base"))
     }
 
     fn stored(address: Address) -> StoredContract {
@@ -305,31 +256,22 @@ mod tests {
     /// A protocol `p` on Base: a seeded `Parent` whose `Made(address child)` names a
     /// `Child` by two rules and an `Other` by a third, and `Child` seeded at [`SEEDED`].
     fn claims() -> Decoder {
-        let root = std::env::temp_dir().join(format!("indexer-claims-{}", std::process::id()));
-        let dir = root.join("p");
-        std::fs::create_dir_all(&dir).expect("create protocol dir");
         let made = r#"[{"type":"event","name":"Made","anonymous":false,"inputs":[
             {"name":"child","type":"address","indexed":false}]}]"#;
         let rule = r#"{ contract = "Parent", event = "Made", param = "child" }"#;
-        for (file, contents) in [
-            ("Parent.json", made.to_owned()),
-            ("Child.json", "[]".to_owned()),
-            ("Other.json", "[]".to_owned()),
-            (
-                "protocol.toml",
-                format!(
-                    "protocol = \"p\"\n\
-                     [[contract]]\nabi = [\"Parent.json\"]\naddresses = {{ base = [\"{PARENT}\"] }}\n\
-                     [[contract]]\nabi = [\"Child.json\"]\naddresses = {{ base = [\"{SEEDED}\"] }}\n\
-                     created_by = [{rule}, {rule}]\n\
-                     [[contract]]\nabi = [\"Other.json\"]\ncreated_by = [{rule}]\n"
-                ),
-            ),
-        ] {
-            std::fs::write(dir.join(file), contents).expect("write file");
-        }
-        let catalog = Catalog::load(&root, &ChainId::new("base"));
-        std::fs::remove_dir_all(&root).expect("clean up");
+        let manifest = format!(
+            "protocol = \"p\"\n\
+             [[contract]]\nabi = [\"Parent.json\"]\naddresses = {{ base = [\"{PARENT}\"] }}\n\
+             [[contract]]\nabi = [\"Child.json\"]\naddresses = {{ base = [\"{SEEDED}\"] }}\n\
+             created_by = [{rule}, {rule}]\n\
+             [[contract]]\nabi = [\"Other.json\"]\ncreated_by = [{rule}]\n"
+        );
+        let catalog = protocol(&[
+            ("Parent.json", made),
+            ("Child.json", "[]"),
+            ("Other.json", "[]"),
+            ("protocol.toml", &manifest),
+        ]);
         Decoder::new(catalog.expect("the protocol loads"))
     }
 

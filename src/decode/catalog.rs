@@ -635,34 +635,20 @@ pub enum CatalogError {
 #[cfg(test)]
 #[expect(clippy::expect_used)]
 mod tests {
-    use std::path::{Path, PathBuf};
-
     use super::{AddressSlot, Catalog, CatalogError};
+    use crate::decode::fixtures::{protocol, protocols, shipped};
     use crate::sink::table::{ColumnType, TableId};
-    use crate::wire::envelope::ChainId;
 
-    fn repository() -> PathBuf {
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("protocols")
-    }
-
-    /// A protocols directory in a temporary location, holding one manifest that shares
-    /// the shipped Uniswap V3 ABIs.
+    /// One protocol holding `manifest` and the shipped Uniswap V3 ABIs.
     fn single(manifest: &str) -> Result<Catalog, CatalogError> {
-        let root = std::env::temp_dir().join(format!(
-            "indexer-protocols-{}-{:x}",
-            std::process::id(),
-            alloy_primitives::keccak256(manifest)
-        ));
-        let dir = root.join("uniswap_v3");
-        std::fs::create_dir_all(&dir).expect("create protocol dir");
-        for file in ["UniswapV3Factory.json", "UniswapV3Pool.json"] {
-            std::fs::copy(repository().join("uniswap/v3").join(file), dir.join(file))
-                .expect("copy ABI");
-        }
-        std::fs::write(dir.join("protocol.toml"), manifest).expect("write manifest");
-        let catalog = Catalog::load(&root, &ChainId::new("base"));
-        std::fs::remove_dir_all(&root).expect("clean up");
-        catalog
+        let abi = |file: &str| {
+            std::fs::read_to_string(protocols().join("uniswap/v3").join(file)).expect("read ABI")
+        };
+        protocol(&[
+            ("UniswapV3Factory.json", &abi("UniswapV3Factory.json")),
+            ("UniswapV3Pool.json", &abi("UniswapV3Pool.json")),
+            ("protocol.toml", manifest),
+        ])
     }
 
     const FACTORY: &str = r#"
@@ -674,23 +660,6 @@ addresses = { base = ["0x33128a8fC17869897dcE68Ed026d694621f6FDfD"], ethereum = 
 
     // The pool's default table names pass the limit, as the shipped manifest's do.
     const POOL: &str = "[[contract]]\nabi = [\"UniswapV3Pool.json\"]\ntable = \"pool\"\n";
-
-    /// A protocol `p` holding `files`, one of which is its `protocol.toml`.
-    fn protocol(files: &[(&str, &str)]) -> Result<Catalog, CatalogError> {
-        let root = std::env::temp_dir().join(format!(
-            "indexer-protocol-{}-{:x}",
-            std::process::id(),
-            alloy_primitives::keccak256(format!("{files:?}"))
-        ));
-        let dir = root.join("p");
-        std::fs::create_dir_all(&dir).expect("create protocol dir");
-        for (name, contents) in files {
-            std::fs::write(dir.join(name), contents).expect("write file");
-        }
-        let catalog = Catalog::load(&root, &ChainId::new("base"));
-        std::fs::remove_dir_all(&root).expect("clean up");
-        catalog
-    }
 
     /// ERC-20's and ERC-721's `Transfer`: one name and selector, a different topic count.
     const TRANSFERS: &str = r#"[
@@ -719,7 +688,7 @@ addresses = { base = ["0x33128a8fC17869897dcE68Ed026d694621f6FDfD"], ethereum = 
     /// `{protocol}_{contract}_{event}`, with the `table` key replacing the contract.
     #[test]
     fn the_shipped_protocols_have_event_tables() {
-        let catalog = Catalog::load(repository(), &ChainId::new("base")).expect("loads");
+        let catalog = shipped("base");
         let names = table_names(&catalog);
         assert!(names.iter().all(|name| name.len() <= super::MAX_IDENTIFIER));
         assert!(names.contains(&"uniswap_v3_uniswap_v3_factory_pool_created".to_owned()));
@@ -835,7 +804,7 @@ addresses = { base = ["0x33128a8fC17869897dcE68Ed026d694621f6FDfD"], ethereum = 
     /// Base addresses, so a short run decodes swaps out of the box.
     #[test]
     fn the_shipped_pools_are_discovered_and_seeded() {
-        let catalog = Catalog::load(repository(), &ChainId::new("base")).expect("loads");
+        let catalog = shipped("base");
         let factory = catalog
             .entry("uniswap_v3", "UniswapV3Factory")
             .expect("factory");

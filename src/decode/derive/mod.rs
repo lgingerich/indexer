@@ -13,7 +13,8 @@
 //! it, so they commit with its block. The rows go to the stores that list the table, as
 //! decoded rows go to the stores that list theirs.
 //!
-//! A derivation is Rust code in this module, one file per protocol. It pins the event's
+//! A derivation is Rust code in this module, one directory per protocol and one file per
+//! table, reading its record with the helpers in `value`. It pins the event's
 //! full signature, so an ABI that retyped an argument leaves the table undeclared and a
 //! store listing it fails at startup. It reads each argument by position and name, so one
 //! that moved under an unchanged signature is caught at its first record. A record a
@@ -37,8 +38,8 @@
 //!   `Catalog::load`, and the `Catalog::derivations` field, in `catalog.rs`.
 //! - `Decoder::derivations`, in `decoder.rs`.
 //! - The `derive::rows` call in `DecodingSink::decode`, the last transaction it keeps
-//!   for a row's sender and recipient, and the test using `derive::fixtures`, in
-//!   `sink.rs`.
+//!   for a row's sender and recipient, and the test of a derived row, in `sink.rs`.
+//! - `fixtures::metric`, in `fixtures.rs`.
 //! - `metrics::derive_failed`.
 //!
 //! What carries a derived row to the stores is generic and can go with them:
@@ -48,12 +49,10 @@
 //! `Event::Derived` and `TableId::Derived` arms in `sink::route`, `sink::progress`, and
 //! `ingest::source::datasets`.
 
-mod metric;
+pub(super) mod metric;
+mod value;
 
-#[cfg(test)]
-pub(super) use metric::fixtures;
-
-use alloy_primitives::{Address, I256, U256};
+use alloy_primitives::Address;
 use tracing::warn;
 
 use crate::metrics;
@@ -212,86 +211,16 @@ pub(super) fn rows(
     Ok(derived)
 }
 
-/// Argument `position` of `decoded`, among all its inputs, when it is named `name`.
-fn argument<'a>(decoded: &'a Decoded, position: usize, name: &str) -> Option<&'a TypedValue> {
-    decoded
-        .indexed
-        .iter()
-        .chain(&decoded.body)
-        .find(|argument| argument.position == position && argument.name == name)
-        .map(|argument| &argument.value)
-}
-
-/// Argument `position` of `decoded`, an `address` named `name`.
-fn address(decoded: &Decoded, position: usize, name: &'static str) -> Result<Address, DeriveError> {
-    match argument(decoded, position, name) {
-        Some(TypedValue::Address { value }) => Ok(*value),
-        _ => Err(DeriveError::Argument {
-            position,
-            name,
-            expected: "an address",
-        }),
-    }
-}
-
-/// Argument `position` of `decoded`, an `int{bits}` named `name`.
-fn int(
-    decoded: &Decoded,
-    position: usize,
-    name: &'static str,
-    bits: u16,
-) -> Result<I256, DeriveError> {
-    match argument(decoded, position, name) {
-        Some(TypedValue::Int { value, bits: found }) if *found == bits => Ok(*value),
-        _ => Err(DeriveError::Argument {
-            position,
-            name,
-            expected: "a signed integer of its declared width",
-        }),
-    }
-}
-
-/// Argument `position` of `decoded`, a `uint{bits}` named `name`.
-fn uint(
-    decoded: &Decoded,
-    position: usize,
-    name: &'static str,
-    bits: u16,
-) -> Result<U256, DeriveError> {
-    match argument(decoded, position, name) {
-        Some(TypedValue::Uint { value, bits: found }) if *found == bits => Ok(*value),
-        _ => Err(DeriveError::Argument {
-            position,
-            name,
-            expected: "an unsigned integer of its declared width",
-        }),
-    }
-}
-
-/// Argument `position` of `decoded`, a dynamic array named `name`.
-fn array<'a>(
-    decoded: &'a Decoded,
-    position: usize,
-    name: &'static str,
-) -> Result<&'a [TypedValue], DeriveError> {
-    match argument(decoded, position, name) {
-        Some(TypedValue::Array { value }) => Ok(value),
-        _ => Err(DeriveError::Argument {
-            position,
-            name,
-            expected: "an array",
-        }),
-    }
-}
-
 #[cfg(test)]
 #[expect(clippy::expect_used)]
 mod tests {
     use alloy_primitives::U256;
 
+    use crate::decode::fixtures::metric::swap;
+    use crate::decode::fixtures::shipped;
     use crate::wire::envelope::{ChainId, Decoded, TypedValue};
 
-    use super::metric::{SWAPS, fixtures};
+    use super::metric::SWAPS;
     use super::{DERIVATIONS, Derivation, DeriveError, Row, rows};
 
     /// Every derivation's pinned signature is declared in the shipped protocols, so the
@@ -299,7 +228,7 @@ mod tests {
     /// a deploy.
     #[test]
     fn the_shipped_protocols_declare_every_derived_table() {
-        let catalog = fixtures::catalog();
+        let catalog = shipped("robinhood");
         for derivation in DERIVATIONS {
             assert!(
                 catalog.schema().derived_table(derivation.table).is_some(),
@@ -314,7 +243,7 @@ mod tests {
     #[test]
     fn an_unreadable_record_derives_nothing() {
         let chain = ChainId::new("base");
-        let mut swap = fixtures::swap(U256::ZERO, U256::ZERO, U256::ZERO);
+        let mut swap = swap(U256::ZERO, U256::ZERO, U256::ZERO);
         assert_eq!(rows(&[SWAPS], &chain, &swap, None).expect("rows").len(), 1);
         swap.body[0].value = TypedValue::Bool { value: true };
         assert!(
@@ -344,7 +273,7 @@ mod tests {
             Ok(rows)
         }
         let chain = ChainId::new("base");
-        let swap = fixtures::swap(U256::ZERO, U256::ZERO, U256::ZERO);
+        let swap = swap(U256::ZERO, U256::ZERO, U256::ZERO);
         let declared: Vec<&str> = SWAPS.columns.iter().map(|&(name, _)| name).collect();
         let mut exchanged = declared.clone();
         exchanged.swap(2, 3);
