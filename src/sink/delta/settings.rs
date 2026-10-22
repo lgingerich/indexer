@@ -38,6 +38,11 @@ pub struct DeltaSettings {
     /// Where the tables live: an `s3://bucket/prefix` URL, or a local directory. Each
     /// chain's tables go under `<uri>/<chain>/`. Required: there is no location that is
     /// right by default.
+    ///
+    /// A relative local directory resolves against the directory of the settings file
+    /// it is read from (see [`Settings::from_file`](crate::config::Settings::from_file)),
+    /// not the process's working directory. A URL, anything with `://`, is used as
+    /// written.
     #[serde(deserialize_with = "crate::config::non_empty")]
     pub uri: String,
     /// The longest a block waits in the buffer before a commit, in seconds, counted from
