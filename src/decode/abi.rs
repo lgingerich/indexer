@@ -545,6 +545,16 @@ fn padded<'a>(word: &'a B256, size: usize, kind: &'static str) -> Result<&'a [u8
     Ok(value)
 }
 
+impl DecodeError {
+    /// Whether this is an internal invariant failure rather than a bad log: the decoder
+    /// disagreeing with its own prepared schema, after which continuing could publish
+    /// wrong data. A caller skips any other failure and keeps the raw log.
+    #[must_use]
+    pub const fn is_invariant(&self) -> bool {
+        matches!(self, Self::Shape)
+    }
+}
+
 fn valid_bits(bits: usize) -> bool {
     (8..=256).contains(&bits) && bits.is_multiple_of(8)
 }
@@ -893,6 +903,59 @@ mod tests {
         assert_eq!(slot, AddressSlot::Topic(1));
         assert_eq!(slot.read(&log), Some(owner));
         assert_eq!(abi.address_input(*key, "note"), None, "not an address");
+    }
+
+    /// Garbled topics and data for an event with indexed string and tuple arguments and
+    /// dynamic body ones are ordinary decode failures or decodes, never the invariant
+    /// failure that stops the run: a hostile log must not be able to halt ingest.
+    #[test]
+    fn garbled_logs_never_fail_as_an_invariant() {
+        let abi = Abi::from_json(
+            r#"[{"type":"event","name":"Odd","anonymous":false,"inputs":[
+                {"name":"label","type":"string","indexed":true},
+                {"name":"key","type":"tuple","indexed":true,"components":[
+                    {"name":"a","type":"address"},{"name":"b","type":"bool"}]},
+                {"name":"note","type":"string","indexed":false},
+                {"name":"pairs","type":"tuple[]","indexed":false,"components":[
+                    {"name":"a","type":"bytes4"},{"name":"b","type":"int8"}]}]}]"#,
+        )
+        .expect("valid ABI");
+        let (selector, _) = *abi.events.keys().next().expect("event");
+        let words = [
+            B256::ZERO,
+            B256::repeat_byte(0xff),
+            B256::with_last_byte(0x20),
+        ];
+        let mut checked = 0;
+        for &topic1 in &words {
+            for &topic2 in &words {
+                for length in (0..=320).step_by(8) {
+                    for fill in [0x00_u8, 0x01, 0x20, 0xff] {
+                        let mut data = vec![fill; length];
+                        // Offsets that point inside the data, at its end, and past it.
+                        if let Some(word) = data.get_mut(..32) {
+                            word.fill(0);
+                            word[31] = u8::try_from(length % 256).expect("a byte");
+                        }
+                        let log = Log {
+                            topic0: Some(selector),
+                            topic1: Some(topic1),
+                            topic2: Some(topic2),
+                            data: data.into(),
+                            ..Log::default()
+                        };
+                        if let Err(error) = abi.decode_log(&log) {
+                            assert!(
+                                !error.is_invariant(),
+                                "{length} bytes of {fill:#x}: {error}"
+                            );
+                        }
+                        checked += 1;
+                    }
+                }
+            }
+        }
+        assert!(checked > 1000);
     }
 
     const ERC20_TRANSFER: &str = r#"[{"type":"event","name":"Transfer","anonymous":false,"inputs":[{"name":"from","type":"address","indexed":true},{"name":"to","type":"address","indexed":true},{"name":"value","type":"uint256","indexed":false}]}]"#;

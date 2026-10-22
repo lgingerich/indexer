@@ -2,7 +2,7 @@
 
 use tracing::{info, warn};
 
-use crate::decode::{DecodeError, Decoder, derive};
+use crate::decode::{Decoder, derive};
 use crate::metrics;
 use crate::sink::{EnvelopeSink, SinkError};
 use alloy_primitives::{Address, TxHash};
@@ -76,7 +76,9 @@ impl<K: EnvelopeSink> DecodingSink<K> {
                 events.push(Event::Decoded(Box::new(decoded)));
                 events.extend(derived.into_iter().map(|row| Event::Derived(Box::new(row))));
             }
-            Err(error @ DecodeError::Shape) => return Err(SinkError::Decode(Box::new(error))),
+            Err(error) if error.is_invariant() => {
+                return Err(SinkError::Decode(Box::new(error)));
+            }
             Err(error) => {
                 metrics::decode_failed();
                 warn!(%chain, address = %log.address,
