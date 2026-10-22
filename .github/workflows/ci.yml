@@ -15,23 +15,24 @@ env:
 # three. Caches are saved from `main` only: a pull request restores `main`'s and does not
 # push it out of the repository's cache space with its own.
 #
-# `dtolnay/rust-toolchain` is pinned to a commit, since its refs are branches that move;
-# the toolchain itself is the `toolchain` input, matching `rust-toolchain.toml`.
+# Every action is pinned to a commit, since its tags and branches move; the comment names
+# the ref it was resolved from. `dtolnay/rust-toolchain`'s toolchain is the `toolchain`
+# input, matching `rust-toolchain.toml`.
 jobs:
   all-features:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master, 2026-10-16
         with:
           toolchain: 1.95.0
           components: rustfmt, clippy
       # The `delta` feature brings DataFusion and the AWS SDK, so a cold build is most of
       # the job's time. Cached per lockfile and toolchain.
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - uses: taiki-e/install-action@nextest
+      - uses: taiki-e/install-action@19c7190d8e0bc0aa6ec705040b2021eaf1c28bbd # nextest
       - run: cargo fmt --check
       - run: cargo clippy --all-targets --all-features -- -D warnings
       - run: cargo doc --no-deps --all-features
@@ -46,15 +47,15 @@ jobs:
   no-default-features:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master, 2026-10-16
         with:
           toolchain: 1.95.0
           components: clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - uses: taiki-e/install-action@nextest
+      - uses: taiki-e/install-action@19c7190d8e0bc0aa6ec705040b2021eaf1c28bbd # nextest
       - run: cargo clippy --no-default-features --all-targets -- -D warnings
       - run: cargo nextest run --no-default-features --all-targets
 
@@ -66,12 +67,12 @@ jobs:
   delta:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master, 2026-10-16
         with:
           toolchain: 1.95.0
           components: clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo clippy --no-default-features --features delta --all-targets -- -D warnings
