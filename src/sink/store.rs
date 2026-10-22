@@ -21,6 +21,10 @@
 //! a table has staged twenty thousand rows since it was last vacuumed, the store vacuums
 //! it after the commit, on an engine that needs it.
 
+/// The tests every SQL store runs, over a harness each engine implements.
+#[cfg(test)]
+pub(crate) mod contract;
+
 use std::collections::HashMap;
 use std::sync::Arc;
 
