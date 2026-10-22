@@ -320,6 +320,8 @@ fn decoding_type(ty: &DynSolType) -> DynSolType {
         DynSolType::String => DynSolType::Bytes,
         // Decode words without coercing malformed booleans or truncating addresses.
         DynSolType::Bool | DynSolType::Address => DynSolType::Uint(256),
+        // A function is 24 bytes of its word; decode all 32 so its padding is checked.
+        DynSolType::Function => DynSolType::FixedBytes(32),
         DynSolType::Array(inner) => DynSolType::Array(Box::new(decoding_type(inner))),
         DynSolType::FixedArray(inner, size) => {
             DynSolType::FixedArray(Box::new(decoding_type(inner)), *size)
@@ -392,9 +394,13 @@ fn convert(ty: &DynSolType, value: &DynSolValue) -> Result<TypedValue, DecodeErr
                 value: alloy_primitives::Address::from_word(B256::from(value.to_be_bytes::<32>())),
             }
         }
-        (DynSolType::Function, DynSolValue::Function(value)) => {
-            TypedValue::Function { value: *value }
-        }
+        (DynSolType::Function, DynSolValue::FixedBytes(word, _)) => TypedValue::Function {
+            value: alloy_primitives::Function::from_slice(padded(
+                word,
+                24,
+                "function has nonzero padding",
+            )?),
+        },
         (DynSolType::Uint(bits), DynSolValue::Uint(value, _)) if valid_bits(*bits) => {
             if value.bit_len() > *bits {
                 return Err(DecodeError::Value {
@@ -422,11 +428,9 @@ fn convert(ty: &DynSolType, value: &DynSolValue) -> Result<TypedValue, DecodeErr
                 bits: width(*bits)?,
             }
         }
-        (DynSolType::FixedBytes(size), DynSolValue::FixedBytes(value, _)) => {
+        (DynSolType::FixedBytes(size), DynSolValue::FixedBytes(word, _)) => {
             TypedValue::FixedBytes {
-                value: Bytes::copy_from_slice(
-                    value.as_slice().get(..*size).ok_or(DecodeError::Shape)?,
-                ),
+                value: Bytes::copy_from_slice(padded(word, *size, "bytesN has nonzero padding")?),
                 size: width(*size)?,
             }
         }
@@ -469,6 +473,19 @@ fn convert(ty: &DynSolType, value: &DynSolValue) -> Result<TypedValue, DecodeErr
         }
         _ => return Err(DecodeError::Shape),
     })
+}
+
+/// The first `size` bytes of `word`, refused for `kind` when any byte after them is not
+/// zero, as a word holding more than its integer type is.
+fn padded<'a>(word: &'a B256, size: usize, kind: &'static str) -> Result<&'a [u8], DecodeError> {
+    let (value, padding) = word
+        .as_slice()
+        .split_at_checked(size)
+        .ok_or(DecodeError::Shape)?;
+    if padding.iter().any(|&byte| byte != 0) {
+        return Err(DecodeError::Value { kind });
+    }
+    Ok(value)
 }
 
 fn valid_bits(bits: usize) -> bool {
@@ -749,6 +766,30 @@ mod tests {
             });
             assert_eq!(converted, expected, "{case}");
         }
+    }
+
+    /// A `bytesN` or `function` word with a nonzero byte past its value is refused, as a
+    /// word holding more than its integer type is; with clean padding it decodes.
+    #[test]
+    fn short_bytes_and_functions_with_dirty_padding_are_refused() {
+        let mut dirty = [0_u8; 32];
+        dirty[31] = 1;
+        let dirty = DynSolValue::FixedBytes(B256::from(dirty), 32);
+        let clean = DynSolValue::FixedBytes(B256::ZERO, 32);
+        for (ty, kind) in [
+            (DynSolType::FixedBytes(4), "bytesN has nonzero padding"),
+            (DynSolType::Function, "function has nonzero padding"),
+        ] {
+            assert!(convert(&ty, &clean).is_ok(), "{kind}");
+            assert!(
+                matches!(convert(&ty, &dirty), Err(DecodeError::Value { kind: found }) if found == kind),
+                "{kind}"
+            );
+        }
+        assert!(
+            convert(&DynSolType::FixedBytes(32), &dirty).is_ok(),
+            "bytes32 has no padding"
+        );
     }
 
     const ERC20_TRANSFER: &str = r#"[{"type":"event","name":"Transfer","anonymous":false,"inputs":[{"name":"from","type":"address","indexed":true},{"name":"to","type":"address","indexed":true},{"name":"value","type":"uint256","indexed":false}]}]"#;
