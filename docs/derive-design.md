@@ -59,7 +59,7 @@ pub struct Derivation {
   lists it in `tables` like any other. `contract_events` does not include it, but a
   glob such as `metric_v1_*` or `*` does.
 - **On the wire** a derived row is `Event::Derived`: the table, the log's identity, and
-  its values as named `TypedValue`s. A new variant does not bump the wire's `v`.
+  its values as named `TypedValue`s. A new variant does not bump the wire's `schema_version`.
 - **When it runs.** A derivation runs when the catalog declares every one of its events'
   exact signatures, and its rows go to the stores that list its table, as decoded rows do. An
   ABI that retyped an argument changes the signature, which leaves the table undeclared,

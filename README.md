@@ -918,13 +918,13 @@ a network.
 ## Event shape
 
 ```json
-{"chain":"base","v":1,
+{"chain":"base","schema_version":1,
  "type":"log","log_index":0,"transaction_hash":"0x…","transaction_index":3,
  "address":"0x…","topic0":"0x…","topic1":null,"topic2":null,"topic3":null,
  "data":"0x…","removed":false,"block_number":51883702,"block_hash":"0x…"}
 ```
 
-`v` is the wire shape's version. It is a field on the envelope rather than a transport
+`schema_version` is the wire shape's version. It is a field on the envelope rather than a transport
 header because one of the sinks is a local database: a header survives no hop into
 `DuckDB`, a file, or a pipe, so a consumer reading those could not tell two shapes
 apart. It is bumped only for a breaking change — a field's type or meaning changing,
@@ -945,7 +945,7 @@ signals** — `reorg` and `accepted_block` — drive a consumer's state machine 
 payload: a `reorg` names the hashes that stopped being canonical, and an `accepted_block`
 closes each block with its identity, so a consumer sees where every block ends, even an
 empty one. The line is one flat object: `chain`,
-`v`, and the event's fields under its `type` tag. Consumers deduplicate on
+`schema_version`, and the event's fields under its `type` tag. Consumers deduplicate on
 each event's `dedupe_key`. Each dataset's key comes from its
 natural key, and a key that descends from a block carries the block hash, so the two
 branches of a reorg are separate rows.
@@ -1037,7 +1037,7 @@ The default nextest profile skips the deterministic simulation (`src/sim/`); run
 ## Compatibility policy
 
 The published shape is versioned by `wire::envelope::SCHEMA_VERSION`, stamped on
-every line as `v`. It is bumped only for a **breaking** change — a field's type or
+every line as `schema_version`. It is bumped only for a **breaking** change — a field's type or
 meaning changing, or a field or variant being removed. Adding an optional field or a
 new event variant does not bump it, so a consumer must skip an unknown `type` and
 ignore unknown fields. A breaking change needs a coexistence window in the store,

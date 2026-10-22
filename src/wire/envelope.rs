@@ -60,8 +60,8 @@ pub use crate::wire::typed::{AbiComponent, AbiType, TypedValue};
 
 /// The version of the envelope's wire shape.
 ///
-/// Stamped on every serialized [`Envelope`] as `v`, so a consumer can tell which
-/// shape it is reading without out-of-band knowledge. Bumped only for a breaking
+/// Stamped on every serialized [`Envelope`] as `schema_version`, so a consumer can tell
+/// which shape it is reading without out-of-band knowledge. Bumped only for a breaking
 /// change; see the compatibility policy in the module docs.
 ///
 /// It is 1 because no shape has been published yet, so a consumer's first number is
@@ -478,21 +478,26 @@ pub struct Envelope {
     pub chain: ChainId,
     /// The wire shape's version, written by [`Envelope::new`].
     ///
-    /// Defaulted on deserialize to the first shape, so a line carrying no `v` reads as
-    /// the shape that predates the field rather than failing or claiming to be current.
-    #[serde(default = "schema_version", rename = "v")]
+    /// Defaulted on deserialize to the first shape, so a line carrying no
+    /// `schema_version` reads as the shape that predates the field rather than failing or
+    /// claiming to be current.
+    ///
+    /// Not shortened to `v`: the event's fields are flattened beside it, and a
+    /// transaction's signature `v` would then be a second key of the same name on one
+    /// object.
+    #[serde(default = "schema_version")]
     pub schema_version: u16,
     /// The event itself.
     #[serde(flatten)]
     pub event: Event,
 }
 
-/// The version an envelope with no `v` field is read as.
+/// The version an envelope with no `schema_version` field is read as.
 ///
-/// A line with no `v` predates the field, so it is the first shape: `1`. Defaulting to
-/// [`SCHEMA_VERSION`] instead would read an unversioned line as the current shape, which
-/// is the case the field exists to distinguish — a reader must not mistake an old line
-/// for a new one after the number is bumped.
+/// A line with no `schema_version` predates the field, so it is the first shape: `1`.
+/// Defaulting to [`SCHEMA_VERSION`] instead would read an unversioned line as the current
+/// shape, which is the case the field exists to distinguish — a reader must not mistake
+/// an old line for a new one after the number is bumped.
 const fn schema_version() -> u16 {
     1
 }

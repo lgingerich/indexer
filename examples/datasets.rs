@@ -19,7 +19,7 @@
 //! - Integers render as `0x` **quantities**, not JSON numbers: `"number":"0x1406f40"`.
 //!   A live `eth_getBlockByNumber` returns every integer that way, so matching it is what
 //!   keeps a consumer from special-casing our encoding against the node's.
-//! - `v` is a plain JSON number. It is ours, not the chain's, so it is not a quantity.
+//! - `schema_version` is a plain JSON number. It is ours, not the chain's, so it is not a quantity.
 //!   There is no `sequence`: a record's position in the stream is the dataset's own, so
 //!   the key in [`Event::dedupe_key`] is what a consumer deduplicates on.
 //! - The event's fields are **flat**, beside a `"type"` tag — `{"type":"log","log_index":…}`.
