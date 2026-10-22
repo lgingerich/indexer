@@ -25,7 +25,8 @@ use std::sync::Arc;
 
 use alloy_primitives::{Address, B256, TxHash};
 
-use crate::wire::envelope::{ChainId, Decoded, DecodedArg, Derived};
+use crate::wire::datasets::evm::{Decoded, DecodedArg, Derived};
+use crate::wire::envelope::ChainId;
 use crate::wire::typed::{AbiType, TypedValue};
 
 use super::{
@@ -456,7 +457,8 @@ mod tests {
     use crate::sink::table::{
         Column, ColumnType, MAX_IDENTIFIER, Schema, TableError, TableId, Value,
     };
-    use crate::wire::envelope::{ChainId, Decoded, DecodedArg, Derived, DerivedField};
+    use crate::wire::datasets::evm::{Decoded, DecodedArg, Derived, DerivedField};
+    use crate::wire::envelope::ChainId;
     use crate::wire::typed::{AbiType, TypedValue};
 
     fn hash(byte: u8) -> B256 {

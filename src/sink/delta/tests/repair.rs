@@ -361,7 +361,7 @@ async fn opening_over_a_different_table_is_drift() {
 fn contract(height: u64, branch: u8) -> Envelope {
     Envelope::new(
         ChainId::new(CHAIN),
-        Event::Contract(Box::new(crate::wire::envelope::Contract {
+        Event::Contract(Box::new(crate::wire::datasets::evm::Contract {
             protocol: "uniswap_v3".to_owned(),
             name: "UniswapV3Pool".to_owned(),
             address: alloy_primitives::Address::from([branch.wrapping_add(0xd0); 20]),

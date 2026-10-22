@@ -12,7 +12,8 @@ use futures_util::stream;
 use super::{MAX_UNFINALIZED_BLOCKS, Machine, PipelineError};
 use crate::ingest::source::{BlockSource, FetchedBlock, HeadStream, SourceError};
 use crate::sink::{EnvelopeSink, SinkError};
-use crate::wire::envelope::{Block, BlockMeta, ChainId, Envelope, Event, Reorg};
+use crate::wire::datasets::evm::Block;
+use crate::wire::envelope::{BlockMeta, ChainId, Envelope, Event, Reorg};
 
 /// Produces deterministic distinct identities for test heights and replacement blocks.
 pub(super) fn hash(height: u64) -> B256 {

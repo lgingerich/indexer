@@ -6,7 +6,8 @@
 use alloy_primitives::{Bytes, I256, Sign};
 
 use crate::sink::table::ColumnType;
-use crate::wire::envelope::{Decoded, TypedValue};
+use crate::wire::datasets::evm::Decoded;
+use crate::wire::typed::TypedValue;
 
 use super::super::value::{address, array, element, signed, uint, unsigned};
 use super::super::{Derivation, DeriveError, Row};
@@ -120,7 +121,7 @@ mod tests {
 
     use crate::decode::fixtures::metric::liquidity as event;
     use crate::decode::fixtures::{int, refused, uint, unnamed};
-    use crate::wire::envelope::TypedValue;
+    use crate::wire::typed::TypedValue;
 
     use super::liquidity;
 

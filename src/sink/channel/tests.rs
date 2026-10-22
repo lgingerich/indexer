@@ -13,7 +13,8 @@ use tokio::task::JoinHandle;
 
 use crate::sink::route::Backend;
 use crate::sink::{EnvelopeSink, SinkError};
-use crate::wire::envelope::{Block, ChainId, Envelope, Event};
+use crate::wire::datasets::evm::Block;
+use crate::wire::envelope::{ChainId, Envelope, Event};
 
 use super::{Batching, CAPACITY, ChannelReceiver, ChannelSink, ENVELOPES, MAX_BLOCKS};
 use crate::sink::stop::Stop;

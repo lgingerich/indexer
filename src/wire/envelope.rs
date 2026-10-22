@@ -60,10 +60,7 @@ use std::fmt;
 use alloy_primitives::{Address, B256};
 use serde::{Deserialize, Serialize};
 
-pub use crate::wire::datasets::evm::{
-    Block, Contract, Decoded, DecodedArg, Derived, DerivedField, Log, Transaction, log_key,
-};
-pub use crate::wire::typed::{AbiComponent, AbiType, TypedValue};
+use crate::wire::datasets::evm::{Block, Contract, Decoded, Derived, Log, Transaction};
 
 /// The version of the envelope's wire shape.
 ///

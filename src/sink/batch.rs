@@ -277,7 +277,8 @@ mod tests {
     use super::Batch;
     use crate::sink::SinkError;
     use crate::sink::table::{Table, TableError, TableId};
-    use crate::wire::envelope::{Block, BlockMeta, ChainId, Envelope, Event};
+    use crate::wire::datasets::evm::Block;
+    use crate::wire::envelope::{BlockMeta, ChainId, Envelope, Event};
 
     fn meta(height: u64, tag: u8) -> BlockMeta {
         BlockMeta {

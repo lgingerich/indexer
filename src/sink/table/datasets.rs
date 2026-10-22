@@ -2,9 +2,8 @@
 
 use std::sync::Arc;
 
-use crate::wire::envelope::{
-    Block, BlockMeta, ChainId, Contract, Decoded, Event, Log, Reorg, Transaction,
-};
+use crate::wire::datasets::evm::{Block, Contract, Decoded, Log, Transaction};
+use crate::wire::envelope::{BlockMeta, ChainId, Event, Reorg};
 
 use super::{
     Cell, Column, Row, Table, TableBuilder, TableDef, TableError, TableId, Timestamp, Value,
@@ -309,9 +308,8 @@ impl DatasetTables {
 mod tests {
     use alloy_primitives::{Address, B256, TxHash, U256};
 
-    use crate::wire::envelope::{
-        Block, BlockMeta, ChainId, Contract, Decoded, Event, Log, Reorg, Transaction,
-    };
+    use crate::wire::datasets::evm::{Block, Contract, Decoded, Log, Transaction};
+    use crate::wire::envelope::{BlockMeta, ChainId, Event, Reorg};
 
     use std::sync::Arc;
 

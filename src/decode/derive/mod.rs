@@ -44,8 +44,9 @@
 //! - `metrics::derive_failed`.
 //!
 //! What carries a derived row to the stores is generic and can go with them:
-//! `Event::Derived` and `DerivedField` in `wire::envelope`; `TableId::Derived`,
-//! `Schema::add_derived`, `Schema::derived_table`, `Schema::derived_row`, and the
+//! `Event::Derived` in `wire::envelope`, and `Derived` and `DerivedField` in
+//! `wire::datasets::evm`; `TableId::Derived`, `Schema::add_derived`,
+//! `Schema::derived_table`, `Schema::derived_row`, and the
 //! `UnknownTable`, `Field`, and `NotADataset` table errors in `sink::table`; and the
 //! `Event::Derived` and `TableId::Derived` arms in `sink::route`, `sink::progress`, and
 //! `ingest::source::datasets`.
@@ -60,7 +61,9 @@ use super::abi::EventKey;
 use super::catalog::EntryId;
 use crate::metrics;
 use crate::sink::table::ColumnType;
-use crate::wire::envelope::{ChainId, Decoded, Derived, DerivedField, TypedValue};
+use crate::wire::datasets::evm::{Decoded, Derived, DerivedField};
+use crate::wire::envelope::ChainId;
+use crate::wire::typed::TypedValue;
 
 /// Every derivation the indexer has.
 pub(super) const DERIVATIONS: &[Derivation] = &[
@@ -273,7 +276,9 @@ mod tests {
 
     use crate::decode::fixtures::metric::swap;
     use crate::decode::fixtures::shipped;
-    use crate::wire::envelope::{ChainId, Decoded, TypedValue};
+    use crate::wire::datasets::evm::Decoded;
+    use crate::wire::envelope::ChainId;
+    use crate::wire::typed::TypedValue;
 
     use super::metric::SWAPS;
     use super::{DERIVATIONS, Derivation, Derivations, DeriveError, Row};

@@ -7,7 +7,8 @@ use alloy_primitives::{I256, U256};
 
 use super::derive::{DeriveError, Row};
 use super::{Catalog, CatalogError};
-use crate::wire::envelope::{ChainId, TypedValue};
+use crate::wire::envelope::ChainId;
+use crate::wire::typed::TypedValue;
 
 /// The shipped protocols directory.
 pub(super) fn protocols() -> PathBuf {
@@ -84,7 +85,8 @@ pub(super) mod uniswap_v3 {
     use alloy_dyn_abi::DynSolValue;
     use alloy_primitives::{Address, B256, I256, keccak256};
 
-    use crate::wire::envelope::{Envelope, Event, Log};
+    use crate::wire::datasets::evm::Log;
+    use crate::wire::envelope::{Envelope, Event};
 
     /// The factory the shipped manifest seeds on Base.
     pub(in crate::decode) const FACTORY: &str = "0x33128a8fC17869897dcE68Ed026d694621f6FDfD";
@@ -136,7 +138,8 @@ pub(super) mod metric {
 
     use crate::decode::Decoder;
     use crate::decode::derive::metric::{BIN_FILLS, LIQUIDITY, POOL_BINS, SWAPS};
-    use crate::wire::envelope::{Decoded, Log, StoredContract};
+    use crate::wire::datasets::evm::{Decoded, Log};
+    use crate::wire::envelope::StoredContract;
 
     use super::shipped;
 

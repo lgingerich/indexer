@@ -11,7 +11,7 @@ mod swaps;
 
 use alloy_primitives::I256;
 
-use crate::wire::envelope::TypedValue;
+use crate::wire::typed::TypedValue;
 
 use super::DeriveError;
 use super::value::{element, signed};
@@ -37,7 +37,8 @@ mod tests {
         bin_swapped, details, int128s, ladder, liquidity, pool_created, swap, uint128s,
     };
     use crate::decode::fixtures::shipped;
-    use crate::wire::envelope::{ChainId, TypedValue};
+    use crate::wire::envelope::ChainId;
+    use crate::wire::typed::TypedValue;
 
     use super::super::Sent;
     use super::{BIN_FILLS, LIQUIDITY, POOL_BINS, SWAPS};

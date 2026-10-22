@@ -25,7 +25,8 @@ use crate::sink::store_runtime::StoreRuntime;
 use crate::sink::table::Schema;
 use crate::sink::{self, DuckDbSink, EnvelopeSink as _, SinkError, Store as _};
 use crate::sink::{Operation, StoreError};
-use crate::wire::envelope::{BlockMeta, ChainId, Envelope, Event, Log, Reorg, StoredContract};
+use crate::wire::datasets::evm::Log;
+use crate::wire::envelope::{BlockMeta, ChainId, Envelope, Event, Reorg, StoredContract};
 
 use super::stores::{finish, ledger};
 use super::{Pipeline, RuntimeError};

@@ -18,7 +18,8 @@
 //! after the swap.
 
 use crate::sink::table::ColumnType;
-use crate::wire::envelope::{Decoded, TypedValue};
+use crate::wire::datasets::evm::Decoded;
+use crate::wire::typed::TypedValue;
 
 use super::super::value::{address, bits, signed, signed_bits, uint, unsigned};
 use super::super::{Derivation, DeriveError, Row};
@@ -90,7 +91,7 @@ mod tests {
 
     use crate::decode::fixtures::metric::{details, int128s, swap, uint128s};
     use crate::decode::fixtures::{int, uint, unnamed};
-    use crate::wire::envelope::TypedValue;
+    use crate::wire::typed::TypedValue;
 
     use super::SWAPS;
 

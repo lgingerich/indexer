@@ -40,7 +40,8 @@ use std::sync::Arc;
 
 use alloy_primitives::B256;
 
-use crate::wire::envelope::{ChainId, Decoded, Event};
+use crate::wire::datasets::evm::Decoded;
+use crate::wire::envelope::{ChainId, Event};
 
 pub use cell::{Cell, Timestamp, Value};
 pub use events::snake_case;

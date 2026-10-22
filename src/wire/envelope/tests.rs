@@ -9,10 +9,11 @@ use alloy_rpc_types_eth::{
 use serde::de::{IgnoredAny, MapAccess};
 use serde::{Deserialize, Deserializer};
 
-use super::{
-    AbiComponent, AbiType, Block, BlockMeta, ChainId, Contract, Decoded, DecodedArg, Derived,
-    DerivedField, Envelope, Event, Log, Reorg, Transaction, TypedValue,
+use super::{BlockMeta, ChainId, Envelope, Event, Reorg};
+use crate::wire::datasets::evm::{
+    Block, Contract, Decoded, DecodedArg, Derived, DerivedField, Log, Transaction,
 };
+use crate::wire::typed::{AbiComponent, AbiType, TypedValue};
 
 fn contract(block_hash: B256) -> Contract {
     Contract {

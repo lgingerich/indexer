@@ -6,7 +6,8 @@
 
 use alloy_primitives::{Address, I256, U256};
 
-use crate::wire::envelope::{Decoded, TypedValue};
+use crate::wire::datasets::evm::Decoded;
+use crate::wire::typed::TypedValue;
 
 use super::DeriveError;
 

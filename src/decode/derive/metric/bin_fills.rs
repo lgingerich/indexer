@@ -13,7 +13,7 @@
 //! never enters a bin.
 
 use crate::sink::table::ColumnType;
-use crate::wire::envelope::Decoded;
+use crate::wire::datasets::evm::Decoded;
 
 use super::super::value::{bits, int, signed, signed_bits, uint, unsigned};
 use super::super::{Derivation, DeriveError, Row};

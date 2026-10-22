@@ -10,7 +10,8 @@
 use alloy_primitives::{I256, U256};
 
 use crate::sink::table::ColumnType;
-use crate::wire::envelope::{Decoded, TypedValue};
+use crate::wire::datasets::evm::Decoded;
+use crate::wire::typed::TypedValue;
 
 use super::super::value::{address, array, bits, element, int, signed};
 use super::super::{Derivation, DeriveError, Row};
@@ -129,7 +130,7 @@ mod tests {
 
     use crate::decode::fixtures::metric::{ladder, pool_created};
     use crate::decode::fixtures::{int, unnamed};
-    use crate::wire::envelope::TypedValue;
+    use crate::wire::typed::TypedValue;
 
     use super::pool_bins;
 

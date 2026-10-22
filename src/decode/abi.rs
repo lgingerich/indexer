@@ -8,8 +8,7 @@ use alloy_json_abi::{Event, JsonAbi};
 use alloy_primitives::{B256, Bytes, keccak256};
 use thiserror::Error;
 
-use crate::wire::datasets::evm::Log;
-use crate::wire::envelope::DecodedArg;
+use crate::wire::datasets::evm::{DecodedArg, Log};
 use crate::wire::typed::{AbiType, TypedValue};
 
 /// A decoded event without chain or transaction metadata.

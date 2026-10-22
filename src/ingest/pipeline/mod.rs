@@ -364,7 +364,8 @@ mod tests {
     use super::*;
     use crate::ingest::source::{FetchedBlock, HeadStream};
     use crate::sink::SinkError;
-    use crate::wire::envelope::{Block, ChainId};
+    use crate::wire::datasets::evm::Block;
+    use crate::wire::envelope::ChainId;
 
     struct LiveSource {
         source: Source,

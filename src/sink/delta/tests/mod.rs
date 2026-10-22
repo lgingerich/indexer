@@ -18,7 +18,8 @@ use super::expr::{in_texts, texts, texts_of};
 use super::{DeltaSettings, DeltaSink};
 use crate::sink::table::{Schema, Table, TableId};
 use crate::sink::{EnvelopeSink, SinkError, Store as _, StoreError};
-use crate::wire::envelope::{Block, BlockMeta, ChainId, Envelope, Event, Log, Reorg, Transaction};
+use crate::wire::datasets::evm::{Block, Log, Transaction};
+use crate::wire::envelope::{BlockMeta, ChainId, Envelope, Event, Reorg};
 
 const CHAIN: &str = "base";
 

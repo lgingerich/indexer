@@ -247,7 +247,8 @@ pub(crate) mod fixtures {
 
     use crate::decode::{Catalog, Decoder};
     use crate::sink::table::Schema;
-    use crate::wire::envelope::{ChainId, Decoded, Derived, Envelope, Event};
+    use crate::wire::datasets::evm::{Decoded, Derived};
+    use crate::wire::envelope::{ChainId, Envelope, Event};
 
     /// The shipped protocols, on `chain`. Which chain does not change the schema, only
     /// which contracts are seeded: Uniswap's on Base, Metric's on Robinhood Chain.
@@ -270,7 +271,8 @@ pub(crate) mod fixtures {
         use alloy_primitives::{Address, B256, I256, TxHash};
 
         use crate::sink::table::ColumnType;
-        use crate::wire::envelope::{DerivedField, TypedValue};
+        use crate::wire::datasets::evm::DerivedField;
+        use crate::wire::typed::TypedValue;
 
         let mut schema = catalog("base").schema().clone();
         schema
@@ -337,7 +339,7 @@ pub(crate) mod fixtures {
             U256::from_str_radix("190000000000190000000000190000000000190000000000190", 16)
                 .expect("a packed word");
         let words = DynSolValue::Array(vec![DynSolValue::Uint(packed, 256); 4]);
-        let log = crate::wire::envelope::Log {
+        let log = crate::wire::datasets::evm::Log {
             address: address!("0x2a53833cc95548cf52c7b159110e22d3a9018f32"),
             topic0: Some(event.selector()),
             topic1: topic(address!("0xb030150465b706f81eecc453ba5e9bae7b06e50d")),
@@ -370,7 +372,7 @@ pub(crate) mod fixtures {
             .abi_encode_params()
             .into(),
             block_hash: B256::with_last_byte(0x0b),
-            ..crate::wire::envelope::Log::default()
+            ..crate::wire::datasets::evm::Log::default()
         };
         Decoder::new(catalog("robinhood"))
             .decode(&log)

@@ -6,7 +6,8 @@ use super::Decoder;
 use super::derive::{Derivations, Sent};
 use crate::metrics;
 use crate::sink::{EnvelopeSink, SinkError};
-use crate::wire::envelope::{ChainId, Envelope, Event, Log};
+use crate::wire::datasets::evm::Log;
+use crate::wire::envelope::{ChainId, Envelope, Event};
 
 /// Forwards every raw record and adds decoded logs, their derived rows, and discovered
 /// contracts.
@@ -253,7 +254,7 @@ mod tests {
     async fn a_derived_row_follows_its_decoded_record_with_its_transaction() {
         use alloy_primitives::{TxHash, U256};
 
-        use crate::wire::envelope::Transaction;
+        use crate::wire::datasets::evm::Transaction;
 
         let mut sink = DecodingSink::new(metric::decoder(), Collect::default());
         let mut swap = metric::swap_log(U256::ZERO, U256::ZERO, U256::ZERO);

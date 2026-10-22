@@ -41,10 +41,11 @@ use std::io::{BufWriter, Write as _};
 use std::process::ExitCode;
 
 use alloy_primitives::{Address, B256, Bloom, Bytes, I256, TxHash, U256};
-use indexer::wire::envelope::{
-    Block, BlockMeta, ChainId, Contract, Decoded, DecodedArg, Derived, DerivedField, Envelope,
-    Event, Log, Reorg, Transaction, TypedValue,
+use indexer::wire::datasets::evm::{
+    Block, Contract, Decoded, DecodedArg, Derived, DerivedField, Log, Transaction,
 };
+use indexer::wire::envelope::{BlockMeta, ChainId, Envelope, Event, Reorg};
+use indexer::wire::typed::TypedValue;
 
 /// The chain these are from.
 const CHAIN: &str = "ethereum";
