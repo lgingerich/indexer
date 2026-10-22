@@ -159,6 +159,10 @@ impl<C: PubSubConnect + Clone> BlockSource for EvmSource<C> {
         &self.chain
     }
 
+    fn follows_heads(&self) -> bool {
+        true
+    }
+
     async fn subscribe_heads(&self) -> Result<HeadStream, SourceError> {
         let client = ClientBuilder::default()
             .pubsub(self.heads.clone())

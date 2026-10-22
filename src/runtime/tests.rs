@@ -396,6 +396,25 @@ impl BlockSource for FakeChain {
         let (meta, events) = self.blocks[&height].clone();
         Ok(FetchedBlock { meta, events })
     }
+    async fn fetch_blocks(&self, from: u64, to: u64) -> Result<Vec<FetchedBlock>, SourceError> {
+        let mut blocks = Vec::new();
+        for height in from..=to {
+            blocks.push(self.fetch_block(height, None).await?);
+        }
+        Ok(blocks)
+    }
+    fn follows_heads(&self) -> bool {
+        true
+    }
+    fn backfill_span(&self) -> u64 {
+        1
+    }
+    fn backfill_concurrency(&self) -> usize {
+        1
+    }
+    fn finality_depth(&self) -> u64 {
+        crate::ingest::pipeline::MAX_UNFINALIZED_BLOCKS as u64
+    }
 }
 
 /// One process lifetime against the store behind `connection`: restore what the store

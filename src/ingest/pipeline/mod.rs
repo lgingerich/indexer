@@ -395,6 +395,25 @@ mod tests {
         fn chain(&self) -> &ChainId {
             self.source.chain()
         }
+        fn follows_heads(&self) -> bool {
+            true
+        }
+        async fn fetch_blocks(&self, from: u64, to: u64) -> Result<Vec<FetchedBlock>, SourceError> {
+            let mut blocks = Vec::new();
+            for height in from..=to {
+                blocks.push(self.fetch_block(height, None).await?);
+            }
+            Ok(blocks)
+        }
+        fn backfill_span(&self) -> u64 {
+            1
+        }
+        fn finality_depth(&self) -> u64 {
+            MAX_UNFINALIZED_BLOCKS as u64
+        }
+        fn backfill_concurrency(&self) -> usize {
+            1
+        }
         async fn subscribe_heads(&self) -> Result<HeadStream, SourceError> {
             let hints = self
                 .hints

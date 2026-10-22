@@ -163,6 +163,11 @@ pub(crate) fn inconsistent(context: &str, detail: impl fmt::Display) -> SourceEr
 }
 
 /// A chain data source: one live subscription plus on-demand block fetches.
+///
+/// No method has a default. [`AnySource`] forwards each to the source it holds, and a
+/// defaulted method it forgot to forward would silently answer with the default — a
+/// finality depth, say, that the source's settings never asked for — where a required
+/// one fails to compile.
 pub trait BlockSource: Send + Sync {
     /// The chain this source reads.
     fn chain(&self) -> &ChainId;
@@ -174,15 +179,17 @@ pub trait BlockSource: Send + Sync {
     /// stops, and leaves the rest to a run on one that can. It also refuses to resume
     /// past a stored tip it disagrees with, since it has no view of the fork that would
     /// retract it.
-    fn follows_heads(&self) -> bool {
-        true
-    }
+    fn follows_heads(&self) -> bool;
 
     /// Opens the live head subscription.
     ///
     /// A notification carries the announced block's [`BlockMeta`], which the fetch path
     /// may reuse to avoid a redundant header read. Notifications are hints, not a
     /// replay log: gaps are reconciled over HTTP.
+    ///
+    /// The pipeline subscribes only to a source that [follows heads](Self::follows_heads).
+    /// One that does not has no heads to announce, and answers with a stream that ends
+    /// at once.
     fn subscribe_heads(&self) -> impl Future<Output = Result<HeadStream, SourceError>> + Send;
 
     /// Fetches the block at `height` with the datasets this source was built for.
@@ -217,41 +224,27 @@ pub trait BlockSource: Send + Sync {
         &self,
         from: u64,
         to: u64,
-    ) -> impl Future<Output = Result<Vec<FetchedBlock>, SourceError>> + Send {
-        async move {
-            let mut blocks = Vec::new();
-            for height in from..=to {
-                blocks.push(self.fetch_block(height, None).await?);
-            }
-            Ok(blocks)
-        }
-    }
+    ) -> impl Future<Output = Result<Vec<FetchedBlock>, SourceError>> + Send;
 
     /// How many heights one [`Self::fetch_blocks`] call should cover right now.
     ///
     /// Read each time backfill cuts a range, so a source that learns its provider's
     /// limits can change it as it goes. At least one; a source that fetches a height at a
-    /// time keeps the default.
-    fn backfill_span(&self) -> u64 {
-        1
-    }
+    /// time answers one.
+    fn backfill_span(&self) -> u64;
 
     /// How many blocks under the head a fork may still reach on this source's chain: the
     /// buried heights, below it, are backfilled straight through, and only those above
-    /// it go block by block through the reorg-aware path. At most
-    /// [`MAX_UNFINALIZED_BLOCKS`](crate::ingest::pipeline::MAX_UNFINALIZED_BLOCKS), the
-    /// deepest fork a run can retract, which is the default.
-    fn finality_depth(&self) -> u64 {
-        crate::ingest::pipeline::MAX_UNFINALIZED_BLOCKS as u64
-    }
+    /// it go block by block through the reorg-aware path. The pipeline holds it to at
+    /// most [`MAX_UNFINALIZED_BLOCKS`](crate::ingest::pipeline::MAX_UNFINALIZED_BLOCKS),
+    /// the deepest fork a run can retract.
+    fn finality_depth(&self) -> u64;
 
     /// How many [`Self::fetch_blocks`] calls backfill keeps in flight at once.
     ///
     /// Blocks are accepted in height order whatever this is; it only overlaps requests.
     /// At least one.
-    fn backfill_concurrency(&self) -> usize {
-        1
-    }
+    fn backfill_concurrency(&self) -> usize;
 
     /// One block's header as [`BlockMeta`], fetched on demand: the block at `height`, or
     /// the chain's head as it is right now when `height` is `None`.
