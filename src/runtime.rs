@@ -225,13 +225,32 @@ pub(crate) struct Pipeline<B = AnySource> {
     decoder: Decoder,
     /// Every table the run has: the dataset tables and each decoded event's.
     schema: Arc<Schema>,
-    /// Each sink the settings name and the tables it writes. Empty for a pipeline built
-    /// with [`Pipeline::new`], whose caller hands its stores their tables directly.
-    routes: Vec<(Backend, HashSet<TableId>)>,
+}
+
+/// Each sink the settings name and the tables it writes: what [`Pipeline::run`] opens.
+///
+/// Apart from [`Pipeline`] so only a pipeline assembled from settings can be run that way:
+/// [`Pipeline::from_settings`] is the one place one is made, from settings that name at
+/// least one sink, so it is never empty. A pipeline from [`Pipeline::new`] has none and
+/// is run with its stores handed over (`Pipeline::run_with_stores`). Were the routes a
+/// field that such a pipeline left empty, `run` would read the empty list as "no stdout,
+/// so store", and open every configured store with no tables.
+#[derive(Debug)]
+pub(crate) struct Routes(Vec<(Backend, HashSet<TableId>)>);
+
+impl Routes {
+    /// Whether the run prints rather than stores. The settings never name stdout beside a
+    /// store, so a run does one or the other.
+    #[cfg(feature = "store")]
+    fn prints(&self) -> bool {
+        self.0
+            .iter()
+            .any(|(backend, _)| *backend == Backend::Stdout)
+    }
 }
 
 impl Pipeline {
-    /// Assembles the pipeline the settings describe.
+    /// Assembles the pipeline the settings describe, and the [`Routes`] it runs with.
     ///
     /// Opens nothing: the stores are connected in [`Pipeline::run`], and the source's
     /// WebSocket at its first subscription, so building fails on unreadable manifests
@@ -242,7 +261,7 @@ impl Pipeline {
     /// Returns [`RuntimeError::Catalog`] when the manifests cannot be loaded,
     /// [`RuntimeError::Route`] when a sink's `tables` do not resolve, and
     /// [`RuntimeError::Source`] when the HTTP client cannot be built.
-    pub(crate) fn from_settings(settings: &Settings) -> Result<Self, RuntimeError> {
+    pub(crate) fn from_settings(settings: &Settings) -> Result<(Self, Routes), RuntimeError> {
         let catalog = settings
             .protocols_path()
             .map_or_else(Catalog::empty, |path| {
@@ -290,15 +309,13 @@ impl Pipeline {
                 )?)
             }
         };
-        Ok(Self {
-            routes,
-            ..Self::new(
-                source,
-                settings.ingest.start_block,
-                settings.ingest.stop_block,
-                catalog,
-            )
-        })
+        let pipeline = Self::new(
+            source,
+            settings.ingest.start_block,
+            settings.ingest.stop_block,
+            catalog,
+        );
+        Ok((pipeline, Routes(routes)))
     }
 }
 
@@ -316,11 +333,11 @@ impl<B: BlockSource + 'static> Pipeline<B> {
             stop_block,
             schema: Arc::new(catalog.schema().clone()),
             decoder: Decoder::new(catalog),
-            routes: Vec::new(),
         }
     }
 
-    /// Runs until ingest or storage stops, or `stop` is requested.
+    /// Runs until ingest or storage stops, or `stop` is requested: opens the stores
+    /// `routes` name, or prints the tables `[sink.stdout]` does.
     ///
     /// # Errors
     ///
@@ -328,19 +345,18 @@ impl<B: BlockSource + 'static> Pipeline<B> {
     /// [`RuntimeError::Resume`] when the stores cannot be brought to one block, and
     /// [`RuntimeError::Ingest`] or [`RuntimeError::Storage`] when a part fails. Each
     /// carries that part's own error, because "storage stopped" says nothing about why.
-    pub(crate) async fn run(self, settings: &Settings, mut stop: Stop) -> Result<(), RuntimeError> {
-        // The settings never name stdout beside a store, so a run either prints or
-        // stores.
+    pub(crate) async fn run(
+        self,
+        routes: Routes,
+        settings: &Settings,
+        mut stop: Stop,
+    ) -> Result<(), RuntimeError> {
         #[cfg(feature = "store")]
-        if self
-            .routes
-            .iter()
-            .all(|(backend, _)| *backend != Backend::Stdout)
-        {
+        if !routes.prints() {
             let stores = tokio::select! {
                 biased;
                 () = stop.wait() => return Ok(()),
-                stores = self.open(settings) => stores?,
+                stores = self.open(&routes, settings) => stores?,
             };
             return Box::pin(self.run_with_stores(stores, stop)).await;
         }
@@ -349,22 +365,22 @@ impl<B: BlockSource + 'static> Pipeline<B> {
         tokio::select! {
             biased;
             () = stop.wait() => Ok(()),
-            printed = self.print() => printed,
+            printed = self.print(routes) => printed,
         }
     }
 
     /// Prints the tables `[sink.stdout]` names. No store, so no tables and nothing to
     /// restore: a run starts fresh from the manifests' seeds.
-    async fn print(self) -> Result<(), RuntimeError> {
+    async fn print(self, routes: Routes) -> Result<(), RuntimeError> {
         let Self {
             source,
             start_block,
             stop_block,
             decoder,
             schema,
-            routes,
         } = self;
         let sinks = routes
+            .0
             .into_iter()
             .map(|(_, tables)| (StdoutJsonSink::new(), tables))
             .collect();
@@ -375,19 +391,23 @@ impl<B: BlockSource + 'static> Pipeline<B> {
         Ok(())
     }
 
-    /// Opens every store the settings name, each with the tables routed to it and on a
+    /// Opens every store the settings name, each with the tables `routes` sends it and on a
     /// runtime of its own (see `crate::sink::store_runtime`). Opened before ingest
     /// starts, so a bad path or connection fails at startup rather than after the first
     /// block.
     #[cfg(feature = "store")]
-    async fn open(&self, settings: &Settings) -> Result<Vec<Opened<AnyStore>>, RuntimeError> {
+    async fn open(
+        &self,
+        routes: &Routes,
+        settings: &Settings,
+    ) -> Result<Vec<Opened<AnyStore>>, RuntimeError> {
         let chain = &settings.ingest.chain;
         let mut stores = Vec::new();
         #[cfg(feature = "duckdb")]
         if let Some(duckdb) = &settings.sink.duckdb {
             let (settings, chain) = (duckdb.clone(), chain.clone());
             let batching = Batching::eager(duckdb.batch_records);
-            let opened = self.open_store(Backend::DuckDb, batching, async move |schema| {
+            let opened = self.open_store(routes, Backend::DuckDb, batching, async move |schema| {
                 Ok(AnyStore::DuckDb(Box::new(
                     sink::DuckDbSink::open(&settings, schema, &chain).await?,
                 )))
@@ -398,18 +418,19 @@ impl<B: BlockSource + 'static> Pipeline<B> {
         if let Some(postgres) = &settings.sink.postgres {
             let (settings, chain) = (postgres.clone(), chain.clone());
             let batching = postgres.batching();
-            let opened = self.open_store(Backend::Postgres, batching, async move |schema| {
-                Ok(AnyStore::Postgres(Box::new(
-                    sink::PostgresSink::open(&settings, schema, &chain).await?,
-                )))
-            });
+            let opened =
+                self.open_store(routes, Backend::Postgres, batching, async move |schema| {
+                    Ok(AnyStore::Postgres(Box::new(
+                        sink::PostgresSink::open(&settings, schema, &chain).await?,
+                    )))
+                });
             stores.push(opened.await?);
         }
         #[cfg(feature = "delta")]
         if let Some(delta) = &settings.sink.delta {
             let (settings, chain) = (delta.clone(), chain.clone());
             let batching = delta.batching();
-            let opened = self.open_store(Backend::Delta, batching, async move |schema| {
+            let opened = self.open_store(routes, Backend::Delta, batching, async move |schema| {
                 Ok(AnyStore::Delta(Box::new(
                     sink::DeltaSink::open(&settings, schema, &chain).await?,
                 )))
@@ -425,6 +446,7 @@ impl<B: BlockSource + 'static> Pipeline<B> {
     #[cfg(feature = "store")]
     async fn open_store<F>(
         &self,
+        routes: &Routes,
         backend: Backend,
         batching: Batching,
         open: impl FnOnce(Arc<Schema>) -> F,
@@ -432,7 +454,7 @@ impl<B: BlockSource + 'static> Pipeline<B> {
     where
         F: Future<Output = Result<AnyStore, sink::StoreError>> + Send + 'static,
     {
-        let (schema, tables) = self.route(backend);
+        let (schema, tables) = self.route(routes, backend);
         let runtime =
             StoreRuntime::dedicated(backend).map_err(|source| RuntimeError::StoreRuntime {
                 store: backend,
@@ -448,11 +470,11 @@ impl<B: BlockSource + 'static> Pipeline<B> {
         })
     }
 
-    /// The tables routed to `backend`, and the schema of them a store opens with.
+    /// The tables `routes` sends `backend`, and the schema of them a store opens with.
     #[cfg(feature = "store")]
-    fn route(&self, backend: Backend) -> (Arc<Schema>, HashSet<TableId>) {
-        let tables = self
-            .routes
+    fn route(&self, routes: &Routes, backend: Backend) -> (Arc<Schema>, HashSet<TableId>) {
+        let tables = routes
+            .0
             .iter()
             .find(|(named, _)| *named == backend)
             .map(|(_, tables)| tables.clone())
@@ -623,9 +645,8 @@ pub async fn run(path: &str) -> Result<(), RuntimeError> {
         // The run may have ended already, and nothing is left to stop.
         let _ = request.send(true);
     });
-    let ran = Pipeline::from_settings(&settings)?
-        .run(&settings, stop.clone())
-        .await;
+    let (pipeline, routes) = Pipeline::from_settings(&settings)?;
+    let ran = pipeline.run(routes, &settings, stop.clone()).await;
     if ran.is_ok() && stop.requested() {
         info!("stopped on request");
     }
