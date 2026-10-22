@@ -217,6 +217,7 @@ impl RuntimeError {
                 error,
                 PipelineError::StartAboveHistory { .. }
                     | PipelineError::BackfillWithoutStart
+                    | PipelineError::StartNotBuried { .. }
                     | PipelineError::StartAboveHead { .. }
                     | PipelineError::StopAboveHead { .. }
                     | PipelineError::StopBelowStart { .. }

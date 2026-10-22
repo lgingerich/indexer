@@ -35,7 +35,7 @@
 //! transaction joined to its receipt, so this is the check that a trailing transaction
 //! was not dropped.
 //!
-//! [Envio HyperSync]: https://docs.envio.dev/docs/`HyperSync`/overview
+//! [Envio HyperSync]: https://docs.envio.dev/docs/HyperSync/overview
 
 use std::fmt;
 use std::num::{NonZeroU64, NonZeroUsize};

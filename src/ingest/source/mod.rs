@@ -189,8 +189,9 @@ pub trait BlockSource: Send + Sync {
     ///
     /// `head` is metadata already known for that height, from a live notification.
     /// A source may reuse it when its selected datasets need no more than identity,
-    /// parent hash, and timestamp; it must fetch a full block when they do, and must
-    /// reject a fetched block whose identity disagrees with `head`.
+    /// parent hash, and timestamp, and must fetch a full block when they do. It need not
+    /// check a fetched block against `head`: the pipeline compares the identity it
+    /// returns with the one it asked for.
     ///
     /// # Errors
     ///
@@ -256,10 +257,11 @@ pub trait BlockSource: Send + Sync {
     /// the chain's head as it is right now when `height` is `None`.
     ///
     /// Reads the header alone — no transactions, receipts, or logs — so it is the
-    /// cheap way to learn a block's identity. The head form is used for startup and
-    /// live reconciliation, never during backfill: backfill captures its head once at
-    /// startup and then reads concrete heights only. The height form checks a restored
-    /// tip against the source before resuming.
+    /// cheap way to learn a block's identity. The head form samples the head: at startup,
+    /// for live reconciliation, and each time backfill reaches the buried bound under the
+    /// head it last sampled, to see whether the chain has buried more. Between those
+    /// samples backfill reads concrete heights only. The height form checks a restored
+    /// tip against the source before resuming, and walks a fork back.
     ///
     /// # Errors
     ///

@@ -141,6 +141,14 @@ impl From<Vec<BlockMeta>> for Ledger {
 /// The allocations happen only when a run is already stopping.
 #[derive(Debug, Error)]
 pub enum PipelineError {
+    /// A block read for one height came back at another.
+    #[error("requested the block at height {requested}, received {actual:?}")]
+    WrongHeight {
+        /// The height asked for.
+        requested: u64,
+        /// The block returned.
+        actual: Box<BlockMeta>,
+    },
     /// Returned block identity disagrees with the request.
     #[error("requested block {expected:?}, received {actual:?}")]
     IdentityMismatch {
@@ -213,6 +221,19 @@ pub enum PipelineError {
          already holds blocks"
     )]
     BackfillWithoutStart,
+    /// A fresh run on a source that does not follow heads was asked to start above the
+    /// heights it backfills: those buried under its finality depth.
+    #[error(
+        "a source that does not follow the chain indexes only buried heights, through \
+         {buried} now, and ingest.start_block {start} is above them; start lower, or run \
+         on a source that follows the chain"
+    )]
+    StartNotBuried {
+        /// Requested start height.
+        start: u64,
+        /// The highest buried height under the sampled head.
+        buried: u64,
+    },
     /// A range fetch returned other than one block per requested height.
     #[error("source returned {returned} blocks for heights {from}..={to}")]
     InvalidRange {
@@ -306,11 +327,9 @@ impl UndoRing {
     /// Collects hashes above the ancestor at height `ancestor`, newest first.
     /// Does not remove them: the sink must accept their retraction before rewind.
     ///
-    /// ponytail: `take_while` stops at the first entry at or below the ancestor, so it
-    /// assumes `entries` is height-ordered ascending. That holds because `push` appends
-    /// and the driver only ever accepts the next height, but nothing here enforces it —
-    /// unordered input yields a partial orphan list. Upgrade path: a `debug_assert!` in
-    /// `push`, or a sort, if a future caller ever pushes out of order.
+    /// Stops at the first entry at or below the ancestor, which relies on `entries`
+    /// ascending by height: `push` appends, and every block is accepted only after it
+    /// links to the tip, one height above it.
     fn orphaned(&self, ancestor: u64) -> Vec<B256> {
         self.entries
             .iter()
@@ -433,8 +452,8 @@ impl<S, K> Machine<S, K> {
     /// Does not establish canonicality or validate linkage to another block.
     fn marker(meta: BlockMeta, height: u64) -> Result<BlockMeta, PipelineError> {
         if meta.height != height {
-            return Err(PipelineError::IdentityMismatch {
-                expected: Box::new(BlockMeta { height, ..meta }),
+            return Err(PipelineError::WrongHeight {
+                requested: height,
                 actual: Box::new(meta),
             });
         }
@@ -515,7 +534,8 @@ impl<S: BlockSource + 'static, K: EnvelopeSink> Machine<S, K> {
     /// Returns [`PipelineError::StartAboveHistory`] for a `start` past a ledger's tip,
     /// [`PipelineError::StartAboveHead`] for one above the sampled head,
     /// [`PipelineError::BackfillWithoutStart`] for neither on a source that only
-    /// backfills, [`PipelineError::StopAboveHead`] and [`PipelineError::StopBelowStart`]
+    /// backfills, [`PipelineError::StartNotBuried`] for one there above the buried
+    /// heights, [`PipelineError::StopAboveHead`] and [`PipelineError::StopBelowStart`]
     /// for a `stop` outside those bounds, [`PipelineError::IdentityMismatch`] when a source
     /// that only backfills holds another block at the stored tip,
     /// [`PipelineError::SubscriptionClosed`] when the subscription ends, and permanent
@@ -630,20 +650,22 @@ impl<S: BlockSource + 'static, K: EnvelopeSink> Machine<S, K> {
         start: Option<u64>,
         stop: Option<u64>,
     ) -> Result<Option<u64>, PipelineError> {
-        let stop = if self.source.follows_heads() {
-            stop
-        } else {
-            Some(self.buried_stop(start, stop).await?)
-        };
-        self.sync_through(start, stop).await?;
-        Ok(stop)
+        if self.source.follows_heads() {
+            self.sync_through(start, stop, None).await?;
+            return Ok(stop);
+        }
+        let (stop, head) = self.buried_stop(start, stop).await?;
+        self.sync_through(start, Some(stop), Some(head)).await?;
+        Ok(Some(stop))
     }
 
-    /// [`Self::sync`], once the stop is known.
+    /// [`Self::sync`], once the stop is known: from `head` when it was already sampled
+    /// and the stop checked against it, and from a head sampled here otherwise.
     async fn sync_through(
         &mut self,
         start: Option<u64>,
         stop: Option<u64>,
+        head: Option<BlockMeta>,
     ) -> Result<(), PipelineError> {
         let restored = self.ring.tip();
         if let (Some(start), Some(tip)) = (start, restored) {
@@ -668,15 +690,13 @@ impl<S: BlockSource + 'static, K: EnvelopeSink> Machine<S, K> {
             );
             return Ok(());
         }
-        let mut head = self.sample_head().await?;
-        if let Some(stop) = stop
-            && stop > head.height
-        {
-            return Err(PipelineError::StopAboveHead {
-                stop,
-                head: head.height,
-            });
-        }
+        let mut head = if let Some(head) = head {
+            head
+        } else {
+            let head = self.sample_head().await?;
+            Self::check_stop(stop, head)?;
+            head
+        };
         let mut next = if let Some(tip) = restored {
             info!(height = tip.height, hash = %tip.hash, head = head.height,
                 "resuming from the stored tip");
@@ -718,9 +738,20 @@ impl<S: BlockSource + 'static, K: EnvelopeSink> Machine<S, K> {
         self.catch_up(tip, target).await
     }
 
+    /// Refuses a `stop` above `head`, the head a run's bounds are checked against.
+    fn check_stop(stop: Option<u64>, head: BlockMeta) -> Result<(), PipelineError> {
+        match stop {
+            Some(stop) if stop > head.height => Err(PipelineError::StopAboveHead {
+                stop,
+                head: head.height,
+            }),
+            _ => Ok(()),
+        }
+    }
+
     /// The stop of a run on a source that does not [follow heads](BlockSource::follows_heads):
-    /// the buried bound under the head it samples now, or `stop` when that is lower. The
-    /// run is then an ordinary one with a stop, and ends there.
+    /// the buried bound under the head it samples now, or `stop` when that is lower, with
+    /// that head. The run is then an ordinary one with a stop, and ends there.
     ///
     /// It is fixed once, not resampled as backfill reaches it: no live phase takes over
     /// after it, and on a fast chain the head moves on during every pass, so a run that
@@ -728,31 +759,47 @@ impl<S: BlockSource + 'static, K: EnvelopeSink> Machine<S, K> {
     ///
     /// # Errors
     /// Returns [`PipelineError::BackfillWithoutStart`] for a fresh run with no `start`,
-    /// which at the head would have nothing buried to index, and
-    /// [`PipelineError::StopAboveHead`] for a `stop` above the sampled head.
+    /// which at the head would have nothing buried to index,
+    /// [`PipelineError::StopAboveHead`] for a `stop` above the sampled head, and, for a
+    /// fresh run, [`PipelineError::StopBelowStart`] for a `stop` below its `start`,
+    /// [`PipelineError::StartAboveHead`] for a `start` above the head, and
+    /// [`PipelineError::StartNotBuried`] for one above the buried heights.
     async fn buried_stop(
         &mut self,
         start: Option<u64>,
         stop: Option<u64>,
-    ) -> Result<u64, PipelineError> {
-        if start.is_none() && self.ring.tip().is_none() {
+    ) -> Result<(u64, BlockMeta), PipelineError> {
+        let fresh = self.ring.tip().is_none();
+        if start.is_none() && fresh {
             return Err(PipelineError::BackfillWithoutStart);
         }
         let head = self.sample_head().await?;
-        if let Some(stop) = stop
-            && stop > head.height
-        {
-            return Err(PipelineError::StopAboveHead {
-                stop,
-                head: head.height,
-            });
-        }
+        Self::check_stop(stop, head)?;
         let buried = Self::buried(head, self.finality_depth());
+        // A fresh start above the buried heights would otherwise surface as the buried
+        // bound below the start, a stop nobody set.
+        if fresh && let Some(start) = start {
+            match stop {
+                Some(stop) if stop < start => {
+                    return Err(PipelineError::StopBelowStart { stop, start });
+                }
+                _ if start > head.height => {
+                    return Err(PipelineError::StartAboveHead {
+                        start,
+                        head: head.height,
+                    });
+                }
+                _ if start > buried => {
+                    return Err(PipelineError::StartNotBuried { start, buried });
+                }
+                _ => {}
+            }
+        }
         let buried = stop.map_or(buried, |stop| stop.min(buried));
         info!(chain = %self.source.chain(), through = buried,
             "this source does not follow the chain: indexing the buried heights, then \
              stopping; restart on one that does to continue");
-        Ok(buried)
+        Ok((buried, head))
     }
 
     /// Reconciles a restored tip against the source, returning the tip to continue from.
@@ -2300,11 +2347,8 @@ mod tests {
         };
         fails_with(
             Driver::marker(marker, 3),
-            &PipelineError::IdentityMismatch {
-                expected: Box::new(BlockMeta {
-                    height: 3,
-                    ..marker
-                }),
+            &PipelineError::WrongHeight {
+                requested: 3,
                 actual: Box::new(marker),
             },
         );
@@ -2479,6 +2523,31 @@ mod tests {
         assert_eq!(reads(&machine).1, 0, "no block is fetched");
     }
 
+    /// A fresh backfill asked to start inside the finality window, where it indexes
+    /// nothing, is told so, rather than refused for a stop below its start that nobody
+    /// set. One that starts below the window samples the head once and backfills to it.
+    #[tokio::test]
+    async fn a_backfill_starting_above_the_buried_heights_is_refused_plainly() {
+        let head = MAX_UNFINALIZED_BLOCKS as u64 + 5;
+        let mut machine = Machine::new(Source::backfilling(head), Sink::default(), Vec::new());
+        fails_with(
+            machine.sync(Some(7), None).await,
+            &PipelineError::StartNotBuried {
+                start: 7,
+                buried: 5,
+            },
+        );
+        assert_eq!(reads(&machine), (1, 0), "one head sample, no block");
+
+        let mut machine = Machine::new(Source::backfilling(head), Sink::default(), Vec::new());
+        assert_eq!(
+            machine.sync(Some(2), None).await.expect("backfill"),
+            Some(5)
+        );
+        assert_eq!(heights(&machine), [2, 3, 4, 5]);
+        assert_eq!(reads(&machine).0, 1, "the head is sampled once");
+    }
+
     /// A start the stored history already reaches is ignored, as a followed run ignores
     /// it; one past the tip's successor would leave a gap, and is refused.
     #[tokio::test]
@@ -2508,7 +2577,7 @@ mod tests {
     async fn a_backfill_stops_under_the_head_it_sampled_first() {
         let window = MAX_UNFINALIZED_BLOCKS as u64;
         let source = Source::backfilling(window + 20);
-        // The stop's sample, then the run's: the head moves every time.
+        // The head moves at every sample; the run takes one, for its stop.
         source
             .data
             .samples
@@ -2519,7 +2588,7 @@ mod tests {
         let stop = machine.sync(Some(2), None).await.expect("backfill");
         assert_eq!(stop, Some(5));
         assert_eq!(heights(&machine), (2..=5).collect::<Vec<_>>());
-        assert_eq!(reads(&machine).0, 2);
+        assert_eq!(reads(&machine).0, 1, "the head is sampled once");
     }
 
     #[tokio::test]

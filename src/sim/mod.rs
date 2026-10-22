@@ -306,6 +306,7 @@ fn unexpected(end: &End, world: &World, faults: bool) -> Option<String> {
                 error,
                 PipelineError::Source(_)
                     | PipelineError::IdentityMismatch { .. }
+                    | PipelineError::WrongHeight { .. }
                     | PipelineError::BrokenLink { .. }
                     | PipelineError::UnstableSource
                     | PipelineError::SubscriptionClosed
