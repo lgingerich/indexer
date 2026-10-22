@@ -53,13 +53,13 @@ use futures_util::FutureExt as _;
 use futures_util::future::BoxFuture;
 use tracing::{info, warn};
 
-use crate::ingest::pipeline::LEDGER_WINDOW;
+use crate::ingest::pipeline::{LEDGER_WINDOW, Ledger};
 use crate::sink::channel::Batching;
 use crate::sink::route::Backend;
 use crate::sink::store_runtime::StoreRuntime;
 use crate::sink::table::TableId;
 use crate::sink::{Restored, Store, StoreError};
-use crate::wire::envelope::BlockMeta;
+use crate::wire::envelope::{BlockMeta, StoredContract};
 
 /// A store, opened, with what the run routes to it and the runtime its work runs on.
 #[derive(Debug)]
@@ -147,8 +147,21 @@ fn describe_tips(tips: &[(Backend, u64)]) -> String {
         .join(", ")
 }
 
+/// What ingest resumes from once the stores hold one block.
+#[derive(Debug)]
+pub(crate) struct Resumed {
+    /// Every contract any store discovered, each from a block ingest will not hand back.
+    pub(crate) contracts: Vec<StoredContract>,
+    /// The common block's ledger, and whether a store holds blocks below it.
+    pub(crate) ledger: Ledger,
+}
+
 /// Brings every store to the newest block they all hold, and returns what ingest
 /// resumes from: that block's ledger, and every contract any store discovered.
+///
+/// The ledger is the slowest store's, cut to the common block. Cut from the top, it can
+/// be shorter than a restore reads while that store, or another, holds blocks below its
+/// oldest one, so it carries whether any does (see [`history_below`]).
 ///
 /// # Errors
 ///
@@ -156,7 +169,7 @@ fn describe_tips(tips: &[(Backend, u64)]) -> String {
 /// failed, and [`ResumeError::NoCommonBlock`] when no block is held by them all.
 pub(crate) async fn resume<S: Store>(
     stores: Vec<Opened<S>>,
-) -> Result<(Vec<Opened<S>>, Restored), ResumeError> {
+) -> Result<(Vec<Opened<S>>, Resumed), ResumeError> {
     let mut read = Vec::with_capacity(stores.len());
     for opened in stores {
         read.push(restore(opened).await?);
@@ -172,13 +185,13 @@ pub(crate) async fn resume<S: Store>(
     })?;
     let Some((common, slowest)) = common else {
         // Every ledger is empty: a fresh run, with nothing to agree on.
-        let restored = Restored {
+        let resumed = Resumed {
             contracts: restored.into_iter().flat_map(|r| r.contracts).collect(),
-            ledger: Vec::new(),
+            ledger: Ledger::default(),
         };
-        return Ok((stores, restored));
+        return Ok((stores, resumed));
     };
-    let ledger: Vec<BlockMeta> = restored[slowest]
+    let blocks: Vec<BlockMeta> = restored[slowest]
         .ledger
         .iter()
         .copied()
@@ -190,17 +203,38 @@ pub(crate) async fn resume<S: Store>(
     for (opened, restored) in stores.into_iter().zip(&mut restored) {
         settled.push(settle(opened, restored, common.height, &mut held).await?);
     }
+    let history_below = history_below(&restored, &blocks);
     // A contract from a block above the common block is discovered again as ingest
     // hands that block back, and only if the block is still canonical.
-    let restored = Restored {
+    let resumed = Resumed {
         contracts: restored
             .into_iter()
             .flat_map(|r| r.contracts)
             .filter(|contract| !held.contains(&contract.block_hash))
             .collect(),
-        ledger,
+        ledger: Ledger {
+            blocks,
+            history_below,
+        },
     };
-    Ok((settled, restored))
+    Ok((settled, resumed))
+}
+
+/// Whether any store, as settled, may hold a block below the oldest of `blocks`: its
+/// ledger starts lower, or is as long as a restore reads, so it may have more below.
+///
+/// Without it, a ledger cut to the common block looked like the slowest store's whole
+/// history, and a fork replacing its oldest block was adopted as if it replaced the first
+/// block ever indexed, where it reaches past what the run can retract.
+fn history_below(restored: &[Restored], blocks: &[BlockMeta]) -> bool {
+    let Some(floor) = blocks.first() else {
+        return false;
+    };
+    restored.iter().any(|restored| {
+        restored.ledger.first().is_some_and(|oldest| {
+            restored.ledger.len() >= LEDGER_WINDOW || oldest.height < floor.height
+        })
+    })
 }
 
 /// Brings `opened`, which read back `restored`, to the block every store holds at
@@ -425,9 +459,13 @@ mod tests {
         ];
         let (stores, restored) = resume(stores).await.expect("resumed");
         assert_eq!(
-            restored.ledger,
+            restored.ledger.blocks,
             ledger(0xa0, 1..=5),
             "the slowest store's ledger"
+        );
+        assert!(
+            !restored.ledger.history_below,
+            "the rewound store holds nothing below it"
         );
         assert_eq!(
             stores
@@ -552,6 +590,64 @@ mod tests {
         ];
         for (label, ledgers, expected) in cases {
             assert_eq!(outcome(&ledgers), expected, "{label}");
+        }
+    }
+
+    /// The ledger ingest resumes from is the slowest store's, cut to the common block,
+    /// and says whether a store holds blocks below it: a full window cut from the top is
+    /// shorter than one but still has history below, as does another store's ledger
+    /// starting lower. Only whole histories starting at or above it have none.
+    #[tokio::test]
+    async fn a_cut_ledger_says_whether_a_store_holds_blocks_below_it() {
+        let window = LEDGER_WINDOW as u64;
+        let forked_tip = |heights: std::ops::RangeInclusive<u64>| {
+            let tip = *heights.end();
+            let mut forked = ledger(0xa0, *heights.start()..=tip - 1);
+            forked.extend(ledger(0xb0, tip..=tip));
+            forked
+        };
+        for (label, slow, fast, common, below) in [
+            (
+                "a full window, its tip orphaned",
+                forked_tip(1..=window),
+                ledger(0xa0, window - 5..=window + 1),
+                window - 1,
+                true,
+            ),
+            (
+                "whole histories, the slow one's tip orphaned",
+                forked_tip(3..=5),
+                ledger(0xa0, 3..=9),
+                4,
+                false,
+            ),
+            (
+                "another store's history starting lower",
+                forked_tip(3..=5),
+                ledger(0xa0, 1..=9),
+                4,
+                true,
+            ),
+        ] {
+            let opened = |backend, ledger| Opened {
+                backend,
+                store: Probe {
+                    ledger,
+                    threads: Arc::default(),
+                },
+                batching: Batching::eager(1),
+                tables: HashSet::new(),
+                runtime: StoreRuntime::dedicated(backend).expect("a runtime"),
+            };
+            let stores = vec![
+                opened(Backend::Postgres, slow.clone()),
+                opened(Backend::Delta, fast),
+            ];
+            let (_, resumed) = resume(stores).await.expect(label);
+            let mut expected = slow;
+            expected.retain(|block| block.height <= common);
+            assert_eq!(resumed.ledger.blocks, expected, "{label}");
+            assert_eq!(resumed.ledger.history_below, below, "{label}");
         }
     }
 

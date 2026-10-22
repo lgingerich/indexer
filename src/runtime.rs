@@ -83,6 +83,8 @@ use tracing::{Instrument as _, info_span};
 
 use crate::config::{IngestSource, Settings, SettingsError};
 use crate::decode::{Catalog, CatalogError, Decoder, DecodingSink};
+#[cfg(feature = "store")]
+use crate::ingest::pipeline::Ledger;
 use crate::ingest::pipeline::{Machine, PipelineError};
 use crate::ingest::source::evm::{http_client, ws_connect};
 use crate::ingest::source::{
@@ -104,7 +106,7 @@ use crate::sink::table::{Schema, TableId};
 use crate::sink::{SinkError, StdoutJsonSink};
 use crate::wire::envelope::ChainId;
 #[cfg(feature = "store")]
-use crate::wire::envelope::{BlockMeta, StoredContract};
+use crate::wire::envelope::StoredContract;
 
 /// Why the indexer stopped.
 ///
@@ -582,8 +584,8 @@ fn restore(mut decoder: Decoder, chain: &ChainId, stored: Vec<StoredContract>) -
 
 /// The accepted blocks a previous run committed, as ingest takes them.
 #[cfg(feature = "store")]
-fn ledger(chain: &ChainId, stored: Vec<BlockMeta>) -> Vec<BlockMeta> {
-    if let (Some(oldest), Some(tip)) = (stored.first(), stored.last()) {
+fn ledger(chain: &ChainId, stored: Ledger) -> Ledger {
+    if let (Some(oldest), Some(tip)) = (stored.blocks.first(), stored.blocks.last()) {
         info!(%chain, from = oldest.height, tip = tip.height, hash = %tip.hash,
             "accepted blocks restored");
     } else {
@@ -1283,7 +1285,10 @@ tables = ["blocks", "transactions", "logs", "decoded_logs", "contract_events"]
                 .await
                 .expect("open");
         let chain = ChainId::new("base");
-        let restored = ledger(&chain, store.restore().await.expect("restore").ledger);
+        let restored = ledger(
+            &chain,
+            store.restore().await.expect("restore").ledger.into(),
+        );
         let machine = Machine::new(FakeChain::new(5, 0xa0), store, restored);
         let result = machine.run(Some(5), None).await;
         assert!(

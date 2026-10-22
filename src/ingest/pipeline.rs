@@ -108,6 +108,32 @@ const STARTUP_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(
 /// block below it, which the oldest unfinalized block's parent hash is checked against.
 pub const LEDGER_WINDOW: usize = MAX_UNFINALIZED_BLOCKS + 1;
 
+/// The accepted blocks a restart resumes from, and whether the stores hold blocks below
+/// the oldest of them.
+///
+/// Which it is decides what a fork replacing the oldest block means: with nothing stored
+/// below, it replaces the first block ever indexed and is adopted; with history below,
+/// it reaches past what the run can retract and stops it.
+#[derive(Debug, Default)]
+pub struct Ledger {
+    /// The accepted blocks, oldest first.
+    pub blocks: Vec<BlockMeta>,
+    /// Whether some store holds blocks below the oldest of [`Self::blocks`].
+    pub history_below: bool,
+}
+
+/// A ledger as one store's restore reads it back: its newest [`LEDGER_WINDOW`] blocks,
+/// so one that long may have history below it, and a shorter one is all the store holds.
+/// A ledger cut any other way — as resuming several stores cuts one — says so itself.
+impl From<Vec<BlockMeta>> for Ledger {
+    fn from(blocks: Vec<BlockMeta>) -> Self {
+        Self {
+            history_below: blocks.len() >= LEDGER_WINDOW,
+            blocks,
+        }
+    }
+}
+
 /// Why ingestion cannot continue safely.
 ///
 /// The identity-bearing variants box their [`BlockMeta`] fields: an unboxed pair is 160
@@ -229,8 +255,8 @@ struct UndoRing {
     floor: Option<BlockMeta>,
     /// Published tail, oldest first, at most [`MAX_UNFINALIZED_BLOCKS`] identities.
     entries: VecDeque<BlockMeta>,
-    /// Whether a restored ledger lost older blocks that did not link to the rest, so
-    /// stored rows may sit below the oldest entry.
+    /// Whether stored rows may sit below the oldest entry: the restored ledger said so, or
+    /// lost older blocks that did not link to the rest.
     truncated: bool,
 }
 
@@ -265,12 +291,8 @@ impl UndoRing {
     }
 
     /// Whether the window still holds the first block this run's history ever indexed:
-    /// nothing has slid into the floor, and no older part of a restored ledger was
-    /// dropped. Then nothing is stored below the oldest entry.
-    ///
-    /// A restart reads back up to a window plus one of the stored ledger, and the store
-    /// prunes only below what it read, so a restored ledger without a floor was never
-    /// pruned.
+    /// nothing has slid into the floor, the restored ledger had no history below it, and
+    /// no older part of it was dropped. Then nothing is stored below the oldest entry.
     fn holds_whole_history(&self) -> bool {
         self.floor.is_none() && !self.truncated
     }
@@ -366,19 +388,23 @@ impl<S: BlockSource, K> Machine<S, K> {
 }
 
 impl<S, K> Machine<S, K> {
-    /// Builds a driver whose undo window starts as `ledger`: the accepted identities a
-    /// store read back, oldest first.
+    /// Builds a driver whose undo window starts as `ledger`: the accepted identities the
+    /// stores read back, oldest first.
     ///
     /// An empty ledger starts fresh, at the sampled head or a requested height. Otherwise
     /// the run resumes after the ledger's tip; see the module docs. Only the newest
     /// parent-linked suffix is kept, and only the newest [`MAX_UNFINALIZED_BLOCKS`] of it
     /// plus one floor are remembered.
     #[must_use]
-    pub fn new(source: S, sink: K, ledger: Vec<BlockMeta>) -> Self {
-        let stored = ledger.len();
-        let linked = linked_suffix(ledger);
+    pub fn new(source: S, sink: K, ledger: impl Into<Ledger>) -> Self {
+        let Ledger {
+            blocks,
+            history_below,
+        } = ledger.into();
+        let stored = blocks.len();
+        let linked = linked_suffix(blocks);
         let mut ring = UndoRing {
-            truncated: linked.len() < stored,
+            truncated: history_below || linked.len() < stored,
             ..UndoRing::default()
         };
         for meta in linked {
@@ -2582,6 +2608,36 @@ mod tests {
         assert_eq!(machine.tip(), Some(meta(5)));
     }
 
+    /// A ledger cut from the top, as resuming several stores cuts the slowest one's, is
+    /// as short as a whole history, but says the stores hold blocks below it. A fork
+    /// replacing its oldest block then stops instead of being adopted over them.
+    #[tokio::test]
+    async fn a_fork_while_down_replacing_the_oldest_block_of_a_cut_ledger_stops() {
+        let mut source = Source::linear(7);
+        fork(&mut source, 3, 7);
+        let stored = Ledger {
+            blocks: ledger(4..=5),
+            history_below: true,
+        };
+        let mut machine = Machine::new(source, Sink::default(), stored);
+        fails_with(
+            machine.sync(None, None).await,
+            &PipelineError::UndoWindowExceeded {
+                floor: Box::new(meta(4)),
+                actual: Box::new(BlockMeta {
+                    hash: hash(104),
+                    parent_hash: hash(103),
+                    ..meta(4)
+                }),
+            },
+        );
+        assert!(
+            machine.sink.events.is_empty(),
+            "nothing is retracted or replayed"
+        );
+        assert_eq!(machine.tip(), Some(meta(5)));
+    }
+
     #[tokio::test]
     async fn the_first_resumed_block_must_link_to_the_stored_tip() {
         let head = MAX_UNFINALIZED_BLOCKS as u64 + 20;
@@ -2634,7 +2690,8 @@ mod tests {
 
     /// Only the newest run of a stored ledger whose heights and parent hashes link is
     /// kept, and a window built from a ledger that lost its older part is marked
-    /// truncated. A whole stored window's worth is kept whole, its oldest as the floor.
+    /// truncated. A whole stored window's worth is kept whole, its oldest as the floor,
+    /// and is marked as having history below too: a restore reads no more than that.
     #[test]
     fn only_the_newest_linked_suffix_of_a_stored_ledger_is_kept() {
         let kept = |stored: Vec<BlockMeta>| {
@@ -2662,7 +2719,7 @@ mod tests {
 
         let window = MAX_UNFINALIZED_BLOCKS as u64;
         let machine = Machine::new(Source::linear(0), Sink::default(), ledger(0..=window));
-        assert!(!machine.ring.truncated);
+        assert!(machine.ring.truncated);
         assert_eq!(machine.ring.entries.len(), MAX_UNFINALIZED_BLOCKS);
         assert_eq!(machine.ring.floor, Some(meta(0)));
         assert_eq!(machine.tip(), Some(meta(window)));
