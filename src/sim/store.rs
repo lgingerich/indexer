@@ -28,7 +28,7 @@ use alloy_primitives::B256;
 use super::CHAIN;
 use super::chain::{Shared, StoreFaults, lock};
 use crate::sink::duckdb::DuckDb;
-use crate::sink::route::Backend;
+use crate::sink::route::StoreBackend;
 use crate::sink::sql::Dialect as _;
 use crate::sink::store::Engine;
 use crate::sink::store_error::{EngineError, Operation, StoreError};
@@ -230,7 +230,7 @@ impl<E: Reconnect> Engine for FaultyEngine<E> {
 pub(super) struct SimStore {
     pub(super) inner: SqlStore<FaultyEngine<DuckDb>>,
     pub(super) world: Shared,
-    pub(super) backend: Backend,
+    pub(super) backend: StoreBackend,
     /// Whether it reports what it buffers, as the lake does, so a byte limit applies.
     pub(super) counts_bytes: bool,
     /// What the envelopes buffered since the last flush take as JSON.

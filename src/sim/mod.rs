@@ -52,17 +52,17 @@ use self::oracle::Stored;
 use self::store::{FaultyEngine, SimStore};
 use crate::decode::Catalog;
 use crate::ingest::pipeline::PipelineError;
-use crate::ingest::source::Datasets;
 use crate::ingest::source::{EvmSource, RetryLayer, SourceError};
 use crate::runtime::{Pipeline, RuntimeError};
 use crate::sink::channel::Batching;
 use crate::sink::duckdb::DuckDb;
 use crate::sink::resume::{Opened, ResumeError};
-use crate::sink::route::Backend;
+use crate::sink::route::StoreBackend;
 use crate::sink::stop::Stop;
 use crate::sink::store_runtime::StoreRuntime;
 use crate::sink::table::{Schema, Table, TableId};
 use crate::sink::{SinkError, SqlStore};
+use crate::wire::datasets::Datasets;
 use crate::wire::envelope::ChainId;
 
 /// The chain the simulation indexes, named as a real one because the catalog accepts
@@ -136,7 +136,7 @@ struct Outcome {
 #[derive(Debug, Clone)]
 pub(super) struct StorePlan {
     /// The role, as errors and logs name the store.
-    pub(super) backend: Backend,
+    pub(super) backend: StoreBackend,
     file: &'static str,
     batching: Batching,
     /// Whether it reports the bytes it buffers, as the lake does.
@@ -158,7 +158,7 @@ impl StorePlan {
             Duration::from_millis(1 + rng.below(1000))
         };
         Self {
-            backend: Backend::Postgres,
+            backend: StoreBackend::Postgres,
             file: "database.duckdb",
             batching: Batching {
                 wait,
@@ -180,7 +180,7 @@ impl StorePlan {
             _ => (false, true),
         };
         Self {
-            backend: Backend::Delta,
+            backend: StoreBackend::Delta,
             file: "lake.duckdb",
             batching: Batching {
                 records: usize::MAX,
@@ -613,10 +613,10 @@ fn unexpected(error: &RuntimeError, world: &World, faults: bool) -> Option<Strin
     let fired = |scenario: &str| world.fired.contains(scenario);
     let refused = fired("rpc refused") || fired("rpc timed out");
     let lagged = fired("backend lags") || fired("batch split across backends");
-    let faulted = |backend: &Backend| match backend {
-        Backend::Postgres => world.store_faulted[0],
-        Backend::Delta => world.store_faulted[1],
-        Backend::DuckDb | Backend::Stdout => false,
+    let faulted = |backend: &StoreBackend| match backend {
+        StoreBackend::Postgres => world.store_faulted[0],
+        StoreBackend::Delta => world.store_faulted[1],
+        StoreBackend::DuckDb => false,
     };
     let expected = faults
         && match error {
