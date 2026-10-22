@@ -49,35 +49,56 @@ pub(super) struct Profile {
     pub(super) skip_head: u64,
     /// An old head announced again: the previous one, or one from a stale view.
     pub(super) stale_head: u64,
-    /// A store statement failing before it runs.
-    pub(super) store_fail: u64,
+    /// Each store's own faults, by its position in the plan: a database and a lake fail
+    /// apart.
+    pub(super) stores: [StoreFaults; 2],
+}
+
+/// How often one store's statements fail, per mille.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct StoreFaults {
+    /// A statement failing before it runs.
+    pub(super) fail: u64,
     /// A commit that lands but reports failure.
     pub(super) commit_lost: u64,
-    /// The process dying at a store statement, before or after it runs.
-    pub(super) store_crash: u64,
+    /// The process dying at a statement, before or after it runs.
+    pub(super) crash: u64,
+    /// A statement that takes seconds, as a checkpoint or a slow fsync does.
+    pub(super) stall: u64,
+}
+
+/// A rate in `0..=max` per mille, or, for most draws, none at all.
+fn rate(rng: &mut Rng, max: u64) -> u64 {
+    if rng.chance(60) {
+        rng.below(max + 1)
+    } else {
+        0
+    }
+}
+
+impl StoreFaults {
+    fn draw(rng: &mut Rng) -> Self {
+        Self {
+            fail: rate(rng, 10),
+            commit_lost: rate(rng, 60),
+            crash: rate(rng, 10),
+            stall: rate(rng, 20),
+        }
+    }
 }
 
 impl Profile {
     fn draw(rng: &mut Rng) -> Self {
-        let mut rate = |max: u64| {
-            if rng.chance(60) {
-                rng.below(max + 1)
-            } else {
-                0
-            }
-        };
         Self {
-            reorg: rate(250),
-            refuse: rate(80),
-            timeout: rate(30),
-            lag: rate(300),
-            split: rate(300),
-            drop_heads: rate(40),
-            skip_head: rate(200),
-            stale_head: rate(150),
-            store_fail: rate(10),
-            commit_lost: rate(60),
-            store_crash: rate(10),
+            reorg: rate(rng, 250),
+            refuse: rate(rng, 80),
+            timeout: rate(rng, 30),
+            lag: rate(rng, 300),
+            split: rate(rng, 300),
+            drop_heads: rate(rng, 40),
+            skip_head: rate(rng, 200),
+            stale_head: rate(rng, 150),
+            stores: [StoreFaults::draw(rng), StoreFaults::draw(rng)],
         }
     }
 }
@@ -135,8 +156,12 @@ pub(super) struct World {
     heads: broadcast::Sender<B256>,
     /// Woken when a store statement kills the process; the driver drops the runtime.
     pub(super) crash: Arc<Notify>,
-    /// Whether a store fault fired in this process lifetime.
-    pub(super) store_faulted: bool,
+    /// Which stores, by position, a fault fired in during this process lifetime.
+    pub(super) store_faulted: [bool; 2],
+    /// Whether this lifetime has been asked to stop.
+    pub(super) stopping: bool,
+    /// Invariants that failed while the process ran, as the stores checked them.
+    pub(super) problems: Vec<String>,
     /// Distinguishes blocks that would otherwise share a hash across branches.
     salt: u64,
     /// Everything that happened, in order: the determinism check compares it.
@@ -160,7 +185,9 @@ impl World {
             views: Vec::new(),
             heads: broadcast::channel(64).0,
             crash: Arc::new(Notify::new()),
-            store_faulted: false,
+            store_faulted: [false; 2],
+            stopping: false,
+            problems: Vec::new(),
             salt: 0,
             trace: vec![format!("{profile:?}")],
             coverage: BTreeMap::new(),
@@ -183,7 +210,13 @@ impl World {
 
     /// Whether the fault firing at the profile's `rate`, per mille, fires now.
     pub(super) fn fault(&mut self, rate: fn(&Profile) -> u64) -> bool {
-        self.faults && self.rng.below(1000) < rate(&self.profile)
+        let rate = rate(&self.profile);
+        self.fires(rate)
+    }
+
+    /// Whether a fault firing at `rate` per mille fires now.
+    pub(super) fn fires(&mut self, rate: u64) -> bool {
+        self.faults && self.rng.below(1000) < rate
     }
 
     fn canonical(&self) -> &[B256] {
