@@ -321,18 +321,14 @@ impl Dialect for Postgres {
         .to_owned()
     }
 
+    /// The type name, which the startup check compares without case, except that the
+    /// server spells `TIMESTAMP` out in full.
     fn reported_type(kind: ColumnType) -> String {
         match kind {
-            ColumnType::Uint => "numeric(20,0)",
-            ColumnType::Int => "bigint",
-            ColumnType::BigInt => "numeric(78,0)",
-            ColumnType::Text => "text",
-            ColumnType::Bool => "boolean",
-            ColumnType::Timestamp => "timestamp without time zone",
-            ColumnType::Document => "jsonb",
-            ColumnType::List(element) => return format!("{}[]", Self::reported_type(*element)),
+            ColumnType::Timestamp => "timestamp without time zone".to_owned(),
+            ColumnType::List(element) => format!("{}[]", Self::reported_type(*element)),
+            other => Self::type_name(other),
         }
-        .to_owned()
     }
 
     fn use_schema(schema: &str) -> String {
@@ -359,8 +355,13 @@ impl Dialect for Postgres {
 }
 
 /// The wire type a column of `kind` is copied as.
-fn pg_type(kind: ColumnType) -> Type {
-    match kind {
+///
+/// # Errors
+///
+/// Fails for a list of lists, which [`ColumnType::list`] never builds and no
+/// one-dimensional array holds, rather than copying it as some other type.
+fn pg_type(kind: ColumnType) -> Result<Type, EngineError> {
+    Ok(match kind {
         ColumnType::Uint | ColumnType::BigInt => Type::NUMERIC,
         ColumnType::Int => Type::INT8,
         ColumnType::Text => Type::TEXT,
@@ -368,15 +369,16 @@ fn pg_type(kind: ColumnType) -> Type {
         ColumnType::Timestamp => Type::TIMESTAMP,
         ColumnType::Document => Type::JSONB,
         // A list's element is a scalar (see `ColumnType::list`), so this is one dimension.
-        ColumnType::List(element) => match pg_type(*element) {
-            Type::INT8 => Type::INT8_ARRAY,
-            Type::TEXT => Type::TEXT_ARRAY,
-            Type::BOOL => Type::BOOL_ARRAY,
-            Type::TIMESTAMP => Type::TIMESTAMP_ARRAY,
-            Type::JSONB => Type::JSONB_ARRAY,
-            _ => Type::NUMERIC_ARRAY,
+        ColumnType::List(element) => match *element {
+            ColumnType::Uint | ColumnType::BigInt => Type::NUMERIC_ARRAY,
+            ColumnType::Int => Type::INT8_ARRAY,
+            ColumnType::Text => Type::TEXT_ARRAY,
+            ColumnType::Bool => Type::BOOL_ARRAY,
+            ColumnType::Timestamp => Type::TIMESTAMP_ARRAY,
+            ColumnType::Document => Type::JSONB_ARRAY,
+            ColumnType::List(_) => return Err(format!("cannot copy a {kind:?} column").into()),
         },
-    }
+    })
 }
 
 /// Parameters as the driver takes them.
@@ -428,7 +430,7 @@ impl Engine for Postgres {
             .columns
             .iter()
             .map(|column| pg_type(column.kind))
-            .collect();
+            .collect::<Result<_, _>>()?;
         let sink = self.client.copy_in(&statement).await.map_err(pg)?;
         let writer = BinaryCopyInWriter::new(sink, &types);
         pin_mut!(writer);

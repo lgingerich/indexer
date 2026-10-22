@@ -192,6 +192,23 @@ fn numeric_binary_reads_back_what_it_wrote() {
     }
 }
 
+/// A list column copies as the array of its element's type, and a list of lists, which no
+/// one-dimensional array holds, is refused rather than copied as some other type.
+#[test]
+fn a_list_copies_as_its_elements_array() {
+    for (element, array) in [
+        (ColumnType::Uint, Type::NUMERIC_ARRAY),
+        (ColumnType::BigInt, Type::NUMERIC_ARRAY),
+        (ColumnType::Int, Type::INT8_ARRAY),
+        (ColumnType::Text, Type::TEXT_ARRAY),
+        (ColumnType::Bool, Type::BOOL_ARRAY),
+    ] {
+        let list = ColumnType::list(element).expect("a scalar list");
+        assert_eq!(pg_type(list).expect("an array"), array, "{element:?}");
+    }
+    assert!(pg_type(ColumnType::List(&ColumnType::List(&ColumnType::Int))).is_err());
+}
+
 /// Every table is keyed on its identity, and indexed and deleted by block exactly when a
 /// reorg retracts its rows.
 #[test]
