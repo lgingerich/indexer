@@ -8,10 +8,10 @@
 //! again and continues while the chain has buried more. Everything above the bound is the
 //! reorgable tail, and startup owns it too — it fills to the last sampled head through
 //! the reorg-aware path before any live head is consumed, so a run never leaves a gap
-//! under its start. A start already inside the window makes that fill the whole run. The live phase then follows `newHeads`, reuses the announced metadata,
-//! and reconciles gaps and forks over HTTP. Every accepted block's identity is retained
-//! in a sliding window so a fork within it is retracted; deeper forks stop rather than
-//! guess.
+//! under its start. A start already inside the window makes that fill the whole run.
+//! The live phase then follows `newHeads`, reuses the announced metadata, and reconciles
+//! gaps and forks over HTTP. Every accepted block's identity is retained in a sliding
+//! window so a fork within it is retracted; deeper forks stop rather than guess.
 //!
 //! A stop height caps startup instead: backfill and the tail fill end at it, and the run
 //! returns without going live. It must be at or below the sampled head.

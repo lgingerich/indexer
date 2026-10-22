@@ -14,7 +14,7 @@
 //! The direction is not yet one way: [`crate::sink`] and [`crate::config`] import
 //! [`LEDGER_WINDOW`](pipeline::LEDGER_WINDOW),
 //! [`MAX_UNFINALIZED_BLOCKS`](pipeline::MAX_UNFINALIZED_BLOCKS), and
-//! [`Datasets`](source::Datasets) from here, and [`crate::sink::resume`] builds the
+//! [`Datasets`](source::Datasets) from here, and `crate::sink::resume` builds the
 //! [`Ledger`](pipeline::Ledger) a resumed run starts from.
 
 pub mod pipeline;
