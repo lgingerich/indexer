@@ -61,7 +61,7 @@ use tracing::warn;
 use super::assemble::{
     BlockRows, check_height, check_log_order, check_logs_present, check_no_leftovers,
 };
-use super::retry::{NetworkError, RetryLayer, os_seed};
+use super::retry::{NetworkError, RetryLayer, not_reached, os_seed};
 use super::{
     BlockSource, Datasets, FetchedBlock, HeadStream, METHOD_NOT_FOUND, SourceError, inconsistent,
     malformed,
@@ -357,20 +357,6 @@ fn block_read(context: &'static str, source: TransportError) -> SourceError {
         return inconsistent(context, format!("{NOT_SERVED}: {}", payload.message));
     }
     transport(context, source)
-}
-
-/// Whether a node's error message says it has not reached the height asked for, in the
-/// words the providers this indexer runs on use.
-fn not_reached(message: &str) -> bool {
-    let message = message.to_ascii_lowercase();
-    [
-        "greater than latest",
-        "header not found",
-        "block not found",
-        "unknown block",
-    ]
-    .iter()
-    .any(|phrase| message.contains(phrase))
 }
 
 /// The error for a failed call at `context`, with any HTTP client error in it a

@@ -120,6 +120,9 @@ pub enum SourceError {
         status: u16,
         /// The response body, truncated.
         detail: String,
+        /// How long the source asked to be left before the next request, in a
+        /// `Retry-After` header of whole seconds.
+        retry_after: Option<std::time::Duration>,
     },
     /// The node's answers disagree with each other — the chain moved mid-fetch, or a
     /// backend lags the block it announced — so, unlike [`Self::Malformed`], asking again

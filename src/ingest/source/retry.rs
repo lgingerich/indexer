@@ -4,7 +4,10 @@
 //! Providers publish their limits in incompatible units, if at all, so the rate is
 //! learned rather than configured: back off fast, recover slowly, as TCP does. One
 //! delay is shared by every request. A transient failure doubles it, and the request is
-//! retried after it. Each success shrinks it by an eighth until it reaches zero.
+//! retried after it. Each request the provider serves shrinks it by an eighth until it
+//! reaches zero; one that fails for good leaves it as it is, since a refused method or a
+//! range too large says nothing about the rate. A provider that names its own wait, in a
+//! `Retry-After` header, is waited for at least that long, up to the longest delay.
 //!
 //! The delay doubles once per burst, as TCP halves its window once per round trip: a
 //! failure of a request sent before the last doubling does not double it again. Requests
@@ -21,7 +24,16 @@
 //! Two failures are not transient for an `eth_getLogs` over more than one height: a
 //! timeout, and Infura's `-32005`, which there means the result is too large rather than
 //! a rate limit. Resending the same range would only fail again, so both are returned at
-//! once for the source to retry smaller.
+//! once for the source to retry smaller. So is a batch over several heights that comes
+//! back partly answered and partly refused for rate: that is a provider's cap on calls
+//! per batch, which every resend of the batch hits again, not a refused second, which
+//! refuses the whole batch. It still slows the pace, in case it was the second.
+//!
+//! An error saying the node has not reached the block asked for — Infura's "header not
+//! found", which alloy counts as a rate limit — is not transient either: it is a backend
+//! behind the one that announced the block, which the source reports as inconsistent
+//! and the pipeline asks about again within a fraction of a second. Waiting out a backoff
+//! of up to [`MAX_DELAY_MS`] here would only delay that.
 //!
 //! A failure to reach the provider at all is a [`NetworkError`], whatever transport
 //! raised it: the layer converts the HTTP client's own errors into one, so the
@@ -240,6 +252,28 @@ impl From<reqwest::Error> for NetworkError {
     }
 }
 
+/// What one attempt at a request came to, which decides the pacing and whether to send it
+/// again. See the [module docs](self).
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Attempt {
+    /// The provider served it: the shared delay shrinks.
+    Served,
+    /// It failed for a reason that says nothing about the rate, and that sending it again
+    /// as it is would not fix: it is returned, and the delay left as it is.
+    Failed,
+    /// The provider refused it in a way only a smaller request gets past: it is returned
+    /// for the source to split, and the delay doubles, as for any refusal.
+    Refused,
+    /// Refused for load, or lost on the way: the delay doubles and it is sent again,
+    /// after at least `wait` when the provider named one.
+    Transient {
+        /// Why, for the log.
+        cause: String,
+        /// The provider's `Retry-After`, if it sent one.
+        wait: Option<Duration>,
+    },
+}
+
 /// One source's shared delay and jitter, and the loop every request is retried in: what
 /// [`RetryLayer`] wraps a JSON-RPC transport in, and what the `HyperSync` source sends
 /// its requests through. See the [module docs](self).
@@ -260,31 +294,44 @@ impl Backoff {
     }
 
     /// Sends a request through `attempt` until it settles: after the shared delay each
-    /// time, and again while `transient` names a cause, up to [`MAX_RETRIES`] retries.
-    /// The last answer is returned as it was. `source` names who is retrying, in the log
-    /// and the retry metric.
+    /// time, and again while `judge` finds it [`Attempt::Transient`], up to
+    /// [`MAX_RETRIES`] retries. The last answer is returned as it was. `source` names who
+    /// is retrying, in the log and the retry metric.
     pub(crate) async fn run<T, F: Future<Output = T>>(
         &self,
         source: &'static str,
         mut attempt: impl FnMut() -> F,
-        transient: impl Fn(&T) -> Option<String>,
+        judge: impl Fn(&T) -> Attempt,
     ) -> T {
         let mut retries = 0;
+        // The wait the provider named after the last refusal, if it named one.
+        let mut named = Duration::ZERO;
         loop {
             let delay = self.pacing.current();
-            if delay > 0 {
-                tokio::time::sleep(self.jitter.delay(delay)).await;
+            if delay > 0 || !named.is_zero() {
+                tokio::time::sleep(self.jitter.delay(delay).max(named)).await;
             }
             let mark = self.pacing.sent();
             let result = attempt().await;
-            let Some(cause) = transient(&result) else {
-                self.pacing.speed_up();
-                return result;
+            let (cause, wait) = match judge(&result) {
+                Attempt::Served => {
+                    self.pacing.speed_up();
+                    return result;
+                }
+                Attempt::Failed => return result,
+                Attempt::Refused => {
+                    self.pacing.slow_down(mark);
+                    return result;
+                }
+                Attempt::Transient { cause, wait } => (cause, wait),
             };
             let delay = self.pacing.slow_down(mark);
             if retries == MAX_RETRIES {
                 return result;
             }
+            named = wait.map_or(Duration::ZERO, |wait| {
+                wait.min(Duration::from_millis(MAX_DELAY_MS))
+            });
             retries += 1;
             metrics::source_retry(source);
             warn!(
@@ -397,9 +444,9 @@ where
                     |result| {
                         // A ranged log query that timed out goes back to be split.
                         if ranged && timed_out(result) {
-                            return None;
+                            return Attempt::Failed;
                         }
-                        transient(request, result)
+                        judge(request, result)
                     },
                 )
                 .await
@@ -407,15 +454,14 @@ where
     }
 }
 
-/// Why `result` is worth retrying, or `None` when it succeeded or failed for good.
+/// What `result` came to; see the [module docs](self).
 ///
-/// A batch is retried whole when any call in it was refused for load. One whose errors
-/// are all permanent, like a `-32601` for `eth_getBlockReceipts`, passes through for
-/// the source to handle, as does a ranged log query's [`LIMIT_EXCEEDED`].
-fn transient(
-    request: &RequestPacket,
-    result: &Result<ResponsePacket, TransportError>,
-) -> Option<String> {
+/// A batch is retried whole when any call in it was refused for load, unless it covers
+/// several heights and other calls were answered: then it is a cap on the batch, and goes
+/// back to be split. One whose errors are all permanent, like a `-32601` for
+/// `eth_getBlockReceipts`, passes through for the source to handle, as do a ranged log
+/// query's [`LIMIT_EXCEEDED`] and an error saying the node has not reached the block.
+fn judge(request: &RequestPacket, result: &Result<ResponsePacket, TransportError>) -> Attempt {
     match result {
         Ok(response) => {
             let ranged: Vec<_> = request
@@ -424,30 +470,84 @@ fn transient(
                 .filter(|call| spans_heights(call))
                 .map(SerializedRequest::id)
                 .collect();
-            response
+            let mut errors = response
                 .responses()
                 .iter()
                 .filter_map(|response| Some((&response.id, response.payload.as_error()?)))
-                .find(|(id, error)| {
-                    error.is_retry_err() && !(error.code == LIMIT_EXCEEDED && ranged.contains(id))
-                })
-                .map(|(_, error)| format!("rpc error {}: {}", error.code, error.message))
+                .peekable();
+            if errors.peek().is_none() {
+                return Attempt::Served;
+            }
+            let Some((_, error)) = errors.find(|(id, error)| {
+                error.is_retry_err()
+                    && !not_reached(&error.message)
+                    && !(error.code == LIMIT_EXCEEDED && ranged.contains(id))
+            }) else {
+                return Attempt::Failed;
+            };
+            let answered = response
+                .responses()
+                .iter()
+                .any(|response| response.payload.is_success());
+            if answered && spans_range(request) {
+                return Attempt::Refused;
+            }
+            Attempt::Transient {
+                cause: format!("rpc error {}: {}", error.code, error.message),
+                wait: None,
+            }
         }
-        Err(RpcError::Transport(TransportErrorKind::HttpError(error))) => {
-            transient_status(error.status).then(|| format!("http status {}", error.status))
-        }
-        Err(RpcError::Transport(TransportErrorKind::MissingBatchResponse(_))) => {
-            Some("batch response missing a call".to_owned())
-        }
-        Err(RpcError::Transport(TransportErrorKind::Custom(error)))
-            if error
-                .downcast_ref::<NetworkError>()
-                .is_some_and(NetworkError::transient) =>
-        {
-            Some(format!("network error: {error}"))
-        }
-        _ => None,
+        Err(RpcError::Transport(kind)) => match kind {
+            TransportErrorKind::MissingBatchResponse(_) => Attempt::Transient {
+                cause: "batch response missing a call".to_owned(),
+                wait: None,
+            },
+            TransportErrorKind::Custom(error)
+                if error
+                    .downcast_ref::<NetworkError>()
+                    .is_some_and(NetworkError::transient) =>
+            {
+                Attempt::Transient {
+                    cause: format!("network error: {error}"),
+                    wait: None,
+                }
+            }
+            _ => match kind.as_http_error() {
+                Some(error) if transient_status(error.status) => Attempt::Transient {
+                    cause: format!("http status {}", error.status),
+                    wait: kind.retry_after(),
+                },
+                _ => Attempt::Failed,
+            },
+        },
+        Err(_) => Attempt::Failed,
     }
+}
+
+/// Whether a node's error message says it has not reached the height asked for, in the
+/// words the providers this indexer runs on use.
+pub(crate) fn not_reached(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    [
+        "greater than latest",
+        "header not found",
+        "block not found",
+        "unknown block",
+    ]
+    .iter()
+    .any(|phrase| message.contains(phrase))
+}
+
+/// Whether `request` covers several heights, which the source fetches in halves when it
+/// fails: a log query over a range, or headers at more than one height.
+fn spans_range(request: &RequestPacket) -> bool {
+    let calls = request.requests();
+    calls.iter().any(spans_heights)
+        || calls
+            .iter()
+            .filter(|call| call.method() == "eth_getBlockByNumber")
+            .count()
+            > 1
 }
 
 /// Whether `result` is a request that ran out of time.
@@ -486,7 +586,11 @@ mod tests {
     use serde_json::{Value, json};
     use tower::{Layer as _, ServiceExt as _};
 
-    use super::{MAX_RETRIES, MIN_DELAY_MS, NetworkError, Pacing, RetryLayer, timed_out};
+    use std::time::Duration;
+
+    use super::{
+        MAX_DELAY_MS, MAX_RETRIES, MIN_DELAY_MS, NetworkError, Pacing, RetryLayer, timed_out,
+    };
 
     fn response(body: &str) -> ResponsePacket {
         serde_json::from_str(body).expect("response")
@@ -508,16 +612,138 @@ mod tests {
         params: Value,
         reply: impl Fn(u32) -> Result<ResponsePacket, TransportError> + Send + Sync + 'static,
     ) -> (Result<ResponsePacket, TransportError>, u32) {
+        let request = Request::new(method, Id::Number(1), params);
+        let request = RequestPacket::Single(request.serialize().expect("request"));
+        send_packet(layer, request, reply).await
+    }
+
+    /// [`send`] for any request: one call, or a batch.
+    async fn send_packet(
+        layer: &RetryLayer,
+        request: RequestPacket,
+        reply: impl Fn(u32) -> Result<ResponsePacket, TransportError> + Send + Sync + 'static,
+    ) -> (Result<ResponsePacket, TransportError>, u32) {
         let calls = Arc::new(AtomicU32::new(0));
         let (counter, reply) = (Arc::clone(&calls), Arc::new(reply));
         let transport = tower::service_fn(move |_: RequestPacket| -> TransportFut<'static> {
             let (n, reply) = (counter.fetch_add(1, Ordering::SeqCst), Arc::clone(&reply));
             Box::pin(async move { reply(n) })
         });
-        let request = Request::new(method, Id::Number(1), params);
-        let request = RequestPacket::Single(request.serialize().expect("request"));
         let result = layer.layer(transport).oneshot(request).await;
         (result, calls.load(Ordering::SeqCst))
+    }
+
+    /// A layer whose shared delay has doubled once, so a test can see what a request
+    /// does to it.
+    fn slowed() -> RetryLayer {
+        let layer = RetryLayer::new(0);
+        layer.backoff.pacing.slow_down(layer.backoff.pacing.sent());
+        assert_eq!(layer.backoff.pacing.current(), MIN_DELAY_MS);
+        layer
+    }
+
+    /// A request that fails for good — a method the node lacks, a ranged log query too
+    /// large to answer, a block the node has not reached — is returned after one call,
+    /// and leaves the shared delay as it was: it says nothing about the rate. Infura's
+    /// "header not found", which alloy counts as a rate limit, is among them, so the
+    /// source can ask again soon rather than after a backoff.
+    #[tokio::test(start_paused = true)]
+    async fn a_permanent_error_neither_retries_nor_moves_the_pace() {
+        let ranged = json!([{"fromBlock": "0x64", "toBlock": "0x6d"}]);
+        for (case, method, params, body) in [
+            (
+                "a missing method",
+                "eth_getBlockReceipts",
+                json!(["0x64"]),
+                r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32601,"message":"not found"}}"#,
+            ),
+            (
+                "a ranged log query too large",
+                "eth_getLogs",
+                ranged,
+                r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32005,"message":"query returned more than 10000 results"}}"#,
+            ),
+            (
+                "a block not reached",
+                "eth_getBlockByNumber",
+                json!(["0x64", false]),
+                r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"header not found"}}"#,
+            ),
+        ] {
+            let layer = slowed();
+            let (result, calls) =
+                send_call(&layer, method, params, move |_| Ok(response(body))).await;
+            assert!(result.expect(case).first_error_code().is_some(), "{case}");
+            assert_eq!(calls, 1, "{case}");
+            assert_eq!(layer.backoff.pacing.current(), MIN_DELAY_MS, "{case}");
+        }
+    }
+
+    /// A provider's `Retry-After` is waited out before the retry, when it asks for longer
+    /// than the backoff would wait, and no longer than the longest delay.
+    #[tokio::test(start_paused = true)]
+    async fn a_named_wait_is_honoured_up_to_the_longest_delay() {
+        for (asked, least, most) in [(5, 5_000, 5_000), (600, MAX_DELAY_MS, MAX_DELAY_MS)] {
+            let start = tokio::time::Instant::now();
+            let (result, calls) = send(&RetryLayer::new(0), move |n| match n {
+                0 => Err(TransportErrorKind::http_error_with_retry_after(
+                    429,
+                    String::new(),
+                    Some(Duration::from_secs(asked)),
+                )),
+                _ => Ok(response(r#"{"jsonrpc":"2.0","id":1,"result":"0x1"}"#)),
+            })
+            .await;
+            result.expect("succeeds");
+            assert_eq!(calls, 2, "asked {asked} s");
+            let waited = u64::try_from(start.elapsed().as_millis()).expect("millis");
+            assert!(
+                (least..=most).contains(&waited),
+                "asked {asked} s, waited {waited} ms"
+            );
+        }
+    }
+
+    /// A batch over several heights that comes back partly answered and partly refused
+    /// for rate is a cap on the batch: it goes back at once to be split, and still slows
+    /// the pace. A one-height batch refused the same way is retried, since the source
+    /// cannot split it.
+    #[tokio::test(start_paused = true)]
+    async fn a_partly_refused_range_is_returned_to_be_split() {
+        let call = |id: u64, method: &'static str, params: Value| {
+            Request::new(method, Id::Number(id), params)
+                .serialize()
+                .expect("request")
+        };
+        for (case, second, expected) in [
+            (
+                "headers at two heights",
+                call(2, "eth_getBlockByNumber", json!(["0x65", false])),
+                1,
+            ),
+            (
+                "a block and its receipts",
+                call(2, "eth_getBlockReceipts", json!(["0x64"])),
+                2,
+            ),
+        ] {
+            let first = call(1, "eth_getBlockByNumber", json!(["0x64", false]));
+            let request = RequestPacket::Batch(vec![first, second]);
+            let layer = RetryLayer::new(0);
+            let (result, calls) = send_packet(&layer, request, |n| {
+                Ok(response(if n == 0 {
+                    r#"[{"jsonrpc":"2.0","id":1,"result":null},{"jsonrpc":"2.0","id":2,"error":{"code":429,"message":"too many requests"}}]"#
+                } else {
+                    r#"[{"jsonrpc":"2.0","id":1,"result":null},{"jsonrpc":"2.0","id":2,"result":null}]"#
+                }))
+            })
+            .await;
+            result.expect(case);
+            assert_eq!(calls, expected, "{case}");
+            if expected == 1 {
+                assert_eq!(layer.backoff.pacing.current(), MIN_DELAY_MS, "{case}");
+            }
+        }
     }
 
     /// A refusal — an HTTP `429`, or a provider's code in a `200` — is retried after the
@@ -558,20 +784,6 @@ mod tests {
         assert_eq!(layer.backoff.pacing.current(), 0);
     }
 
-    /// A permanent error, like the `-32601` the receipt fallback depends on, is
-    /// handed back after one call.
-    #[tokio::test(start_paused = true)]
-    async fn a_permanent_error_is_returned_at_once() {
-        let (result, calls) = send(&RetryLayer::new(0), |_| {
-            Ok(response(
-                r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32601,"message":"not found"}}"#,
-            ))
-        })
-        .await;
-        assert_eq!(result.expect("a response").first_error_code(), Some(-32601));
-        assert_eq!(calls, 1);
-    }
-
     /// Retrying ends, and the provider's own last error is what the caller sees.
     #[tokio::test(start_paused = true)]
     async fn retries_stop_and_return_the_last_error() {
@@ -594,7 +806,7 @@ mod tests {
             .expect("bind");
         let url = format!("http://{}", listener.local_addr().expect("address"));
         let error = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_millis(1))
+            .timeout(Duration::from_millis(1))
             .build()
             .expect("client")
             .get(url)

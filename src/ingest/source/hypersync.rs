@@ -52,7 +52,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 use super::assemble::{
     BlockRows, check_height, check_log_order, check_logs_present, check_no_leftovers,
 };
-use super::retry::{Backoff, os_seed, transient_status};
+use super::retry::{Attempt, Backoff, os_seed, transient_status};
 use super::{
     BlockSource, Datasets, FetchedBlock, HeadStream, SourceError, inconsistent, malformed,
 };
@@ -343,7 +343,7 @@ impl HyperSyncSource {
     ) -> Result<T, SourceError> {
         let request = &request;
         self.backoff
-            .run(CONTEXT, || self.attempt(request), transient)
+            .run(CONTEXT, || self.attempt(request), judge)
             .await
     }
 
@@ -357,12 +357,21 @@ impl HyperSyncSource {
             .send()
             .await?;
         let status = response.status();
+        // The delay-seconds form only, as alloy reads it for the RPC source; a date is
+        // rare, and the backoff covers it.
+        let retry_after = response
+            .headers()
+            .get(reqwest::header::RETRY_AFTER)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.trim().parse().ok())
+            .map(Duration::from_secs);
         let body = response.bytes().await?;
         if !status.is_success() {
             return Err(SourceError::Status {
                 context: CONTEXT,
                 status: status.as_u16(),
                 detail: String::from_utf8_lossy(&body).chars().take(500).collect(),
+                retry_after,
             });
         }
         serde_json::from_slice(&body).map_err(|source| SourceError::Json {
@@ -382,22 +391,31 @@ impl HyperSyncSource {
     }
 }
 
-/// Why `result` is worth sending again, or `None` when it succeeded or failed for good.
+/// What `result` came to: whether it is worth sending again, and how it moves the pace.
 ///
 /// The same rule the RPC source's retry layer applies: a transient status, or a request
 /// the HTTP client failed in flight — a timeout, a refused or reset connection, one that
 /// closed mid-body — is sent again. A request that could not be sent as built, a status
 /// such as a refused token, and an answer that does not decode are not: asking again
 /// gets the same answer. Every query is a read, so a retry cannot apply anything twice.
-fn transient<T>(result: &Result<T, SourceError>) -> Option<String> {
+fn judge<T>(result: &Result<T, SourceError>) -> Attempt {
     match result {
-        Err(error @ SourceError::Status { status, .. }) if transient_status(*status) => {
-            Some(error.to_string())
-        }
-        Err(SourceError::Http(error)) if error.transient() => {
-            Some(format!("network error: {error}"))
-        }
-        _ => None,
+        Ok(_) => Attempt::Served,
+        Err(
+            error @ SourceError::Status {
+                status,
+                retry_after,
+                ..
+            },
+        ) if transient_status(*status) => Attempt::Transient {
+            cause: error.to_string(),
+            wait: *retry_after,
+        },
+        Err(SourceError::Http(error)) if error.transient() => Attempt::Transient {
+            cause: format!("network error: {error}"),
+            wait: None,
+        },
+        Err(_) => Attempt::Failed,
     }
 }
 
