@@ -33,8 +33,8 @@ use crate::sink::batch::Batch;
 use crate::sink::sql::{self, Dialect};
 use crate::sink::store_error::{EngineError, InvalidStoredValue, Operation, StoreError};
 use crate::sink::table::{Row, Schema, Table, TableDef, TableError, TableId, Value};
-use crate::sink::{EnvelopeSink, Restored, SinkError, Store};
-use crate::wire::envelope::{BlockMeta, ChainId, Envelope, StoredContract};
+use crate::sink::{EnvelopeSink, Restored, SinkError, Store, StoredContract};
+use crate::wire::envelope::{BlockMeta, ChainId, Envelope};
 
 /// What runs a [`SqlStore`]'s statements.
 pub trait Engine: Send {

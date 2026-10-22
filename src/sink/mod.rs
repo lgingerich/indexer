@@ -85,11 +85,12 @@ pub use store::SqlStore;
 #[cfg(feature = "store")]
 pub use store_error::{InvalidStoredValue, Operation, StoreError};
 
+use alloy_primitives::{Address, B256};
 use thiserror::Error;
 
-use crate::wire::envelope::Envelope;
 #[cfg(feature = "store")]
-use crate::wire::envelope::{BlockMeta, StoredContract};
+use crate::wire::envelope::BlockMeta;
+use crate::wire::envelope::Envelope;
 
 /// Receives envelopes in per-chain order, as the pipeline publishes them.
 ///
@@ -150,6 +151,29 @@ pub trait EnvelopeSink: Send {
     fn observe_head(&mut self, height: u64) {
         let _ = height;
     }
+}
+
+/// A contract a previous run discovered, as a store reads it back: only what decode
+/// needs to decode it again.
+///
+/// Not published, so not a wire type: it is what `Restored` hands decode at startup.
+/// Not behind the `store` feature either, since decode restores from it in every build.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredContract {
+    /// The protocol its manifest declares.
+    pub protocol: String,
+    /// Its contract name within that protocol, for example `UniswapV3Pool`.
+    pub name: String,
+    /// The contract.
+    pub address: Address,
+    /// The hash of the block whose creation log discovered it, so a reorg that orphans
+    /// that block after a restart still retracts it.
+    pub block_hash: B256,
+    /// The height of that block.
+    pub block_number: u64,
+    /// The creation log's index in its block. With the height, it orders discoveries as
+    /// a run made them, so a restore keeps the claim on an address that the run kept.
+    pub log_index: u64,
 }
 
 /// What a previous run left in a store for the next one: the contracts it discovered,

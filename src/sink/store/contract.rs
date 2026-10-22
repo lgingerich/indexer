@@ -24,9 +24,11 @@ use crate::ingest::pipeline::LEDGER_WINDOW;
 use crate::sink::sql::{self, Dialect};
 use crate::sink::store::{Engine, SqlStore};
 use crate::sink::table::{ColumnType, Schema, Table, TableId, Value};
-use crate::sink::{EnvelopeSink as _, Operation, SinkError, Store as _, StoreError};
+use crate::sink::{
+    EnvelopeSink as _, Operation, SinkError, Store as _, StoreError, StoredContract,
+};
 use crate::wire::datasets::evm::{Block, Contract, Log, Transaction};
-use crate::wire::envelope::{BlockMeta, ChainId, Envelope, Event, Reorg, StoredContract};
+use crate::wire::envelope::{BlockMeta, ChainId, Envelope, Event, Reorg};
 
 /// How an engine's tests open a store and look inside it.
 pub(crate) trait Harness: Sized {

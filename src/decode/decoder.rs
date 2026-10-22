@@ -18,8 +18,8 @@ use tracing::warn;
 
 use super::abi::{DecodeError, EventKey, event_key};
 use super::catalog::{Catalog, EntryId};
+use crate::sink::StoredContract;
 use crate::wire::datasets::evm::{Contract, Decoded, Log};
-use crate::wire::envelope::StoredContract;
 
 /// What one log produced: its decoded record, and any contracts its event created.
 #[derive(Debug)]
@@ -243,8 +243,8 @@ mod tests {
     use crate::decode::DecodeError;
     use crate::decode::fixtures::uniswap_v3::{FACTORY, pool_created, swap};
     use crate::decode::fixtures::{protocol, shipped};
+    use crate::sink::StoredContract;
     use crate::wire::datasets::evm::Log;
-    use crate::wire::envelope::StoredContract;
 
     fn decoder() -> Decoder {
         Decoder::new(shipped("base"))

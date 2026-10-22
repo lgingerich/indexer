@@ -58,8 +58,8 @@ use crate::sink::channel::Batching;
 use crate::sink::route::Backend;
 use crate::sink::store_runtime::StoreRuntime;
 use crate::sink::table::TableId;
-use crate::sink::{Restored, Store, StoreError};
-use crate::wire::envelope::{BlockMeta, StoredContract};
+use crate::sink::{Restored, Store, StoreError, StoredContract};
+use crate::wire::envelope::BlockMeta;
 
 /// A store, opened, with what the run routes to it and the runtime its work runs on.
 #[derive(Debug)]

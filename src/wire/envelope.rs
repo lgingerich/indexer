@@ -57,7 +57,7 @@
 
 use std::fmt;
 
-use alloy_primitives::{Address, B256};
+use alloy_primitives::B256;
 use serde::{Deserialize, Serialize};
 
 use crate::wire::datasets::evm::{Block, Contract, Decoded, Derived, Log, Transaction};
@@ -140,26 +140,6 @@ pub struct BlockMeta {
     /// The block's timestamp.
     #[serde(with = "alloy_serde::quantity")]
     pub timestamp: u64,
-}
-
-/// A contract a previous run discovered, as a store reads it back: only what decode
-/// needs to decode it again. Not published.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct StoredContract {
-    /// The protocol its manifest declares.
-    pub protocol: String,
-    /// Its contract name within that protocol, for example `UniswapV3Pool`.
-    pub name: String,
-    /// The contract.
-    pub address: Address,
-    /// The hash of the block whose creation log discovered it, so a reorg that orphans
-    /// that block after a restart still retracts it.
-    pub block_hash: B256,
-    /// The height of that block.
-    pub block_number: u64,
-    /// The creation log's index in its block. With the height, it orders discoveries as
-    /// a run made them, so a restore keeps the claim on an address that the run kept.
-    pub log_index: u64,
 }
 
 /// Everything the indexer publishes, tagged by `type` on the wire.

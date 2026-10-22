@@ -138,8 +138,8 @@ pub(super) mod metric {
 
     use crate::decode::Decoder;
     use crate::decode::derive::metric::{BIN_FILLS, LIQUIDITY, POOL_BINS, SWAPS};
+    use crate::sink::StoredContract;
     use crate::wire::datasets::evm::{Decoded, Log};
-    use crate::wire::envelope::StoredContract;
 
     use super::shipped;
 

@@ -18,8 +18,8 @@ use crate::sink::route::{Backend, Router};
 use crate::sink::stop::Stop;
 use crate::sink::store_runtime::StoreRuntime;
 use crate::sink::table::{Schema, TableId};
-use crate::sink::{self, SinkError};
-use crate::wire::envelope::{ChainId, StoredContract};
+use crate::sink::{self, SinkError, StoredContract};
+use crate::wire::envelope::ChainId;
 
 use super::{Pipeline, Routes, RuntimeError};
 

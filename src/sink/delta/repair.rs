@@ -15,9 +15,10 @@ use super::arrow::PARTITION;
 use super::expr::{at_or_above, in_texts, of_blocks, parse, texts, texts_of, uint, uints};
 use super::{CONCURRENT_TABLES, DeltaSink, hex, millis};
 use crate::ingest::pipeline::LEDGER_WINDOW;
+use crate::sink::StoredContract;
 use crate::sink::store_error::{InvalidStoredValue, StoreError};
 use crate::sink::table::{Table, TableId};
-use crate::wire::envelope::{BlockMeta, StoredContract};
+use crate::wire::envelope::BlockMeta;
 
 /// The `contracts` columns a restore reads back.
 pub(super) const CONTRACT_COLUMNS: [&str; 6] = [
