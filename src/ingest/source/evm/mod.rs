@@ -625,6 +625,32 @@ mod tests {
         );
     }
 
+    /// A log range a lagging backend answers with geth's "beyond current head block" is
+    /// inconsistent after one call, for the pipeline to ask again, not a range too large to
+    /// halve: the halves would reach for the same heights the backend lacks.
+    #[tokio::test]
+    async fn a_range_past_the_node_head_is_inconsistent_not_halved() {
+        const BEYOND: &str = "block range extends beyond current head block";
+        let (url, server) = rpc_server(1, |request| {
+            let mut reply = range_reply(request, &[], None);
+            let id = &log_query(request)["id"];
+            for response in reply.as_array_mut().expect("batch") {
+                if response["id"] == *id {
+                    *response = json!({"jsonrpc": "2.0", "id": id,
+                        "error": {"code": -32602, "message": BEYOND}});
+                }
+            }
+            reply
+        });
+        let result = logs_only(url).fetch_blocks(100, 101).await;
+        assert_eq!(server.join().expect("server").len(), 1);
+        assert!(
+            matches!(&result, Err(SourceError::Inconsistent { context, detail })
+                if context == "eth_getLogs" && *detail == format!("{NOT_SERVED}: {BEYOND}")),
+            "{result:?}"
+        );
+    }
+
     /// A range that comes back but breaks a range check fails as it is: a smaller range
     /// would not fix data the node got wrong.
     #[tokio::test]
