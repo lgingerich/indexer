@@ -67,13 +67,14 @@ pub struct Abi {
 }
 
 impl Abi {
-    /// Parses and prepares all events. Anonymous events are explicitly unsupported.
+    /// Parses and prepares all events. Anonymous events are explicitly unsupported. An
+    /// event the file lists twice identically is kept once, as across files.
     ///
     /// # Errors
     /// Returns a typed parse/layout error or rejects anonymous and conflicting events.
     pub fn from_json(json: &str) -> Result<Self, AbiError> {
         let abi: JsonAbi = serde_json::from_str(json)?;
-        let mut events = BTreeMap::new();
+        let mut parsed = Self::default();
         for (event_index, event) in abi.events().enumerate() {
             if event.anonymous {
                 return Err(AbiError::Anonymous {
@@ -92,11 +93,9 @@ impl Abi {
                 event_index,
                 source,
             })?;
-            if events.insert(key, prepared).is_some() {
-                return Err(AbiError::Conflict { selector: key.0 });
-            }
+            parsed.add(key, prepared)?;
         }
-        Ok(Self { events })
+        Ok(parsed)
     }
 
     /// Adds `other`'s events. An event both declare identically is kept once.
@@ -106,13 +105,19 @@ impl Abi {
     /// differently, since a log could then decode either way.
     pub fn merge(&mut self, other: Self) -> Result<(), AbiError> {
         for (key, event) in other.events {
-            match self.events.entry(key) {
-                Entry::Vacant(entry) => {
-                    entry.insert(event);
-                }
-                Entry::Occupied(entry) if entry.get().id == event.id => {}
-                Entry::Occupied(_) => return Err(AbiError::Conflict { selector: key.0 }),
+            self.add(key, event)?;
+        }
+        Ok(())
+    }
+
+    /// Adds `event` under `key`, keeping an identical one already there once.
+    fn add(&mut self, key: EventKey, event: PreparedEvent) -> Result<(), AbiError> {
+        match self.events.entry(key) {
+            Entry::Vacant(entry) => {
+                entry.insert(event);
             }
+            Entry::Occupied(entry) if entry.get().id == event.id => {}
+            Entry::Occupied(_) => return Err(AbiError::Conflict { selector: key.0 }),
         }
         Ok(())
     }
@@ -791,6 +796,20 @@ mod tests {
             }
             other => panic!("expected a conflict, got {other:?}"),
         }
+    }
+
+    /// One file listing an event twice identically keeps it once, as two files do, and
+    /// still refuses two definitions under one key.
+    #[test]
+    fn a_file_may_list_an_identical_event_twice() {
+        let event = ERC20_TRANSFER.trim_start_matches('[').trim_end_matches(']');
+        let twice = Abi::from_json(&format!("[{event},{event}]")).expect("identical events");
+        assert_eq!(twice.events.len(), 1);
+        let renamed = event.replace("\"value\"", "\"amount\"");
+        assert!(matches!(
+            Abi::from_json(&format!("[{event},{renamed}]")),
+            Err(AbiError::Conflict { .. })
+        ));
     }
 
     /// An event's identity is its own definition: an unrelated event added to the file
