@@ -176,7 +176,7 @@ records, kept here so the per-event layer grows into it rather than around it.
 | Kind | Example | Key | Reorg handling | May route to |
 |---|---|---|---|---|
 | Event (built) | `metric_v1_swaps` | the log, plus the table | the store's delete by `block_hash` | any store |
-| State | `metric_v1_pool_bins` | natural key, no block hash: `(pool, bin_idx)` | an undo journal | one SQL store |
+| State | `metric_v1_bin_balances` | natural key, no block hash: `(pool, bin_idx)` | an undo journal | one SQL store |
 | Aggregate | `metric_v1_pool_hourly` | `(pool, hour)` | an undo journal | one SQL store |
 
 **What state and aggregate tables need:**
@@ -202,8 +202,8 @@ records, kept here so the per-event layer grows into it rather than around it.
 
 - **State:** pools with their config, bins with balances and total shares, positions and
   their per-bin shares, and extensions.
-- **Event:** bin fills linked to their swap, liquidity rows per bin, reserves after each
-  change, and fee collections.
+- **Event:** bin fills linked to their swap, reserves after each change, and fee
+  collections. Liquidity rows per bin are built (`metric_v1_liquidity`).
 - **Aggregate:** pool by hour in token units.
 - **Stays in SQL:** USD, token metadata, and labels remain views in `metric-tools`, which
   then read these tables instead of replaying history.
