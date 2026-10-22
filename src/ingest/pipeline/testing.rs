@@ -45,6 +45,8 @@ pub(super) struct Data {
     pub(super) samples: std::sync::Mutex<VecDeque<u64>>,
     pub(super) head_calls: AtomicUsize,
     pub(super) block_calls: AtomicUsize,
+    /// Header reads at a height, as the fork walk and its rechecks make.
+    pub(super) header_calls: AtomicUsize,
     /// The heights backfill asks for in one `fetch_blocks`.
     pub(super) range: u64,
     /// The `fetch_blocks` calls backfill keeps in flight.
@@ -84,6 +86,7 @@ impl Source {
                 samples: std::sync::Mutex::default(),
                 head_calls: AtomicUsize::new(0),
                 block_calls: AtomicUsize::new(0),
+                header_calls: AtomicUsize::new(0),
                 range: 1,
                 concurrency: 1,
                 short: false,
@@ -131,6 +134,9 @@ impl BlockSource for Source {
         Ok(Box::pin(stream::pending()))
     }
     async fn fetch_header(&self, height: Option<u64>) -> Result<BlockMeta, SourceError> {
+        if height.is_some() {
+            self.data.header_calls.fetch_add(1, Ordering::Relaxed);
+        }
         let height = height.unwrap_or_else(|| {
             self.data.head_calls.fetch_add(1, Ordering::Relaxed);
             let sample = self.data.samples.lock().expect("samples").pop_front();

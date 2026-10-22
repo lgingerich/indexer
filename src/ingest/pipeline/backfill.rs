@@ -1,39 +1,12 @@
 //! Backfill: the buried heights, fetched in ranges ahead and accepted in order.
 
-use std::pin::Pin;
 use std::sync::Arc;
-use std::task::{Context, Poll, ready};
 
-use futures_util::StreamExt as _;
-use futures_util::stream::FuturesOrdered;
-
+use super::prefetch::Prefetch;
 use super::{Machine, PipelineError};
 use crate::ingest::source::{BlockSource, FetchedBlock};
 use crate::sink::EnvelopeSink;
 use crate::wire::envelope::BlockMeta;
-
-/// A spawned task, aborted when dropped: a backfill range that will not be accepted
-/// stops reading the source rather than finishing for nothing.
-pub(super) struct Spawned<T>(pub(super) tokio::task::JoinHandle<T>);
-
-impl<T> Future for Spawned<T> {
-    type Output = T;
-
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<T> {
-        match ready!(Pin::new(&mut self.0).poll(cx)) {
-            Ok(output) => Poll::Ready(output),
-            // Only a drop aborts the task, and a dropped one is never polled, so this is
-            // a panic inside it: it surfaces here, as it would have inline.
-            Err(error) => std::panic::resume_unwind(error.into_panic()),
-        }
-    }
-}
-
-impl<T> Drop for Spawned<T> {
-    fn drop(&mut self) {
-        self.0.abort();
-    }
-}
 
 impl<S: BlockSource + 'static, K: EnvelopeSink> Machine<S, K> {
     /// Delivers a block fetched for `height` and records its identity.
@@ -87,23 +60,17 @@ impl<S: BlockSource + 'static, K: EnvelopeSink> Machine<S, K> {
             return Ok((next, head));
         }
         let source = Arc::clone(&self.source);
-        let concurrency = source.backfill_concurrency().max(1);
-        let mut fetches = FuturesOrdered::new();
-        // The first height not yet requested; `next` is the first not yet accepted.
-        let mut cut = next;
+        // `next` is the first height not yet accepted.
+        let mut fetches = Prefetch::new(next, source.backfill_concurrency());
         loop {
-            while fetches.len() < concurrency && cut <= end {
-                let span = source.backfill_span().max(1);
-                let last = end.min(cut.saturating_add(span - 1));
-                // Its own task, so responses are read and parsed on every worker while
-                // this one accepts blocks, not only while it waits on the next range.
-                let source = Arc::clone(&source);
-                let fetch = Spawned(tokio::spawn(
-                    async move { source.fetch_blocks(cut, last).await },
-                ));
-                fetches.push_back(async move { (cut, last, fetch.await) });
-                cut = Self::next(last)?;
-            }
+            fetches.fill(
+                end,
+                || source.backfill_span(),
+                |from, to| {
+                    let source = Arc::clone(&source);
+                    async move { source.fetch_blocks(from, to).await }
+                },
+            )?;
             let Some((from, to, answer)) = fetches.next().await else {
                 // Everything requested is accepted, through `end`.
                 if stop == Some(end) {

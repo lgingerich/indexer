@@ -2,11 +2,9 @@
 
 use std::sync::Arc;
 
-use futures_util::StreamExt as _;
-use futures_util::stream::FuturesOrdered;
-use tracing::info;
+use tracing::{debug, info};
 
-use super::backfill::Spawned;
+use super::prefetch::Prefetch;
 use super::{MAX_UNFINALIZED_BLOCKS, Machine, PipelineError};
 use crate::ingest::source::{BlockSource, FetchedBlock};
 use crate::metrics;
@@ -43,7 +41,7 @@ impl<S: BlockSource + 'static, K: EnvelopeSink> Machine<S, K> {
         if self.header(head.height).await? != head {
             return Err(PipelineError::UnstableSource);
         }
-        self.handle_reorg(head).await
+        self.handle_reorg(head, head).await
     }
 
     /// Whether `head`, below the oldest remembered block, is that block's ancestor on
@@ -83,7 +81,8 @@ impl<S: BlockSource + 'static, K: EnvelopeSink> Machine<S, K> {
     ///
     /// Only a fetch at the target height may reuse the notification metadata, because
     /// that is the only height it describes. A link failure at the next height means
-    /// the branch diverged, so the target is re-read and reconciled.
+    /// the branch diverged, so the target is re-read and reconciled, the fork walk
+    /// starting at the block that did not link.
     ///
     /// The heights after the next are fetched ahead, up to the source's
     /// [`backfill_concurrency`](BlockSource::backfill_concurrency) in flight, each on its
@@ -96,22 +95,21 @@ impl<S: BlockSource + 'static, K: EnvelopeSink> Machine<S, K> {
         mut tip: BlockMeta,
         target: BlockMeta,
     ) -> Result<(), PipelineError> {
-        let ahead = self.source.backfill_concurrency().max(1);
-        let mut fetches = FuturesOrdered::new();
-        // The first height not yet requested.
-        let mut cut = Self::next(tip.height)?;
+        let source = Arc::clone(&self.source);
+        let mut fetches = Prefetch::new(Self::next(tip.height)?, source.backfill_concurrency());
         while tip.height < target.height {
-            while fetches.len() < ahead && cut <= target.height {
-                let height = cut;
-                let source = Arc::clone(&self.source);
-                let fetch = Spawned(tokio::spawn(async move {
-                    let head = (height == target.height).then_some(&target);
-                    source.fetch_block(height, head).await
-                }));
-                fetches.push_back(async move { (height, fetch.await) });
-                cut = Self::next(height)?;
-            }
-            let Some((next, block)) = fetches.next().await else {
+            fetches.fill(
+                target.height,
+                || 1,
+                |height, _| {
+                    let source = Arc::clone(&source);
+                    async move {
+                        let head = (height == target.height).then_some(&target);
+                        source.fetch_block(height, head).await
+                    }
+                },
+            )?;
+            let Some((next, _, block)) = fetches.next().await else {
                 break;
             };
             let block = block?;
@@ -127,23 +125,34 @@ impl<S: BlockSource + 'static, K: EnvelopeSink> Machine<S, K> {
             if self.header(target.height).await? != target {
                 return Err(PipelineError::UnstableSource);
             }
-            return self.handle_reorg(target).await;
+            return self.handle_reorg(target, meta).await;
         }
         Ok(())
     }
 
     /// Resolves the branch ending at `target` in one bounded walk-and-replay operation.
     ///
-    /// Walks back by header to a retained ancestor — or to the first block ever indexed,
-    /// below which nothing needs one — and rechecks the target before output. Retracts
-    /// only a nonempty old suffix, then fetches and publishes the replacements ascending.
-    /// A replay failure leaves the accepted history at what was
-    /// delivered, and the first replacement is fetched before the retraction, so that
-    /// history is never empty. Delivery can be partial on error, so public callers consume
-    /// the instance.
-    pub(super) async fn handle_reorg(&mut self, target: BlockMeta) -> Result<(), PipelineError> {
+    /// Walks back by header from `start`, a block of that branch at or below the target,
+    /// to a retained ancestor — or to the first block ever indexed, below which nothing
+    /// needs one — and rechecks the target and `start` before output. Retracts only a
+    /// nonempty old suffix, then fetches and publishes the replacements ascending
+    /// through the target; see [`Self::replay`]. A replay failure leaves the accepted
+    /// history at what was delivered, and the first replacement is fetched before the
+    /// retraction, so that history is never empty. Delivery can be partial on error, so
+    /// public callers consume the instance.
+    ///
+    /// `start` is the target itself unless the caller knows a lower block of the branch:
+    /// catching up, the first block that did not link to the tip. Every block above it is
+    /// unaccepted, so walking down to it from the target would read each of their headers
+    /// one at a time for nothing, and a fork near the bottom of a long catch-up cost
+    /// thousands of sequential reads.
+    pub(super) async fn handle_reorg(
+        &mut self,
+        target: BlockMeta,
+        start: BlockMeta,
+    ) -> Result<(), PipelineError> {
         // The walk's oldest block so far, and the branch above it, newest first.
-        let mut lowest = target;
+        let mut lowest = start;
         let mut above = Vec::new();
         let ancestor = loop {
             let meta = lowest;
@@ -178,7 +187,7 @@ impl<S: BlockSource + 'static, K: EnvelopeSink> Machine<S, K> {
                     actual: Box::new(meta),
                 });
             }
-            info!(
+            debug!(
                 depth = above.len() + 1,
                 walked_to = parent_height,
                 "reconciling a fork, walking back toward an accepted ancestor"
@@ -192,9 +201,12 @@ impl<S: BlockSource + 'static, K: EnvelopeSink> Machine<S, K> {
             lowest = below;
         };
 
-        // The source may change branches during discovery. Recheck the candidate at its
-        // fixed height before publishing any retraction.
-        if self.header(target.height).await? != target {
+        // The source may change branches during discovery. Recheck the candidate, and the
+        // block the walk started from, at their fixed heights before publishing any
+        // retraction: both canonical now puts them on the one branch the walk followed.
+        if self.header(target.height).await? != target
+            || (start != target && self.header(start.height).await? != start)
+        {
             return Err(PipelineError::UnstableSource);
         }
         let block = self.replacement(lowest).await?;
@@ -202,6 +214,12 @@ impl<S: BlockSource + 'static, K: EnvelopeSink> Machine<S, K> {
         self.observe_head(target.height);
         let orphaned = self.ring.orphaned(ancestor);
         if !orphaned.is_empty() {
+            info!(
+                ancestor,
+                orphaned = orphaned.len(),
+                head = target.height,
+                "retracting the blocks a fork orphaned"
+            );
             metrics::reorg(orphaned.len());
             self.deliver(vec![Event::Reorg(Reorg {
                 height: Self::next(ancestor)?,
@@ -212,9 +230,55 @@ impl<S: BlockSource + 'static, K: EnvelopeSink> Machine<S, K> {
             self.ring.rewind(ancestor);
         }
         self.commit(lowest, block.events).await?;
-        for meta in above.into_iter().rev() {
-            let block = self.replacement(meta).await?;
+        above.reverse();
+        self.replay(lowest, &above, target).await
+    }
+
+    /// Fetches and commits the replacements above `tip` through `target`, fetched ahead
+    /// as [`Self::catch_up`] fetches.
+    ///
+    /// `walked` are the headers a fork walk found above `tip`, ascending: the block at
+    /// each of those heights must be the one walked. Above them, up to the target, each
+    /// block must link to the one below, and the one at the target must be the target.
+    /// Anything else is the source changing branches mid-replay.
+    async fn replay(
+        &mut self,
+        mut tip: BlockMeta,
+        walked: &[BlockMeta],
+        target: BlockMeta,
+    ) -> Result<(), PipelineError> {
+        let first = Self::next(tip.height)?;
+        let walked_at = |height: u64| walked.get(usize::try_from(height - first).ok()?).copied();
+        let source = Arc::clone(&self.source);
+        let mut fetches = Prefetch::new(first, source.backfill_concurrency());
+        while tip.height < target.height {
+            fetches.fill(
+                target.height,
+                || 1,
+                |height, _| {
+                    let source = Arc::clone(&source);
+                    let head =
+                        walked_at(height).or_else(|| (height == target.height).then_some(target));
+                    async move { source.fetch_block(height, head.as_ref()).await }
+                },
+            )?;
+            let Some((height, _, block)) = fetches.next().await else {
+                break;
+            };
+            let block = block?;
+            let meta = Self::marker(block.meta, height)?;
+            let expected = match walked_at(height) {
+                Some(walked) => meta == walked,
+                None => {
+                    Self::validate_link(tip, meta).is_ok()
+                        && (height != target.height || meta == target)
+                }
+            };
+            if !expected {
+                return Err(PipelineError::UnstableSource);
+            }
             self.commit(meta, block.events).await?;
+            tip = meta;
         }
         Ok(())
     }
@@ -296,6 +360,51 @@ mod tests {
             .skip(1)
             .collect();
         assert_eq!(replayed, (tip..=tip + 10).collect::<Vec<_>>());
+    }
+
+    /// A fork near the bottom of a long catch-up is walked from the block that did not
+    /// link, not from the head: a handful of header reads rather than one per height of
+    /// the tail, and the new branch is replayed with fetches made ahead, not one block
+    /// at a time.
+    #[tokio::test(start_paused = true)]
+    async fn a_fork_under_a_long_catch_up_is_walked_from_where_it_diverged() {
+        let head = MAX_UNFINALIZED_BLOCKS as u64 + 5;
+        let mut machine = Machine::new(Source::linear(head), Sink::default(), Vec::new());
+        settle(&mut machine, Some(0)).await;
+        let tip = machine.tip().expect("tip").height;
+        let source = chain(&mut machine);
+        source.data.concurrency = 4;
+        source.data.slow_blocks = true;
+        // The tip is replaced, and the new branch runs 300 blocks past it.
+        let tail = 300;
+        fork(source, tip, tip + tail);
+        let started = tokio::time::Instant::now();
+        observe(&mut machine, tip + tail).await;
+        let markers = reorgs(&machine);
+        assert_eq!(markers.len(), 1);
+        assert_eq!(markers[0].height, tip);
+        assert_eq!(markers[0].orphaned_hashes, [hash(tip)]);
+        assert_eq!(markers[0].new_head_hash, hash(tip + tail + 100));
+        let replayed: Vec<u64> = heights(&machine)
+            .into_iter()
+            .skip_while(|&height| height != tip)
+            .skip(1)
+            .collect();
+        assert_eq!(replayed, (tip..=tip + tail).collect::<Vec<_>>());
+        assert_eq!(
+            machine.source.data.header_calls.load(Ordering::Relaxed),
+            4,
+            "the target, before the walk and again before the retraction, the block the \
+             walk started from, and the one header it walked"
+        );
+        // The clock is paused, so the time taken is the fetches' waits: one at a time,
+        // the tail's replay alone would take `tail` of them.
+        let one = std::time::Duration::from_millis(5);
+        assert!(
+            started.elapsed() < one * u32::try_from(tail).expect("tail") / 2,
+            "took {:?}",
+            started.elapsed()
+        );
     }
 
     /// A restart whose node is behind the store, below every block the store handed
@@ -463,7 +572,7 @@ mod tests {
         // accepted history must survive intact.
         machine.source.data.fail_once.store(true, Ordering::Relaxed);
         fails_with(
-            machine.handle_reorg(candidate).await,
+            machine.handle_reorg(candidate, candidate).await,
             &malformed("injected source failure"),
         );
         assert_eq!(machine.tip(), Some(meta(head)));

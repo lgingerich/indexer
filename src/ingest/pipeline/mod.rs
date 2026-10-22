@@ -41,6 +41,7 @@
 
 mod backfill;
 mod error;
+mod prefetch;
 mod reorg;
 mod ring;
 mod startup;

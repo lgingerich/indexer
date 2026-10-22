@@ -240,7 +240,7 @@ impl<S: BlockSource + 'static, K: EnvelopeSink> Machine<S, K> {
                 actual: Box::new(current),
             });
         }
-        self.handle_reorg(current).await?;
+        self.handle_reorg(current, current).await?;
         Ok(current)
     }
 }
