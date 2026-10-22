@@ -426,13 +426,6 @@ impl fmt::Debug for HyperSyncSource {
     }
 }
 
-/// Renders the source as its chain, for log fields.
-impl fmt::Display for HyperSyncSource {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "hypersync[{}]", self.chain)
-    }
-}
-
 impl BlockSource for HyperSyncSource {
     fn chain(&self) -> &ChainId {
         &self.chain

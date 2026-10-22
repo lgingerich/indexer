@@ -38,6 +38,11 @@ impl From<&AnyRpcBlock> for BlockMeta {
 /// retry (`0x6a`) — decode instead of failing the whole block. Everything this
 /// source reads is reachable through the standard `Transaction`/`BlockHeader`
 /// accessors; only the transaction type falls back to a raw `u8`.
+///
+/// Only for `benches/hot_path.rs`, which measures [`decode_block`] without a node; the
+/// source itself fetches and projects inside [`EvmSource`](super::EvmSource). Hidden
+/// from the docs, since it is not an API for anything else.
+#[doc(hidden)]
 #[derive(Debug, Clone)]
 pub struct RpcBatch {
     /// The block metadata the projection is anchored to.
@@ -54,8 +59,8 @@ pub struct RpcBatch {
     ///
     /// `None` when the node does not serve that method; the caller then has to
     /// fetch each receipt by transaction hash. Some nodes answer the method with
-    /// a [`METHOD_NOT_FOUND`](crate::ingest::source::METHOD_NOT_FOUND) error and others with a `null` result, so both are
-    /// treated the same way.
+    /// a [`METHOD_NOT_FOUND`](crate::ingest::source::METHOD_NOT_FOUND) error and others
+    /// with a `null` result, so both are treated the same way.
     pub receipts: Option<Vec<AnyTransactionReceipt>>,
     /// Logs from `eth_getLogs` for this height.
     ///
@@ -66,18 +71,19 @@ pub struct RpcBatch {
 
 /// Turns a parsed batch into ordered dataset events and its metadata.
 ///
-/// Projects every row in the batch, whatever a deployment would have selected: the
-/// caller filters with [`Datasets::keeps`] if it wants
-/// less. Order is the block row, then each transaction followed by its logs, all in
-/// index order, so a consumer sees every transaction before its logs. A body is only
-/// required for the rows that read one, so a logs-only block with no fetched block
-/// still decodes.
+/// Projects every row in the batch, as a source built for every dataset does. Order is
+/// the block row, then each transaction followed by its logs, all in index order, so a
+/// consumer sees every transaction before its logs. A body is only required for the
+/// rows that read one, so a logs-only block with no fetched block still decodes.
+///
+/// Only for `benches/hot_path.rs` and the projection's tests, like [`RpcBatch`].
 ///
 /// # Errors
 ///
 /// Returns [`SourceError::Malformed`] when a body the rows read is absent, or the
 /// receipts do not line up with its transactions, and [`SourceError::Inconsistent`]
 /// when the receipts belong to another block or are missing as a lagging node's are.
+#[doc(hidden)]
 pub fn decode_block(batch: RpcBatch) -> Result<FetchedBlock, SourceError> {
     let RpcBatch {
         meta,

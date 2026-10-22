@@ -63,6 +63,8 @@ use crate::wire::envelope::{BlockMeta, ChainId};
 use fetch::{RpcBlockMeta, block_read, invalid_json, transport};
 use plan::{FetchPlan, Span};
 use project::project;
+// Only for `benches/hot_path.rs`, which decodes a batch without a node.
+#[doc(hidden)]
 pub use project::{RpcBatch, decode_block};
 
 /// The method labels these calls are reported under, shared by the fetch path and
@@ -325,13 +327,6 @@ impl<C> fmt::Debug for EvmSource<C> {
             .field("concurrency", &self.concurrency)
             .field("finality_depth", &self.finality_depth)
             .finish_non_exhaustive()
-    }
-}
-
-/// Renders the source as its chain, for log fields.
-impl<C> fmt::Display for EvmSource<C> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "evm[{}]", self.chain)
     }
 }
 
