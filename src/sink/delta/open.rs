@@ -1,28 +1,154 @@
-//! Opening the lake's tables: the object store they share, and the checks an existing
-//! table must pass before the run writes to it.
+//! Opening the lake: its tables, the object store they share, the checks an existing
+//! table must pass before the run writes to it, and the repair that follows.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
+use std::time::Duration;
 
 use deltalake::logstore::object_store::GetOptions;
 use deltalake::logstore::{ObjectStoreRef, store_for};
+use deltalake::parquet::basic::{Compression, ZstdLevel};
+use deltalake::parquet::file::properties::WriterProperties;
 use deltalake::{
     DeltaTable, DeltaTableBuilder, DeltaTableError, ObjectStoreError, ensure_table_uri,
 };
+use futures_util::stream::{self, StreamExt as _, TryStreamExt as _};
 use serde::Deserialize;
 use tokio::sync::Semaphore;
+use tokio::time::Instant;
 use tracing::{info, warn};
 
 use super::arrow::{self, PARTITION};
-use super::lake::{Lake, commit_properties};
-use super::repair::REORG_COLUMNS;
+use super::lake::{CONCURRENT_CHECKPOINTS, Lake, commit_properties};
+use super::repair::{CONTRACT_COLUMNS, LEDGER_COLUMNS, REORG_COLUMNS};
+use super::{
+    COMMIT_DEADLINE, CONCURRENT_TABLES, DeltaSettings, DeltaSink, PendingLedger, hex, maintenance,
+    millis,
+};
 use crate::secret::Secret;
+use crate::sink::Restored;
+use crate::sink::batch::Batch;
 use crate::sink::store_error::{Operation, StoreError};
-use crate::sink::table::{ColumnType, Table, TableDef, TableError, TableId};
+use crate::sink::table::{ColumnType, Schema, Table, TableDef, TableError, TableId};
+use crate::wire::envelope::ChainId;
+
+impl DeltaSink {
+    /// Opens every table of `schema` under `<uri>/<chain>/`, creating the ones that do
+    /// not exist, and repairs what a stopped commit left behind.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::Engine`] when a table cannot be opened, created, read, or
+    /// repaired, [`StoreError::Reserved`] when a table declares the partition column,
+    /// [`StoreError::Drift`] when an existing table does not match its definition,
+    /// [`StoreError::Table`] when a startup read names a column its table lacks, and
+    /// [`StoreError::Restore`] when the ledger holds a value that does not parse.
+    pub async fn open(
+        settings: &DeltaSettings,
+        schema: Arc<Schema>,
+        chain: &str,
+    ) -> Result<Self, StoreError> {
+        for (table, columns) in [
+            (Table::Contract, &CONTRACT_COLUMNS[..]),
+            (Table::AcceptedBlock, &LEDGER_COLUMNS[..]),
+            (Table::Reorg, &REORG_COLUMNS[..]),
+        ] {
+            require(schema.dataset(table), columns)?;
+        }
+        let started = Instant::now();
+        let root = settings.uri.trim_end_matches('/');
+        let storage = Storage::new(root, &settings.storage)?;
+        let checkpoints = Arc::new(Semaphore::new(CONCURRENT_CHECKPOINTS));
+        // Each open is a few requests that wait on the store, and a run has a table per
+        // event, so they overlap: one after another, a hundred tables took minutes.
+        // Boxed, as is the repair's scan: the compiler cannot otherwise prove the open
+        // `Send` through these closures' borrowed arguments, which running it on the
+        // store's own runtime needs (rust-lang/rust#102211).
+        let lakes: Vec<Lake> = stream::iter(schema.tables())
+            .map(|def| {
+                let uri = format!("{root}/{chain}/{}", def.name);
+                open_table(
+                    &storage,
+                    uri,
+                    def,
+                    settings.partition_blocks,
+                    Arc::clone(&checkpoints),
+                )
+            })
+            .boxed()
+            .buffered(CONCURRENT_TABLES)
+            .try_collect()
+            .await?;
+        let opened = started.elapsed();
+        let positions = lakes
+            .iter()
+            .enumerate()
+            .map(|(position, lake)| (lake.def.id, position))
+            .collect();
+        let mut sink = Self {
+            chain: ChainId::new(chain),
+            lakes,
+            positions,
+            batch: Batch::new(Arc::clone(&schema)),
+            schema,
+            committed: HashMap::new(),
+            failed: false,
+            writer: WriterProperties::builder()
+                .set_compression(Compression::ZSTD(ZstdLevel::default()))
+                .build(),
+            published_tip: Arc::new(AtomicU64::new(0)),
+            maintenance: None,
+            ledger: PendingLedger::default(),
+            deadline: COMMIT_DEADLINE,
+            opened: None,
+        };
+        let read = Instant::now();
+        let ledger = sink.read_ledger().await?;
+        let read = read.elapsed();
+        let repaired = Instant::now();
+        let contracts = sink.repair(&ledger).await?;
+        let repaired = repaired.elapsed();
+        sink.committed = ledger
+            .iter()
+            .map(|block| (hex(&block.hash), block.height))
+            .collect();
+        sink.opened = Some(Restored { contracts, ledger });
+        sink.publish_tip();
+        if settings.maintenance {
+            // Started after the repair, so it never compacts what the repair deletes.
+            let tables = sink
+                .lakes
+                .iter()
+                .filter(|lake| arrow::partitioned(&lake.def).is_some())
+                .map(|lake| (lake.def.name.clone(), lake.table.log_store(), lake.width))
+                .collect();
+            let retention = Duration::from_hours(settings.vacuum_retention_hours.max(1));
+            sink.maintenance = Some(maintenance::spawn(
+                tables,
+                Arc::clone(&sink.published_tip),
+                retention,
+                sink.writer.clone(),
+            ));
+        }
+        info!(
+            %chain,
+            uri = root,
+            tables = sink.lakes.len(),
+            tip = ?sink.tip(),
+            open_ms = millis(opened),
+            ledger_ms = millis(read),
+            repair_ms = millis(repaired),
+            elapsed_ms = millis(started.elapsed()),
+            "delta lake opened"
+        );
+        Ok(sink)
+    }
+}
 
 /// The object store every table of the lake is opened through: one client, so one
 /// credential chain and one connection pool, rather than one of each per table.
-pub(super) struct Storage {
+struct Storage {
     /// The store, rooted at the bucket (or the filesystem root), as delta-rs scopes a
     /// shared store to each table's path itself.
     root: ObjectStoreRef,
@@ -31,7 +157,7 @@ pub(super) struct Storage {
 }
 
 impl Storage {
-    pub(super) fn new(uri: &str, options: &BTreeMap<String, Secret>) -> Result<Self, StoreError> {
+    fn new(uri: &str, options: &BTreeMap<String, Secret>) -> Result<Self, StoreError> {
         deltalake::aws::register_handlers(None);
         let options: HashMap<String, String> = options
             .iter()
@@ -61,7 +187,7 @@ impl Storage {
 /// Opens the table of `def` at `uri`, creating it `width` heights to a partition when it
 /// does not exist, checks an existing one against its definition and `width`, and
 /// starts its checkpoint if one is due.
-pub(super) async fn open_table(
+async fn open_table(
     storage: &Storage,
     uri: String,
     def: &Arc<TableDef>,
@@ -296,7 +422,7 @@ fn check(
 }
 
 /// Fails when `def` lacks any of `columns`, which a startup read names.
-pub(super) fn require(def: &TableDef, columns: &[&str]) -> Result<(), TableError> {
+fn require(def: &TableDef, columns: &[&str]) -> Result<(), TableError> {
     for column in columns {
         def.require(column)?;
     }
