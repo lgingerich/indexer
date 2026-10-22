@@ -414,6 +414,7 @@ pub(crate) async fn nothing_is_durable_until_the_flush<H: Harness>() {
     let buffered = envelopes.len();
     buffer(&mut sink, envelopes).await;
     assert_eq!(sink.buffered(), buffered, "buffered but not written");
+    assert!(sink.buffered_bytes() > 0, "the drain sees what is buffered");
     for table in Table::ALL {
         assert_eq!(
             row_count(&mut harness, table.name()).await,
@@ -424,6 +425,7 @@ pub(crate) async fn nothing_is_durable_until_the_flush<H: Harness>() {
 
     sink.flush().await.expect("batch flushes");
     assert_eq!(sink.buffered(), 0, "the buffers are cleared");
+    assert_eq!(sink.buffered_bytes(), 0);
     for table in Table::ALL {
         assert_eq!(
             row_count(&mut harness, table.name()).await,

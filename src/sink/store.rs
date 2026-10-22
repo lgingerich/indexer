@@ -515,6 +515,10 @@ impl<E: Engine> EnvelopeSink for SqlStore<E> {
         self.batch.push(&envelope)
     }
 
+    fn buffered_bytes(&self) -> usize {
+        self.batch.bytes()
+    }
+
     /// A write that fails because the server closed the connection is written again once
     /// the engine [restores](Engine::recover) it: the batch stays buffered until a commit
     /// lands, and writing it again after a commit whose acknowledgement was lost upserts

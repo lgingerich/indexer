@@ -17,15 +17,14 @@
 //! A store ahead on the canonical chain therefore deletes nothing on a restart, which
 //! matters for a database serving an app: see `sink::resume`.
 
+use std::borrow::Borrow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
 use alloy_primitives::B256;
 
 use crate::sink::SinkError;
-#[cfg(feature = "delta")]
-use crate::sink::table::Value;
-use crate::sink::table::{Row, Schema, TableId};
+use crate::sink::table::{Row, Schema, TableId, Value};
 use crate::wire::envelope::{BlockMeta, Envelope, Event, Reorg};
 
 /// What a store has been handed since its last commit: the rows to write, and the
@@ -48,7 +47,6 @@ pub(super) struct Batch {
     /// lowest buffered `reorg` height, which none of them is below.
     pub(super) orphaned: BTreeMap<String, (u64, BTreeSet<String>)>,
     /// Roughly how many bytes `rows` hold in memory.
-    #[cfg(feature = "delta")]
     bytes: usize,
     /// Where the rows of the block being buffered start in `rows`: every row from here
     /// on came after the last `accepted_block` marker.
@@ -66,7 +64,6 @@ impl Batch {
         Self {
             rows: Vec::new(),
             orphaned: BTreeMap::new(),
-            #[cfg(feature = "delta")]
             bytes: 0,
             block_start: 0,
             held: BTreeMap::new(),
@@ -128,10 +125,7 @@ impl Batch {
         let tail = self.rows.split_off(start);
         for row in tail {
             if row.block_hash() == Some(hash.as_str()) {
-                #[cfg(feature = "delta")]
-                {
-                    self.bytes = self.bytes.saturating_sub(row_size(&row));
-                }
+                self.bytes = self.bytes.saturating_sub(row_size(&row));
             } else {
                 self.rows.push(row);
             }
@@ -155,10 +149,7 @@ impl Batch {
                 row.chain() != chain || !row.block_hash().is_some_and(|h| hashes.contains(h))
             });
             self.block_start = self.block_start.min(self.rows.len());
-            #[cfg(feature = "delta")]
-            {
-                self.bytes = self.rows.iter().map(row_size).sum();
-            }
+            self.bytes = self.rows.iter().map(row_size).sum();
             let (height, orphaned) = self
                 .orphaned
                 .entry(chain.to_owned())
@@ -186,10 +177,7 @@ impl Batch {
         if !self.schema.writes(row.table().id) {
             return;
         }
-        #[cfg(feature = "delta")]
-        {
-            self.bytes += row_size(&row);
-        }
+        self.bytes += row_size(&row);
         self.rows.push(row);
     }
 
@@ -201,38 +189,15 @@ impl Batch {
     /// knows; a staging table's physical order does not promise it.
     #[cfg(any(feature = "duckdb", feature = "postgres"))]
     pub(super) fn by_table(&self) -> HashMap<TableId, Vec<&Row>> {
-        // Sized up front: growing a set of half a million keys rehashes it again and again.
-        let mut seen = HashSet::with_capacity(self.rows.len());
-        let mut tables: HashMap<TableId, Vec<&Row>> = HashMap::new();
-        for row in self.rows.iter().rev() {
-            let id = row.table().id;
-            if seen.insert((id, row.chain(), row.dedupe_key())) {
-                tables.entry(id).or_default().push(row);
-            }
-        }
-        for rows in tables.values_mut() {
-            rows.reverse();
-        }
-        tables
+        grouped(self.rows.iter().zip(last_copies(&self.rows)))
     }
 
     /// [`by_table`](Self::by_table)'s rows, owned: taken out of the batch, so whoever
     /// writes them can free each as soon as it is written rather than all at the end.
     #[cfg(feature = "delta")]
     pub(super) fn take_tables(&mut self) -> HashMap<TableId, Vec<Row>> {
-        let mut keep = vec![false; self.rows.len()];
-        let mut seen = HashSet::with_capacity(self.rows.len());
-        for (position, row) in self.rows.iter().enumerate().rev() {
-            keep[position] = seen.insert((row.table().id, row.chain(), row.dedupe_key()));
-        }
-        drop(seen);
-        let mut tables: HashMap<TableId, Vec<Row>> = HashMap::new();
-        for (row, keep) in std::mem::take(&mut self.rows).into_iter().zip(keep) {
-            if keep {
-                tables.entry(row.table().id).or_default().push(row);
-            }
-        }
-        tables
+        let last = last_copies(&self.rows);
+        grouped(std::mem::take(&mut self.rows).into_iter().zip(last))
     }
 
     /// Whether there is nothing to commit. A `reorg` always buffers its own row, so a
@@ -242,7 +207,6 @@ impl Batch {
     }
 
     /// Roughly how many bytes the buffered rows hold in memory.
-    #[cfg(feature = "delta")]
     pub(super) fn bytes(&self) -> usize {
         self.bytes
     }
@@ -253,16 +217,35 @@ impl Batch {
         self.rows.clear();
         self.orphaned.clear();
         self.block_start = 0;
-        #[cfg(feature = "delta")]
-        {
-            self.bytes = 0;
+        self.bytes = 0;
+    }
+}
+
+/// Whether each of `rows` is the last copy of its `(table, chain, dedupe_key)`, by
+/// position: what both [`Batch::by_table`] and [`Batch::take_tables`] keep.
+fn last_copies(rows: &[Row]) -> Vec<bool> {
+    let mut last = vec![false; rows.len()];
+    // Sized up front: growing a set of half a million keys rehashes it again and again.
+    let mut seen = HashSet::with_capacity(rows.len());
+    for (position, row) in rows.iter().enumerate().rev() {
+        last[position] = seen.insert((row.table().id, row.chain(), row.dedupe_key()));
+    }
+    last
+}
+
+/// The `rows` marked to keep, by table, each table's in the order given.
+fn grouped<R: Borrow<Row>>(rows: impl Iterator<Item = (R, bool)>) -> HashMap<TableId, Vec<R>> {
+    let mut tables: HashMap<TableId, Vec<R>> = HashMap::new();
+    for (row, keep) in rows {
+        if keep {
+            tables.entry(row.borrow().table().id).or_default().push(row);
         }
     }
+    tables
 }
 
 /// Roughly how many bytes `row` holds in memory: the row with its own copies of the
 /// chain and key, every value's slot, and what each value holds on the heap.
-#[cfg(feature = "delta")]
 fn row_size(row: &Row) -> usize {
     size_of::<Row>()
         + row.chain().len()
@@ -270,7 +253,6 @@ fn row_size(row: &Row) -> usize {
         + row.values().iter().map(value_size).sum::<usize>()
 }
 
-#[cfg(feature = "delta")]
 fn value_size(value: &Value) -> usize {
     size_of::<Value>()
         + match value {
