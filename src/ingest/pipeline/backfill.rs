@@ -118,7 +118,6 @@ mod tests {
         let moved = MAX_UNFINALIZED_BLOCKS as u64 + 15;
         let source = Source::linear(moved);
         source
-            .data
             .samples
             .lock()
             .expect("samples")
@@ -142,7 +141,7 @@ mod tests {
         // The buried bound is 17: ranges of seven are 0..=6, 7..=13, then 14..=17.
         let head = MAX_UNFINALIZED_BLOCKS as u64 + 17;
         let mut source = Source::linear(head);
-        source.data.range = 7;
+        source.range = 7;
         let mut machine = Machine::new(source, Sink::default(), Vec::new());
         settle(&mut machine, Some(0)).await;
         assert_eq!(heights(&machine), (0..=head).collect::<Vec<_>>());
@@ -157,8 +156,8 @@ mod tests {
     async fn a_range_answered_short_is_rejected_before_output() {
         let head = MAX_UNFINALIZED_BLOCKS as u64 + 5;
         let mut source = Source::linear(head);
-        source.data.range = 4;
-        source.data.short = true;
+        source.range = 4;
+        source.short = true;
         let mut machine = Machine::new(source, Sink::default(), Vec::new());
         fails_with(
             machine.sync(Some(0), None).await,
@@ -176,7 +175,7 @@ mod tests {
     async fn a_backfill_source_failure_keeps_what_was_accepted() {
         let head = MAX_UNFINALIZED_BLOCKS as u64 + 5;
         let mut source = Source::linear(head);
-        source.data.blocks.remove(&3);
+        source.blocks.remove(&3);
         let mut machine = Machine::new(source, Sink::default(), Vec::new());
         fails_with(
             machine.sync(Some(0), None).await,
@@ -193,13 +192,13 @@ mod tests {
         // The buried bound is 17: ranges of four, three in flight, the first answering last.
         let head = MAX_UNFINALIZED_BLOCKS as u64 + 17;
         let mut source = Source::linear(head);
-        source.data.range = 4;
-        source.data.concurrency = 3;
-        source.data.slow = Some(0);
+        source.range = 4;
+        source.concurrency = 3;
+        source.slow = true;
         let mut machine = Machine::new(source, Sink::default(), Vec::new());
         settle(&mut machine, Some(0)).await;
         assert_eq!(heights(&machine), (0..=head).collect::<Vec<_>>());
-        assert_eq!(machine.source.data.peak.load(Ordering::Relaxed), 3);
+        assert_eq!(machine.source.peak.load(Ordering::Relaxed), 3);
         assert_eq!(
             reads(&machine).1,
             usize::try_from(head + 1).expect("count"),
@@ -213,9 +212,9 @@ mod tests {
     async fn a_failed_range_in_flight_keeps_the_ranges_below_it() {
         let head = MAX_UNFINALIZED_BLOCKS as u64 + 17;
         let mut source = Source::linear(head);
-        source.data.range = 2;
-        source.data.concurrency = 3;
-        source.data.blocks.remove(&3);
+        source.range = 2;
+        source.concurrency = 3;
+        source.blocks.remove(&3);
         let mut machine = Machine::new(source, Sink::default(), Vec::new());
         fails_with(
             machine.sync(Some(0), None).await,

@@ -345,177 +345,12 @@ impl<S: BlockSource + 'static, K: EnvelopeSink> Machine<S, K> {
 #[cfg(test)]
 #[expect(clippy::expect_used)]
 mod tests {
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-
-    use futures_util::stream;
-    use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
+    use std::sync::atomic::Ordering;
+    use std::time::Duration;
 
     use super::testing::*;
     use super::*;
-    use crate::ingest::source::{FetchedBlock, HeadStream};
     use crate::sink::SinkError;
-    use crate::wire::datasets::evm::Block;
-    use crate::wire::envelope::ChainId;
-
-    struct LiveSource {
-        source: Source,
-        head: Arc<AtomicU64>,
-        forked: Arc<AtomicBool>,
-        /// Set to answer the next block fetch inconsistently.
-        inconsistent: Arc<AtomicBool>,
-        hints: std::sync::Mutex<Option<UnboundedReceiver<BlockMeta>>>,
-    }
-
-    impl LiveSource {
-        /// A live chain over [`Source::linear`]`(6)` whose head starts at 1, and the
-        /// sender of the heads its subscription announces.
-        fn new() -> (Self, UnboundedSender<BlockMeta>) {
-            let (hints, hint_stream) = unbounded_channel();
-            let source = Self {
-                source: Source::linear(6),
-                head: Arc::new(AtomicU64::new(1)),
-                forked: Arc::default(),
-                inconsistent: Arc::default(),
-                hints: std::sync::Mutex::new(Some(hint_stream)),
-            };
-            (source, hints)
-        }
-    }
-
-    impl BlockSource for LiveSource {
-        fn chain(&self) -> &ChainId {
-            self.source.chain()
-        }
-        fn follows_heads(&self) -> bool {
-            true
-        }
-        async fn fetch_blocks(&self, from: u64, to: u64) -> Result<Vec<FetchedBlock>, SourceError> {
-            let mut blocks = Vec::new();
-            for height in from..=to {
-                blocks.push(self.fetch_block(height, None).await?);
-            }
-            Ok(blocks)
-        }
-        fn backfill_span(&self) -> u64 {
-            1
-        }
-        fn finality_depth(&self) -> u64 {
-            MAX_UNFINALIZED_BLOCKS as u64
-        }
-        fn backfill_concurrency(&self) -> usize {
-            1
-        }
-        async fn subscribe_heads(&self) -> Result<HeadStream, SourceError> {
-            let hints = self
-                .hints
-                .lock()
-                .expect("hints lock")
-                .take()
-                .expect("subscribe once");
-            Ok(Box::pin(stream::unfold(hints, |mut hints| async move {
-                hints.recv().await.map(|hint| (Ok(hint), hints))
-            })))
-        }
-        async fn fetch_header(&self, height: Option<u64>) -> Result<BlockMeta, SourceError> {
-            if let Some(height) = height {
-                return Ok(self.fetch_block(height, None).await?.meta);
-            }
-            let height = self.head.load(Ordering::Relaxed);
-            let replacement = self.forked.load(Ordering::Relaxed) && height >= 3;
-            let tip_hash = hash(height + if replacement { 100 } else { 0 });
-            let parent = if height == 0 {
-                hash(0)
-            } else if replacement && height >= 3 {
-                hash(height + 99)
-            } else {
-                hash(height - 1)
-            };
-            Ok(BlockMeta {
-                height,
-                hash: tip_hash,
-                parent_hash: parent,
-                timestamp: height,
-            })
-        }
-        async fn fetch_block(
-            &self,
-            height: u64,
-            head: Option<&BlockMeta>,
-        ) -> Result<FetchedBlock, SourceError> {
-            if self.inconsistent.swap(false, Ordering::Relaxed) {
-                return Err(SourceError::Inconsistent {
-                    context: "test".into(),
-                    detail: "injected inconsistency".into(),
-                });
-            }
-            let mut block = self.source.fetch_block(height, head).await?;
-            if self.forked.load(Ordering::Relaxed) && height >= 3 {
-                block.meta.hash = hash(height + 100);
-                block.meta.parent_hash = hash(if height == 3 { 2 } else { height + 99 });
-                let Event::Block(marker) = &mut block.events[0] else {
-                    unreachable!()
-                };
-                marker.hash = block.meta.hash;
-                marker.parent_hash = block.meta.parent_hash;
-            }
-            Ok(block)
-        }
-    }
-
-    /// Forwards every event but the per-block ledger markers, which the live test does
-    /// not assert on: it is about which blocks and reorgs reach the sink, and in what order.
-    struct LiveSink(UnboundedSender<Event>);
-
-    impl EnvelopeSink for LiveSink {
-        async fn publish(&mut self, envelope: Envelope) -> Result<(), SinkError> {
-            if matches!(envelope.event, Event::AcceptedBlock(_)) {
-                return Ok(());
-            }
-            self.0
-                .send(envelope.event)
-                .map_err(|_| SinkError::StorageClosed)
-        }
-        async fn flush(&mut self) -> Result<(), SinkError> {
-            Ok(())
-        }
-    }
-
-    /// Forwards as [`LiveSink`] does, and keeps the newest head it was told of.
-    struct HeadSink(LiveSink, Arc<AtomicU64>);
-
-    impl EnvelopeSink for HeadSink {
-        async fn publish(&mut self, envelope: Envelope) -> Result<(), SinkError> {
-            self.0.publish(envelope).await
-        }
-        async fn flush(&mut self) -> Result<(), SinkError> {
-            self.0.flush().await
-        }
-        fn observe_head(&mut self, height: u64) {
-            self.1.store(height, Ordering::Relaxed);
-        }
-    }
-
-    /// The next event a live run forwarded, which must be a block; `what` names it in
-    /// the failure.
-    async fn next_block(received: &mut UnboundedReceiver<Event>, what: &str) -> Box<Block> {
-        match received.recv().await {
-            Some(Event::Block(block)) => block,
-            other => panic!("expected {what}, received {other:?}"),
-        }
-    }
-
-    /// Ends a live run by closing its subscription, and checks that is why it ended.
-    async fn close(
-        hints: UnboundedSender<BlockMeta>,
-        run: tokio::task::JoinHandle<Result<(), PipelineError>>,
-    ) {
-        drop(hints);
-        fails_with(
-            run.await.expect("driver task"),
-            &PipelineError::SubscriptionClosed,
-        );
-    }
 
     #[tokio::test]
     async fn failed_run_drops_its_sink() {
@@ -555,58 +390,47 @@ mod tests {
     /// measured against the head sampled at startup, and read zero.
     #[tokio::test(start_paused = true)]
     async fn an_announced_head_is_observed() {
-        let observed = Arc::new(AtomicU64::new(0));
-        let (events, mut received) = unbounded_channel();
-        let (source, hints) = LiveSource::new();
-        let sink = HeadSink(LiveSink(events), Arc::clone(&observed));
-        let run = tokio::spawn(Machine::new(source, sink, Vec::new()).run(None, None));
-        assert_eq!(next_block(&mut received, "block 1").await.number, 1);
-        assert_eq!(observed.load(Ordering::Relaxed), 1);
-        hints.send(meta(3)).expect("hint");
+        let mut live = Live::start().await;
+        assert_eq!(live.observed.load(Ordering::Relaxed), 1);
+        live.announce(3);
         for expected in [2, 3] {
-            let block = next_block(&mut received, "the announced head caught up to").await;
+            let block = live.next_block("the announced head caught up to").await;
             assert_eq!(block.number, expected);
         }
-        assert_eq!(observed.load(Ordering::Relaxed), 3);
-        close(hints, run).await;
+        assert_eq!(live.observed.load(Ordering::Relaxed), 3);
+        live.close().await;
     }
 
     #[tokio::test(start_paused = true)]
     async fn silent_subscription_reconciles_gaps_and_reorgs_without_duplicate_stale_hints() {
-        let (events, mut received) = unbounded_channel();
-        let (source, hints) = LiveSource::new();
-        let head = Arc::clone(&source.head);
-        let forked = Arc::clone(&source.forked);
-        // The source's head is at 1, so the default start lands there — the live-only
-        // case: startup seeds block 1 and the timer fills the rest, leaving a tallied
-        // window for the later fork.
-        let run = tokio::spawn(Machine::new(source, LiveSink(events), Vec::new()).run(None, None));
-        assert_eq!(next_block(&mut received, "block 1").await.number, 1);
+        // Startup seeded block 1 and the timer fills the rest, leaving a tallied window
+        // for the later fork.
+        let mut live = Live::start().await;
         // No new head hint arrives during the outage: the timer must discover the gap.
-        head.store(6, Ordering::Relaxed);
-        tokio::time::advance(std::time::Duration::from_secs(30)).await;
+        live.chain().head = 6;
+        tokio::time::advance(Duration::from_secs(30)).await;
         for expected in 2..=6 {
-            let block = next_block(&mut received, "a catch-up block, not a reorg").await;
+            let block = live.next_block("a catch-up block, not a reorg").await;
             assert_eq!(block.number, expected);
         }
         // A second silent period spans a fork, not just a height gap.
-        forked.store(true, Ordering::Relaxed);
-        tokio::time::advance(std::time::Duration::from_secs(30)).await;
-        let Some(Event::Reorg(reorg)) = received.recv().await else {
+        fork(&mut live.chain(), 3, 6);
+        tokio::time::advance(Duration::from_secs(30)).await;
+        let Some(Event::Reorg(reorg)) = live.received.recv().await else {
             panic!("the old suffix must be retracted before replacement blocks");
         };
         assert_eq!(reorg.height, 3);
         assert_eq!(reorg.orphaned_hashes, [hash(6), hash(5), hash(4), hash(3)]);
         for expected in 3..=6 {
-            let block = next_block(&mut received, "a replacement after the reorg").await;
+            let block = live.next_block("a replacement after the reorg").await;
             assert_eq!(block.number, expected);
             assert_eq!(block.hash, hash(expected + 100));
         }
         // Stale, already-accepted hints must not re-fetch or duplicate output.
         for _ in 0..2 {
-            hints.send(meta(2)).expect("stale hint");
+            live.announce(2);
         }
-        close(hints, run).await;
+        let mut received = live.close().await;
         assert_eq!(
             received.try_recv(),
             Err(tokio::sync::mpsc::error::TryRecvError::Disconnected),
@@ -618,20 +442,16 @@ mod tests {
     /// delivered for it, so the next head catches up from the same tip.
     #[tokio::test(start_paused = true)]
     async fn an_inconsistent_live_answer_skips_the_head() {
-        let (events, mut received) = unbounded_channel();
-        let (source, hints) = LiveSource::new();
-        let inconsistent = Arc::clone(&source.inconsistent);
-        let run = tokio::spawn(Machine::new(source, LiveSink(events), Vec::new()).run(None, None));
-        assert_eq!(next_block(&mut received, "block 1").await.number, 1);
-        inconsistent.store(true, Ordering::Relaxed);
+        let mut live = Live::start().await;
+        live.chain().fail(2, Fault::Inconsistent, 1);
         for height in [2, 3] {
-            hints.send(meta(height)).expect("hint");
+            live.announce(height);
         }
         for expected in [2, 3] {
-            let block = next_block(&mut received, "the next head caught up").await;
+            let block = live.next_block("the next head caught up").await;
             assert_eq!(block.number, expected);
         }
-        close(hints, run).await;
+        live.close().await;
     }
 
     /// A live head the source answers inconsistently is asked about again within a
@@ -639,25 +459,21 @@ mod tests {
     /// on a slow chain those are seconds away, and the head's rows with them.
     #[tokio::test(start_paused = true)]
     async fn an_inconsistent_live_head_is_asked_about_again_soon() {
-        let (events, mut received) = unbounded_channel();
-        let (source, hints) = LiveSource::new();
-        let inconsistent = Arc::clone(&source.inconsistent);
-        let run = tokio::spawn(Machine::new(source, LiveSink(events), Vec::new()).run(None, None));
-        assert_eq!(next_block(&mut received, "block 1").await.number, 1);
-        inconsistent.store(true, Ordering::Relaxed);
+        let mut live = Live::start().await;
+        live.chain().fail(2, Fault::Inconsistent, 1);
         let announced = tokio::time::Instant::now();
-        hints.send(meta(2)).expect("hint");
+        live.announce(2);
         // No other head is announced: only the retry can deliver block 2, and well before
         // the reconcile timer, which would not either, since the source's head is still 1.
         // The clock is paused, so the time it took is exactly the wait before the retry.
-        let block = next_block(&mut received, "block 2, asked about again").await;
+        let block = live.next_block("block 2, asked about again").await;
         assert_eq!(block.number, 2);
         let waited = announced.elapsed();
         assert!(
             (RETRY_FIRST..RETRY_FIRST * 2).contains(&waited),
             "asked again after {waited:?}, not after the first retry wait"
         );
-        close(hints, run).await;
+        live.close().await;
     }
 
     /// A head asked about again waits twice as long each time, up to the longest wait;

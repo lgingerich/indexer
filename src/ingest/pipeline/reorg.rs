@@ -314,10 +314,9 @@ mod tests {
             let mut machine = Machine::new(Source::linear(3), Sink::default(), Vec::new());
             settle(&mut machine, Some(3)).await;
             let source = chain(&mut machine);
-            source.data.concurrency = concurrency;
-            source.data.slow_blocks = true;
+            source.concurrency = concurrency;
+            source.slow = true;
             source
-                .data
                 .blocks
                 .extend((4..=40).map(|h| (h, (hash(h), hash(h - 1)))));
             let (_, before) = reads(&machine);
@@ -327,7 +326,7 @@ mod tests {
             assert_eq!(reads(&machine).1 - before, 37, "{label}");
             // The clock is paused, so every fetch requested ahead starts before any ends.
             assert_eq!(
-                machine.source.data.blocks_peak.load(Ordering::Relaxed),
+                machine.source.peak.load(Ordering::Relaxed),
                 concurrency,
                 "{label}: fetches in flight at once"
             );
@@ -345,8 +344,8 @@ mod tests {
         settle(&mut machine, Some(0)).await;
         let tip = machine.tip().expect("tip").height;
         let source = chain(&mut machine);
-        source.data.concurrency = 4;
-        source.data.slow_blocks = true;
+        source.concurrency = 4;
+        source.slow = true;
         // The tip is replaced, and the new branch runs ten blocks past it.
         fork(source, tip, tip + 10);
         observe(&mut machine, tip + 10).await;
@@ -374,8 +373,8 @@ mod tests {
         settle(&mut machine, Some(0)).await;
         let tip = machine.tip().expect("tip").height;
         let source = chain(&mut machine);
-        source.data.concurrency = 4;
-        source.data.slow_blocks = true;
+        source.concurrency = 4;
+        source.slow = true;
         // The tip is replaced, and the new branch runs 300 blocks past it.
         let tail = 300;
         fork(source, tip, tip + tail);
@@ -393,7 +392,7 @@ mod tests {
             .collect();
         assert_eq!(replayed, (tip..=tip + tail).collect::<Vec<_>>());
         assert_eq!(
-            machine.source.data.header_calls.load(Ordering::Relaxed),
+            machine.source.header_calls.load(Ordering::Relaxed),
             4,
             "the target, before the walk and again before the retraction, the block the \
              walk started from, and the one header it walked"
@@ -416,7 +415,7 @@ mod tests {
     async fn a_head_behind_the_store_below_the_window_is_not_a_fork() {
         let mut source = Source::linear(13);
         // A fresh run stored 12 and 13; the node now reports 11 as its head.
-        source.data.head = 11;
+        source.head = 11;
         let mut machine = Machine::new(source, Sink::default(), ledger(12..=13));
         machine
             .sync(None, None)
@@ -431,8 +430,8 @@ mod tests {
     #[tokio::test]
     async fn a_forked_head_below_the_window_still_stops() {
         let mut source = Source::linear(13);
-        source.data.head = 11;
-        source.data.blocks.insert(11, (hash(111), hash(10)));
+        source.head = 11;
+        source.blocks.insert(11, (hash(111), hash(10)));
         let mut machine = Machine::new(source, Sink::default(), ledger(12..=13));
         fails_with(
             machine.sync(None, None).await,
@@ -481,7 +480,6 @@ mod tests {
         settle(&mut machine, Some(0)).await;
         // Replace the branch above the tip's predecessor and announce the new head.
         chain(&mut machine)
-            .data
             .blocks
             .insert(head, (hash(head + 100), hash(head - 1)));
         observe(&mut machine, head).await;
@@ -505,13 +503,10 @@ mod tests {
         let mut machine = Machine::new(Source::linear(3), Sink::default(), Vec::new());
         settle(&mut machine, Some(3)).await;
         // The window holds only the first block; its replacement descends from height 1.
-        chain(&mut machine)
-            .data
-            .blocks
-            .insert(3, (hash(103), hash(1)));
+        chain(&mut machine).blocks.insert(3, (hash(103), hash(1)));
         // The replacement is fetched before the first block is retracted, so a failure
         // cannot leave the window empty.
-        machine.source.data.fail_once.store(true, Ordering::Relaxed);
+        machine.source.fail(3, Fault::Failed, 1);
         fails_with(
             machine.process_head(machine.source.head_meta()).await,
             &malformed("injected source failure"),
@@ -540,7 +535,6 @@ mod tests {
         let mut machine = Machine::new(Source::linear(head), Sink::default(), Vec::new());
         settle(&mut machine, Some(0)).await;
         chain(&mut machine)
-            .data
             .blocks
             .insert(head, (hash(head + 100), hash(head - 1)));
         machine.sink.fail = true;
@@ -561,7 +555,6 @@ mod tests {
         let mut machine = Machine::new(Source::linear(head), Sink::default(), Vec::new());
         settle(&mut machine, Some(0)).await;
         chain(&mut machine)
-            .data
             .blocks
             .insert(head, (hash(head + 100), hash(head - 1)));
         let candidate = machine
@@ -571,7 +564,7 @@ mod tests {
             .expect("candidate");
         // Injection fires on the replacement's fetch, which precedes any retraction, so the
         // accepted history must survive intact.
-        machine.source.data.fail_once.store(true, Ordering::Relaxed);
+        machine.source.fail(head, Fault::Failed, 1);
         fails_with(
             machine.handle_reorg(candidate, candidate).await,
             &malformed("injected source failure"),

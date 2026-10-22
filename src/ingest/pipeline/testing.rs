@@ -1,13 +1,16 @@
-//! The fake chain and sink the pipeline's tests drive a machine with.
+//! The fake chains and sinks the pipeline's tests drive a machine with.
 
 #![expect(clippy::expect_used)]
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::Duration;
 
 use alloy_primitives::B256;
 use futures_util::stream;
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
+use tokio::task::JoinHandle;
 
 use super::{Machine, PipelineError};
 use crate::ingest::source::{BlockSource, FetchedBlock, HeadStream, SourceError};
@@ -31,47 +34,48 @@ pub(super) fn meta(height: u64) -> BlockMeta {
     }
 }
 
-/// A deterministic chain source. `head` moves when `fork` or a test edits it,
-/// `head_calls` counts discovery so a test can bound what backfill makes, and
-/// `block_calls` counts full block fetches.
-pub(super) struct Source {
-    pub(super) chain: ChainId,
-    pub(super) data: Data,
+/// How a block read [`Source::fail`] injected answers instead of the block.
+#[derive(Clone, Copy)]
+pub(super) enum Fault {
+    /// As a backend behind the head does, which startup and the live phase ask again.
+    Inconsistent,
+    /// As [`malformed`]`("injected source failure")`, which nothing asks again.
+    Failed,
 }
 
-pub(super) struct Data {
+/// A deterministic chain source. `head` moves when `fork` or a test edits it,
+/// `head_calls` counts discovery so a test can bound what backfill makes, and
+/// `block_calls` counts block reads.
+pub(super) struct Source {
+    pub(super) chain: ChainId,
+    /// Each height's hash and parent hash.
     pub(super) blocks: HashMap<u64, (B256, B256)>,
     pub(super) head: u64,
-    pub(super) fail_once: AtomicBool,
     /// Heads the next samples return, in order, before `head`.
-    pub(super) samples: std::sync::Mutex<VecDeque<u64>>,
+    pub(super) samples: Mutex<VecDeque<u64>>,
+    /// Per height, how the next block reads there fail, and how many more do.
+    faults: Mutex<HashMap<u64, (Fault, u32)>>,
     pub(super) head_calls: AtomicUsize,
     pub(super) block_calls: AtomicUsize,
     /// Header reads at a height, as the fork walk and its rechecks make.
     pub(super) header_calls: AtomicUsize,
     /// The heights backfill asks for in one `fetch_blocks`.
     pub(super) range: u64,
-    /// The `fetch_blocks` calls backfill keeps in flight.
+    /// The reads backfill and fetches made ahead keep in flight.
     pub(super) concurrency: usize,
     /// Answer each `fetch_blocks` one block short.
     pub(super) short: bool,
-    /// Every range answers after a second, and the one starting at this height after
-    /// two, so the ranges above it answer first.
-    pub(super) slow: Option<u64>,
-    /// `fetch_blocks` calls in flight now, and the most there ever were.
-    pub(super) in_flight: AtomicUsize,
+    /// Whether reads wait, so concurrent ones overlap: each `fetch_block` a moment, each
+    /// `fetch_blocks` a second, and the range from 0 two, so the ranges above it answer
+    /// first.
+    pub(super) slow: bool,
+    /// Slow reads in flight now, and the most there ever were.
+    in_flight: AtomicUsize,
     pub(super) peak: AtomicUsize,
     /// Whether the source follows heads, or only backfills.
     pub(super) follows: bool,
     /// The source's finality depth.
     pub(super) finality: u64,
-    /// Whether each `fetch_block` waits a moment, so fetches made ahead overlap.
-    pub(super) slow_blocks: bool,
-    /// How many more times the block at each height is answered inconsistently.
-    pub(super) inconsistent: std::sync::Mutex<HashMap<u64, u32>>,
-    /// `fetch_block` calls in flight now, and the most there ever were.
-    pub(super) blocks_in_flight: AtomicUsize,
-    pub(super) blocks_peak: AtomicUsize,
 }
 
 impl Source {
@@ -79,49 +83,112 @@ impl Source {
     pub(super) fn linear(head: u64) -> Self {
         Self {
             chain: ChainId::new("ethereum"),
-            data: Data {
-                blocks: (0..=head)
-                    .map(|h| (h, (hash(h), hash(h.saturating_sub(1)))))
-                    .collect(),
-                head,
-                fail_once: AtomicBool::new(false),
-                samples: std::sync::Mutex::default(),
-                head_calls: AtomicUsize::new(0),
-                block_calls: AtomicUsize::new(0),
-                header_calls: AtomicUsize::new(0),
-                range: 1,
-                concurrency: 1,
-                short: false,
-                slow: None,
-                in_flight: AtomicUsize::new(0),
-                peak: AtomicUsize::new(0),
-                follows: true,
-                finality: MAX_UNFINALIZED_BLOCKS as u64,
-                slow_blocks: false,
-                inconsistent: std::sync::Mutex::default(),
-                blocks_in_flight: AtomicUsize::new(0),
-                blocks_peak: AtomicUsize::new(0),
-            },
+            blocks: (0..=head)
+                .map(|h| (h, (hash(h), hash(h.saturating_sub(1)))))
+                .collect(),
+            head,
+            samples: Mutex::default(),
+            faults: Mutex::default(),
+            head_calls: AtomicUsize::new(0),
+            block_calls: AtomicUsize::new(0),
+            header_calls: AtomicUsize::new(0),
+            range: 1,
+            concurrency: 1,
+            short: false,
+            slow: false,
+            in_flight: AtomicUsize::new(0),
+            peak: AtomicUsize::new(0),
+            follows: true,
+            finality: MAX_UNFINALIZED_BLOCKS as u64,
         }
     }
 
     /// [`Self::linear`], as a source that only backfills.
     pub(super) fn backfilling(head: u64) -> Self {
-        let mut source = Self::linear(head);
-        source.data.follows = false;
-        source
+        Self {
+            follows: false,
+            ..Self::linear(head)
+        }
+    }
+
+    /// Makes the next `times` block reads at `height` answer `fault`.
+    pub(super) fn fail(&self, height: u64, fault: Fault, times: u32) {
+        self.faults
+            .lock()
+            .expect("faults")
+            .insert(height, (fault, times));
     }
 
     /// The metadata a source would announce for its current head.
     pub(super) fn head_meta(&self) -> BlockMeta {
-        let height = self.data.head;
-        let (hash, parent) = self.data.blocks[&height];
-        BlockMeta {
+        self.meta_at(self.head).expect("the head is on the chain")
+    }
+
+    /// The identity the chain holds at `height`.
+    fn meta_at(&self, height: u64) -> Result<BlockMeta, SourceError> {
+        let &(hash, parent_hash) = self
+            .blocks
+            .get(&height)
+            .ok_or_else(|| source_malformed("missing block"))?;
+        Ok(BlockMeta {
             height,
             hash,
-            parent_hash: parent,
+            parent_hash,
             timestamp: height,
+        })
+    }
+
+    /// Reads the block at `height`, counted, answering an injected fault first.
+    fn read(&self, height: u64) -> Result<FetchedBlock, SourceError> {
+        self.block_calls.fetch_add(1, Ordering::Relaxed);
+        if let Some((fault, left)) = self
+            .faults
+            .lock()
+            .expect("faults")
+            .get_mut(&height)
+            .filter(|(_, left)| *left > 0)
+        {
+            *left -= 1;
+            return Err(match fault {
+                Fault::Inconsistent => SourceError::Inconsistent {
+                    context: "test".into(),
+                    detail: "a backend behind the head".into(),
+                },
+                Fault::Failed => source_malformed("injected source failure"),
+            });
         }
+        let meta = self.meta_at(height)?;
+        Ok(FetchedBlock {
+            meta,
+            events: vec![Event::Block(Box::new(Block {
+                number: height,
+                hash: meta.hash,
+                parent_hash: meta.parent_hash,
+                ..Block::default()
+            }))],
+        })
+    }
+
+    /// Reads `from..=to`, stopping at the first failure, one block short if `short`.
+    fn read_range(&self, from: u64, to: u64) -> Result<Vec<FetchedBlock>, SourceError> {
+        let mut blocks = (from..=to)
+            .map(|height| self.read(height))
+            .collect::<Result<Vec<_>, _>>()?;
+        if self.short {
+            blocks.pop();
+        }
+        Ok(blocks)
+    }
+
+    /// Waits `duration`, counted in flight, if the source is slow.
+    async fn wait(&self, duration: Duration) {
+        if !self.slow {
+            return;
+        }
+        let now = self.in_flight.fetch_add(1, Ordering::Relaxed) + 1;
+        self.peak.fetch_max(now, Ordering::Relaxed);
+        tokio::time::sleep(duration).await;
+        self.in_flight.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
@@ -130,120 +197,43 @@ impl BlockSource for Source {
         &self.chain
     }
     fn follows_heads(&self) -> bool {
-        self.data.follows
+        self.follows
     }
     async fn subscribe_heads(&self) -> Result<HeadStream, SourceError> {
         Ok(Box::pin(stream::pending()))
     }
     async fn fetch_header(&self, height: Option<u64>) -> Result<BlockMeta, SourceError> {
         if height.is_some() {
-            self.data.header_calls.fetch_add(1, Ordering::Relaxed);
+            self.header_calls.fetch_add(1, Ordering::Relaxed);
         }
         let height = height.unwrap_or_else(|| {
-            self.data.head_calls.fetch_add(1, Ordering::Relaxed);
-            let sample = self.data.samples.lock().expect("samples").pop_front();
-            sample.unwrap_or(self.data.head)
+            self.head_calls.fetch_add(1, Ordering::Relaxed);
+            let sample = self.samples.lock().expect("samples").pop_front();
+            sample.unwrap_or(self.head)
         });
-        let Some(&(hash, parent)) = self.data.blocks.get(&height) else {
-            return Err(SourceError::Malformed {
-                context: "test".into(),
-                detail: "missing block".into(),
-            });
-        };
-        Ok(BlockMeta {
-            height,
-            hash,
-            parent_hash: parent,
-            timestamp: height,
-        })
+        self.meta_at(height)
     }
     async fn fetch_blocks(&self, from: u64, to: u64) -> Result<Vec<FetchedBlock>, SourceError> {
-        let data = &self.data;
-        let now = data.in_flight.fetch_add(1, Ordering::Relaxed) + 1;
-        data.peak.fetch_max(now, Ordering::Relaxed);
-        if let Some(slow) = data.slow {
-            let seconds = if from == slow { 2 } else { 1 };
-            tokio::time::sleep(std::time::Duration::from_secs(seconds)).await;
-        }
-        let mut blocks = Vec::new();
-        let mut result = Ok(());
-        for height in from..=to {
-            match self.fetch_block(height, None).await {
-                Ok(block) => blocks.push(block),
-                Err(error) => {
-                    result = Err(error);
-                    break;
-                }
-            }
-        }
-        data.in_flight.fetch_sub(1, Ordering::Relaxed);
-        result?;
-        if data.short {
-            blocks.pop();
-        }
-        Ok(blocks)
+        self.wait(Duration::from_secs(if from == 0 { 2 } else { 1 }))
+            .await;
+        self.read_range(from, to)
     }
     fn backfill_span(&self) -> u64 {
-        self.data.range
+        self.range
     }
     fn backfill_concurrency(&self) -> usize {
-        self.data.concurrency
+        self.concurrency
     }
     fn finality_depth(&self) -> u64 {
-        self.data.finality
+        self.finality
     }
     async fn fetch_block(
         &self,
         height: u64,
         _head: Option<&BlockMeta>,
     ) -> Result<FetchedBlock, SourceError> {
-        let data = &self.data;
-        data.block_calls.fetch_add(1, Ordering::Relaxed);
-        if data.slow_blocks {
-            let now = data.blocks_in_flight.fetch_add(1, Ordering::Relaxed) + 1;
-            data.blocks_peak.fetch_max(now, Ordering::Relaxed);
-            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-            data.blocks_in_flight.fetch_sub(1, Ordering::Relaxed);
-        }
-        if let Some(left) = data
-            .inconsistent
-            .lock()
-            .expect("inconsistent")
-            .get_mut(&height)
-            .filter(|left| **left > 0)
-        {
-            *left -= 1;
-            return Err(SourceError::Inconsistent {
-                context: "test".into(),
-                detail: "a backend behind the head".into(),
-            });
-        }
-        if data.fail_once.swap(false, Ordering::Relaxed) {
-            return Err(SourceError::Malformed {
-                context: "test".into(),
-                detail: "injected source failure".into(),
-            });
-        }
-        let Some(&(hash, parent)) = data.blocks.get(&height) else {
-            return Err(SourceError::Malformed {
-                context: "test".into(),
-                detail: "missing block".into(),
-            });
-        };
-        Ok(FetchedBlock {
-            meta: BlockMeta {
-                height,
-                hash,
-                parent_hash: parent,
-                timestamp: height,
-            },
-            events: vec![Event::Block(Box::new(Block {
-                number: height,
-                hash,
-                parent_hash: parent,
-                ..Block::default()
-            }))],
-        })
+        self.wait(Duration::from_millis(5)).await;
+        self.read(height)
     }
 }
 
@@ -284,6 +274,165 @@ impl EnvelopeSink for Sink {
     }
 }
 
+/// A [`Source`] a spawned run reads while the test moves it through the same lock, with
+/// a subscription announcing the heads the test sends. Headers are read as blocks are,
+/// so an injected fault meets whichever read of its height comes first.
+struct LiveSource {
+    id: ChainId,
+    chain: Arc<Mutex<Source>>,
+    hints: Mutex<Option<UnboundedReceiver<BlockMeta>>>,
+}
+
+impl LiveSource {
+    fn lock(&self) -> MutexGuard<'_, Source> {
+        self.chain.lock().expect("chain")
+    }
+}
+
+impl BlockSource for LiveSource {
+    fn chain(&self) -> &ChainId {
+        &self.id
+    }
+    fn follows_heads(&self) -> bool {
+        self.lock().follows
+    }
+    async fn fetch_blocks(&self, from: u64, to: u64) -> Result<Vec<FetchedBlock>, SourceError> {
+        self.lock().read_range(from, to)
+    }
+    fn backfill_span(&self) -> u64 {
+        self.lock().range
+    }
+    fn finality_depth(&self) -> u64 {
+        self.lock().finality
+    }
+    fn backfill_concurrency(&self) -> usize {
+        self.lock().concurrency
+    }
+    async fn subscribe_heads(&self) -> Result<HeadStream, SourceError> {
+        let hints = self
+            .hints
+            .lock()
+            .expect("hints lock")
+            .take()
+            .expect("subscribe once");
+        Ok(Box::pin(stream::unfold(hints, |mut hints| async move {
+            hints.recv().await.map(|hint| (Ok(hint), hints))
+        })))
+    }
+    async fn fetch_header(&self, height: Option<u64>) -> Result<BlockMeta, SourceError> {
+        let chain = self.lock();
+        match height {
+            Some(height) => Ok(chain.read(height)?.meta),
+            None => Ok(chain.head_meta()),
+        }
+    }
+    async fn fetch_block(
+        &self,
+        height: u64,
+        _head: Option<&BlockMeta>,
+    ) -> Result<FetchedBlock, SourceError> {
+        self.lock().read(height)
+    }
+}
+
+/// Forwards every event but the per-block ledger markers, which the live tests do not
+/// assert on: they are about which blocks and reorgs reach the sink, and in what order.
+/// Keeps the newest head it was told of.
+struct LiveSink {
+    events: UnboundedSender<Event>,
+    head: Arc<AtomicU64>,
+}
+
+impl EnvelopeSink for LiveSink {
+    async fn publish(&mut self, envelope: Envelope) -> Result<(), SinkError> {
+        if matches!(envelope.event, Event::AcceptedBlock(_)) {
+            return Ok(());
+        }
+        self.events
+            .send(envelope.event)
+            .map_err(|_| SinkError::StorageClosed)
+    }
+    async fn flush(&mut self) -> Result<(), SinkError> {
+        Ok(())
+    }
+    fn observe_head(&mut self, height: u64) {
+        self.head.store(height, Ordering::Relaxed);
+    }
+}
+
+/// A spawned live run over [`Source::linear`]`(6)` whose head starts at 1, so the
+/// default start lands there: the live-only case, where startup seeds block 1 and the
+/// run follows from it. [`Self::start`] returns once block 1 is forwarded.
+pub(super) struct Live {
+    chain: Arc<Mutex<Source>>,
+    hints: UnboundedSender<BlockMeta>,
+    pub(super) received: UnboundedReceiver<Event>,
+    /// The newest head the sink was told of.
+    pub(super) observed: Arc<AtomicU64>,
+    run: JoinHandle<Result<(), PipelineError>>,
+}
+
+impl Live {
+    pub(super) async fn start() -> Self {
+        let (hints, hint_stream) = unbounded_channel();
+        let (events, received) = unbounded_channel();
+        let chain = Arc::new(Mutex::new(Source {
+            head: 1,
+            ..Source::linear(6)
+        }));
+        let observed = Arc::new(AtomicU64::new(0));
+        let source = LiveSource {
+            id: ChainId::new("ethereum"),
+            chain: Arc::clone(&chain),
+            hints: Mutex::new(Some(hint_stream)),
+        };
+        let sink = LiveSink {
+            events,
+            head: Arc::clone(&observed),
+        };
+        let run = tokio::spawn(Machine::new(source, sink, Vec::new()).run(None, None));
+        let mut live = Self {
+            chain,
+            hints,
+            received,
+            observed,
+            run,
+        };
+        assert_eq!(live.next_block("block 1").await.number, 1);
+        live
+    }
+
+    /// The chain the run reads, to move between its reads.
+    pub(super) fn chain(&self) -> MutexGuard<'_, Source> {
+        self.chain.lock().expect("chain")
+    }
+
+    /// Announces the head at `height` on the subscription.
+    pub(super) fn announce(&self, height: u64) {
+        self.hints.send(meta(height)).expect("hint");
+    }
+
+    /// The next event the run forwarded, which must be a block; `what` names it in the
+    /// failure.
+    pub(super) async fn next_block(&mut self, what: &str) -> Box<Block> {
+        match self.received.recv().await {
+            Some(Event::Block(block)) => block,
+            other => panic!("expected {what}, received {other:?}"),
+        }
+    }
+
+    /// Ends the run by closing its subscription, checks that is why it ended, and hands
+    /// back what it forwarded that was not read yet.
+    pub(super) async fn close(self) -> UnboundedReceiver<Event> {
+        drop(self.hints);
+        fails_with(
+            self.run.await.expect("driver task"),
+            &PipelineError::SubscriptionClosed,
+        );
+        self.received
+    }
+}
+
 /// Starts a machine at `from` and syncs it to the sampled head, as `run` does before
 /// going live.
 pub(super) async fn settle(machine: &mut Machine<Source, Sink>, from: Option<u64>) {
@@ -293,7 +442,7 @@ pub(super) async fn settle(machine: &mut Machine<Source, Sink>, from: Option<u64
 /// Moves the fake chain to `height` and feeds that head to the live phase, as a
 /// notification or heartbeat would.
 pub(super) async fn observe(machine: &mut Machine<Source, Sink>, height: u64) {
-    chain(machine).data.head = height;
+    chain(machine).head = height;
     let head = machine.source.head_meta();
     machine.process_head(head).await.expect("observe");
 }
@@ -303,12 +452,12 @@ pub(super) fn chain(machine: &mut Machine<Source, Sink>) -> &mut Source {
     Arc::get_mut(&mut machine.source).expect("no fetch in flight")
 }
 
-/// How often the fake chain was asked so far: head samples, then block fetches.
+/// How often the fake chain was asked so far: head samples, then block reads.
 pub(super) fn reads(machine: &Machine<Source, Sink>) -> (usize, usize) {
-    let data = &machine.source.data;
+    let source = &machine.source;
     (
-        data.head_calls.load(Ordering::Relaxed),
-        data.block_calls.load(Ordering::Relaxed),
+        source.head_calls.load(Ordering::Relaxed),
+        source.block_calls.load(Ordering::Relaxed),
     )
 }
 
@@ -335,12 +484,16 @@ pub(super) fn fails_with<T: std::fmt::Debug>(
     assert_eq!(format!("{error:?}"), format!("{expected:?}"));
 }
 
-/// The error the fake chain answers with, as the pipeline surfaces it.
-pub(super) fn malformed(detail: &str) -> PipelineError {
-    PipelineError::Source(SourceError::Malformed {
+fn source_malformed(detail: &str) -> SourceError {
+    SourceError::Malformed {
         context: "test".into(),
         detail: detail.into(),
-    })
+    }
+}
+
+/// The error the fake chain answers with, as the pipeline surfaces it.
+pub(super) fn malformed(detail: &str) -> PipelineError {
+    PipelineError::Source(source_malformed(detail))
 }
 
 /// The identities a store would hand back after committing `heights` of the linear
@@ -358,10 +511,7 @@ pub(super) fn fork(source: &mut Source, from: u64, through: u64) {
         } else {
             hash(height + 99)
         };
-        source
-            .data
-            .blocks
-            .insert(height, (hash(height + 100), parent));
+        source.blocks.insert(height, (hash(height + 100), parent));
     }
 }
 

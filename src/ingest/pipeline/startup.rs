@@ -248,7 +248,6 @@ impl<S: BlockSource + 'static, K: EnvelopeSink> Machine<S, K> {
 #[cfg(test)]
 #[expect(clippy::expect_used)]
 mod tests {
-    use std::sync::atomic::Ordering;
 
     use super::*;
     use crate::ingest::pipeline::testing::*;
@@ -323,7 +322,7 @@ mod tests {
     async fn a_buried_stop_ends_the_run_there() {
         let head = MAX_UNFINALIZED_BLOCKS as u64 + 20;
         let mut source = Source::linear(head);
-        source.data.range = 4;
+        source.range = 4;
         let mut machine = Machine::new(source, Sink::default(), Vec::new());
         assert_eq!(machine.sync(Some(0), Some(9)).await.expect("sync"), Some(9));
         assert_eq!(heights(&machine), (0..=9).collect::<Vec<_>>());
@@ -371,12 +370,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn startup_asks_an_inconsistent_source_again() {
         let source = Source::linear(6);
-        source
-            .data
-            .inconsistent
-            .lock()
-            .expect("inconsistent")
-            .insert(3, 1);
+        source.fail(3, Fault::Inconsistent, 1);
         let mut machine = Machine::new(source, Sink::default(), ledger(0..=2));
         assert_eq!(
             machine
@@ -401,12 +395,9 @@ mod tests {
         let attempts = u64::from(STARTUP_ATTEMPTS);
         let head = 2 * attempts;
         let source = Source::linear(head);
-        source
-            .data
-            .inconsistent
-            .lock()
-            .expect("inconsistent")
-            .extend((1..=head).map(|height| (height, 1)));
+        for height in 1..=head {
+            source.fail(height, Fault::Inconsistent, 1);
+        }
         let mut machine = Machine::new(source, Sink::default(), ledger(0..=0));
         machine
             .sync_settled(None, Some(head))
@@ -415,12 +406,7 @@ mod tests {
         assert_eq!(heights(&machine), (1..=head).collect::<Vec<_>>());
 
         let source = Source::linear(6);
-        source
-            .data
-            .inconsistent
-            .lock()
-            .expect("inconsistent")
-            .insert(3, u32::MAX);
+        source.fail(3, Fault::Inconsistent, u32::MAX);
         let mut machine = Machine::new(source, Sink::default(), ledger(0..=2));
         let error = machine
             .sync_settled(None, Some(6))
@@ -445,7 +431,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn startup_returns_source_errors_without_retrying() {
         let source = Source::linear(3);
-        source.data.fail_once.store(true, Ordering::Relaxed);
+        source.fail(3, Fault::Failed, 1);
         let mut machine = Machine::new(source, Sink::default(), Vec::new());
         // The failure is injected once, so a retry would succeed and return `Ok`.
         fails_with(
@@ -475,14 +461,14 @@ mod tests {
     #[tokio::test]
     async fn a_backfill_stops_at_the_chains_finality_depth() {
         let mut source = Source::backfilling(100);
-        source.data.finality = 10;
+        source.finality = 10;
         let mut machine = Machine::new(source, Sink::default(), Vec::new());
         machine.sync(Some(2), None).await.expect("backfill");
         assert_eq!(heights(&machine), (2..=90).collect::<Vec<_>>());
 
         let head = MAX_UNFINALIZED_BLOCKS as u64 + 5;
         let mut source = Source::backfilling(head);
-        source.data.finality = u64::MAX;
+        source.finality = u64::MAX;
         let mut machine = Machine::new(source, Sink::default(), Vec::new());
         machine.sync(Some(2), None).await.expect("backfill");
         assert_eq!(heights(&machine), (2..=5).collect::<Vec<_>>());
@@ -595,7 +581,6 @@ mod tests {
         let source = Source::backfilling(window + 20);
         // The head moves at every sample; the run takes one, for its stop.
         source
-            .data
             .samples
             .lock()
             .expect("samples")
@@ -727,7 +712,7 @@ mod tests {
     async fn the_first_resumed_block_must_link_to_the_stored_tip() {
         let head = MAX_UNFINALIZED_BLOCKS as u64 + 20;
         let mut source = Source::linear(head);
-        source.data.blocks.insert(6, (hash(6), hash(99)));
+        source.blocks.insert(6, (hash(6), hash(99)));
         let mut machine = Machine::new(source, Sink::default(), ledger(0..=5));
         fails_with(
             machine.sync(None, None).await,
@@ -746,7 +731,7 @@ mod tests {
     #[tokio::test]
     async fn a_source_behind_the_stored_tip_waits_for_it() {
         let mut machine = Machine::new(Source::linear(8), Sink::default(), ledger(0..=5));
-        chain(&mut machine).data.head = 3;
+        chain(&mut machine).head = 3;
         settle(&mut machine, None).await;
         assert!(machine.sink.events.is_empty());
         assert_eq!(machine.tip(), Some(meta(5)));
