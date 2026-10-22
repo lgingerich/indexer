@@ -42,8 +42,8 @@ use std::process::ExitCode;
 
 use alloy_primitives::{Address, B256, Bloom, Bytes, I256, TxHash, U256};
 use indexer::wire::envelope::{
-    Block, ChainId, Contract, Decoded, DecodedArg, Envelope, Event, Log, Reorg, Transaction,
-    TypedValue,
+    Block, BlockMeta, ChainId, Contract, Decoded, DecodedArg, Derived, DerivedField, Envelope,
+    Event, Log, Reorg, Transaction, TypedValue,
 };
 
 /// The chain these are from.
@@ -67,7 +67,7 @@ fn main() -> ExitCode {
             .unwrap_or_else(|error| panic!("{} serializes: {error}", envelope.kind()));
         writeln!(writer, "{line}").unwrap_or_else(|error| panic!("write {OUTPUT}: {error}"));
         println!(
-            "{:<12} {:>5} bytes  dedupe_key={}",
+            "{:<14} {:>5} bytes  dedupe_key={}",
             envelope.kind(),
             line.len(),
             envelope.event.dedupe_key()
@@ -93,7 +93,9 @@ fn envelopes() -> Vec<Envelope> {
         log(),
         decoded(),
         contract(),
+        derived(),
         reorg(),
+        accepted_block(),
     ]
 }
 
@@ -138,6 +140,8 @@ fn transaction() -> Envelope {
         to: Some(CONTRACT),
         value: U256::from(10u64.pow(18)),
         gas: 45_000,
+        // The price paid, as a node reports it for an EIP-1559 transaction.
+        gas_price: Some(1_500_000_000),
         max_fee_per_gas: Some(2_000_000_000),
         max_priority_fee_per_gas: Some(1_000_000_000),
         input: Bytes::from_static(&[0x01, 0x02, 0x03]),
@@ -145,6 +149,12 @@ fn transaction() -> Envelope {
         // an OP-stack deposit is `0x7e` and an Arbitrum retry `0x6a`.
         transaction_type: 2,
         chain_id: Some(1),
+        // The signature. A typed transaction's `v` is its parity; the envelope's own
+        // version is `schema_version`, so the two never share a key.
+        r: Some(U256::from(0x1234)),
+        s: Some(U256::from(0x5678)),
+        v: Some(1),
+        y_parity: Some(1),
         receipt_status: true,
         receipt_gas_used: 21_000,
         receipt_cumulative_gas_used: 21_000,
@@ -264,6 +274,31 @@ fn contract() -> Envelope {
     })))
 }
 
+/// One row a derivation computed from the decoded swap, beside the log's identity.
+fn derived() -> Envelope {
+    envelope(Event::Derived(Box::new(Derived {
+        table: "metric_v1_swaps".to_owned(),
+        address: CONTRACT,
+        transaction_hash: TX_HASH,
+        transaction_index: 0,
+        log_index: 7,
+        row: 0,
+        // Denormalized from the transaction, as Allium's `dex.trades` carries them.
+        transaction_from_address: Some(Address::from([0x55; 20])),
+        transaction_to_address: Some(CONTRACT),
+        fields: vec![DerivedField {
+            name: "amount0_raw".to_owned(),
+            value: TypedValue::Int {
+                value: I256::MINUS_ONE,
+                bits: 256,
+            },
+        }],
+        block_number: BLOCK_NUMBER,
+        block_hash: BLOCK_HASH,
+        block_timestamp: TIMESTAMP,
+    })))
+}
+
 /// A discontinuity: the last few published blocks are no longer canonical.
 fn reorg() -> Envelope {
     envelope(Event::Reorg(Reorg {
@@ -271,6 +306,16 @@ fn reorg() -> Envelope {
         new_head_hash: hash(0x17),
         // Newest first.
         orphaned_hashes: vec![BLOCK_HASH],
+    }))
+}
+
+/// The marker that closes a block's batch, published last for every block.
+fn accepted_block() -> Envelope {
+    envelope(Event::AcceptedBlock(BlockMeta {
+        height: BLOCK_NUMBER,
+        hash: BLOCK_HASH,
+        parent_hash: hash(0x10),
+        timestamp: TIMESTAMP,
     }))
 }
 

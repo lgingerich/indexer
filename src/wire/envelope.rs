@@ -983,6 +983,22 @@ mod tests {
         assert_eq!(read, envelope);
     }
 
+    /// The checked-in fixtures are lines a consumer can copy as examples, so each must be
+    /// exactly what the encoder writes today: read back and written again, it is the same
+    /// bytes. A stale fixture — an old key, an omitted absent field — fails here.
+    #[test]
+    fn the_published_fixtures_are_what_the_encoder_writes() {
+        let fixtures = [
+            include_str!("../../examples/fixtures/datasets.ndjson"),
+            include_str!("../../examples/fixtures/uniswap_v3_swaps.ndjson"),
+        ];
+        for line in fixtures.iter().flat_map(|fixture| fixture.lines()) {
+            let envelope: Envelope =
+                serde_json::from_str(line).unwrap_or_else(|error| panic!("{line} reads: {error}"));
+            assert_eq!(serde_json::to_string(&envelope).expect("serializes"), line);
+        }
+    }
+
     /// A derived row's key is its log's, its table, and its position among the log's
     /// rows, pinned as a literal like every other key.
     #[test]
