@@ -103,8 +103,13 @@ async fn main() -> ExitCode {
             // to store. Debug would wrap the same chain in the raw values behind it: a
             // settings parse error alone would print the whole document, its byte spans,
             // and its key list. The path is named here because this caller is the one
-            // that has it.
-            error!(%error, settings = %path, "indexer stopped");
+            // that has it. A check names itself, since nothing ran to stop and a deploy's
+            // log should not read as a chain going down.
+            if check {
+                error!(%error, settings = %path, "settings check failed");
+            } else {
+                error!(%error, settings = %path, "indexer stopped");
+            }
             if error.is_config() {
                 ExitCode::from(EXIT_CONFIG)
             } else {
