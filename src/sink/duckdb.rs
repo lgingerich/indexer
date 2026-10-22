@@ -1035,6 +1035,54 @@ mod tests {
         }
     }
 
+    /// A store more than the ledger's window ahead, the only kind that is rewound, has
+    /// pruned the ledger rows of the blocks just above the height; the rewind deletes those
+    /// blocks' rows all the same.
+    #[tokio::test]
+    async fn a_rewind_deletes_blocks_whose_ledger_rows_were_pruned() {
+        let mut sink = sink().await;
+        let tip = BlockMeta {
+            height: LEDGER_WINDOW as u64 + 10,
+            hash: B256::repeat_byte(0xee),
+            parent_hash: B256::repeat_byte(0xed),
+            timestamp: 1_700_000_000,
+        };
+        for meta in (1..=5).map(accepted).chain([tip]) {
+            for event in [
+                Event::Block(Box::new(Block {
+                    number: meta.height,
+                    hash: meta.hash,
+                    ..Block::default()
+                })),
+                Event::AcceptedBlock(meta),
+            ] {
+                sink.publish(Envelope::new(chain(), event))
+                    .await
+                    .expect("buffer");
+            }
+            sink.flush().await.expect("flush");
+        }
+        assert_eq!(
+            column::<u64>(
+                &sink.engine.connection,
+                "SELECT height FROM accepted_blocks"
+            ),
+            [tip.height],
+            "the flush at the tip pruned the ledger below its window"
+        );
+
+        sink.rewind(3).await.expect("rewind");
+
+        assert_eq!(
+            column::<u64>(
+                &sink.engine.connection,
+                "SELECT number FROM blocks ORDER BY number"
+            ),
+            [1, 2, 3],
+            "no block above the height is left"
+        );
+    }
+
     /// The ledger reads back the newest unorphaned accepted blocks of one chain, oldest
     /// first, and deletes nothing.
     #[tokio::test]

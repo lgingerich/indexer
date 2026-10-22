@@ -159,29 +159,20 @@ pub(crate) fn delete_blocks<D: Dialect>(table: &TableDef) -> Option<String> {
     ))
 }
 
-/// Deletes chain `$1`'s rows of every block `ledger` holds above height `$2`, for a table
-/// whose rows belong to a block: one statement for the whole rewind, so a remote database
-/// pays one round trip a table rather than one a block.
+/// Deletes chain `$1`'s rows of every block above height `$2`, for a table whose rows
+/// belong to a block: one statement for the whole rewind, so a remote database pays one
+/// round trip a table rather than one a block. `PostgreSQL` finds the rows through the
+/// block index, and `DuckDB`, which keeps no index, skips the row groups below.
 ///
-/// The height bound finds the rows: `PostgreSQL` reads the block index above it, and
-/// `DuckDB`, which keeps no index, skips the row groups below. The hashes, from the
-/// ledger, keep the delete to blocks it accepted. Run against the ledger last: its rows
-/// are what the others are found by.
-pub(crate) fn delete_above(table: &TableDef, ledger: &TableDef) -> Option<String> {
-    let (hash, number) = table.block_hash.as_ref().zip(table.block_number.as_ref())?;
-    let (ledger_hash, ledger_number) = ledger
-        .block_hash
-        .as_ref()
-        .zip(ledger.block_number.as_ref())?;
+/// By height alone, as the lake rewinds: the ledger cannot name the blocks, since each
+/// flush prunes it to the window below the tip and a store is rewound only when it is
+/// more than that window ahead. Everything above the height goes, whatever its hash.
+pub(crate) fn delete_above(table: &TableDef) -> Option<String> {
+    let number = table.block_number.as_ref()?;
     Some(format!(
-        "DELETE FROM {} WHERE \"chain\" = $1 AND {} > $2 AND {} IN \
-         (SELECT {} FROM {} WHERE \"chain\" = $1 AND {} > $2)",
+        "DELETE FROM {} WHERE \"chain\" = $1 AND {} > $2",
         ident(&table.name),
-        ident(number),
-        ident(hash),
-        ident(ledger_hash),
-        ident(&ledger.name),
-        ident(ledger_number)
+        ident(number)
     ))
 }
 

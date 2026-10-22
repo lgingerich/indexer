@@ -95,7 +95,7 @@ struct Prepared {
 }
 
 impl Prepared {
-    fn new<D: Dialect>(position: usize, def: &Arc<TableDef>, ledger: &TableDef) -> Self {
+    fn new<D: Dialect>(position: usize, def: &Arc<TableDef>) -> Self {
         let staging = format!("staging_{position}");
         Self {
             create_staging: D::create_staging(def, &staging),
@@ -103,7 +103,7 @@ impl Prepared {
             clear_staging: D::clear_staging(&staging),
             staged: 0,
             delete: sql::delete_blocks::<D>(def),
-            delete_above: sql::delete_above(def, ledger),
+            delete_above: sql::delete_above(def),
             staging,
             def: Arc::clone(def),
         }
@@ -213,9 +213,7 @@ impl<E: Engine> SqlStore<E> {
                 .tables()
                 .iter()
                 .enumerate()
-                .map(|(position, def)| {
-                    Prepared::new::<E::Dialect>(position, def, schema.dataset(Table::AcceptedBlock))
-                })
+                .map(|(position, def)| Prepared::new::<E::Dialect>(position, def))
                 .collect(),
             reads: Reads::new(&schema)?,
             batch: Batch::new(schema),
@@ -369,19 +367,11 @@ impl<E: Engine> SqlStore<E> {
         self.vacuum_staging().await
     }
 
-    /// Deletes every block above `height` from each table whose rows belong to one.
-    ///
-    /// The blocks are the ledger's: a block's rows commit with its ledger entry, so every
-    /// block above `height` with rows is named there. Each table takes one statement that
-    /// finds them in the ledger by hash, as a reorg deletes, so the delete uses the hash
-    /// index rather than scanning by height. The ledger goes last, since the others are
-    /// found through it.
+    /// Deletes every block above `height` from each table whose rows belong to one, the
+    /// ledger included, by height (see [`sql::delete_above`]).
     async fn delete_above(&mut self, height: u64) -> Result<(), StoreError> {
         let params = [chain_param(&self.chain), Value::Uint(height)];
-        let ledger = TableId::Dataset(Table::AcceptedBlock);
-        let (others, last): (Vec<&Prepared>, Vec<&Prepared>) =
-            self.tables.iter().partition(|table| table.def.id != ledger);
-        for table in others.into_iter().chain(last) {
+        for table in &self.tables {
             let Some(delete) = &table.delete_above else {
                 continue;
             };

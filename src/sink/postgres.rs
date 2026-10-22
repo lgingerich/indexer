@@ -1211,6 +1211,68 @@ mod tests {
         scratch.remove(sink).await;
     }
 
+    /// A store more than the ledger's window ahead, the only kind that is rewound, has
+    /// pruned the ledger rows of the blocks just above the height; the rewind deletes those
+    /// blocks' rows all the same.
+    #[tokio::test]
+    #[ignore = "requires INDEXER_TEST_POSTGRES_URL pointing to PostgreSQL 18"]
+    async fn a_rewind_deletes_blocks_whose_ledger_rows_were_pruned() {
+        use crate::ingest::pipeline::LEDGER_WINDOW;
+        use crate::sink::Store as _;
+        use crate::wire::datasets::evm::Block;
+        use crate::wire::envelope::BlockMeta;
+
+        let (client, scratch) = Scratch::create("rewind_pruned").await;
+        let schema = &scratch.schema;
+        let mut sink = dataset_sink(client, schema).await;
+        let tip = LEDGER_WINDOW as u64 + 10;
+        for height in (1..=5).chain([tip]) {
+            let meta = BlockMeta {
+                height,
+                hash: B256::from(U256::from(height)),
+                parent_hash: B256::from(U256::from(height - 1)),
+                timestamp: 1_700_000_000 + height,
+            };
+            for event in [
+                Event::Block(Box::new(Block {
+                    number: height,
+                    hash: meta.hash,
+                    ..Block::default()
+                })),
+                Event::AcceptedBlock(meta),
+            ] {
+                sink.publish(Envelope::new(ChainId::new(schema), event))
+                    .await
+                    .expect("publish");
+            }
+            sink.flush().await.expect("commit");
+        }
+        let heights = async |sink: &PostgresSink, sql: &str| {
+            db(sink)
+                .query(sql, &[])
+                .await
+                .expect("read back")
+                .iter()
+                .map(|row| row.get::<_, i64>(0))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            heights(&sink, "SELECT height::BIGINT FROM accepted_blocks").await,
+            [i64::try_from(tip).expect("small")],
+            "the commit at the tip pruned the ledger below its window"
+        );
+
+        sink.rewind(3).await.expect("rewind");
+
+        assert_eq!(
+            heights(&sink, "SELECT number::BIGINT FROM blocks ORDER BY number").await,
+            [1, 2, 3],
+            "no block above the height is left"
+        );
+
+        scratch.remove(sink).await;
+    }
+
     /// A reorg deletes its orphaned blocks' rows in every table — committed earlier or
     /// buffered in the same batch — and a block that returns is stored. Run with every
     /// table in a publication, which refuses a delete from a table without a replica
