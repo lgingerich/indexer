@@ -957,11 +957,9 @@ render different DDL rather than each deciding what a log is.
 
 Identity uses `alloy_primitives::{B256, BlockHash, TxHash}`, encoded as lowercase
 `0x` hex, and quantity fields encode as `0x` hex via `alloy-serde`. The wire shape
-is pinned by tests in `src/wire/envelope.rs`: `every_variant_round_trips_through_json`
-covers every event kind, `the_wire_object_carries_only_the_envelope_and_event_fields`
-pins the exact key set, and
-`the_schema_version_is_stamped_and_absent_v_parses` pins both the `v` stamp and
-backward compatibility with a line written without the field. Every sink
+is pinned in `src/wire/envelope.rs` by
+`every_variant_round_trips_through_json_with_unique_keys`: every event kind, with every
+optional field set, reads back unchanged, and no key appears twice on its line. Every sink
 renders through the same encoding, so stdout and the local
 store cannot drift apart. A chain whose
 identity does not fit that shape — Solana's base58 blockhash and 64-byte signature

@@ -39,7 +39,8 @@
 //! "alloy_serde::quantity")]` so they render as the Ethereum JSON-RPC "quantity"
 //! form (`0x` hex) the node itself uses, not as bare JSON numbers; `U256` and the
 //! byte/address types already serialize to their canonical `0x` forms. The whole
-//! envelope is pinned by round-trip and wire-format tests in [`crate::wire::envelope`].
+//! envelope is pinned by `every_variant_round_trips_through_json_with_unique_keys` in
+//! [`crate::wire::envelope`].
 
 use alloy_primitives::{Address, B64, B256, BlockHash, Bloom, Bytes, TxHash, U256};
 use alloy_rpc_types_eth::{AccessList, SignedAuthorization, Withdrawal};
