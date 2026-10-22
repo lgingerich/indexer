@@ -104,8 +104,6 @@ From the code-quality review. None changes behavior.
   `AnyStore`, its `each!` macro, and `Pipeline::open`, which repeats one open block per
   backend. Open stores through `AnyStore` from a typed view of their settings, and give
   `DuckDbSettings` and `PostgresSettings` a `batching()` like `DeltaSettings`.
-- **`src/runtime.rs` is past 1,000 lines** (mostly tests): move them to
-  `src/runtime/tests.rs`, as `src/sink/delta/tests.rs` does.
 - **`Datasets` leftovers.** Its `Default` (all three) and settings-file docs predate the
   derived fetch; `route::datasets` belongs on the type.
 - **A third hand-rolled transaction** in `SqlStore` (`rewind` beside `new` and

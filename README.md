@@ -240,7 +240,8 @@ the process boundary. The layers share one definition of the stream through `wir
 ```
 src/
 ├── main.rs         the process boundary: logging, the settings path, the exit code
-├── runtime.rs      assembles the pipeline the settings describe, and runs it
+├── runtime/        assembles the pipeline the settings describe, and runs it; `stores`
+│                   is what a run that stores adds, behind the `store` feature
 ├── config.rs       typed settings — layer configuration, not string lookups
 ├── metrics.rs      the Prometheus series every layer records, and the endpoint serving them
 ├── wire/           the wire contract: envelope, events, and dataset records. Pure data.
@@ -925,7 +926,7 @@ column added to a dataset appears without anyone editing the DDL.
 
 Configuration is a typed struct in `src/config.rs`, not a string lookup scattered through
 each layer, so a layer can be constructed in a test with no environment at all.
-`src/runtime.rs` turns those settings into the pipeline, so the wiring is testable without
+`src/runtime/` turns those settings into the pipeline, so the wiring is testable without
 a network.
 
 ## Event shape
