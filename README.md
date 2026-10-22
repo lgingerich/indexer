@@ -243,14 +243,20 @@ src/
 ├── runtime/        assembles the pipeline the settings describe, and runs it; `stores`
 │                   is what a run that stores adds, behind the `store` feature
 ├── config.rs       typed settings — layer configuration, not string lookups
+├── secret.rs       a setting that must not be logged, written as its value or `{ env = … }`
 ├── metrics.rs      the Prometheus series every layer records, and the endpoint serving them
-├── wire/           the wire contract: envelope, events, and dataset records. Pure data.
-├── ingest/         block sources and the reorg-aware pipeline.
+├── wire/           the wire contract: envelope, events, dataset records, and the dataset
+│                   selection (`wire::datasets`). Pure data.
+├── window.rs       the undo window's size and the ledger a restart rebuilds it from,
+│                   shared by ingest and the stores
+├── ingest/         block sources (`source/evm/`, `source/hypersync/`) and the
+│                   reorg-aware pipeline (`pipeline/`, mapped in PIPELINE.md).
 ├── decode/         protocol manifests, the log decoder and its contract set, factory
 │                   discovery, the live decoding sink, and `derive/`: tables computed
 │                   from one decoded event each, one file per protocol.
-└── sink/           where envelopes go: the sink trait, the decode→storage channel, the
-                    table definitions, the SQL renderer, the shared store, and stdout.
+├── sink/           where envelopes go: the sink trait, the decode→storage channel, the
+│                   table definitions, the SQL renderer, the shared store, and stdout.
+└── sim/            the deterministic simulation, test-only (see Checks)
 ```
 
 `wire` depends on `alloy` and `serde` and on nothing else in the tree. `decode`
@@ -258,9 +264,9 @@ knows nothing about `ingest`, so it cannot reach into the pipeline's ordering an
 state machine.
 
 The layers are modules, so their one-way dependency direction is a convention a
-reviewer checks rather than one the compiler enforces. At this size, one owner reads
-all of it, and each module documents the direction it may depend in. CI checks the one
-that matters most: `decode` must not depend on `ingest`.
+reviewer checks rather than one the compiler or CI enforces. At this size, one owner
+reads all of it, and each module documents the direction it may depend in. The one that
+matters most is that `decode` must not depend on `ingest`.
 
 ## What works
 
@@ -334,18 +340,22 @@ that matters most: `decode` must not depend on `ingest`.
   deletes the orphaned blocks' rows in the same transaction, so its tables hold only the
   current chain and the `reorgs` rows are the history of what was retracted.
   The sliding window retains up to a fixed 4,096 identities. See `src/ingest/pipeline/ring.rs`.
-- **Headless backfill, then live heads.** Startup samples the head once and captures it
-  as a backfill target; on an empty store `[ingest] start_block` may request earlier
-  inclusive history but defaults to the head. Backfill then reads consecutive concrete
-  heights until it reaches the target, samples the head again, and continues while the
-  chain buried more meanwhile; then live heads take over. Decode runs on both paths, so a historical
+- **Headless backfill, then live heads.** Startup samples the head; on an empty store
+  `[ingest] start_block` may request earlier inclusive history but defaults to the head.
+  Backfill then reads consecutive concrete heights up to `ingest.finality_depth` below
+  the head, samples the head again, and continues while the chain buried more
+  meanwhile; the tail above is filled through the reorg-aware path, and then live heads
+  take over. With `stop_block` the run ends there instead of going live. Decode runs on both paths, so a historical
   log is stored raw and, when it matches, decoded. Alloy keeps the WebSocket subscription
   independent of fetches and sink delivery, and reconnects and resubscribes with bounded
   retries. Live notifications are inputs and hints, not a replay log: a duplicate head is
   skipped before any fetch, a gap is filled from the next height, and a 30-second timer
   reconciles when the subscription is silent. A live head the node answers
-  inconsistently is skipped and retried at the next one. HTTP failures and exhausted
-  subscription recovery are terminal.
+  inconsistently is asked about again after 100 ms, the wait doubling to 2 s while it
+  keeps failing, and at startup an inconsistent answer is retried every 2 s, up to 30
+  times in a row without progress. HTTP failures, after the transport's own paced
+  retries, and exhausted subscription recovery are terminal. PIPELINE.md maps the
+  whole flow.
 - **Resume from the store.** A restart continues after the last block the store
   committed, reconciling a fork that happened while it was down. See
   [Resume from the store](#resume-from-the-store).
@@ -888,8 +898,8 @@ use `NUMERIC(20,0)`, wider integers — wei amounts, prices, difficulty — `NUM
 times `TIMESTAMP` (UTC), hashes and addresses `0x` hex `TEXT`, booleans `BOOLEAN`, and
 documents `JSONB`. A replay updates the existing row. Columns of an existing table are
 not migrated. Failed batches remain buffered. A lost connection during commit can leave
-the outcome unknown; retrying is not exactly-once. Restart recovery remains unimplemented,
-as with the DuckDB sink.
+the outcome unknown; retrying is not exactly-once, and a restart reads back what did
+commit and [resumes from it](#resume-from-the-store), as with the DuckDB sink.
 
 For logical replication (CDC) into a streaming engine, publish the chain's schema, so
 event tables a new manifest adds are included as they are created:
@@ -932,11 +942,17 @@ a network.
 ## Event shape
 
 ```json
-{"chain":"base","schema_version":1,
- "type":"log","log_index":0,"transaction_hash":"0x…","transaction_index":3,
- "address":"0x…","topic0":"0x…","topic1":null,"topic2":null,"topic3":null,
- "data":"0x…","removed":false,"block_number":51883702,"block_hash":"0x…"}
+{"chain":"ethereum","schema_version":1,
+ "type":"log","log_index":"0x7","transaction_hash":"0x2222…","transaction_index":"0x0",
+ "address":"0x3333…","topic0":"0x0707…","topic1":"0x0000…5555","topic2":"0x0000…6666",
+ "topic3":null,"data":"0xdeadbeef","removed":false,"block_number":"0x1406f40",
+ "block_hash":"0x1111…","block_timestamp":"0x6553f100"}
 ```
+
+Quantities — heights, indexes, timestamps, amounts — are `0x` hex strings, and an absent
+value is written as `null` rather than left out, so every line of a type has the same
+keys. `examples/fixtures/datasets.ndjson` has one full line per event type, regenerated
+from the encoder and checked against it by a test.
 
 `schema_version` is the wire shape's version. It is a field on the envelope rather than a transport
 header because one of the sinks is a local database: a header survives no hop into
@@ -971,13 +987,13 @@ render different DDL rather than each deciding what a log is.
 
 Identity uses `alloy_primitives::{B256, BlockHash, TxHash}`, encoded as lowercase
 `0x` hex, and quantity fields encode as `0x` hex via `alloy-serde`. The wire shape
-is pinned in `src/wire/envelope.rs` by
+is pinned in `src/wire/envelope/tests.rs` by
 `every_variant_round_trips_through_json_with_unique_keys`: every event kind, with every
 optional field set, reads back unchanged, and no key appears twice on its line. Every sink
 renders through the same encoding, so stdout and the local
 store cannot drift apart. A chain whose
 identity does not fit that shape — Solana's base58 blockhash and 64-byte signature
-are the expected case — gets its own module beside `src/datasets/evm.rs` plus a
+are the expected case — gets its own module beside `src/wire/datasets/evm.rs` plus a
 variant in `Event`, rather than a shared type widened to fit both.
 
 ## Examples
@@ -1039,9 +1055,15 @@ published with its fields spelled out rather than as one opaque `raw` string.
 ```bash
 cargo fmt --check
 cargo clippy --all-targets --all-features -- -D warnings
-cargo doc --no-deps --all-features
+RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features
 cargo nextest run --all-targets --all-features
 ```
+
+CI (`.github/workflows/ci.yml`) runs these four, then the builds a feature set can break
+alone: `cargo clippy` and `cargo nextest run` with `--no-default-features`, and
+`cargo clippy` with `--no-default-features --features delta` and with
+`--features postgres,delta`, the production image's pair. A deploy runs only on a commit
+CI passed.
 
 The default nextest profile skips the deterministic simulation (`src/sim/`); run it with
 `--ignore-default-filter`.
