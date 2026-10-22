@@ -15,6 +15,12 @@ pub trait Dialect {
     /// Whether the engine builds the tables' secondary indexes.
     const INDEXES: bool;
 
+    /// Lifts the session's statement timeout until the end of the transaction, run first
+    /// in the one that creates the tables: an index newly declared on a large table is
+    /// built there, and a build cut short by the timeout would fail every start alike.
+    /// `None` for an engine that sets no timeout.
+    const UNTIMED: Option<&'static str> = None;
+
     /// The type a column of `kind` is stored as.
     fn type_name(kind: ColumnType) -> String;
 

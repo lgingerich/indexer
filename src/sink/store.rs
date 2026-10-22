@@ -184,20 +184,21 @@ impl<E: Engine> SqlStore<E> {
             .map_err(StoreError::engine(Operation::Begin, None))?;
         // Every table and index in one batch, so a remote database pays one round trip for
         // the schema rather than one a statement. Each is `IF NOT EXISTS`, so a rerun
-        // creates only what is missing.
-        let create = schema
-            .tables()
-            .iter()
-            .flat_map(|def| {
+        // creates only what is missing. A failure rolls back, so the session is not left in
+        // an aborted transaction.
+        let create = E::Dialect::UNTIMED
+            .map(str::to_owned)
+            .into_iter()
+            .chain(schema.tables().iter().flat_map(|def| {
                 std::iter::once(sql::create_table::<E::Dialect>(def))
                     .chain(sql::create_indexes::<E::Dialect>(def))
-            })
+            }))
             .collect::<Vec<_>>()
             .join(";\n");
-        engine
-            .execute(&create, &[])
-            .await
-            .map_err(StoreError::engine(Operation::Create, Some(chain)))?;
+        if let Err(error) = engine.execute(&create, &[]).await {
+            let _ = engine.execute("ROLLBACK", &[]).await;
+            return Err(StoreError::engine(Operation::Create, Some(chain))(error));
+        }
         engine
             .execute("COMMIT", &[])
             .await

@@ -70,8 +70,8 @@ const fn default_batch_records() -> usize {
 }
 
 /// Session settings applied on open: server-side TCP keepalives, and a statement
-/// timeout well above a commit's half second and generous for startup's table and
-/// index creation.
+/// timeout well above a commit's half second. Startup's table and index creation runs
+/// without it (see [`Dialect::UNTIMED`]), since an index build has no such bound.
 const SESSION_SETTINGS: &str = "SET tcp_keepalives_idle = 30; \
      SET tcp_keepalives_interval = 10; \
      SET tcp_keepalives_count = 3; \
@@ -322,6 +322,7 @@ fn pg(error: tokio_postgres::Error) -> EngineError {
 
 impl Dialect for Postgres {
     const INDEXES: bool = true;
+    const UNTIMED: Option<&'static str> = Some("SET LOCAL statement_timeout = 0");
     const DESCRIBE: &'static str = "SELECT c.relname::TEXT, a.attname::TEXT, \
          format_type(a.atttypid, a.atttypmod) FROM pg_attribute a \
          JOIN pg_class c ON c.oid = a.attrelid \
