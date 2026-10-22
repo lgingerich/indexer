@@ -231,6 +231,8 @@ fn live(world: &Shared, path: &Path, plan: Plan, lifetime: u64, crash: Option<Du
         let engine = FaultyEngine {
             inner: DuckDb { connection },
             world: Arc::clone(world),
+            closed: false,
+            landed: false,
         };
         let schema = Arc::new(catalog.schema().clone());
         let http = ClientBuilder::default()
