@@ -35,7 +35,7 @@
 //!
 //! - `mod derive` in `decode/mod.rs`.
 //! - `Catalog::add_derivations`, which declares their tables and binds them, its call
-//!   in `Catalog::load`, and the `Catalog::derivations` field, in `catalog.rs`.
+//!   in `Catalog::load`, and the `Catalog::derivations` field, in `catalog/mod.rs`.
 //! - `Decoding::event`, which names the event a record decoded as, in `decoder.rs`.
 //! - The `derivations` field of `DecodingSink` and its `rows` call, the last
 //!   transaction it keeps for a row's sender and recipient, and the test of a derived
@@ -63,7 +63,7 @@ use crate::sink::table::ColumnType;
 use crate::wire::envelope::{ChainId, Decoded, Derived, DerivedField, TypedValue};
 
 /// Every derivation the indexer has.
-pub(super) const DERIVATIONS: [Derivation; 4] = [
+pub(super) const DERIVATIONS: &[Derivation] = &[
     metric::SWAPS,
     metric::BIN_FILLS,
     metric::LIQUIDITY,
@@ -89,23 +89,30 @@ pub(super) struct Derivation {
     /// The indexes the app's reads need, each its columns in order, beside the ones every
     /// table has by block.
     pub(super) indexes: &'static [&'static [&'static str]],
-    /// One record's rows. A record may derive none.
-    pub(super) derive: fn(&Decoded) -> Result<Vec<Row>, DeriveError>,
+    /// One record's rows, given the index in `signatures` of the event it decoded as. A
+    /// record may derive none.
+    pub(super) derive: fn(&Decoded, usize) -> Result<Vec<Row>, DeriveError>,
 }
 
 /// One derived row: each of its table's columns, by name, with its value.
 pub(super) type Row = Vec<(&'static str, TypedValue)>;
 
 impl Derivation {
-    /// The rows `decoded` derives, numbered in order.
+    /// The rows `decoded`, a record of signature `signature` of [`Self::signatures`],
+    /// derives, numbered in order.
     ///
     /// # Errors
     ///
     /// Returns [`DeriveError::Argument`] when an argument is missing, misnamed, of another
     /// type, or out of the range the contract keeps it in, and [`DeriveError::Columns`]
     /// when a row does not name the table's columns in order.
-    fn rows(&self, decoded: &Decoded, sent: Option<Sent>) -> Result<Vec<Derived>, DeriveError> {
-        (self.derive)(decoded)?
+    fn rows(
+        &self,
+        decoded: &Decoded,
+        signature: usize,
+        sent: Option<Sent>,
+    ) -> Result<Vec<Derived>, DeriveError> {
+        (self.derive)(decoded, signature)?
             .into_iter()
             .zip(0..)
             .map(|(values, row)| {
@@ -192,22 +199,27 @@ pub(super) struct Derivations {
 struct Bound {
     entry: EntryId,
     event: EventKey,
+    /// The event's index in the derivation's `signatures`.
+    signature: usize,
     derivation: Derivation,
 }
 
 impl Derivations {
-    /// Runs `derivation` on every record of `entry` decoded as one of `events`.
+    /// Runs `derivation` on every record of `entry` decoded as one of `events`, each the
+    /// index in its `signatures` of the event's signature and the event's key.
     pub(super) fn bind(
         &mut self,
         derivation: Derivation,
         entry: EntryId,
-        events: impl IntoIterator<Item = EventKey>,
+        events: impl IntoIterator<Item = (usize, EventKey)>,
     ) {
-        self.bound.extend(events.into_iter().map(|event| Bound {
-            entry,
-            event,
-            derivation,
-        }));
+        self.bound
+            .extend(events.into_iter().map(|(signature, event)| Bound {
+                entry,
+                event,
+                signature,
+                derivation,
+            }));
     }
 
     /// The rows `decoded`, a record of `entry` decoded as `event`, derives from every
@@ -228,12 +240,16 @@ impl Derivations {
         sent: Option<Sent>,
     ) -> Result<Vec<Derived>, DeriveError> {
         let mut derived = Vec::new();
-        for Bound { derivation, .. } in self
+        for Bound {
+            derivation,
+            signature,
+            ..
+        } in self
             .bound
             .iter()
             .filter(|bound| bound.entry == entry && bound.event == event)
         {
-            match derivation.rows(decoded, sent) {
+            match derivation.rows(decoded, *signature, sent) {
                 Ok(rows) => derived.extend(rows),
                 Err(error @ DeriveError::Columns { .. }) => return Err(error),
                 Err(error @ DeriveError::Argument { .. }) => {
@@ -319,7 +335,7 @@ mod tests {
         let mut swap = swap(U256::ZERO, U256::ZERO, U256::ZERO);
         let event = (0, (swap.selector, 3));
         let mut derivations = Derivations::default();
-        derivations.bind(SWAPS, event.0, [event.1]);
+        derivations.bind(SWAPS, event.0, [(0, event.1)]);
         let rows = |swap: &Decoded| derivations.rows(&chain, event, swap, None).expect("rows");
         assert_eq!(rows(&swap).len(), 1);
         swap.body[0].value = TypedValue::Bool { value: true };
@@ -331,15 +347,15 @@ mod tests {
     /// stored short, shifted, or with values under each other's columns.
     #[test]
     fn a_row_not_naming_its_columns_in_order_is_an_error() {
-        fn short(decoded: &Decoded) -> Result<Vec<Row>, DeriveError> {
-            let mut rows = (SWAPS.derive)(decoded)?;
+        fn short(decoded: &Decoded, signature: usize) -> Result<Vec<Row>, DeriveError> {
+            let mut rows = (SWAPS.derive)(decoded, signature)?;
             for row in &mut rows {
                 row.pop();
             }
             Ok(rows)
         }
-        fn swapped(decoded: &Decoded) -> Result<Vec<Row>, DeriveError> {
-            let mut rows = (SWAPS.derive)(decoded)?;
+        fn swapped(decoded: &Decoded, signature: usize) -> Result<Vec<Row>, DeriveError> {
+            let mut rows = (SWAPS.derive)(decoded, signature)?;
             for row in &mut rows {
                 row.swap(2, 3);
             }
@@ -378,7 +394,7 @@ mod tests {
         ] {
             let event = (0, (swap.selector, 3));
             let mut derivations = Derivations::default();
-            derivations.bind(derivation, event.0, [event.1]);
+            derivations.bind(derivation, event.0, [(0, event.1)]);
             match derivations.rows(&chain, event, &swap, None) {
                 Err(DeriveError::Columns { table, names }) => {
                     assert_eq!((table, names), (SWAPS.table, expected), "{case}");

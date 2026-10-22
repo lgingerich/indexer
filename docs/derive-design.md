@@ -35,7 +35,7 @@ pub struct Derivation {
     pub table: &'static str,               // "metric_v1_swaps"
     pub columns: &'static [(&'static str, ColumnType)],
     pub indexes: &'static [&'static [&'static str]], // [["chain", "address", "block_number", "log_index"]]
-    pub derive: fn(&Decoded) -> Result<Vec<Row>, DeriveError>, // rows
+    pub derive: fn(&Decoded, usize) -> Result<Vec<Row>, DeriveError>, // rows, given which signature
 }
 
 type Row = Vec<(&'static str, TypedValue)>; // [("amount0_raw", value), ...]

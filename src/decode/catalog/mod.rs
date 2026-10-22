@@ -67,18 +67,23 @@
 //! truncate, is a startup error asking for a shorter `table`. So is a name produced twice:
 //! two contracts given the same `table`, or one contract declaring two events by one name.
 
+mod column;
+mod error;
+
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 
-use alloy_dyn_abi::DynSolType;
 use alloy_primitives::Address;
 use serde::Deserialize;
 use tracing::warn;
 
-use super::abi::{Abi, AbiError, AddressSlot, EventKey, InputSpec, topic_hashed};
+use super::abi::{Abi, AddressSlot, EventKey};
 use super::derive::{DERIVATIONS, Derivation, Derivations};
-use crate::sink::table::{Column, ColumnType, MAX_IDENTIFIER, Schema, TableError, snake_case};
+use crate::sink::table::{MAX_IDENTIFIER, Schema, snake_case};
 use crate::wire::envelope::ChainId;
+use column::param;
+pub use error::CatalogError;
+use error::event_table_error;
 
 /// The file each protocol directory must hold.
 const MANIFEST: &str = "protocol.toml";
@@ -164,16 +169,14 @@ impl Catalog {
     ///
     /// # Errors
     ///
-    /// Returns [`CatalogError::Table`] when a dataset table's declaration is inconsistent.
+    /// Returns [`CatalogError::Datasets`] when a dataset table's declaration is
+    /// inconsistent.
     pub fn empty() -> Result<Self, CatalogError> {
         Ok(Self {
             entries: Vec::new(),
             seeds: Vec::new(),
             derivations: Derivations::default(),
-            schema: Schema::new().map_err(|source| CatalogError::Table {
-                contract: "the dataset tables".to_owned(),
-                source,
-            })?,
+            schema: Schema::new().map_err(CatalogError::Datasets)?,
         })
     }
 
@@ -238,99 +241,98 @@ impl Catalog {
     /// Adds one manifest's contracts, `chain`'s seeds, and then its rules, which may name
     /// any contract in the manifest.
     fn add(&mut self, manifest: Manifest, dir: &Path, chain: &ChainId) -> Result<(), CatalogError> {
+        let protocol = manifest.protocol;
         let mut by_name = HashMap::new();
         let mut rules = Vec::new();
         for spec in manifest.contract {
             let id = self.entries.len();
-            let Some(name) = spec
-                .abi
-                .first()
-                .and_then(|file| file.file_stem())
-                .map(|stem| stem.to_string_lossy().into_owned())
-            else {
-                return Err(CatalogError::NoAbi {
-                    protocol: manifest.protocol,
-                });
-            };
+            let name = contract_name(&spec, &protocol)?;
             if by_name.insert(name.clone(), id).is_some() {
-                return Err(CatalogError::DuplicateContract {
-                    protocol: manifest.protocol,
-                    name,
-                });
+                return Err(CatalogError::DuplicateContract { protocol, name });
             }
-            let mut abi = Abi::default();
-            for file in &spec.abi {
-                let path = dir.join(file);
-                let json = std::fs::read_to_string(&path).map_err(|source| CatalogError::File {
-                    path: path.display().to_string(),
-                    source,
-                })?;
-                Abi::from_json(&json)
-                    .and_then(|part| abi.merge(part))
-                    .map_err(|source| CatalogError::Abi {
-                        path: path.display().to_string(),
-                        source,
-                    })?;
-            }
-            let prefix = spec.table.clone().unwrap_or_else(|| snake_case(&name));
-            for event in abi.events() {
-                let table = format!("{}_{prefix}_{}", manifest.protocol, snake_case(event.name));
-                let contract = || format!("{}.{name}", manifest.protocol);
-                if table.len() > MAX_IDENTIFIER {
-                    return Err(CatalogError::TableName {
-                        table,
-                        contract: contract(),
-                    });
-                }
-                let params = event.inputs.iter().map(param).collect();
-                let key = (manifest.protocol.as_str(), name.as_str(), event.id);
-                self.schema
-                    .add_event(key, table.clone(), params)
-                    .map_err(|source| event_table_error(source, table, contract()))?;
-            }
-            let seeds = chain_addresses(&spec.addresses, chain, || {
-                format!("{}.{name}", manifest.protocol)
-            })?;
+            let abi = load_abi(dir, &spec.abi)?;
+            let label = format!("{protocol}.{name}");
+            let prefix = spec.table.unwrap_or_else(|| snake_case(&name));
+            self.add_event_tables(&protocol, &name, &prefix, &abi, &label)?;
+            let seeds = chain_addresses(&spec.addresses, chain, || label)?;
             self.seeds
                 .extend(seeds.iter().map(|&address| (address, id)));
             rules.extend(spec.created_by.into_iter().map(|rule| (id, rule)));
             self.entries.push(Entry {
-                protocol: manifest.protocol.clone(),
+                protocol: protocol.clone(),
                 name,
                 abi,
                 rules: HashMap::new(),
             });
         }
         for (child, rule) in rules {
-            let label = || self.label(child);
-            let parent =
-                *by_name
-                    .get(&rule.contract)
-                    .ok_or_else(|| CatalogError::UnknownParent {
-                        contract: label(),
-                        parent: rule.contract.clone(),
-                    })?;
-            let events = self.entries[parent].abi.events_named(&rule.event);
-            let [event] = events[..] else {
-                return Err(CatalogError::Event {
-                    contract: label(),
-                    event: rule.event,
-                    found: events.len(),
-                });
-            };
-            let Some(slot) = self.entries[parent].abi.address_input(event, &rule.param) else {
-                return Err(CatalogError::Param {
-                    contract: label(),
-                    event: rule.event,
-                    param: rule.param,
-                });
-            };
-            self.entries[parent]
-                .rules
-                .entry(event)
-                .or_default()
-                .push(Rule { slot, child });
+            self.add_rule(&by_name, child, rule)?;
         }
+        Ok(())
+    }
+
+    /// Declares the table of every event of `abi`, contract `name` of `protocol`, named
+    /// with its `prefix`; `label` names the contract in errors.
+    fn add_event_tables(
+        &mut self,
+        protocol: &str,
+        name: &str,
+        prefix: &str,
+        abi: &Abi,
+        label: &str,
+    ) -> Result<(), CatalogError> {
+        for event in abi.events() {
+            let table = format!("{protocol}_{prefix}_{}", snake_case(event.name));
+            if table.len() > MAX_IDENTIFIER {
+                return Err(CatalogError::TableName {
+                    table,
+                    contract: label.to_owned(),
+                });
+            }
+            let params = event.inputs.iter().map(param).collect();
+            self.schema
+                .add_event((protocol, name, event.id), table.clone(), params)
+                .map_err(|source| event_table_error(source, table, label.to_owned()))?;
+        }
+        Ok(())
+    }
+
+    /// Adds the discovery `rule` of entry `child` to its parent, which `by_name` finds
+    /// among the manifest's contracts.
+    fn add_rule(
+        &mut self,
+        by_name: &HashMap<String, EntryId>,
+        child: EntryId,
+        rule: CreatedBy,
+    ) -> Result<(), CatalogError> {
+        let label = || self.label(child);
+        let parent = *by_name
+            .get(&rule.contract)
+            .ok_or_else(|| CatalogError::UnknownParent {
+                contract: label(),
+                parent: rule.contract.clone(),
+            })?;
+        let abi = &self.entries[parent].abi;
+        let events = abi.events_named(&rule.event);
+        let [event] = events[..] else {
+            return Err(CatalogError::Event {
+                contract: label(),
+                event: rule.event,
+                found: events.len(),
+            });
+        };
+        let Some(slot) = abi.address_input(event, &rule.param) else {
+            return Err(CatalogError::Param {
+                contract: label(),
+                event: rule.event,
+                param: rule.param,
+            });
+        };
+        self.entries[parent]
+            .rules
+            .entry(event)
+            .or_default()
+            .push(Rule { slot, child });
         Ok(())
     }
 
@@ -372,7 +374,7 @@ impl Catalog {
                 continue;
             };
             let mut events = Vec::with_capacity(signatures.len());
-            for &signature in signatures {
+            for (index, &signature) in signatures.iter().enumerate() {
                 let keys = self.entries[entry].abi.keys(signature);
                 if keys.is_empty() {
                     warn!(
@@ -384,7 +386,7 @@ impl Catalog {
                     );
                     continue 'derivations;
                 }
-                events.extend(keys);
+                events.extend(keys.into_iter().map(|key| (index, key)));
             }
             self.schema
                 .add_derived(table, columns, indexes)
@@ -392,7 +394,7 @@ impl Catalog {
                     contract: self.label(entry),
                     source,
                 })?;
-            self.derivations.bind(derivation, entry, events);
+            self.derivations.bind(*derivation, entry, events);
         }
         Ok(())
     }
@@ -404,6 +406,36 @@ impl Catalog {
             self.entries[entry].protocol, self.entries[entry].name
         )
     }
+}
+
+/// A contract's name: its first ABI file's, without the extension.
+fn contract_name(spec: &ContractSpec, protocol: &str) -> Result<String, CatalogError> {
+    spec.abi
+        .first()
+        .and_then(|file| file.file_stem())
+        .map(|stem| stem.to_string_lossy().into_owned())
+        .ok_or_else(|| CatalogError::NoAbi {
+            protocol: protocol.to_owned(),
+        })
+}
+
+/// One contract's ABI: `files`, under `dir`, merged into one event set.
+fn load_abi(dir: &Path, files: &[PathBuf]) -> Result<Abi, CatalogError> {
+    let mut abi = Abi::default();
+    for file in files {
+        let path = dir.join(file);
+        let json = std::fs::read_to_string(&path).map_err(|source| CatalogError::File {
+            path: path.display().to_string(),
+            source,
+        })?;
+        Abi::from_json(&json)
+            .and_then(|part| abi.merge(part))
+            .map_err(|source| CatalogError::Abi {
+                path: path.display().to_string(),
+                source,
+            })?;
+    }
+    Ok(abi)
 }
 
 /// The addresses a contract, `contract` for messages, lists on `chain`, after checking
@@ -442,191 +474,6 @@ fn find_manifests(dir: &Path, protocols: &mut Vec<PathBuf>) -> Result<(), Catalo
         }
     }
     Ok(())
-}
-
-/// A failure to add `table`, an event table of `contract`: a repeated name keeps its own
-/// variant, since two contracts naming one table is a manifest mistake to fix with a
-/// `table` key.
-fn event_table_error(source: TableError, table: String, contract: String) -> CatalogError {
-    match source {
-        TableError::DuplicateTable { .. } => CatalogError::DuplicateTable { table, contract },
-        source => CatalogError::Table { contract, source },
-    }
-}
-
-/// How one input is stored in its event's table: a column under its ABI name.
-///
-/// A scalar is its own typed column and an array of scalars a list of that type. A tuple,
-/// or an array of tuples or arrays, is one document, so a tuple's components stay together.
-fn param(input: &InputSpec<'_>) -> Column {
-    let (kind, required) = match input.ty {
-        ty if input.indexed && topic_hashed(ty) => (ColumnType::Text, true),
-        DynSolType::Array(element) | DynSolType::FixedArray(element, _) => scalar(element)
-            .and_then(|(element, _)| ColumnType::list(element))
-            .map_or((ColumnType::Document, true), |list| (list, true)),
-        ty => scalar(ty).unwrap_or((ColumnType::Document, true)),
-    };
-    Column::new(input.name.to_owned(), kind, !required)
-}
-
-/// A scalar ABI type's column type and whether every value fills it; `None` for an array
-/// or a tuple.
-const fn scalar(ty: &DynSolType) -> Option<(ColumnType, bool)> {
-    Some(match ty {
-        DynSolType::Bool => (ColumnType::Bool, true),
-        DynSolType::Uint(bits) if *bits <= 64 => (ColumnType::Uint, true),
-        DynSolType::Int(bits) if *bits <= 64 => (ColumnType::Int, true),
-        DynSolType::Uint(_) | DynSolType::Int(_) => (ColumnType::BigInt, true),
-        DynSolType::Address
-        | DynSolType::Function
-        | DynSolType::FixedBytes(_)
-        | DynSolType::Bytes => (ColumnType::Text, true),
-        // Null when the bytes are not text.
-        DynSolType::String => (ColumnType::Text, false),
-        _ => return None,
-    })
-}
-
-/// Why the catalog could not be loaded.
-#[derive(Debug, thiserror::Error)]
-pub enum CatalogError {
-    /// The protocols directory could not be read.
-    #[error("read protocols directory {path}: {source}")]
-    Directory {
-        /// The directory.
-        path: String,
-        /// The underlying I/O error.
-        source: std::io::Error,
-    },
-    /// The protocols directory holds no `protocol.toml` anywhere in its tree, so the
-    /// setting names the wrong directory.
-    #[error("no protocol.toml under {path}")]
-    NoManifests {
-        /// The directory.
-        path: String,
-    },
-    /// A manifest or ABI file could not be read.
-    #[error("read {path}: {source}")]
-    File {
-        /// The file.
-        path: String,
-        /// The underlying I/O error.
-        source: std::io::Error,
-    },
-    /// A manifest did not parse, or a required value was absent.
-    #[error("invalid manifest {path}: {source}")]
-    Manifest {
-        /// The manifest.
-        path: String,
-        /// The underlying TOML error.
-        source: toml::de::Error,
-    },
-    /// An ABI file did not parse, or conflicts with another file of the same contract.
-    #[error("invalid ABI at {path}: {source}")]
-    Abi {
-        /// The ABI file.
-        path: String,
-        /// The ABI failure.
-        source: AbiError,
-    },
-    /// A contract lists no ABI file, so it has no name and nothing to decode with.
-    #[error("{protocol} has a contract with no ABI file")]
-    NoAbi {
-        /// The protocol.
-        protocol: String,
-    },
-    /// Two manifests name the same protocol.
-    #[error("protocol {protocol:?} is declared twice; first in {first}")]
-    DuplicateProtocol {
-        /// The protocol.
-        protocol: String,
-        /// The manifest that declared it first.
-        first: String,
-    },
-    /// One manifest has two contracts whose first ABI file has the same name.
-    #[error("{protocol} declares contract {name:?} twice")]
-    DuplicateContract {
-        /// The protocol.
-        protocol: String,
-        /// The contract's name.
-        name: String,
-    },
-    /// A contract lists addresses under a chain the indexer does not know: a typo, which
-    /// would otherwise leave that chain without the contract's seeds.
-    #[error("{contract} lists addresses on unknown chain {chain:?}; known chains are {CHAINS:?}")]
-    UnknownChain {
-        /// The contract, as `protocol.name`.
-        contract: String,
-        /// The chain as written.
-        chain: String,
-    },
-    /// One address is listed under two contracts on the loaded chain.
-    #[error("{address} is listed as both {first} and {second}")]
-    DuplicateAddress {
-        /// The address.
-        address: Address,
-        /// The first contract, as `protocol.name`.
-        first: String,
-        /// The second contract, as `protocol.name`.
-        second: String,
-    },
-    /// A rule names a parent contract its protocol does not declare.
-    #[error("{contract} is created_by unknown contract {parent:?}")]
-    UnknownParent {
-        /// The child contract, as `protocol.name`.
-        contract: String,
-        /// The parent as written.
-        parent: String,
-    },
-    /// A rule's event is absent from the parent's ABI, or overloaded.
-    #[error("{contract} is created_by event {event:?}, which the parent declares {found} times")]
-    Event {
-        /// The child contract, as `protocol.name`.
-        contract: String,
-        /// The event as written.
-        event: String,
-        /// How many events by that name the parent declares; exactly one is required.
-        found: usize,
-    },
-    /// An event table's name is longer than `PostgreSQL`'s identifier limit.
-    #[error(
-        "event table {table} is longer than {MAX_IDENTIFIER} bytes; give {contract} a shorter `table`"
-    )]
-    TableName {
-        /// The table.
-        table: String,
-        /// The contract, as `protocol.name`.
-        contract: String,
-    },
-    /// An event table's name is produced twice.
-    #[error(
-        "event table {table} already exists when adding {contract}: two contracts share a \
-         `table`, or the contract declares two events by one name"
-    )]
-    DuplicateTable {
-        /// The table.
-        table: String,
-        /// The contract that produced it again, as `protocol.name`.
-        contract: String,
-    },
-    /// A table generated for a contract's events is inconsistent.
-    #[error("{contract}: {source}")]
-    Table {
-        /// The contract whose events the table holds, as `protocol.name`.
-        contract: String,
-        /// What is wrong with the table.
-        source: TableError,
-    },
-    /// A rule's parameter is absent from its event, or not an `address`.
-    #[error("{contract} is created_by {event}.{param}, which is not an address argument")]
-    Param {
-        /// The child contract, as `protocol.name`.
-        contract: String,
-        /// The event.
-        event: String,
-        /// The parameter as written.
-        param: String,
-    },
 }
 
 #[cfg(test)]

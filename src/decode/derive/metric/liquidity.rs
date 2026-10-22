@@ -40,9 +40,10 @@ pub(in crate::decode) const LIQUIDITY: Derivation = Derivation {
     derive: liquidity,
 };
 
-/// A `LiquidityAdded` or `LiquidityRemoved`'s rows, one per bin.
-fn liquidity(decoded: &Decoded) -> Result<Vec<Row>, DeriveError> {
-    let removed = decoded.name == "LiquidityRemoved";
+/// A `LiquidityAdded`'s rows, one per bin, or a `LiquidityRemoved`'s when `signature` is
+/// 1, the index of its signature in [`LIQUIDITY`].
+fn liquidity(decoded: &Decoded, signature: usize) -> Result<Vec<Row>, DeriveError> {
+    let removed = signature == 1;
     let direction = if removed { "remove" } else { "add" };
     let owner = address(decoded, 0, "provider")?;
     let salt = uint(decoded, 1, "salt", 80)?;
@@ -136,10 +137,13 @@ mod tests {
             value: Address::repeat_byte(0x0e),
         };
         let salt = uint(U256::from(7), 80);
-        let rows = unnamed(liquidity(&event(
-            false,
-            &[(-2, 5, 0), (0, 3, 4)].map(|(bin, d0, d1)| (bin, d0, d1, 10)),
-        )));
+        let rows = unnamed(liquidity(
+            &event(
+                false,
+                &[(-2, 5, 0), (0, 3, 4)].map(|(bin, d0, d1)| (bin, d0, d1, 10)),
+            ),
+            0,
+        ));
         assert_eq!(
             rows,
             [
@@ -163,7 +167,7 @@ mod tests {
                 ],
             ]
         );
-        let rows = unnamed(liquidity(&event(true, &[(1, -5, -6, 10)])));
+        let rows = unnamed(liquidity(&event(true, &[(1, -5, -6, 10)]), 1));
         assert_eq!(
             rows,
             [vec![
@@ -183,13 +187,13 @@ mod tests {
         };
         shares.pop();
         refused(
-            liquidity(&uneven),
+            liquidity(&uneven, 0),
             4,
             "shares",
             "an array with one entry per bin",
         );
         refused(
-            liquidity(&event(false, &[(i32::from(i16::MAX) + 1, 1, 1, 1)])),
+            liquidity(&event(false, &[(i32::from(i16::MAX) + 1, 1, 1, 1)]), 0),
             2,
             "binIdxs",
             "bin indexes in the int16 range",

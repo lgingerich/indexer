@@ -37,7 +37,7 @@ mod tests {
         bin_swapped, details, int128s, ladder, liquidity, pool_created, swap, uint128s,
     };
     use crate::decode::fixtures::shipped;
-    use crate::wire::envelope::ChainId;
+    use crate::wire::envelope::{ChainId, TypedValue};
 
     use super::super::Sent;
     use super::{BIN_FILLS, LIQUIDITY, POOL_BINS, SWAPS};
@@ -82,12 +82,49 @@ mod tests {
                 from: Address::repeat_byte(0xf0),
                 to: Some(Address::repeat_byte(0xf1)),
             });
-            let rows = derivation.rows(&decoded, sent).expect("derives");
+            // Through the catalog's bindings, as the sink runs them.
+            let entry = catalog
+                .entry(derivation.protocol, derivation.contract)
+                .expect("the contract");
+            let event = (decoded.selector, decoded.indexed.len() + 1);
+            let rows = catalog
+                .derivations
+                .rows(&chain, (entry, event), &decoded, sent)
+                .expect("derives");
             assert_eq!(rows.len(), expected, "{}", derivation.table);
             for (row, number) in rows.iter().zip(0..) {
-                assert_eq!(row.row, number);
+                assert_eq!((row.table.as_str(), row.row), (derivation.table, number));
                 catalog.schema().derived_row(&chain, row).expect("a row");
             }
+        }
+    }
+
+    /// A liquidity row's direction follows the event its record is bound as, not the
+    /// record's name: `LiquidityRemoved` removes, `LiquidityAdded` adds.
+    #[test]
+    fn liquidity_direction_follows_the_bound_event() {
+        let catalog = shipped("robinhood");
+        let pool = catalog
+            .entry("metric_v1", "MetricOmmPool")
+            .expect("the pool");
+        for (removed, direction) in [(false, "add"), (true, "remove")] {
+            let mut decoded = liquidity(removed, &[(0, 1, 1, 1)]);
+            let event = (decoded.selector, 3);
+            decoded.name = "renamed".to_owned();
+            let rows = catalog
+                .derivations
+                .rows(&ChainId::new("robinhood"), (pool, event), &decoded, None)
+                .expect("derives");
+            let [row] = &rows[..] else {
+                panic!("one row: {rows:?}");
+            };
+            assert_eq!(
+                row.fields[0].value,
+                TypedValue::String {
+                    value: direction.as_bytes().to_vec().into(),
+                    text: Some(direction.to_owned()),
+                }
+            );
         }
     }
 }

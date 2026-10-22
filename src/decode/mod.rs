@@ -21,7 +21,7 @@ mod derive;
 mod fixtures;
 mod sink;
 
-pub use abi::{Abi, AbiError, DecodeError, DecodedEvent};
+pub use abi::{AbiError, DecodeError};
 pub use catalog::{Catalog, CatalogError};
 pub use decoder::{Decoder, Decoding};
 pub use sink::DecodingSink;

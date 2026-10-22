@@ -14,19 +14,19 @@ use crate::wire::typed::{AbiType, TypedValue};
 
 /// A decoded event without chain or transaction metadata.
 #[derive(Debug)]
-pub struct DecodedEvent {
+pub(crate) struct DecodedEvent {
     /// Identity of the event definition used: see [`Abi`].
-    pub id: B256,
+    pub(crate) id: B256,
     /// ABI event name.
-    pub name: String,
+    pub(crate) name: String,
     /// The event's key in its [`Abi`]: its selector and topic count.
-    pub key: EventKey,
+    pub(crate) key: EventKey,
     /// Canonical event signature.
-    pub signature: String,
+    pub(crate) signature: String,
     /// Indexed arguments with their original positions and declared schemas.
-    pub indexed: Vec<DecodedArg>,
+    pub(crate) indexed: Vec<DecodedArg>,
     /// Non-indexed arguments with their original positions and declared schemas.
-    pub body: Vec<DecodedArg>,
+    pub(crate) body: Vec<DecodedArg>,
 }
 
 #[derive(Debug, Clone)]
@@ -62,7 +62,7 @@ pub(crate) type EventKey = (B256, usize);
 /// identity — a hash of its definition — so a decoded record names the one event it used
 /// rather than the file it came from.
 #[derive(Debug, Clone, Default)]
-pub struct Abi {
+pub(crate) struct Abi {
     events: BTreeMap<EventKey, PreparedEvent>,
 }
 
@@ -72,7 +72,7 @@ impl Abi {
     ///
     /// # Errors
     /// Returns a typed parse/layout error or rejects anonymous and conflicting events.
-    pub fn from_json(json: &str) -> Result<Self, AbiError> {
+    pub(crate) fn from_json(json: &str) -> Result<Self, AbiError> {
         let abi: JsonAbi = serde_json::from_str(json)?;
         let mut parsed = Self::default();
         for (event_index, event) in abi.events().enumerate() {
@@ -103,7 +103,7 @@ impl Abi {
     /// # Errors
     /// Returns [`AbiError::Conflict`] when the two define one selector and topic count
     /// differently, since a log could then decode either way.
-    pub fn merge(&mut self, other: Self) -> Result<(), AbiError> {
+    pub(crate) fn merge(&mut self, other: Self) -> Result<(), AbiError> {
         for (key, event) in other.events {
             self.add(key, event)?;
         }
@@ -189,7 +189,7 @@ impl Abi {
     ///
     /// # Errors
     /// Reports malformed topics, layout mismatches, and invalid decoded values.
-    pub fn decode_log(&self, log: &Log) -> Result<Option<DecodedEvent>, DecodeError> {
+    pub(crate) fn decode_log(&self, log: &Log) -> Result<Option<DecodedEvent>, DecodeError> {
         let flattened = [log.topic0, log.topic1, log.topic2, log.topic3];
         let mut topics = Vec::with_capacity(4);
         let mut gap = false;

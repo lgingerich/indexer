@@ -38,7 +38,7 @@ pub(in crate::decode) const BIN_FILLS: Derivation = Derivation {
 };
 
 /// A `BinSwapped`'s row.
-fn bin_fill(decoded: &Decoded) -> Result<Vec<Row>, DeriveError> {
+fn bin_fill(decoded: &Decoded, _: usize) -> Result<Vec<Row>, DeriveError> {
     let bin = bin_index(int(decoded, 0, "binIdx", 256)?, 0, "binIdx")?;
     let deltas = uint(decoded, 1, "binDeltas", 256)?;
     let fees = uint(decoded, 2, "fees", 256)?;
@@ -106,12 +106,12 @@ mod tests {
             ),
         ];
         for (bin_idx, deltas, fees, expected) in cases {
-            let rows = unnamed(bin_fill(&bin_swapped(bin_idx, deltas, fees)));
+            let rows = unnamed(bin_fill(&bin_swapped(bin_idx, deltas, fees), 0));
             assert_eq!(rows, [expected]);
         }
         for outside in [i32::from(i16::MIN) - 1, i32::from(i16::MAX) + 1] {
             refused(
-                bin_fill(&bin_swapped(bin(outside), U256::ZERO, U256::ZERO)),
+                bin_fill(&bin_swapped(bin(outside), U256::ZERO, U256::ZERO), 0),
                 0,
                 "binIdx",
                 "bin indexes in the int16 range",
