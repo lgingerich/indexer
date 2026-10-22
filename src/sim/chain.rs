@@ -1,7 +1,8 @@
 //! The simulated chain: a tree of blocks, one path of which is canonical.
 //!
 //! Blocks are real alloy headers with real hashes, so parent linkage is what a node
-//! would serve. Each carries a few logs, and its `logsBloom` covers them, so the
+//! would serve. Each carries a few logs, some of them the synthetic protocol's (see
+//! `protocol`), and its `logsBloom` covers them, so the
 //! source's bloom check holds. The world outlives every simulated process: a crash
 //! drops the indexer, never the chain.
 //!
@@ -309,12 +310,42 @@ impl World {
     /// point is a view of its own, as a node mid-reorg would serve it.
     fn reorg(&mut self, depth: usize) {
         let mut chain = self.canonical().to_vec();
-        chain.truncate(chain.len().saturating_sub(depth).max(1));
+        let kept = chain.len().saturating_sub(depth).max(1);
+        let created = super::protocol::created();
+        if chain[kept..].iter().any(|hash| {
+            self.blocks.get(hash).is_some_and(|block| {
+                block
+                    .logs
+                    .iter()
+                    .any(|log| log.topics.first() == Some(&created))
+            })
+        }) {
+            self.reached("reorg orphaned a pool's creation");
+        }
+        chain.truncate(kept);
         self.trace
             .push(format!("reorg depth {depth} at {}", chain.len() - 1));
         self.views.push(chain);
         for _ in 0..=depth {
             self.extend();
+        }
+    }
+
+    /// A log no contract in the catalog emits.
+    fn noise(&mut self, transaction_hash: B256) -> SimLog {
+        let address = Address::repeat_byte(match self.rng.below(3) {
+            0 => 1,
+            1 => 2,
+            _ => 3,
+        });
+        let topics = (0..self.rng.below(5)).map(|_| self.rng.b256()).collect();
+        let length = self.index_below(33);
+        let data = Bytes::copy_from_slice(&self.rng.b256()[..length]);
+        SimLog {
+            address,
+            topics,
+            data,
+            transaction_hash,
         }
     }
 
@@ -339,20 +370,8 @@ impl World {
                     Some(last) if self.rng.chance(50) => last.transaction_hash,
                     _ => self.rng.b256(),
                 };
-                let address = Address::repeat_byte(match self.rng.below(3) {
-                    0 => 1,
-                    1 => 2,
-                    _ => 3,
-                });
-                let topics = (0..self.rng.below(5)).map(|_| self.rng.b256()).collect();
-                let length = self.index_below(33);
-                let data = Bytes::copy_from_slice(&self.rng.b256()[..length]);
-                let log = SimLog {
-                    address,
-                    topics,
-                    data,
-                    transaction_hash,
-                };
+                let log = super::protocol::log(&mut self.rng, transaction_hash)
+                    .unwrap_or_else(|| self.noise(transaction_hash));
                 bloom.accrue_raw_log(log.address, &log.topics);
                 logs.push(log);
             }

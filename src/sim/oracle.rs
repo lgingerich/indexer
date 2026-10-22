@@ -8,12 +8,13 @@
 //! ingest decoded from a block depends on the blocks before it, and compares every
 //! table the store writes, row for row.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
-use alloy_primitives::B256;
+use alloy_primitives::{Address, B256};
 
 use super::chain::{SimBlock, World};
+use super::protocol::{self, PROTOCOL};
 use super::{CHAIN, Plan, StorePlan};
 
 /// Rows as text, by table, each table's rows sorted.
@@ -41,6 +42,36 @@ const TABLES: &[(&str, &str, usize)] = &[
          block_number::VARCHAR, epoch(block_timestamp)::BIGINT::VARCHAR, \
          removed::VARCHAR FROM sim.logs",
         13,
+    ),
+    (
+        "decoded_logs",
+        "SELECT block_hash, log_index::VARCHAR, address, transaction_hash, protocol, \
+         contract, name FROM sim.decoded_logs",
+        7,
+    ),
+    (
+        "contracts",
+        "SELECT block_hash, log_index::VARCHAR, address, transaction_hash, protocol, \
+         name, factory_address FROM sim.contracts",
+        7,
+    ),
+    (
+        "metric_v1_factory_pool_created",
+        "SELECT block_hash, log_index::VARCHAR, address, transaction_hash, pool_address \
+         FROM sim.metric_v1_factory_pool_created",
+        5,
+    ),
+    (
+        "metric_v1_pool_swap",
+        "SELECT block_hash, log_index::VARCHAR, address, transaction_hash, sender, \
+         recipient FROM sim.metric_v1_pool_swap",
+        6,
+    ),
+    (
+        "metric_v1_swaps",
+        "SELECT block_hash, log_index::VARCHAR, address, transaction_hash, sender, \
+         recipient FROM sim.metric_v1_swaps",
+        6,
     ),
 ];
 
@@ -70,7 +101,14 @@ pub(super) fn expected(
     }
     branch.reverse();
     let mut stored = Stored::new();
-    for block in branch.iter().filter(|block| block.number() >= first) {
+    // The pools discovered on the branch so far: decoding depends on every block from
+    // the start, though a store holds rows only from its first.
+    let mut pools: BTreeSet<Address> = BTreeSet::new();
+    for block in branch {
+        let decoded = decode(block, &mut pools);
+        if block.number() < first {
+            continue;
+        }
         let mut add = |table: &'static str, rows: Vec<Vec<String>>| {
             stored.entry(table).or_default().extend(rows);
         };
@@ -80,6 +118,11 @@ pub(super) fn expected(
         }
         if plan.datasets.logs && store.raw {
             add("logs", log_rows(block));
+        }
+        for (table, row) in decoded {
+            if table == "contracts" || store.decoded {
+                add(table, vec![row]);
+            }
         }
     }
     for rows in stored.values_mut() {
@@ -145,6 +188,64 @@ pub(super) fn ends(stored: &Stored) -> Option<(B256, u64)> {
     let tip = ledger.iter().max_by_key(|row| height(row))?;
     let first = ledger.iter().map(height).min()?;
     Some((tip[1].parse().ok()?, first))
+}
+
+/// The rows decode makes of `block`'s logs, given the `pools` discovered before it,
+/// which it adds the block's creations to: a pool decodes from the log after the one
+/// that created it, in the same block too, and a swap from an address not yet created
+/// decodes nothing.
+fn decode(block: &SimBlock, pools: &mut BTreeSet<Address>) -> Vec<(&'static str, Vec<String>)> {
+    let mut rows = Vec::new();
+    let text = |address: &Address| format!("{address:#x}");
+    for (log, index) in block.logs.iter().zip(0_u64..) {
+        let hash = |table: &'static str, mut own: Vec<String>| {
+            let mut row = vec![
+                format!("{:#x}", block.hash()),
+                index.to_string(),
+                text(&log.address),
+                format!("{:#x}", log.transaction_hash),
+            ];
+            row.append(&mut own);
+            (table, row)
+        };
+        let topic = |i: usize| log.topics.get(i).map(|topic| Address::from_word(*topic));
+        if log.address == protocol::FACTORY && log.topics.first() == Some(&protocol::created()) {
+            let Some(pool) = topic(1) else { continue };
+            let own = |name: &str| vec![PROTOCOL.to_owned(), name.to_owned()];
+            rows.push(hash(
+                "decoded_logs",
+                [own("Factory"), vec!["PoolCreated".to_owned()]].concat(),
+            ));
+            rows.push(hash("metric_v1_factory_pool_created", vec![text(&pool)]));
+            // A contract's row names the pool it created, and the factory after.
+            let (table, mut row) = hash(
+                "contracts",
+                [own("MetricOmmPool"), vec![text(&log.address)]].concat(),
+            );
+            row[2] = text(&pool);
+            rows.push((table, row));
+            pools.insert(pool);
+        } else if pools.contains(&log.address) && log.topics.first() == Some(&protocol::swap()) {
+            let (Some(sender), Some(recipient)) = (topic(1), topic(2)) else {
+                continue;
+            };
+            let own = vec![
+                PROTOCOL.to_owned(),
+                "MetricOmmPool".to_owned(),
+                "Swap".to_owned(),
+            ];
+            rows.push(hash("decoded_logs", own));
+            rows.push(hash(
+                "metric_v1_pool_swap",
+                vec![text(&sender), text(&recipient)],
+            ));
+            rows.push(hash(
+                "metric_v1_swaps",
+                vec![text(&sender), text(&recipient)],
+            ));
+        }
+    }
+    rows
 }
 
 fn ledger_row(block: &SimBlock) -> Vec<String> {

@@ -33,6 +33,7 @@
 mod chain;
 mod node;
 mod oracle;
+mod protocol;
 mod store;
 
 use std::collections::{BTreeMap, HashSet};
@@ -62,7 +63,7 @@ use crate::sink::stop::Stop;
 use crate::sink::store_runtime::StoreRuntime;
 use crate::sink::table::{Schema, Table, TableId};
 use crate::sink::{SinkError, SqlStore};
-use crate::wire::datasets::Datasets;
+use crate::wire::envelope::ChainId;
 
 const CHAIN: &str = "sim";
 
@@ -290,6 +291,7 @@ fn run(seed: u64, dir: &Path) -> Outcome {
     };
     let world: Shared = Arc::new(Mutex::new(World::new(rng, length)));
     lock(&world).trace.push(format!("{plan:?}"));
+    protocol::write(dir);
     let mut problems = Vec::new();
 
     for lifetime in 0..plan.lifetimes {
@@ -436,6 +438,30 @@ async fn open(
     })
 }
 
+/// The source a lifetime reads: the real one, over the simulated node and its heads,
+/// with the real retry layer jittered by `jitter`.
+fn source(world: &Shared, plan: &Plan, jitter: u64) -> EvmSource<SimHeads> {
+    let http = ClientBuilder::default()
+        .layer(RetryLayer::new(jitter))
+        .transport(
+            SimNode {
+                world: Arc::clone(world),
+            },
+            true,
+        );
+    let heads = SimHeads {
+        world: Arc::clone(world),
+    };
+    EvmSource::new(
+        CHAIN,
+        http,
+        heads,
+        plan.datasets,
+        CONCURRENCY,
+        plan.finality,
+    )
+}
+
 /// One process lifetime, ending as `chosen` says unless something ends it first. A
 /// faulty one runs while the chain grows; the final one runs for five minutes while the
 /// chain holds still.
@@ -455,27 +481,10 @@ fn live(world: &Shared, dir: &Path, plan: &Plan, lifetime: u64, chosen: Lifetime
         (world.rng.next(), Arc::clone(&world.crash))
     };
     let end = runtime.block_on(async {
-        let catalog = Catalog::empty().expect("empty catalog");
+        let catalog = Catalog::load(dir.join("protocols"), &ChainId::new(CHAIN))
+            .expect("the simulated protocol loads");
         let schema = catalog.schema().clone();
-        let http = ClientBuilder::default()
-            .layer(RetryLayer::new(jitter))
-            .transport(
-                SimNode {
-                    world: Arc::clone(world),
-                },
-                true,
-            );
-        let heads = SimHeads {
-            world: Arc::clone(world),
-        };
-        let source = EvmSource::new(
-            CHAIN,
-            http,
-            heads,
-            plan.datasets,
-            CONCURRENCY,
-            plan.finality,
-        );
+        let source = source(world, plan, jitter);
         let pipeline = Pipeline::new(source, chosen.start, None, catalog);
 
         // The chain grows while faults run, and holds still for the final catch-up.
