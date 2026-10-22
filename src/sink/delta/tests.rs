@@ -965,7 +965,7 @@ async fn a_ledger_append_overlaps_the_next_commit() {
         buffer(&mut sink, block(height, 0)).await;
         sink.flush().await.expect("flushed");
         assert!(
-            sink.ledger.is_some(),
+            sink.ledger.is_running(),
             "{height}: the flush left its append running"
         );
         assert_eq!(
@@ -975,7 +975,10 @@ async fn a_ledger_append_overlaps_the_next_commit() {
         );
     }
     assert_eq!(ledger_heights(&mut sink).await, [1, 2, 3]);
-    assert!(sink.ledger.is_none(), "the restore waited for the append");
+    assert!(
+        !sink.ledger.is_running(),
+        "the restore waited for the append"
+    );
     assert_eq!(ledger_version(&sink), opened + 3);
     assert_eq!(blocks(&sink).await, expected(&[(1, 0), (2, 0), (3, 0)]));
 }

@@ -85,7 +85,7 @@ use deltalake::parquet::basic::{Compression, ZstdLevel};
 use deltalake::parquet::file::properties::WriterProperties;
 use futures_util::stream::{self, StreamExt as _, TryStreamExt as _};
 use tokio::sync::Semaphore;
-use tokio::task::JoinHandle;
+use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::Instant;
 use tracing::info;
 
@@ -132,11 +132,8 @@ pub struct DeltaSink {
     /// The background compaction and vacuum, when the settings ask for it. Held, never
     /// read: dropping the store stops the task.
     maintenance: Option<Maintenance>,
-    /// The last commit's ledger append, still running: it overlaps the next commit's
-    /// table appends (see [`write`](Self::write)), and is waited for before anything
-    /// else touches the ledger, before the next one starts, and by
-    /// [`finish`](EnvelopeSink::finish).
-    ledger: Option<JoinHandle<Result<DeltaTable, StoreError>>>,
+    /// The last commit's ledger append, while it runs on beside the next commit.
+    ledger: PendingLedger,
     /// What opening read back, for the first [`restore`](Store::restore) to hand on
     /// rather than read again: the ledger and the contracts take tens of seconds on a
     /// large lake. Dropped once anything is written or rewound.
@@ -209,7 +206,7 @@ impl DeltaSink {
                 .build(),
             published_tip: Arc::new(AtomicU64::new(0)),
             maintenance: None,
-            ledger: None,
+            ledger: PendingLedger::default(),
             opened: None,
         };
         let read = Instant::now();
@@ -306,94 +303,62 @@ impl DeltaSink {
     /// 3. every table's rows, all at once: each table has its own log, and no rule orders
     ///    one table's rows against another's;
     /// 4. the new blocks into the ledger, once their rows are all present, running on
-    ///    while the next commit's rows are appended (see [`start_ledger`](Self::start_ledger)).
+    ///    while the next commit's rows are appended (see [`PendingLedger`]).
     ///
     /// A failure part-way leaves the lake as the next open repairs it. The batch is not
     /// kept for a retry: the store refuses every later write with
     /// [`StoreError::Failed`], and a restart resumes from the ledger.
     async fn commit(&mut self) -> Result<(), StoreError> {
+        self.guarded(async |sink| {
+            if sink.batch.is_empty() {
+                return Ok(());
+            }
+            sink.write().await
+        })
+        .await
+    }
+
+    /// Runs `step`, a write to the lake, unless an earlier one failed, and refuses every
+    /// later one if this one fails: a write that stopped part-way leaves what only a
+    /// reopen repairs.
+    async fn guarded<T>(
+        &mut self,
+        step: impl AsyncFnOnce(&mut Self) -> Result<T, StoreError>,
+    ) -> Result<T, StoreError> {
+        self.refuse_if_failed()?;
+        let result = step(self).await;
+        self.failed = result.is_err();
+        result
+    }
+
+    /// Refuses with [`StoreError::Failed`] once a write has failed.
+    fn refuse_if_failed(&self) -> Result<(), StoreError> {
         if self.failed {
             return Err(StoreError::Failed);
         }
-        if self.batch.is_empty() {
-            return Ok(());
-        }
-        let written = self.write().await;
-        self.failed = written.is_err();
-        written
+        Ok(())
     }
 
-    /// Writes the batch for [`commit`](Self::commit).
+    /// Writes the batch for [`commit`](Self::commit), and logs what it wrote.
     async fn write(&mut self) -> Result<(), StoreError> {
         self.opened = None;
         self.refuse_replays()?;
         let started = Instant::now();
         // Taken out so the commit can take its rows while it writes, and put back cleared.
         let mut batch = std::mem::replace(&mut self.batch, Batch::new(Arc::clone(&self.schema)));
-        let orphans = self.committed_orphans(&batch);
-        let mut tables = batch.take_tables();
-        let reorgs = tables
-            .remove(&TableId::Dataset(Table::Reorg))
-            .unwrap_or_default();
-        let accepted = tables
-            .remove(&TableId::Dataset(Table::AcceptedBlock))
-            .unwrap_or_default();
-
-        // A retraction's steps are ordered against the ledger, so it waits for the last
-        // one; a commit without one never does.
-        if !reorgs.is_empty() || orphans.is_some() {
-            self.settle_ledger().await?;
-        }
-        self.append_some(
-            self.position(Table::Reorg),
-            &reorgs.iter().collect::<Vec<_>>(),
-        )
-        .await?;
-        if let Some((floor, hashes)) = &orphans {
-            self.retract(*floor, hashes).await?;
-        }
-        let mut rows = reorgs.len() + accepted.len();
-        let appends: Vec<(usize, Vec<Row>)> = (0..self.lakes.len())
-            .filter_map(|position| Some((position, tables.remove(&self.lakes[position].def.id)?)))
-            .collect();
-        drop((tables, reorgs));
-        rows += appends.iter().map(|(_, rows)| rows.len()).sum::<usize>();
-        let tables_written = appends.len();
-        let built = Instant::now();
-        let ledger_batch = self.ledger_batch(&accepted.iter().collect::<Vec<_>>())?;
-        let first = accepted.iter().filter_map(Row::block_number).min();
-        // What the ledger's window needs of the accepted blocks, once their rows are gone.
-        let accepted: Vec<(String, u64)> = accepted
-            .iter()
-            .filter_map(|row| Some((row.block_hash()?.to_owned(), row.block_number()?)))
-            .collect();
-        let batches = self.record_batches(appends).await?;
-        let built = built.elapsed();
-        let written = Instant::now();
-        let appended = self.append_all(batches).await;
-        let written = written.elapsed();
-        // The last commit's ledger append ran beside these appends; this waits out what is
-        // left of it, which is usually nothing. Waited for even when an append failed, so
-        // it is not left running.
-        let ledger = Instant::now();
-        let settled = self.settle_ledger().await;
-        let ledger = ledger.elapsed();
-        appended?;
-        settled?;
-        self.start_ledger(ledger_batch);
-
-        let orphaned = orphans.map(|(_, hashes)| hashes).unwrap_or_default();
-        self.advance(&orphaned, accepted);
+        let commit = self.take_apart(&mut batch)?;
+        let summary = commit.summary;
+        let timings = self.write_in_order(commit).await?;
         info!(
             chain = %self.chain,
-            rows,
-            orphaned = orphaned.len(),
-            from = ?first,
+            rows = summary.rows,
+            orphaned = summary.orphaned,
+            from = ?summary.from,
             to = ?self.tip(),
-            tables = tables_written,
-            build_ms = millis(built),
-            write_ms = millis(written),
-            ledger_wait_ms = millis(ledger),
+            tables = summary.tables,
+            build_ms = millis(timings.build),
+            write_ms = millis(timings.write),
+            ledger_wait_ms = millis(timings.ledger_wait),
             elapsed_ms = millis(started.elapsed()),
             "lake commit"
         );
@@ -402,21 +367,97 @@ impl DeltaSink {
         Ok(())
     }
 
-    /// Starts appending `batch`, the accepted blocks, to the ledger, on a task of its own,
-    /// and returns: the
-    /// rows of these blocks are all present, so their entries may go in any time, and the
-    /// next commit's table appends overlap them, which takes a whole commit's round trips
-    /// off every commit. A failure surfaces when it is next waited for.
-    ///
-    /// Safe for the reason the ledger is written last at all: until an entry lands, its
-    /// block's rows are rows the ledger does not name, which a reopen deletes and ingest
-    /// fetches again. Every later commit's rows are, too, until its own entry lands.
+    /// Takes `batch`'s rows apart by the step of [`commit`](Self::commit) that writes
+    /// them, building the ledger's Arrow batch from the accepted blocks' rows.
+    fn take_apart(&self, batch: &mut Batch) -> Result<Commit, StoreError> {
+        let orphans = self.committed_orphans(batch);
+        let mut tables = batch.take_tables();
+        let reorgs = tables
+            .remove(&TableId::Dataset(Table::Reorg))
+            .unwrap_or_default();
+        let accepted = tables
+            .remove(&TableId::Dataset(Table::AcceptedBlock))
+            .unwrap_or_default();
+        let appends: Vec<(usize, Vec<Row>)> = (0..self.lakes.len())
+            .filter_map(|position| Some((position, tables.remove(&self.lakes[position].def.id)?)))
+            .collect();
+        let summary = Summary {
+            rows: reorgs.len()
+                + accepted.len()
+                + appends.iter().map(|(_, rows)| rows.len()).sum::<usize>(),
+            orphaned: orphans.as_ref().map_or(0, |(_, hashes)| hashes.len()),
+            from: accepted.iter().filter_map(Row::block_number).min(),
+            tables: appends.len(),
+        };
+        let ledger = self.ledger_batch(&accepted.iter().collect::<Vec<_>>())?;
+        // What the ledger's window needs of the accepted blocks, once their rows are gone.
+        let accepted = accepted
+            .iter()
+            .filter_map(|row| Some((row.block_hash()?.to_owned(), row.block_number()?)))
+            .collect();
+        Ok(Commit {
+            reorgs,
+            orphans,
+            appends,
+            ledger,
+            accepted,
+            summary,
+        })
+    }
+
+    /// Writes `commit` in the ledger's order (see [`commit`](Self::commit)), and returns
+    /// how long its slow parts took.
+    async fn write_in_order(&mut self, commit: Commit) -> Result<Timings, StoreError> {
+        let Commit {
+            reorgs,
+            orphans,
+            appends,
+            ledger,
+            accepted,
+            summary: _,
+        } = commit;
+        // A retraction's steps are ordered against the ledger, so it waits for the last
+        // one; a commit without one never does.
+        if !reorgs.is_empty() || orphans.is_some() {
+            self.settle_ledger().await?;
+        }
+        // 1. Retractions into `reorgs`, while the ledger still names their orphans.
+        let position = self.position(Table::Reorg);
+        self.append_some(position, &reorgs.iter().collect::<Vec<_>>())
+            .await?;
+        drop(reorgs);
+        // 2. The orphans out of the ledger, then out of every other table.
+        if let Some((floor, hashes)) = &orphans {
+            self.retract(*floor, hashes).await?;
+        }
+        // 3. Every table's rows, all at once.
+        let (batches, build) = timed(self.record_batches(appends)).await;
+        let (appended, write) = timed(self.append_all(batches?)).await;
+        // The last commit's ledger append ran beside these appends; this waits out what is
+        // left of it, which is usually nothing. Waited for even when an append failed, so
+        // it is not left running.
+        let (settled, ledger_wait) = timed(self.settle_ledger()).await;
+        appended?;
+        settled?;
+        // 4. The new blocks into the ledger, running on beside the next commit.
+        self.start_ledger(ledger);
+        let orphaned = orphans.map(|(_, hashes)| hashes).unwrap_or_default();
+        self.advance(&orphaned, accepted);
+        Ok(Timings {
+            build,
+            write,
+            ledger_wait,
+        })
+    }
+
+    /// Starts appending `batch`, the accepted blocks, to the ledger (see
+    /// [`PendingLedger`]); nothing when the commit accepts no block.
     fn start_ledger(&mut self, batch: Option<RecordBatch>) {
         let Some(batch) = batch else {
             return;
         };
-        let lake = &self.lakes[self.position(Table::AcceptedBlock)];
-        self.ledger = Some(tokio::spawn(lake.append(&self.writer, vec![batch])));
+        let lake = &self.lakes[self.positions[&TableId::Dataset(Table::AcceptedBlock)]];
+        self.ledger.start(lake, &self.writer, batch);
     }
 
     /// `accepted` as the ledger's Arrow batch, for [`start_ledger`](Self::start_ledger);
@@ -432,14 +473,10 @@ impl DeltaSink {
     /// Waits for the ledger append [`start_ledger`](Self::start_ledger) left running, if
     /// any, and takes the ledger as of it.
     async fn settle_ledger(&mut self) -> Result<(), StoreError> {
-        let Some(task) = self.ledger.take() else {
-            return Ok(());
-        };
-        let table = task
-            .await
-            .unwrap_or_else(|join| std::panic::resume_unwind(join.into_panic()))?;
-        let position = self.position(Table::AcceptedBlock);
-        self.lakes[position].committed(table);
+        if let Some(table) = self.ledger.settle().await? {
+            let position = self.position(Table::AcceptedBlock);
+            self.lakes[position].committed(table);
+        }
         Ok(())
     }
 
@@ -461,44 +498,37 @@ impl DeltaSink {
     ) -> Result<Vec<(usize, Vec<RecordBatch>)>, StoreError> {
         let tables = appends.len();
         // Every build starts before any is waited for.
-        let mut builds = Vec::new();
+        let mut builds = JoinSet::new();
         for (position, rows) in appends {
             let lake = &self.lakes[position];
             let mut rows = rows.into_iter();
-            loop {
-                let chunk: Vec<Row> = rows.by_ref().take(ROWS_PER_BATCH).collect();
-                if chunk.is_empty() {
+            for chunk in 0_usize.. {
+                let part: Vec<Row> = rows.by_ref().take(ROWS_PER_BATCH).collect();
+                if part.is_empty() {
                     break;
                 }
                 let (arrow, def, width) =
                     (Arc::clone(&lake.arrow), Arc::clone(&lake.def), lake.width);
-                let build = tokio::spawn(async move {
-                    arrow::record_batch(&arrow, &def, width, &chunk.iter().collect::<Vec<_>>())
-                        .map_err(StoreError::engine(Operation::Append, Some(&def.name)))
+                builds.spawn(async move {
+                    let built =
+                        arrow::record_batch(&arrow, &def, width, &part.iter().collect::<Vec<_>>())
+                            .map_err(StoreError::engine(Operation::Append, Some(&def.name)));
+                    ((position, chunk), built)
                 });
-                builds.push((position, build));
             }
         }
-        // Every build is waited for, failed or not, before the first failure is returned,
-        // as every append is: none is left running, holding its rows, once the commit
-        // has given up.
+        let (built, failure) = join_every(builds).await;
+        if let Some(error) = failure {
+            return Err(error);
+        }
         let mut batches: Vec<(usize, Vec<RecordBatch>)> = Vec::with_capacity(tables);
-        let mut failure = None;
-        for (position, build) in builds {
-            let built = build
-                .await
-                .unwrap_or_else(|join| std::panic::resume_unwind(join.into_panic()));
-            match built {
-                Ok(batch) => match batches.last_mut() {
-                    Some((last, table)) if *last == position => table.push(batch),
-                    _ => batches.push((position, vec![batch])),
-                },
-                Err(error) => {
-                    failure.get_or_insert(error);
-                }
+        for ((position, _), batch) in built {
+            match batches.last_mut() {
+                Some((last, table)) if *last == position => table.push(batch),
+                _ => batches.push((position, vec![batch])),
             }
         }
-        failure.map_or(Ok(batches), Err)
+        Ok(batches)
     }
 
     /// Appends each table's batch as a commit of its own log, every table on its own task
@@ -506,29 +536,18 @@ impl DeltaSink {
     /// its own log and no rule orders one table's rows against another's, so they go at
     /// once: most tables' appends are small, and their time is the store's round trips,
     /// which overlap only when they run together.
-    ///
-    /// Every append is waited for, failed or not, before the first failure is returned:
-    /// none is left running to commit after the store has given up.
     async fn append_all(
         &mut self,
         batches: Vec<(usize, Vec<RecordBatch>)>,
     ) -> Result<(), StoreError> {
-        let tasks: Vec<_> = batches
-            .into_iter()
-            .map(|(position, batches)| {
-                let append = self.lakes[position].append(&self.writer, batches);
-                (position, tokio::spawn(append))
-            })
-            .collect();
-        let mut failure = None;
-        for (position, task) in tasks {
-            match task.await {
-                Ok(Ok(table)) => self.lakes[position].committed(table),
-                Ok(Err(error)) => {
-                    failure.get_or_insert(error);
-                }
-                Err(join) => std::panic::resume_unwind(join.into_panic()),
-            }
+        let mut appends = JoinSet::new();
+        for (position, batches) in batches {
+            let append = self.lakes[position].append(&self.writer, batches);
+            appends.spawn(async move { (position, append.await) });
+        }
+        let (appended, failure) = join_every(appends).await;
+        for (position, table) in appended {
+            self.lakes[position].committed(table);
         }
         failure.map_or(Ok(()), Err)
     }
@@ -663,19 +682,15 @@ impl Store for DeltaSink {
     /// Final on failure, as a commit is: every later write is refused with
     /// [`StoreError::Failed`] until the store is reopened.
     async fn rewind(&mut self, height: u64) -> Result<(), StoreError> {
-        if self.failed {
-            return Err(StoreError::Failed);
-        }
-        self.opened = None;
-        let rewound = match self.settle_ledger().await {
-            Ok(()) => self.delete_above(height).await,
-            Err(error) => Err(error),
-        };
-        self.failed = rewound.is_err();
-        rewound?;
-        self.committed.retain(|_, committed| *committed <= height);
-        self.publish_tip();
-        Ok(())
+        self.guarded(async |sink| {
+            sink.opened = None;
+            sink.settle_ledger().await?;
+            sink.delete_above(height).await?;
+            sink.committed.retain(|_, committed| *committed <= height);
+            sink.publish_tip();
+            Ok(())
+        })
+        .await
     }
 }
 
@@ -686,9 +701,7 @@ impl EnvelopeSink for DeltaSink {
     ///
     /// Refused with [`StoreError::Failed`] once a commit has failed.
     async fn publish(&mut self, envelope: Envelope) -> Result<(), SinkError> {
-        if self.failed {
-            return Err(StoreError::Failed.into());
-        }
+        self.refuse_if_failed()?;
         self.batch.push(&envelope)
     }
 
@@ -709,14 +722,112 @@ impl EnvelopeSink for DeltaSink {
     /// Waits for the last commit's ledger append, so its blocks count once the stream
     /// ends. Final on failure, as a commit is.
     async fn finish(&mut self) -> Result<(), SinkError> {
-        if self.failed {
-            return Err(StoreError::Failed.into());
-        }
-        let settled = self.settle_ledger().await;
-        self.failed = settled.is_err();
-        settled?;
+        self.guarded(async |sink| sink.settle_ledger().await)
+            .await?;
         Ok(())
     }
+}
+
+/// The last commit's ledger append, on a task of its own: the rows of its blocks are all
+/// present, so their entries may go in any time, and the next commit's table appends
+/// overlap it, which takes a whole commit's round trips off every commit. It is waited
+/// for before anything else touches the ledger, before the next one starts, and by
+/// [`finish`](EnvelopeSink::finish); a failure surfaces then.
+///
+/// Safe for the reason the ledger is written last at all: until an entry lands, its
+/// block's rows are rows the ledger does not name, which a reopen deletes and ingest
+/// fetches again. Every later commit's rows are, too, until its own entry lands.
+#[derive(Debug, Default)]
+struct PendingLedger(Option<JoinHandle<Result<DeltaTable, StoreError>>>);
+
+impl PendingLedger {
+    /// Starts appending `batch` to `ledger`, once the last append is settled.
+    fn start(&mut self, ledger: &Lake, writer: &WriterProperties, batch: RecordBatch) {
+        debug_assert!(self.0.is_none(), "the last ledger append is settled first");
+        self.0 = Some(tokio::spawn(ledger.append(writer, vec![batch])));
+    }
+
+    /// Waits for the running append, if any, and hands back the ledger as of it.
+    async fn settle(&mut self) -> Result<Option<DeltaTable>, StoreError> {
+        let Some(task) = self.0.as_mut() else {
+            return Ok(None);
+        };
+        let appended = task
+            .await
+            .unwrap_or_else(|join| std::panic::resume_unwind(join.into_panic()));
+        self.0 = None;
+        appended.map(Some)
+    }
+
+    /// Whether an append is still to be settled.
+    #[cfg(test)]
+    fn is_running(&self) -> bool {
+        self.0.is_some()
+    }
+}
+
+/// A batch taken apart by the step of a commit that writes each part (see
+/// [`DeltaSink::commit`]).
+struct Commit {
+    /// The retractions' rows, for `reorgs`.
+    reorgs: Vec<Row>,
+    /// The committed blocks the batch orphans, with the lowest height any is at.
+    orphans: Option<(u64, Vec<String>)>,
+    /// Every other table's rows, by the table's position.
+    appends: Vec<(usize, Vec<Row>)>,
+    /// The accepted blocks as the ledger's Arrow batch; `None` when there are none.
+    ledger: Option<RecordBatch>,
+    /// The accepted blocks' hashes and heights, for the window of committed blocks.
+    accepted: Vec<(String, u64)>,
+    summary: Summary,
+}
+
+/// What a commit writes, for its log line.
+#[derive(Clone, Copy)]
+struct Summary {
+    rows: usize,
+    orphaned: usize,
+    /// The lowest height the commit accepts.
+    from: Option<u64>,
+    /// How many tables besides the ledger and `reorgs` it appends to.
+    tables: usize,
+}
+
+/// How long a commit's slow parts took, for its log line.
+struct Timings {
+    /// Building every table's Arrow batches.
+    build: Duration,
+    /// Appending them.
+    write: Duration,
+    /// Waiting out the last commit's ledger append once they were appended.
+    ledger_wait: Duration,
+}
+
+/// Waits for every task, failed or not, and returns what each succeeded with, in the
+/// order of their keys, and the first failure among them: none is left running, holding
+/// its rows or committing, once the commit has given up. A task that panicked panics
+/// here too.
+async fn join_every<K: Ord + 'static, T: 'static>(
+    mut tasks: JoinSet<(K, Result<T, StoreError>)>,
+) -> (Vec<(K, T)>, Option<StoreError>) {
+    let mut done = Vec::with_capacity(tasks.len());
+    let mut failure = None;
+    while let Some(joined) = tasks.join_next().await {
+        match joined.unwrap_or_else(|join| std::panic::resume_unwind(join.into_panic())) {
+            (key, Ok(value)) => done.push((key, value)),
+            (_, Err(error)) => {
+                failure.get_or_insert(error);
+            }
+        }
+    }
+    done.sort_by(|(left, _), (right, _)| left.cmp(right));
+    (done, failure)
+}
+
+/// Runs `future`, and returns what it resolved to with how long it took.
+async fn timed<T>(future: impl Future<Output = T>) -> (T, Duration) {
+    let started = Instant::now();
+    (future.await, started.elapsed())
 }
 
 /// A duration in whole milliseconds, for a log field.
