@@ -274,7 +274,7 @@ that matters most: `decode` must not depend on `ingest`.
   hash instead of re-reading the header (an empty answer still reads it, to check the
   bloom); a block or transaction dataset still fetches the body it needs. The whole
   choice is one table, `FetchPlan`, in
-  `src/ingest/source/evm.rs`. Without transactions, buried backfill fetches up to a
+  `src/ingest/source/evm/plan.rs`. Without transactions, buried backfill fetches up to a
   hundred heights in one batch — a header per height and one ranged `eth_getLogs`. A
   range the provider fails on, or that times out, is fetched in halves, and later ranges
   start at the size that worked, growing back after a run of successes. Backfill keeps

@@ -1,7 +1,7 @@
 //! Which on-chain datasets a deployment fetches and stores.
 //!
 //! A block's metadata is reported separately from its events, so the selection is
-//! enforced where the events are projected: `src/ingest/source/evm.rs` reads only what
+//! enforced where the events are projected: `src/ingest/source/evm/` reads only what
 //! the selected datasets need, which is what makes the logs-only fetch skip its block
 //! read. [`Datasets::keeps`] is the same answer as a predicate, for a consumer that
 //! decodes a whole batch itself and has to filter. Control signals always pass.
