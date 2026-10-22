@@ -962,6 +962,27 @@ mod tests {
         }
     }
 
+    /// An absent value is written as `null` whatever its encoding, a quantity or not, so
+    /// a consumer meets one kind of absence; and the line reads back as `None`.
+    #[test]
+    fn an_absent_value_is_null_and_not_omitted() {
+        let envelope = Envelope::new(ChainId::new("ethereum"), Event::Transaction(Box::default()));
+        let line = serde_json::to_string(&envelope).expect("serializes");
+        let object: serde_json::Value = serde_json::from_str(&line).expect("an object");
+        for key in [
+            "v",
+            "gas_price",
+            "receipt_l1_block_number",
+            "r",
+            "to",
+            "access_list",
+        ] {
+            assert_eq!(object.get(key), Some(&serde_json::Value::Null), "{key}");
+        }
+        let read: Envelope = serde_json::from_str(&line).expect("reads back");
+        assert_eq!(read, envelope);
+    }
+
     /// A derived row's key is its log's, its table, and its position among the log's
     /// rows, pinned as a literal like every other key.
     #[test]

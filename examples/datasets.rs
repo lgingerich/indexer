@@ -24,9 +24,8 @@
 //!   the key in [`Event::dedupe_key`] is what a consumer deduplicates on.
 //! - The event's fields are **flat**, beside a `"type"` tag — `{"type":"log","log_index":…}`.
 //!   There is no nested `event` object to unwrap.
-//! - Optional fields are **omitted**, not `null`, unless they are genuinely
-//!   per-record (`topic0`..`topic3`, `to`, `withdrawals_root`). A consumer must tolerate
-//!   a missing key, not only a null one.
+//! - An absent value is **`null`**, never an omitted key: `"gas_price":null`,
+//!   `"topic3":null`. Every line of a dataset carries the same keys.
 //! - `logs_bloom` is `"0x…"` hex — 512 characters of it, because a bloom filter is 256
 //!   bytes and does not compress. It is most of a block's and a transaction's line.
 //!
@@ -128,8 +127,8 @@ fn block() -> Envelope {
     })))
 }
 
-/// A successful EIP-1559 transaction joined to its receipt: `gas_price` is left out,
-/// because the key is omitted rather than null when it does not apply.
+/// A successful EIP-1559 transaction joined to its receipt. Fields that do not apply,
+/// such as `max_fee_per_blob_gas`, are `null`.
 fn transaction() -> Envelope {
     envelope(Event::Transaction(Box::new(Transaction {
         hash: TX_HASH,
@@ -173,7 +172,7 @@ fn log() -> Envelope {
         topic0: Some(hash(0x07)),
         topic1: Some(topic(Address::from([0x55; 20]))),
         topic2: Some(topic(Address::from([0x66; 20]))),
-        // Fewer than four topics is normal, so this is `null` rather than omitted.
+        // Fewer than four topics is normal; an absent one is `null`.
         topic3: None,
         data: Bytes::from(vec![0xde, 0xad, 0xbe, 0xef]),
         removed: false,

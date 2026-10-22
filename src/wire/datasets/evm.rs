@@ -38,7 +38,11 @@
 //! ([`AccessList`], `SignedAuthorization`, [`Withdrawal`]). Integer fields carry `#[serde(with =
 //! "alloy_serde::quantity")]` so they render as the Ethereum JSON-RPC "quantity"
 //! form (`0x` hex) the node itself uses, not as bare JSON numbers; `U256` and the
-//! byte/address types already serialize to their canonical `0x` forms. The whole
+//! byte/address types already serialize to their canonical `0x` forms.
+//!
+//! An absent value is `null`, never an omitted key, so every line of a dataset carries
+//! the same keys and a consumer handles one kind of absence rather than two. A missing
+//! key still reads as `None`, so a line written before a field existed parses. The whole
 //! envelope is pinned by `every_variant_round_trips_through_json_with_unique_keys` in
 //! [`crate::wire::envelope`].
 
@@ -99,25 +103,13 @@ pub struct Block {
     #[serde(with = "alloy_serde::quantity")]
     pub transaction_count: u64,
     /// Minimum gas price required for inclusion, in wei; `None` before EIP-1559.
-    #[serde(
-        default,
-        with = "alloy_serde::quantity::opt",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(default, with = "alloy_serde::quantity::opt")]
     pub base_fee_per_gas: Option<u64>,
     /// Total blob gas used by this block's blob transactions; EIP-4844.
-    #[serde(
-        default,
-        with = "alloy_serde::quantity::opt",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(default, with = "alloy_serde::quantity::opt")]
     pub blob_gas_used: Option<u64>,
     /// Excess blob gas carried from the parent; EIP-4844.
-    #[serde(
-        default,
-        with = "alloy_serde::quantity::opt",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(default, with = "alloy_serde::quantity::opt")]
     pub excess_blob_gas: Option<u64>,
     /// Root of the parent beacon block; EIP-4788.
     pub parent_beacon_block_root: Option<B256>,
@@ -131,18 +123,10 @@ pub struct Block {
     /// Hash of the execution-layer requests; EIP-7685.
     pub requests_hash: Option<B256>,
     /// The L1 block an Arbitrum chain's block is anchored to.
-    #[serde(
-        default,
-        with = "alloy_serde::quantity::opt",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(default, with = "alloy_serde::quantity::opt")]
     pub l1_block_number: Option<u64>,
     /// How many L2-to-L1 messages an Arbitrum chain has sent, through this block.
-    #[serde(
-        default,
-        with = "alloy_serde::quantity::opt",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(default, with = "alloy_serde::quantity::opt")]
     pub send_count: Option<u64>,
     /// Root of an Arbitrum chain's outbox Merkle tree of L2-to-L1 messages.
     pub send_root: Option<B256>,
@@ -201,37 +185,21 @@ pub struct Transaction {
     ///
     /// `max_fee_per_gas` is the ceiling; this is what was paid. They differ on every
     /// EIP-1559 transaction.
-    #[serde(
-        default,
-        with = "alloy_serde::quantity::opt",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(default, with = "alloy_serde::quantity::opt")]
     pub gas_price: Option<u128>,
     /// Maximum fee per gas, in wei; EIP-1559.
     ///
     /// `None` when the transaction carries no such cap — a legacy or EIP-2930
     /// transaction, or a chain-specific type the node does not give one. The field is
-    /// absent rather than defaulted, so a consumer can tell "no cap" from a real cap of
+    /// `null` rather than defaulted, so a consumer can tell "no cap" from a real cap of
     /// zero; [`Transaction::gas_price`] is the price actually paid either way.
-    #[serde(
-        default,
-        with = "alloy_serde::quantity::opt",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(default, with = "alloy_serde::quantity::opt")]
     pub max_fee_per_gas: Option<u128>,
     /// Maximum priority fee per gas, in wei; EIP-1559.
-    #[serde(
-        default,
-        with = "alloy_serde::quantity::opt",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(default, with = "alloy_serde::quantity::opt")]
     pub max_priority_fee_per_gas: Option<u128>,
     /// Maximum fee per blob gas, in wei; EIP-4844.
-    #[serde(
-        default,
-        with = "alloy_serde::quantity::opt",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(default, with = "alloy_serde::quantity::opt")]
     pub max_fee_per_blob_gas: Option<u128>,
     /// Calldata sent with this transaction.
     pub input: Bytes,
@@ -243,11 +211,7 @@ pub struct Transaction {
     #[serde(with = "alloy_serde::quantity")]
     pub transaction_type: u8,
     /// Chain this transaction is valid on, from EIP-155.
-    #[serde(
-        default,
-        with = "alloy_serde::quantity::opt",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(default, with = "alloy_serde::quantity::opt")]
     pub chain_id: Option<u64>,
     /// Access list; EIP-2930.
     pub access_list: Option<AccessList>,
@@ -263,19 +227,11 @@ pub struct Transaction {
     /// The signature's `v` as the node reports it: for a legacy transaction the
     /// EIP-155 value carrying the chain id (or 27/28 before it), for a typed one the
     /// parity.
-    #[serde(
-        default,
-        with = "alloy_serde::quantity::opt",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(default, with = "alloy_serde::quantity::opt")]
     pub v: Option<u128>,
     /// The signature's parity, 0 or 1, for a typed transaction; a legacy one carries
     /// it in `v` alone.
-    #[serde(
-        default,
-        with = "alloy_serde::quantity::opt",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(default, with = "alloy_serde::quantity::opt")]
     pub y_parity: Option<u8>,
     /// Success status of the transaction, from its receipt.
     pub receipt_status: bool,
@@ -293,33 +249,17 @@ pub struct Transaction {
     /// Bloom filter for this transaction's logs.
     pub receipt_logs_bloom: Bloom,
     /// Blob gas used; EIP-4844.
-    #[serde(
-        default,
-        with = "alloy_serde::quantity::opt",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(default, with = "alloy_serde::quantity::opt")]
     pub receipt_blob_gas_used: Option<u64>,
     /// Blob gas price paid, in wei; EIP-4844.
-    #[serde(
-        default,
-        with = "alloy_serde::quantity::opt",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(default, with = "alloy_serde::quantity::opt")]
     pub receipt_blob_gas_price: Option<u128>,
     /// Gas an Arbitrum chain charged this transaction for posting it to L1, included in
     /// `receipt_gas_used`.
-    #[serde(
-        default,
-        with = "alloy_serde::quantity::opt",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(default, with = "alloy_serde::quantity::opt")]
     pub receipt_gas_used_for_l1: Option<u64>,
     /// The L1 block an Arbitrum chain saw when it executed this transaction.
-    #[serde(
-        default,
-        with = "alloy_serde::quantity::opt",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(default, with = "alloy_serde::quantity::opt")]
     pub receipt_l1_block_number: Option<u64>,
     /// Number of logs emitted by this transaction.
     #[serde(with = "alloy_serde::quantity")]
