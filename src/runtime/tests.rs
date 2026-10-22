@@ -19,7 +19,7 @@ use crate::ingest::source::{BlockSource, FetchedBlock, HeadStream, SourceError};
 use crate::sink::channel::Batching;
 use crate::sink::duckdb::DuckDb;
 use crate::sink::resume::Opened;
-use crate::sink::route::Backend;
+use crate::sink::route::StoreBackend;
 use crate::sink::stop::Stop;
 use crate::sink::store_runtime::StoreRuntime;
 use crate::sink::table::Schema;
@@ -66,13 +66,13 @@ fn a_failed_store_is_reported_ahead_of_the_closed_send() {
     })));
     let ingest = Err(PipelineError::Sink(SinkError::StorageClosed));
 
-    let error =
-        finish(vec![(Backend::DuckDb, storage)], ingest).expect_err("the store rejected the batch");
+    let error = finish(vec![(StoreBackend::DuckDb, storage)], ingest)
+        .expect_err("the store rejected the batch");
     assert!(
         matches!(
             &error,
             RuntimeError::Storage {
-                store: Backend::DuckDb,
+                store: StoreBackend::DuckDb,
                 source: SinkError::Store(StoreError::Engine {
                     target: Some(table),
                     ..
@@ -91,7 +91,7 @@ fn a_store_that_cannot_start_as_it_stands_is_a_config_error() {
     use crate::sink::resume::ResumeError;
 
     let open = |source| RuntimeError::OpenStore {
-        store: Backend::Postgres,
+        store: StoreBackend::Postgres,
         source,
     };
     for (case, error, config) in [
@@ -122,14 +122,14 @@ fn a_store_that_cannot_start_as_it_stands_is_a_config_error() {
         (
             "stores with no common block",
             RuntimeError::Resume(ResumeError::NoCommonBlock {
-                tips: vec![(Backend::Postgres, 9), (Backend::Delta, 5)],
+                tips: vec![(StoreBackend::Postgres, 9), (StoreBackend::Delta, 5)],
             }),
             true,
         ),
         (
             "a ledger that timed out",
             RuntimeError::Resume(ResumeError::Restore {
-                store: Backend::Delta,
+                store: StoreBackend::Delta,
                 source: StoreError::Engine {
                     operation: Operation::Read,
                     target: Some("accepted_blocks".to_owned()),
@@ -166,7 +166,7 @@ async fn duckdb_store(connection: duckdb::Connection) -> DuckDbSink {
 }
 
 /// `store`, writing every table of [`schema`].
-fn every_table<S>(backend: Backend, store: S, batching: Batching) -> Opened<S> {
+fn every_table<S>(backend: StoreBackend, store: S, batching: Batching) -> Opened<S> {
     Opened {
         backend,
         store,
@@ -244,7 +244,7 @@ async fn a_discovered_contract_is_stored_and_survives_a_restart() {
     let connection = duckdb::Connection::open_in_memory().expect("open in-memory DuckDB");
     let reader = connection.try_clone().expect("a second handle");
     let mut store = duckdb_store(connection).await;
-    let (blocks, receiver) = sink::channel::ChannelSink::new(Backend::DuckDb);
+    let (blocks, receiver) = sink::channel::ChannelSink::new(StoreBackend::DuckDb);
     let storage = tokio::spawn(async move {
         receiver
             .drain(&mut store, Batching::eager(500), Stop::never())
@@ -428,7 +428,11 @@ async fn run_once(connection: &duckdb::Connection, chain: FakeChain, start: Opti
         Catalog::load(protocols(), &ChainId::new("base")).expect("shipped protocols load");
     let result = Pipeline::new(chain, start, None, catalog)
         .run_with_stores(
-            vec![every_table(Backend::DuckDb, store, Batching::eager(500))],
+            vec![every_table(
+                StoreBackend::DuckDb,
+                store,
+                Batching::eager(500),
+            )],
             Stop::never(),
         )
         .await;
@@ -642,7 +646,7 @@ async fn run_lake(settings: &sink::DeltaSettings, chain: FakeChain, start: Optio
     let catalog =
         Catalog::load(protocols(), &ChainId::new("base")).expect("shipped protocols load");
     let result = Box::pin(Pipeline::new(chain, start, None, catalog).run_with_stores(
-        vec![every_table(Backend::Delta, store, settings.batching())],
+        vec![every_table(StoreBackend::Delta, store, settings.batching())],
         Stop::never(),
     ))
     .await;
@@ -790,12 +794,12 @@ async fn run_both(
     };
     let stores = vec![
         own(every_table(
-            Backend::DuckDb,
+            StoreBackend::DuckDb,
             AnyStore::DuckDb(Box::new(database)),
             Batching::eager(500),
         )),
         own(every_table(
-            Backend::Delta,
+            StoreBackend::Delta,
             AnyStore::Delta(Box::new(lake)),
             settings.batching(),
         )),

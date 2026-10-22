@@ -46,7 +46,7 @@ use crate::runtime::{Pipeline, RuntimeError};
 use crate::sink::channel::Batching;
 use crate::sink::duckdb::DuckDb;
 use crate::sink::resume::Opened;
-use crate::sink::route::Backend;
+use crate::sink::route::StoreBackend;
 use crate::sink::stop::Stop;
 use crate::sink::store_runtime::StoreRuntime;
 use crate::sink::{SinkError, SqlStore};
@@ -252,13 +252,13 @@ fn live(world: &Shared, path: &Path, plan: Plan, lifetime: u64, crash: Option<Du
             let store = SqlStore::new(engine, schema, CHAIN)
                 .await
                 .map_err(|source| RuntimeError::OpenStore {
-                    store: Backend::DuckDb,
+                    store: StoreBackend::DuckDb,
                     source,
                 })?;
             pipeline
                 .run_with_stores(
                     vec![Opened {
-                        backend: Backend::DuckDb,
+                        backend: StoreBackend::DuckDb,
                         store,
                         batching: Batching::eager(plan.batch_records),
                         tables,

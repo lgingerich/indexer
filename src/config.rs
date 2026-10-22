@@ -375,16 +375,114 @@ impl Sinks {
         named
     }
 
+    /// Where the stream goes: printed, with the tables `[sink.stdout]` lists, or into
+    /// every store named, each with its own settings. The one place the two are told
+    /// apart, so nothing past it that opens a store can be handed stdout.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SettingsError::NoSink`] when no sink is named, and
+    /// [`SettingsError::StdoutBesideStore`] when `stdout` is named beside a store.
+    pub fn destination(&self) -> Result<Destination, SettingsError> {
+        #[cfg(feature = "store")]
+        {
+            let stores = self.stores();
+            match (&self.stdout, stores.is_empty()) {
+                (Some(_), false) => return Err(SettingsError::StdoutBesideStore),
+                (None, false) => return Ok(Destination::Store(stores)),
+                (_, true) => {}
+            }
+        }
+        self.stdout
+            .as_ref()
+            .map(|stdout| Destination::Print(stdout.tables.clone()))
+            .ok_or(SettingsError::NoSink)
+    }
+
+    /// Every store named, in the fixed order of [`tables`](Self::tables).
+    #[cfg(feature = "store")]
+    fn stores(&self) -> Vec<StoreSettings> {
+        let mut stores = Vec::new();
+        #[cfg(feature = "duckdb")]
+        stores.extend(self.duckdb.clone().map(StoreSettings::DuckDb));
+        #[cfg(feature = "postgres")]
+        stores.extend(self.postgres.clone().map(StoreSettings::Postgres));
+        #[cfg(feature = "delta")]
+        stores.extend(self.delta.clone().map(StoreSettings::Delta));
+        stores
+    }
+
     /// Refuses a file that names no sink, or `stdout` beside a store.
     fn check(&self) -> Result<(), SettingsError> {
-        let named = self.tables();
-        if named.is_empty() {
-            return Err(SettingsError::NoSink);
+        self.destination().map(drop)
+    }
+}
+
+/// Where the stream goes, as [`Sinks::destination`] resolves it: a run prints or stores,
+/// never both.
+#[derive(Debug)]
+pub enum Destination {
+    /// `[sink.stdout]`: print these tables, and open no store.
+    Print(Tables),
+    /// Every store named, in a fixed order. Never empty.
+    #[cfg(feature = "store")]
+    Store(Vec<StoreSettings>),
+}
+
+/// One store's settings, of whichever backend its `[sink.<backend>]` names.
+#[cfg(feature = "store")]
+#[derive(Debug, Clone)]
+pub enum StoreSettings {
+    /// `[sink.duckdb]`.
+    #[cfg(feature = "duckdb")]
+    DuckDb(crate::sink::duckdb::DuckDbSettings),
+    /// `[sink.postgres]`.
+    #[cfg(feature = "postgres")]
+    Postgres(crate::sink::postgres::PostgresSettings),
+    /// `[sink.delta]`.
+    #[cfg(feature = "delta")]
+    Delta(crate::sink::delta::DeltaSettings),
+}
+
+#[cfg(feature = "store")]
+impl StoreSettings {
+    /// The store's backend.
+    #[must_use]
+    pub const fn backend(&self) -> crate::sink::route::StoreBackend {
+        use crate::sink::route::StoreBackend;
+        match self {
+            #[cfg(feature = "duckdb")]
+            Self::DuckDb(_) => StoreBackend::DuckDb,
+            #[cfg(feature = "postgres")]
+            Self::Postgres(_) => StoreBackend::Postgres,
+            #[cfg(feature = "delta")]
+            Self::Delta(_) => StoreBackend::Delta,
         }
-        if self.stdout.is_some() && named.len() > 1 {
-            return Err(SettingsError::StdoutBesideStore);
+    }
+
+    /// The tables the store writes.
+    #[must_use]
+    pub const fn tables(&self) -> &Tables {
+        match self {
+            #[cfg(feature = "duckdb")]
+            Self::DuckDb(duckdb) => &duckdb.tables,
+            #[cfg(feature = "postgres")]
+            Self::Postgres(postgres) => &postgres.tables,
+            #[cfg(feature = "delta")]
+            Self::Delta(delta) => &delta.tables,
         }
-        Ok(())
+    }
+
+    /// When the store's drain commits, as its settings say.
+    pub(crate) fn batching(&self) -> crate::sink::channel::Batching {
+        match self {
+            #[cfg(feature = "duckdb")]
+            Self::DuckDb(duckdb) => duckdb.batching(),
+            #[cfg(feature = "postgres")]
+            Self::Postgres(postgres) => postgres.batching(),
+            #[cfg(feature = "delta")]
+            Self::Delta(delta) => delta.batching(),
+        }
     }
 }
 

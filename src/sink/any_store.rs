@@ -3,12 +3,16 @@
 //! Each store's drain runs on its own task, so nothing calls a store through this type
 //! on the hot path but the drain itself, which `match`es once per call.
 
+use std::sync::Arc;
+
+use crate::config::StoreSettings;
 #[cfg(feature = "delta")]
 use crate::sink::DeltaSink;
 #[cfg(feature = "duckdb")]
 use crate::sink::DuckDbSink;
 #[cfg(feature = "postgres")]
 use crate::sink::PostgresSink;
+use crate::sink::table::Schema;
 use crate::sink::{EnvelopeSink, Restored, SinkError, Store, StoreError};
 use crate::wire::envelope::{BlockMeta, Envelope};
 
@@ -43,6 +47,34 @@ macro_rules! each {
             AnyStore::Delta($sink) => $call,
         }
     };
+}
+
+impl AnyStore {
+    /// Opens the store `settings` describe, of `schema`'s tables, for `chain`.
+    ///
+    /// # Errors
+    ///
+    /// Returns what the backend's own open returns.
+    pub(crate) async fn open(
+        settings: StoreSettings,
+        schema: Arc<Schema>,
+        chain: &str,
+    ) -> Result<Self, StoreError> {
+        Ok(match settings {
+            #[cfg(feature = "duckdb")]
+            StoreSettings::DuckDb(duckdb) => {
+                Self::DuckDb(Box::new(DuckDbSink::open(&duckdb, schema, chain).await?))
+            }
+            #[cfg(feature = "postgres")]
+            StoreSettings::Postgres(postgres) => Self::Postgres(Box::new(
+                PostgresSink::open(&postgres, schema, chain).await?,
+            )),
+            #[cfg(feature = "delta")]
+            StoreSettings::Delta(delta) => {
+                Self::Delta(Box::new(DeltaSink::open(&delta, schema, chain).await?))
+            }
+        })
+    }
 }
 
 impl EnvelopeSink for AnyStore {

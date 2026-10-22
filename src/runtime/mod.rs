@@ -94,14 +94,14 @@ use std::sync::Arc;
 use thiserror::Error;
 use tracing::info;
 
-use crate::config::{IngestSource, Settings, SettingsError};
+use crate::config::{Destination, IngestSource, Settings, SettingsError};
 use crate::decode::{Catalog, CatalogError, Decoder, DecodingSink};
 use crate::ingest::pipeline::{Machine, PipelineError};
 use crate::ingest::source::evm::{http_client, ws_connect};
 use crate::ingest::source::{
     AnySource, BlockSource, EvmSource, HyperSyncRanges, HyperSyncSource, SourceError,
 };
-use crate::sink::route::{self, Backend, RouteError, Router};
+use crate::sink::route::{self, Backend, RouteError, Router, StoreBackend};
 use crate::sink::stop::Stop;
 use crate::sink::table::{Schema, TableId};
 use crate::sink::{SinkError, StdoutJsonSink};
@@ -147,7 +147,7 @@ pub enum RuntimeError {
     #[error("{store} could not be opened: {source}")]
     OpenStore {
         /// The store.
-        store: Backend,
+        store: StoreBackend,
         /// Why it could not be opened.
         source: crate::sink::StoreError,
     },
@@ -156,7 +156,7 @@ pub enum RuntimeError {
     #[error("{store}'s runtime could not be started: {source}")]
     StoreRuntime {
         /// The store.
-        store: Backend,
+        store: StoreBackend,
         /// The operating system's error.
         source: std::io::Error,
     },
@@ -173,7 +173,7 @@ pub enum RuntimeError {
     #[error("{store} stopped: {source}")]
     Storage {
         /// The store.
-        store: Backend,
+        store: StoreBackend,
         /// Why it stopped.
         source: SinkError,
     },
@@ -185,7 +185,7 @@ pub enum RuntimeError {
     #[error("{store} task panicked: {source}")]
     StorageTaskPanicked {
         /// The store.
-        store: Backend,
+        store: StoreBackend,
         /// `tokio`'s join error, which carries the panic payload.
         source: tokio::task::JoinError,
     },
@@ -245,16 +245,29 @@ pub(crate) struct Pipeline<B = AnySource> {
     schema: Arc<Schema>,
 }
 
-/// Each sink the settings name and the tables it writes: what [`Pipeline::run`] opens.
+/// Where [`Pipeline::run`] sends the stream, resolved from the settings once: the tables
+/// to print, or each store to open, with its settings and the tables it writes.
 ///
 /// Apart from [`Pipeline`] so only a pipeline assembled from settings can be run that way:
-/// [`Pipeline::from_settings`] is the one place one is made, from settings that name at
-/// least one sink, so it is never empty. A pipeline from [`Pipeline::new`] has none and
-/// is run with its stores handed over (`Pipeline::run_with_stores`). Were the routes a
-/// field that such a pipeline left empty, `run` would read the empty list as "no stdout,
-/// so store", and open every configured store with no tables.
+/// [`Pipeline::from_settings`] is the one place one is made. A pipeline from
+/// [`Pipeline::new`] has none and is run with its stores handed over
+/// (`Pipeline::run_with_stores`).
 #[derive(Debug)]
-pub(crate) struct Routes(Vec<(Backend, HashSet<TableId>)>);
+pub(crate) enum Routes {
+    /// `[sink.stdout]`, and the tables it prints.
+    Print(HashSet<TableId>),
+    /// Every store named, in a fixed order. Never empty.
+    #[cfg(feature = "store")]
+    Store(Vec<StoreRoute>),
+}
+
+/// One store [`Pipeline::run`] opens: its settings, and the tables routed to it.
+#[cfg(feature = "store")]
+#[derive(Debug)]
+pub(crate) struct StoreRoute {
+    settings: crate::config::StoreSettings,
+    tables: HashSet<TableId>,
+}
 
 impl Pipeline {
     /// Assembles the pipeline the settings describe, and the [`Routes`] it runs with.
@@ -274,18 +287,25 @@ impl Pipeline {
             .map_or_else(Catalog::empty, |path| {
                 Catalog::load(path, &ChainId::new(&settings.ingest.chain))
             })?;
-        let routes = settings
-            .sink
-            .tables()
-            .into_iter()
-            .map(|(store, tables)| {
-                let resolved = tables
-                    .resolve(catalog.schema())
-                    .map_err(|source| RuntimeError::Route { store, source })?;
-                Ok((store, resolved))
-            })
-            .collect::<Result<Vec<_>, RuntimeError>>()?;
-        let datasets = route::datasets(routes.iter().map(|(_, tables)| tables));
+        let resolve = |store: Backend, tables: &route::Tables| {
+            tables
+                .resolve(catalog.schema())
+                .map_err(|source| RuntimeError::Route { store, source })
+        };
+        let routes = match settings.sink.destination()? {
+            Destination::Print(tables) => Routes::Print(resolve(Backend::Stdout, &tables)?),
+            #[cfg(feature = "store")]
+            Destination::Store(stores) => Routes::Store(
+                stores
+                    .into_iter()
+                    .map(|settings| {
+                        let tables = resolve(settings.backend().into(), settings.tables())?;
+                        Ok(StoreRoute { settings, tables })
+                    })
+                    .collect::<Result<_, RuntimeError>>()?,
+            ),
+        };
+        let datasets = route::datasets(routes.tables());
         info!(%datasets, "fetching what the sinks write");
         let chain = settings.ingest.chain.as_str();
         let source = match &settings.ingest.source {
@@ -322,7 +342,18 @@ impl Pipeline {
             settings.ingest.stop_block,
             catalog,
         );
-        Ok((pipeline, Routes(routes)))
+        Ok((pipeline, routes))
+    }
+}
+
+impl Routes {
+    /// The tables each sink writes, whose union ingest fetches.
+    fn tables(&self) -> Vec<&HashSet<TableId>> {
+        match self {
+            Self::Print(tables) => vec![tables],
+            #[cfg(feature = "store")]
+            Self::Store(stores) => stores.iter().map(|store| &store.tables).collect(),
+        }
     }
 }
 
@@ -352,35 +383,33 @@ impl<B: BlockSource + 'static> Pipeline<B> {
     /// [`RuntimeError::Resume`] when the stores cannot be brought to one block, and
     /// [`RuntimeError::Ingest`] or [`RuntimeError::Storage`] when a part fails. Each
     /// carries that part's own error, because "storage stopped" says nothing about why.
-    pub(crate) async fn run(
-        self,
-        routes: Routes,
-        settings: &Settings,
-        mut stop: Stop,
-    ) -> Result<(), RuntimeError> {
-        #[cfg(feature = "store")]
-        if !routes.prints() {
-            // A stop while opening drops what is open; see "Shutdown" in the module docs.
-            let stores = tokio::select! {
-                biased;
-                () = stop.wait() => return Ok(()),
-                stores = self.open(&routes, settings) => stores?,
-            };
-            return Box::pin(self.run_with_stores(stores, stop)).await;
-        }
-        #[cfg(not(feature = "store"))]
-        let _ = settings;
+    pub(crate) async fn run(self, routes: Routes, mut stop: Stop) -> Result<(), RuntimeError> {
+        // A build without a store can only print, so its match has one arm.
+        #[cfg_attr(not(feature = "store"), expect(clippy::infallible_destructuring_match))]
+        let tables = match routes {
+            Routes::Print(tables) => tables,
+            #[cfg(feature = "store")]
+            Routes::Store(routes) => {
+                // A stop while opening drops what is open; see "Shutdown" in the module docs.
+                let stores = tokio::select! {
+                    biased;
+                    () = stop.wait() => return Ok(()),
+                    stores = self.open(routes) => stores?,
+                };
+                return Box::pin(self.run_with_stores(stores, stop)).await;
+            }
+        };
         // A stop drops ingest; stdout has nothing to finish.
         tokio::select! {
             biased;
             () = stop.wait() => Ok(()),
-            printed = self.print(routes) => printed,
+            printed = self.print(tables) => printed,
         }
     }
 
-    /// Prints the tables `[sink.stdout]` names. No store, so no tables and nothing to
-    /// restore: a run starts fresh from the manifests' seeds.
-    async fn print(self, routes: Routes) -> Result<(), RuntimeError> {
+    /// Prints `tables`, as `[sink.stdout]` names them. No store, so nothing to restore: a
+    /// run starts fresh from the manifests' seeds.
+    async fn print(self, tables: HashSet<TableId>) -> Result<(), RuntimeError> {
         let Self {
             source,
             start_block,
@@ -388,11 +417,7 @@ impl<B: BlockSource + 'static> Pipeline<B> {
             decoder,
             schema,
         } = self;
-        let sinks = routes
-            .0
-            .into_iter()
-            .map(|(_, tables)| (StdoutJsonSink::new(), tables))
-            .collect();
+        let sinks = vec![(StdoutJsonSink::new(), tables)];
         let sink = DecodingSink::new(decoder, Router::new(schema, sinks));
         Machine::new(source, sink, Vec::new())
             .run(start_block, stop_block)
@@ -434,7 +459,7 @@ pub async fn run(path: &str) -> Result<(), RuntimeError> {
         let _ = request.send(true);
     });
     let (pipeline, routes) = Pipeline::from_settings(&settings)?;
-    let ran = pipeline.run(routes, &settings, stop.clone()).await;
+    let ran = pipeline.run(routes, stop.clone()).await;
     if ran.is_ok() && stop.requested() {
         info!("stopped on request");
     }

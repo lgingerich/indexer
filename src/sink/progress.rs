@@ -11,7 +11,7 @@ use tokio::time::Instant;
 use tracing::info;
 
 use crate::metrics;
-use crate::sink::route::Backend;
+use crate::sink::route::StoreBackend;
 use crate::wire::envelope::{ChainId, Envelope, Event};
 
 /// How far behind the sampled head still counts as caught up.
@@ -49,7 +49,7 @@ impl Progress {
     /// `None` for one that holds no block.
     pub(crate) fn committed(
         &mut self,
-        store: Backend,
+        store: StoreBackend,
         rows: u64,
         elapsed: Duration,
         head: Option<u64>,

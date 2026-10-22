@@ -2,115 +2,59 @@
 //! running ingest into them. A build without a store has none of it, so the whole module
 //! is behind the `store` feature rather than each item in it.
 
-use std::collections::HashSet;
 use std::sync::Arc;
 
 use tracing::{Instrument as _, info, info_span};
 
-use crate::config::Settings;
 use crate::decode::{Decoder, DecodingSink};
 use crate::ingest::pipeline::{Machine, PipelineError};
 use crate::ingest::source::BlockSource;
 use crate::sink::any_store::AnyStore;
-use crate::sink::channel::Batching;
 use crate::sink::resume::Opened;
-use crate::sink::route::{Backend, Router};
+use crate::sink::route::{Router, StoreBackend};
 use crate::sink::stop::Stop;
 use crate::sink::store_runtime::StoreRuntime;
-use crate::sink::table::{Schema, TableId};
 use crate::sink::{self, SinkError, StoredContract};
 use crate::window::Ledger;
 use crate::wire::envelope::ChainId;
 
-use super::{Pipeline, Routes, RuntimeError};
+use super::{Pipeline, RuntimeError, StoreRoute};
 
 impl<B: BlockSource + 'static> Pipeline<B> {
-    /// Opens every store the settings name, each with the tables `routes` sends it and on a
-    /// runtime of its own (see `crate::sink::store_runtime`). Opened before ingest
-    /// starts, so a bad path or connection fails at startup rather than after the first
-    /// block.
+    /// Opens every store `routes` names, each with the tables routed to it and on a
+    /// runtime of its own (see `crate::sink::store_runtime`), so what opening spawns — a
+    /// connection's task, the lake's checkpoints and maintenance — runs there too. Opened
+    /// before ingest starts, so a bad path or connection fails at startup rather than
+    /// after the first block.
     pub(super) async fn open(
         &self,
-        routes: &Routes,
-        settings: &Settings,
+        routes: Vec<StoreRoute>,
     ) -> Result<Vec<Opened<AnyStore>>, RuntimeError> {
-        let chain = &settings.ingest.chain;
-        let mut stores = Vec::new();
-        #[cfg(feature = "duckdb")]
-        if let Some(duckdb) = &settings.sink.duckdb {
-            let (settings, chain) = (duckdb.clone(), chain.clone());
-            let batching = Batching::eager(duckdb.batch_records);
-            let opened = self.open_store(routes, Backend::DuckDb, batching, async move |schema| {
-                Ok(AnyStore::DuckDb(Box::new(
-                    sink::DuckDbSink::open(&settings, schema, &chain).await?,
-                )))
+        let chain = self.source.chain().as_str().to_owned();
+        let mut stores = Vec::with_capacity(routes.len());
+        for StoreRoute { settings, tables } in routes {
+            let backend = settings.backend();
+            let batching = settings.batching();
+            let schema = Arc::new(self.schema.select(&tables));
+            let runtime =
+                StoreRuntime::dedicated(backend).map_err(|source| RuntimeError::StoreRuntime {
+                    store: backend,
+                    source,
+                })?;
+            let chain = chain.clone();
+            let store = runtime
+                .run(async move { AnyStore::open(settings, schema, &chain).await })
+                .await
+                .map_err(opening(backend))?;
+            stores.push(Opened {
+                backend,
+                store,
+                batching,
+                tables,
+                runtime,
             });
-            stores.push(opened.await?);
-        }
-        #[cfg(feature = "postgres")]
-        if let Some(postgres) = &settings.sink.postgres {
-            let (settings, chain) = (postgres.clone(), chain.clone());
-            let batching = postgres.batching();
-            let opened =
-                self.open_store(routes, Backend::Postgres, batching, async move |schema| {
-                    Ok(AnyStore::Postgres(Box::new(
-                        sink::PostgresSink::open(&settings, schema, &chain).await?,
-                    )))
-                });
-            stores.push(opened.await?);
-        }
-        #[cfg(feature = "delta")]
-        if let Some(delta) = &settings.sink.delta {
-            let (settings, chain) = (delta.clone(), chain.clone());
-            let batching = delta.batching();
-            let opened = self.open_store(routes, Backend::Delta, batching, async move |schema| {
-                Ok(AnyStore::Delta(Box::new(
-                    sink::DeltaSink::open(&settings, schema, &chain).await?,
-                )))
-            });
-            stores.push(opened.await?);
         }
         Ok(stores)
-    }
-
-    /// Opens `backend` with `open`, handed the schema of the tables routed to it, on a
-    /// runtime of the store's own, so what opening spawns — a connection's task, the
-    /// lake's checkpoints and maintenance — runs there too.
-    async fn open_store<F>(
-        &self,
-        routes: &Routes,
-        backend: Backend,
-        batching: Batching,
-        open: impl FnOnce(Arc<Schema>) -> F,
-    ) -> Result<Opened<AnyStore>, RuntimeError>
-    where
-        F: Future<Output = Result<AnyStore, sink::StoreError>> + Send + 'static,
-    {
-        let (schema, tables) = self.route(routes, backend);
-        let runtime =
-            StoreRuntime::dedicated(backend).map_err(|source| RuntimeError::StoreRuntime {
-                store: backend,
-                source,
-            })?;
-        let store = runtime.run(open(schema)).await.map_err(opening(backend))?;
-        Ok(Opened {
-            backend,
-            store,
-            batching,
-            tables,
-            runtime,
-        })
-    }
-
-    /// The tables `routes` sends `backend`, and the schema of them a store opens with.
-    fn route(&self, routes: &Routes, backend: Backend) -> (Arc<Schema>, HashSet<TableId>) {
-        let tables = routes
-            .0
-            .iter()
-            .find(|(named, _)| *named == backend)
-            .map(|(_, tables)| tables.clone())
-            .unwrap_or_default();
-        (Arc::new(self.schema.select(&tables)), tables)
     }
 
     /// Runs against open `stores`: brings them to one block, then ingests into each the
@@ -189,16 +133,6 @@ impl<B: BlockSource + 'static> Pipeline<B> {
     }
 }
 
-impl Routes {
-    /// Whether the run prints rather than stores. The settings never name stdout beside a
-    /// store, so a run does one or the other.
-    pub(super) fn prints(&self) -> bool {
-        self.0
-            .iter()
-            .any(|(backend, _)| *backend == Backend::Stdout)
-    }
-}
-
 /// Adds the contracts a previous run discovered, as the stores read them back.
 fn restore(mut decoder: Decoder, chain: &ChainId, stored: Vec<StoredContract>) -> Decoder {
     let restored = decoder.restore(stored);
@@ -218,13 +152,13 @@ pub(super) fn ledger(chain: &ChainId, stored: Ledger) -> Ledger {
 }
 
 /// The error for `store` failing to open.
-fn opening(store: Backend) -> impl FnOnce(sink::StoreError) -> RuntimeError {
+fn opening(store: StoreBackend) -> impl FnOnce(sink::StoreError) -> RuntimeError {
     move |source| RuntimeError::OpenStore { store, source }
 }
 
 /// How each store's drain ended, as its task returned it.
 pub(super) type Stopped = (
-    Backend,
+    StoreBackend,
     Result<Result<u64, SinkError>, tokio::task::JoinError>,
 );
 

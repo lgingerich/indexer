@@ -26,7 +26,7 @@ use std::num::NonZeroUsize;
 use tokio::runtime::{Builder, Handle, Runtime};
 use tokio::task::JoinHandle;
 
-use crate::sink::route::Backend;
+use crate::sink::route::StoreBackend;
 
 /// The runtime a store's work runs on: one of its own, or, in tests and the
 /// simulation, the runtime already running.
@@ -58,7 +58,7 @@ impl StoreRuntime {
     /// # Errors
     ///
     /// Returns the operating system's error when the runtime's threads cannot be made.
-    pub(crate) fn dedicated(store: Backend) -> std::io::Result<Self> {
+    pub(crate) fn dedicated(store: StoreBackend) -> std::io::Result<Self> {
         let runtime = Builder::new_multi_thread()
             .worker_threads(workers(store).get())
             .thread_name(format!("store-{store}"))
@@ -114,10 +114,10 @@ impl StoreRuntime {
 /// - A database, one: its drain commits over one connection, one transaction at a time,
 ///   mostly waiting on the network. `DuckDB`'s calls block, and it parallelizes queries
 ///   on threads of its own.
-fn workers(store: Backend) -> NonZeroUsize {
+fn workers(store: StoreBackend) -> NonZeroUsize {
     match store {
-        Backend::Delta => std::thread::available_parallelism().unwrap_or(NonZeroUsize::MIN),
-        Backend::DuckDb | Backend::Postgres | Backend::Stdout => NonZeroUsize::MIN,
+        StoreBackend::Delta => std::thread::available_parallelism().unwrap_or(NonZeroUsize::MIN),
+        StoreBackend::DuckDb | StoreBackend::Postgres => NonZeroUsize::MIN,
     }
 }
 
@@ -128,13 +128,13 @@ fn workers(store: Backend) -> NonZeroUsize {
 #[expect(clippy::expect_used)]
 mod tests {
     use super::StoreRuntime;
-    use crate::sink::route::Backend;
+    use crate::sink::route::StoreBackend;
 
     /// Work handed to a store's runtime runs on that runtime's threads, and what it
     /// spawns lands there too, while the caller's runtime only waits for it.
     #[tokio::test]
     async fn work_and_what_it_spawns_run_on_the_stores_own_threads() {
-        let store = StoreRuntime::dedicated(Backend::Postgres).expect("a runtime");
+        let store = StoreRuntime::dedicated(StoreBackend::Postgres).expect("a runtime");
         let names = store
             .run(async {
                 let own = std::thread::current().name().map(str::to_owned);
@@ -158,7 +158,7 @@ mod tests {
     /// where a run lets go of it.
     #[tokio::test]
     async fn a_stores_runtime_can_be_dropped_inside_another() {
-        let store = StoreRuntime::dedicated(Backend::Postgres).expect("a runtime");
+        let store = StoreRuntime::dedicated(StoreBackend::Postgres).expect("a runtime");
         store.spawn(std::future::pending::<()>());
         drop(store);
     }

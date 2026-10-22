@@ -11,7 +11,7 @@ use tokio::sync::Notify;
 use tokio::sync::mpsc::error::TryRecvError;
 use tokio::task::JoinHandle;
 
-use crate::sink::route::Backend;
+use crate::sink::route::StoreBackend;
 use crate::sink::{EnvelopeSink, SinkError};
 use crate::wire::datasets::evm::Block;
 use crate::wire::envelope::{ChainId, Envelope, Event};
@@ -122,7 +122,7 @@ async fn waits(send: impl Future<Output = ()>) -> bool {
 /// in order: the flush is the block boundary.
 #[tokio::test]
 async fn a_block_crosses_whole_and_only_on_flush() {
-    let (mut sink, mut receiver) = ChannelSink::new(Backend::DuckDb);
+    let (mut sink, mut receiver) = ChannelSink::new(StoreBackend::DuckDb);
     sink.publish(envelope(0)).await.expect("publish");
     sink.publish(envelope(1)).await.expect("publish");
     assert!(
@@ -153,7 +153,7 @@ async fn a_block_crosses_whole_and_only_on_flush() {
 #[tokio::test(start_paused = true)]
 async fn the_envelope_budget_holds_back_large_blocks() {
     let half = u64::try_from(ENVELOPES / 2 + 1).expect("fits");
-    let (mut sink, mut receiver) = ChannelSink::new(Backend::DuckDb);
+    let (mut sink, mut receiver) = ChannelSink::new(StoreBackend::DuckDb);
     send_block(&mut sink, 0..half).await;
     assert!(
         waits(send_block(&mut sink, half..2 * half)).await,
@@ -167,7 +167,7 @@ async fn the_envelope_budget_holds_back_large_blocks() {
         "room again once storage took the first"
     );
 
-    let (mut sink, mut receiver) = ChannelSink::new(Backend::DuckDb);
+    let (mut sink, mut receiver) = ChannelSink::new(StoreBackend::DuckDb);
     let whole = u64::try_from(ENVELOPES + 1).expect("fits");
     assert!(
         !waits(send_block(&mut sink, 0..whole)).await,
@@ -187,7 +187,7 @@ async fn the_envelope_budget_holds_back_large_blocks() {
 /// block: the bound is checked between blocks.
 #[tokio::test]
 async fn a_backlog_shares_a_flush_and_blocks_are_never_split() {
-    let (mut sink, receiver) = ChannelSink::new(Backend::DuckDb);
+    let (mut sink, receiver) = ChannelSink::new(StoreBackend::DuckDb);
     send_block(&mut sink, 0..3).await;
     send_block(&mut sink, 3..6).await;
     send_block(&mut sink, 6..9).await;
@@ -209,7 +209,7 @@ async fn a_backlog_shares_a_flush_and_blocks_are_never_split() {
 /// gathered when the channel closes is flushed too.
 #[tokio::test(start_paused = true)]
 async fn a_gathered_block_is_flushed_by_its_deadline_in_a_stall() {
-    let (mut sink, receiver) = ChannelSink::new(Backend::DuckDb);
+    let (mut sink, receiver) = ChannelSink::new(StoreBackend::DuckDb);
     let storage = spawn_drain(receiver, waiting(Duration::from_secs(30)), Stop::never());
     send_block(&mut sink, 0..1).await;
     tokio::time::sleep(Duration::from_secs(10)).await;
@@ -246,7 +246,7 @@ async fn a_block_queued_behind_a_slow_commit_has_already_waited() {
         }
     }
 
-    let (mut sink, receiver) = ChannelSink::new(Backend::DuckDb);
+    let (mut sink, receiver) = ChannelSink::new(StoreBackend::DuckDb);
     let mut store = Slow {
         start: tokio::time::Instant::now(),
         began: Vec::new(),
@@ -276,7 +276,7 @@ async fn a_block_queued_behind_a_slow_commit_has_already_waited() {
 /// wait; a block is never split to stay under it.
 #[tokio::test]
 async fn a_store_past_its_byte_limit_flushes_early() {
-    let (mut sink, receiver) = ChannelSink::new(Backend::DuckDb);
+    let (mut sink, receiver) = ChannelSink::new(StoreBackend::DuckDb);
     for height in 0..4 {
         send_block(&mut sink, height..height + 1).await;
     }
@@ -301,7 +301,7 @@ async fn a_store_past_its_byte_limit_flushes_early() {
 #[tokio::test]
 async fn a_flush_holds_at_most_half_a_window_of_blocks() {
     let max = MAX_BLOCKS as u64;
-    let (mut sink, receiver) = ChannelSink::new(Backend::DuckDb);
+    let (mut sink, receiver) = ChannelSink::new(StoreBackend::DuckDb);
     let storage = spawn_drain(receiver, waiting(Duration::from_hours(1)), Stop::never());
     for height in 0..max + 10 {
         send_block(&mut sink, height..height + 1).await;
@@ -317,7 +317,7 @@ async fn a_flush_holds_at_most_half_a_window_of_blocks() {
 #[tokio::test(start_paused = true)]
 async fn a_full_channel_blocks_the_sender() {
     let capacity = CAPACITY as u64;
-    let (mut sink, mut receiver) = ChannelSink::new(Backend::DuckDb);
+    let (mut sink, mut receiver) = ChannelSink::new(StoreBackend::DuckDb);
     for height in 0..capacity {
         assert!(
             !waits(send_block(&mut sink, height..height + 1)).await,
@@ -364,7 +364,7 @@ async fn a_store_that_stops_committing_reports_a_growing_lag() {
             .find_map(|line| line.strip_prefix("indexer_store_lag_blocks{store=\"duckdb\"} "))
             .map(str::to_owned)
     };
-    let (mut sink, receiver) = ChannelSink::new(Backend::DuckDb);
+    let (mut sink, receiver) = ChannelSink::new(StoreBackend::DuckDb);
     sink.observe_head(10);
     assert_eq!(lag(), None, "no lag before the store's first commit");
 
@@ -397,7 +397,7 @@ async fn a_store_that_stops_committing_reports_a_growing_lag() {
 /// directly and keeps the channel's own types out of the assertion.
 #[tokio::test]
 async fn a_stopped_store_fails_the_next_flush() {
-    let (mut sink, receiver) = ChannelSink::new(Backend::DuckDb);
+    let (mut sink, receiver) = ChannelSink::new(StoreBackend::DuckDb);
     drop(receiver);
     sink.publish(envelope(0)).await.expect("publish buffers");
     let error = sink.flush().await.expect_err("nobody is reading");
@@ -439,7 +439,7 @@ async fn a_stop_finishes_the_commit_under_way_and_drops_the_rest() {
 
     let entered = Arc::new(Notify::new());
     let release = Arc::new(Notify::new());
-    let (mut sink, receiver) = ChannelSink::new(Backend::DuckDb);
+    let (mut sink, receiver) = ChannelSink::new(StoreBackend::DuckDb);
     let (request, stop) = Stop::new();
     let mut store = Gated {
         inner: Batches::default(),
@@ -477,7 +477,7 @@ async fn a_stop_finishes_the_commit_under_way_and_drops_the_rest() {
 /// leaving it to be fetched again, and drops nothing it had in hand.
 #[tokio::test(start_paused = true)]
 async fn a_stop_commits_what_is_gathered() {
-    let (mut sink, receiver) = ChannelSink::new(Backend::DuckDb);
+    let (mut sink, receiver) = ChannelSink::new(StoreBackend::DuckDb);
     let (request, stop) = Stop::new();
     let storage = spawn_drain(receiver, waiting(Duration::from_hours(1)), stop);
     send_block(&mut sink, 0..1).await;
@@ -518,7 +518,7 @@ async fn a_stop_abandons_a_commit_that_runs_out_of_time() {
         }
     }
 
-    let (mut sink, receiver) = ChannelSink::new(Backend::DuckDb);
+    let (mut sink, receiver) = ChannelSink::new(StoreBackend::DuckDb);
     let (request, stop) = Stop::new();
     let storage = tokio::spawn(async move {
         let mut store = Stuck::default();
@@ -561,7 +561,7 @@ async fn a_stop_abandons_what_a_commit_left_running_once_out_of_time() {
         }
     }
 
-    let (mut sink, receiver) = ChannelSink::new(Backend::DuckDb);
+    let (mut sink, receiver) = ChannelSink::new(StoreBackend::DuckDb);
     let (request, stop) = Stop::new();
     let storage = tokio::spawn(async move {
         let mut store = Hung(Batches::default());
@@ -595,7 +595,7 @@ async fn a_failing_sink_ends_the_drain_with_its_error() {
         }
     }
 
-    let (mut sink, receiver) = ChannelSink::new(Backend::DuckDb);
+    let (mut sink, receiver) = ChannelSink::new(StoreBackend::DuckDb);
     send_block(&mut sink, 0..1).await;
     let error = receiver
         .drain(&mut OutOfSpace, Batching::eager(100), Stop::never())

@@ -32,7 +32,11 @@ use crate::wire::envelope::Envelope;
 /// protocols added later.
 pub const CONTRACT_EVENTS: &str = "contract_events";
 
-/// A store's backend, which also names the store: a run writes at most one of each.
+/// A sink's backend, which also names the sink: a run writes at most one of each.
+///
+/// What a settings file names. Everything past the settings that only a store does —
+/// opening, resuming, draining — takes a [`StoreBackend`] instead, which cannot be
+/// stdout.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Backend {
     /// Standard output.
@@ -59,6 +63,49 @@ impl Backend {
 }
 
 impl fmt::Display for Backend {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.name())
+    }
+}
+
+/// A store's backend, which also names the store: the [`Backend`]s that keep what they
+/// are handed, and so the only ones a store's open, resume, and drain are given.
+///
+/// Every variant exists in every build, whichever engines it has: only the
+/// settings and the open are behind each engine's feature.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StoreBackend {
+    /// An embedded `DuckDB` database.
+    DuckDb,
+    /// A remote `PostgreSQL` database.
+    Postgres,
+    /// Delta Lake tables on object storage.
+    Delta,
+}
+
+impl StoreBackend {
+    /// The store's name, as its `[sink.<name>]` table spells it.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::DuckDb => Backend::DuckDb.name(),
+            Self::Postgres => Backend::Postgres.name(),
+            Self::Delta => Backend::Delta.name(),
+        }
+    }
+}
+
+impl From<StoreBackend> for Backend {
+    fn from(store: StoreBackend) -> Self {
+        match store {
+            StoreBackend::DuckDb => Self::DuckDb,
+            StoreBackend::Postgres => Self::Postgres,
+            StoreBackend::Delta => Self::Delta,
+        }
+    }
+}
+
+impl fmt::Display for StoreBackend {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.name())
     }

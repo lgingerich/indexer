@@ -21,6 +21,7 @@ use serde::Deserialize;
 use tracing::info;
 
 use crate::secret::Secret;
+use crate::sink::channel::Batching;
 use crate::sink::route::Tables;
 use crate::sink::sql::{Dialect, ident};
 use crate::sink::store::{Engine, SqlStore};
@@ -83,6 +84,14 @@ pub struct DuckDbSettings {
     /// Values are [`Secret`]s, since some are credentials.
     #[serde(default)]
     pub settings: BTreeMap<String, Secret>,
+}
+
+impl DuckDbSettings {
+    /// When the store commits: up to [`batch_records`](Self::batch_records) records, as
+    /// soon as they are gathered.
+    pub(crate) const fn batching(&self) -> Batching {
+        Batching::eager(self.batch_records)
+    }
 }
 
 fn default_path() -> PathBuf {

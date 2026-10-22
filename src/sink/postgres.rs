@@ -25,7 +25,7 @@ use tokio_postgres::types::{FromSql, IsNull, Kind, ToSql, Type, to_sql_checked};
 use crate::metrics;
 use crate::secret::Secret;
 use crate::sink::channel::Batching;
-use crate::sink::route::{Backend, Tables};
+use crate::sink::route::{StoreBackend, Tables};
 use crate::sink::sql::{self, Dialect, ident};
 use crate::sink::store::{Engine, SqlStore};
 use crate::sink::store_error::{EngineError, Operation, StoreError};
@@ -455,7 +455,7 @@ impl Engine for Postgres {
         loop {
             match self.reconnect().await {
                 Ok(()) => {
-                    metrics::store_reconnected(Backend::Postgres.name());
+                    metrics::store_reconnected(StoreBackend::Postgres.name());
                     tracing::info!("PostgreSQL connection restored; retrying the commit");
                     return Ok(true);
                 }

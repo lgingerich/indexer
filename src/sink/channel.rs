@@ -55,7 +55,7 @@ use tracing::{info, warn};
 use super::progress::{self, HEAD_UNKNOWN, Progress};
 use super::stop::Stop;
 use crate::metrics;
-use crate::sink::route::Backend;
+use crate::sink::route::StoreBackend;
 use crate::sink::{EnvelopeSink, SinkError};
 use crate::wire::envelope::Envelope;
 
@@ -153,7 +153,7 @@ pub(crate) struct ChannelSink {
     /// Newest canonical head ingest has sampled. Storage reads it when a commit lands.
     head: Arc<AtomicU64>,
     /// The store this sends to, as its lag is reported.
-    store: Backend,
+    store: StoreBackend,
     /// The newest block the store has committed, or [`UNCOMMITTED`]: what a head sampled
     /// between commits measures the store's lag against.
     committed: Arc<AtomicU64>,
@@ -166,7 +166,7 @@ impl ChannelSink {
     /// Creates the channel: this sending half, which decode publishes into, and the
     /// receiving half `store` drains, whose commits it reports under that name.
     #[must_use]
-    pub(crate) fn new(store: Backend) -> (Self, ChannelReceiver) {
+    pub(crate) fn new(store: StoreBackend) -> (Self, ChannelReceiver) {
         let (sender, receiver) = mpsc::channel(CAPACITY);
         let room = Arc::new(Semaphore::new(ENVELOPES));
         let head = Arc::new(AtomicU64::new(HEAD_UNKNOWN));
@@ -248,7 +248,7 @@ impl EnvelopeSink for ChannelSink {
 pub(crate) struct ChannelReceiver {
     receiver: mpsc::Receiver<Parcel>,
     /// The store this drains into, as its commits are reported.
-    store: Backend,
+    store: StoreBackend,
     head: Arc<AtomicU64>,
     committed: Arc<AtomicU64>,
     progress: Progress,

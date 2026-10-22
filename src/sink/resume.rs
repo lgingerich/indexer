@@ -54,7 +54,7 @@ use futures_util::future::BoxFuture;
 use tracing::{info, warn};
 
 use crate::sink::channel::Batching;
-use crate::sink::route::Backend;
+use crate::sink::route::StoreBackend;
 use crate::sink::store_runtime::StoreRuntime;
 use crate::sink::table::TableId;
 use crate::sink::{Restored, Store, StoreError, StoredContract, millis};
@@ -65,7 +65,7 @@ use crate::wire::envelope::BlockMeta;
 #[derive(Debug)]
 pub(crate) struct Opened<S> {
     /// Which store it is.
-    pub(crate) backend: Backend,
+    pub(crate) backend: StoreBackend,
     /// The store.
     pub(crate) store: S,
     /// When its drain commits.
@@ -103,7 +103,7 @@ pub enum ResumeError {
     #[error("{store} could not be read back: {source}")]
     Restore {
         /// The store.
-        store: Backend,
+        store: StoreBackend,
         /// What failed.
         source: StoreError,
     },
@@ -111,7 +111,7 @@ pub enum ResumeError {
     #[error("{store} could not be rewound to height {height}: {source}")]
     Rewind {
         /// The store.
-        store: Backend,
+        store: StoreBackend,
         /// The height it was being rewound to.
         height: u64,
         /// What failed.
@@ -123,7 +123,7 @@ pub enum ResumeError {
     #[error("the stores hold no block in common ({})", describe_tips(.tips))]
     NoCommonBlock {
         /// Each store with a ledger, and the height of its tip.
-        tips: Vec<(Backend, u64)>,
+        tips: Vec<(StoreBackend, u64)>,
     },
 }
 
@@ -140,7 +140,7 @@ impl ResumeError {
     }
 }
 
-fn describe_tips(tips: &[(Backend, u64)]) -> String {
+fn describe_tips(tips: &[(StoreBackend, u64)]) -> String {
     tips.iter()
         .map(|(store, height)| format!("{store} at {height}"))
         .collect::<Vec<_>>()
@@ -383,7 +383,7 @@ mod tests {
     use alloy_primitives::B256;
 
     use crate::sink::channel::Batching;
-    use crate::sink::route::Backend;
+    use crate::sink::route::StoreBackend;
     use crate::sink::store_runtime::StoreRuntime;
     use crate::sink::{EnvelopeSink, Restored, SinkError, Store, StoreError};
     use crate::wire::envelope::{BlockMeta, Envelope};
@@ -449,8 +449,11 @@ mod tests {
         // The lake is ahead with a full window that starts above the database's tip, so
         // it is rewound rather than reconciled, and read back again.
         let stores = vec![
-            opened(Backend::Postgres, ledger(0xa0, 1..=5)),
-            opened(Backend::Delta, ledger(0xa0, 7..=6 + LEDGER_WINDOW as u64)),
+            opened(StoreBackend::Postgres, ledger(0xa0, 1..=5)),
+            opened(
+                StoreBackend::Delta,
+                ledger(0xa0, 7..=6 + LEDGER_WINDOW as u64),
+            ),
         ];
         let (stores, restored) = resume(stores).await.expect("resumed");
         assert_eq!(
@@ -467,7 +470,7 @@ mod tests {
                 .iter()
                 .map(|opened| opened.backend)
                 .collect::<Vec<_>>(),
-            [Backend::Postgres, Backend::Delta],
+            [StoreBackend::Postgres, StoreBackend::Delta],
             "every store comes back, in order"
         );
         assert_eq!(
@@ -635,8 +638,8 @@ mod tests {
                 runtime: StoreRuntime::dedicated(backend).expect("a runtime"),
             };
             let stores = vec![
-                opened(Backend::Postgres, slow.clone()),
-                opened(Backend::Delta, fast),
+                opened(StoreBackend::Postgres, slow.clone()),
+                opened(StoreBackend::Delta, fast),
             ];
             let (_, resumed) = resume(stores).await.expect(label);
             let mut expected = slow;
