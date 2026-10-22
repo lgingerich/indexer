@@ -504,6 +504,15 @@ path = "indexer.duckdb"
 protocols = "protocols"
 ```
 
+`--check` before the path loads the settings and assembles the pipeline without running
+it — no store is opened and nothing is fetched — and exits as the run would have at that
+point: 78 for settings at fault, 0 when they assemble. Under the environment it will run
+in, it finds a mistyped key or an unset variable before a restart does:
+
+```bash
+infisical run -- target/release/indexer --check indexer.bsc.toml
+```
+
 Raw data in the lake and decoded events in PostgreSQL, from one fetch:
 
 ```toml

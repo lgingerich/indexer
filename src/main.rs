@@ -16,6 +16,11 @@
 //! ```bash
 //! cargo run --release -- indexer.local.toml
 //! ```
+//!
+//! `--check` before the path loads the settings and assembles the pipeline without
+//! running it: no store is opened and the network is not touched, so a file — and the
+//! environment variables it names — can be checked before a deploy restarts a chain on
+//! it. It exits as a run that failed there would, and 0 when they assemble.
 
 use std::process::ExitCode;
 
@@ -49,8 +54,9 @@ const DEFAULT_LOG_LEVEL: LevelFilter = if cfg!(debug_assertions) {
 };
 
 /// How to run the binary, printed when the command line does not name a settings file.
-const USAGE: &str = "usage: indexer <settings.toml>\n\n\
-    Runs the pipeline the settings file describes; indexer.example.toml documents every key.";
+const USAGE: &str = "usage: indexer [--check] <settings.toml>\n\n\
+    Runs the pipeline the settings file describes; indexer.example.toml documents every key.\n\
+    --check loads the settings and assembles the pipeline without running it.";
 
 /// Prints [`USAGE`] and exits [`EXIT_USAGE`]. Printed rather than logged: it is for the
 /// person at the terminal, and needs no level or timestamp.
@@ -77,11 +83,19 @@ async fn main() -> ExitCode {
         )
         .init();
 
-    let Some(path) = std::env::args().nth(1) else {
-        return usage();
+    let mut args = std::env::args().skip(1);
+    let (check, path) = match (args.next(), args.next(), args.next()) {
+        (Some(flag), Some(path), None) if flag == "--check" => (true, path),
+        (Some(path), None, None) if !path.starts_with('-') => (false, path),
+        _ => return usage(),
     };
-    // Boxed: the whole run's state is one future, too large to keep on the stack.
-    match Box::pin(indexer::runtime::run(&path)).await {
+    let ran = if check {
+        indexer::runtime::check(&path)
+    } else {
+        // Boxed: the whole run's state is one future, too large to keep on the stack.
+        Box::pin(indexer::runtime::run(&path)).await
+    };
+    match ran {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             // Display, not Debug: every variant in the chain prints its cause — `{source}`
@@ -102,8 +116,6 @@ async fn main() -> ExitCode {
 
 #[cfg(test)]
 mod tests {
-    use std::str::FromStr as _;
-
     use indexer::config::Settings;
     use indexer::ingest::PipelineError;
     use indexer::runtime::RuntimeError;
@@ -124,7 +136,7 @@ ws_url = "wss://example.invalid"
 
 [sink.nope]
 "#;
-        let Err(error) = Settings::from_str(input) else {
+        let Err(error) = Settings::parse(input, indexer::secret::process_env) else {
             panic!("an unknown sink backend must be a parse failure");
         };
         let shown = RuntimeError::from(error).to_string();

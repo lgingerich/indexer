@@ -599,7 +599,7 @@ fn finish(stopped: Vec<Stopped>, ingest: Result<(), PipelineError>) -> Result<()
 /// not be read, the pipeline if it could not be assembled, and otherwise the part that
 /// failed while running.
 pub async fn run(path: &str) -> Result<(), RuntimeError> {
-    let settings = Settings::from_file(path)?;
+    let settings = Settings::from_file(path, crate::secret::process_env)?;
     info!(
         settings = path,
         chain = %settings.ingest.chain,
@@ -630,6 +630,21 @@ pub async fn run(path: &str) -> Result<(), RuntimeError> {
         info!("stopped on request");
     }
     ran
+}
+
+/// Loads the settings at `path` and assembles the pipeline they describe, without
+/// running it: no store is opened and nothing is fetched. What `indexer --check` runs,
+/// so a settings file and the variables it names are found wanting before a deploy
+/// restarts a chain on them.
+///
+/// # Errors
+///
+/// As [`run`] before it opens the stores: [`RuntimeError::Settings`],
+/// [`RuntimeError::Catalog`], [`RuntimeError::Route`], or [`RuntimeError::Source`].
+pub fn check(path: &str) -> Result<(), RuntimeError> {
+    let settings = Settings::from_file(path, crate::secret::process_env)?;
+    Pipeline::from_settings(&settings)?;
+    Ok(())
 }
 
 /// Waits for the first signal that asks the process to stop: `SIGTERM`, which `docker
@@ -672,8 +687,6 @@ async fn termination() -> &'static str {
 // or setup is wrong.
 #[expect(clippy::expect_used)]
 mod tests {
-    use std::str::FromStr as _;
-
     use alloy_dyn_abi::DynSolValue;
     use alloy_primitives::{Address, B256, keccak256};
 
@@ -696,7 +709,7 @@ mod tests {
 
     use super::{Pipeline, RuntimeError, finish, ledger};
 
-    /// The shipped protocols, as an absolute path so [`Settings::from_str`] carries no
+    /// The shipped protocols, as an absolute path so [`Settings::parse`] carries no
     /// directory to resolve it against.
     fn protocols() -> String {
         format!("{}/protocols", env!("CARGO_MANIFEST_DIR"))
@@ -812,7 +825,8 @@ tables = ["blocks", "transactions", "logs", "decoded_logs", "contract_events"]
     #[test]
     fn the_shipped_protocols_assemble() {
         let decode = format!("\n[decode]\nprotocols = {:?}\n", protocols());
-        let settings = Settings::from_str(&format!("{SETTINGS}{decode}")).expect("settings parse");
+        let settings = Settings::parse(&format!("{SETTINGS}{decode}"), crate::secret::process_env)
+            .expect("settings parse");
         Pipeline::from_settings(&settings).expect("the pipeline builds");
     }
 

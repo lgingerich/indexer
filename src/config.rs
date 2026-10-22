@@ -12,7 +12,8 @@
 //! - **A secret is named, not written.** A [`Secret`] field takes `{ env = "NAME" }`, read
 //!   from the environment as the file loads, so the file stays in git while the platform
 //!   injects the value. A literal is accepted too, for a public endpoint or local
-//!   development.
+//!   development. The environment is the parse's input (an [`Env`]), so a test parses a
+//!   deployment's file with stand-in values.
 //!
 //! Where records end up. The backend is the table: `[sink.duckdb]` opens `DuckDB` and
 //! holds its settings, `[sink.delta]` the lake, and so on — any combination, one of
@@ -58,7 +59,7 @@ use serde::Deserialize;
 use serde::de::{self, Unexpected};
 
 use crate::metrics::MetricsSettings;
-use crate::secret::Secret;
+use crate::secret::{self, Env, Secret};
 use crate::sink::route::{Backend, Tables};
 
 /// Deserializes a required string, refusing an empty or whitespace-only one.
@@ -98,8 +99,8 @@ pub struct Settings {
     #[serde(default)]
     pub metrics: Option<MetricsSettings>,
     /// The directory the settings file lives in, which a relative path in it resolves
-    /// against. Filled by [`Settings::from_file`]; empty for text parsed from elsewhere,
-    /// which leaves a relative path as written. Not a file key, so a `dir` in the file is
+    /// against. Filled by [`Settings::from_file`]; empty for text given to
+    /// [`Settings::parse`], which leaves a relative path as written. Not a file key, so a `dir` in the file is
     /// still reported as a typo.
     #[serde(skip)]
     dir: PathBuf,
@@ -434,46 +435,45 @@ pub enum SettingsError {
     StdoutBesideStore,
 }
 
-impl std::str::FromStr for Settings {
-    /// [`SettingsError::Parse`]; there is no file to read in this form.
-    type Err = SettingsError;
-
-    /// Parses settings from TOML text, filling defaults and rejecting what is required
-    /// but absent, an `[ingest]` that does not name one source, and sinks that cannot
-    /// run together.
+impl Settings {
+    /// Parses settings from TOML text, filling defaults, reading each `{ env = "NAME" }`
+    /// secret from `env`, and rejecting what is required but absent, an `[ingest]` that
+    /// does not name one source, and sinks that cannot run together.
     ///
     /// This is the in-memory form of [`Settings::from_file`], for a caller that has the
     /// text already. A relative path in the text resolves against the process's working
     /// directory rather than a file's, since there is no file; prefer
     /// [`Settings::from_file`].
-    fn from_str(text: &str) -> Result<Self, SettingsError> {
-        let settings: Self =
-            toml::from_str(text).map_err(|source| SettingsError::Parse { source })?;
-        settings.sink.check()?;
-        Ok(settings)
-    }
-}
-
-impl Settings {
-    /// Reads settings from a TOML file.
     ///
     /// # Errors
     ///
-    /// Returns [`SettingsError::Read`] when the file cannot be read,
-    /// [`SettingsError::Parse`] when it does not parse, a required value is absent, or
-    /// `[ingest]` does not name one source, and
+    /// Returns [`SettingsError::Parse`] when the text does not parse, a required value
+    /// or a named variable is absent, or `[ingest]` does not name one source, and
     /// [`SettingsError::NoSink`] or [`SettingsError::StdoutBesideStore`] when its sinks
-    /// cannot run. A
-    /// malformed file reports its line and column; an unknown field is an error rather
-    /// than being ignored, so a misspelled key is caught at startup instead of silently
-    /// leaving a setting at its default.
-    pub fn from_file(path: impl AsRef<Path>) -> Result<Self, SettingsError> {
+    /// cannot run. A malformed document reports its line and column; an unknown field is
+    /// an error rather than being ignored, so a misspelled key is caught at startup
+    /// instead of silently leaving a setting at its default.
+    pub fn parse(text: &str, env: Env) -> Result<Self, SettingsError> {
+        let settings: Self = secret::reading(env, || toml::from_str(text))
+            .map_err(|source| SettingsError::Parse { source })?;
+        settings.sink.check()?;
+        Ok(settings)
+    }
+
+    /// Reads settings from a TOML file, as [`Settings::parse`] does, and resolves the
+    /// relative paths in it against the file's directory.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SettingsError::Read`] when the file cannot be read, and otherwise what
+    /// [`Settings::parse`] returns.
+    pub fn from_file(path: impl AsRef<Path>, env: Env) -> Result<Self, SettingsError> {
         let path = path.as_ref();
         let text = std::fs::read_to_string(path).map_err(|source| SettingsError::Read {
             path: path.display().to_string(),
             source,
         })?;
-        let mut settings: Self = text.parse()?;
+        let mut settings = Self::parse(&text, env)?;
         // Remember where the file lives, so a relative path in it resolves against that
         // directory rather than the process's working directory. A bare filename's
         // parent is empty, and joining onto an empty path is the path as written.
@@ -508,10 +508,20 @@ impl Settings {
 // means the fixture or setup is wrong.
 #[expect(clippy::expect_used)]
 mod tests {
-    use std::str::FromStr as _;
+    use std::env::VarError;
 
     use super::{Settings, SettingsError};
     use crate::sink::route::{Backend, Tables};
+
+    /// An environment with nothing set, so a test reads only the variables it stands in.
+    fn unset(_: &str) -> Result<String, VarError> {
+        Err(VarError::NotPresent)
+    }
+
+    /// `text` parsed with nothing in the environment.
+    fn parse(text: &str) -> Result<Settings, SettingsError> {
+        Settings::parse(text, unset)
+    }
 
     /// The minimum a file needs: a chain, its endpoints, and a store.
     fn minimal() -> &'static str {
@@ -531,9 +541,54 @@ tables = ["blocks"]
     /// `[sink.stdout]`, which every build has, and comments out the stores.
     #[test]
     fn the_example_settings_file_assembles() {
-        let settings = Settings::from_str(include_str!("../indexer.example.toml"))
-            .expect("indexer.example.toml parses");
+        let settings =
+            parse(include_str!("../indexer.example.toml")).expect("indexer.example.toml parses");
         crate::runtime::Pipeline::from_settings(&settings).expect("indexer.example.toml assembles");
+    }
+
+    /// Every settings file in the repository — each chain production runs, and any added
+    /// later — parses and assembles with a stand-in for every variable it names. A typo
+    /// in one is otherwise found only at deploy, where it exits 78 and the supervisor,
+    /// which does not restart on that code, leaves the chain down. Found by listing the
+    /// directory, so a new chain's file is covered without being named here; a
+    /// gitignored `*.local.toml` is left out.
+    #[cfg(all(feature = "postgres", feature = "delta"))]
+    #[test]
+    fn every_settings_file_in_the_repository_assembles() {
+        // Every variable set, to a value any secret field takes.
+        let stand_in: super::Env = |_| Ok("https://stand-in.invalid".to_owned());
+
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut files: Vec<_> = std::fs::read_dir(root)
+            .expect("read the crate root")
+            .map(|entry| entry.expect("a directory entry").path())
+            .filter(|path| {
+                let name = path.file_name().and_then(|name| name.to_str());
+                let parts: Vec<_> = name
+                    .map(|name| name.split('.').collect())
+                    .unwrap_or_default();
+                matches!(parts.as_slice(), ["indexer", middle, "toml"] if *middle != "local")
+            })
+            .collect();
+        files.sort();
+        let names: Vec<_> = files
+            .iter()
+            .filter_map(|path| path.file_name()?.to_str())
+            .collect();
+        for shipped in [
+            "indexer.bsc.toml",
+            "indexer.ethereum.toml",
+            "indexer.robinhood.toml",
+        ] {
+            assert!(names.contains(&shipped), "{shipped} is listed: {names:?}");
+        }
+        for path in &files {
+            let shown = path.display();
+            let settings = Settings::from_file(path, stand_in)
+                .unwrap_or_else(|error| panic!("{shown} parses: {error}"));
+            crate::runtime::Pipeline::from_settings(&settings)
+                .unwrap_or_else(|error| panic!("{shown} assembles: {error}"));
+        }
     }
 
     /// A protocols path resolves against the settings file's own directory, not the
@@ -549,7 +604,7 @@ tables = ["blocks"]
         )
         .expect("write settings");
 
-        let settings = Settings::from_file(&path).expect("settings load");
+        let settings = Settings::from_file(&path, unset).expect("settings load");
         assert_eq!(settings.protocols_path(), Some(dir.join("protocols")));
 
         std::fs::remove_dir_all(&dir).expect("clean up");
@@ -571,7 +626,7 @@ tables = ["blocks"]
                 &format!("[sink.duckdb]\npath = \"{written}\""),
             );
             std::fs::write(&path, text).expect("write settings");
-            let settings = Settings::from_file(&path).expect("settings load");
+            let settings = Settings::from_file(&path, unset).expect("settings load");
             let duckdb = settings.sink.duckdb.expect("a DuckDB sink");
             assert_eq!(duckdb.path, resolved);
         }
@@ -580,7 +635,7 @@ tables = ["blocks"]
 
     /// Why `text` is refused, which must be a parse failure: the message names the key.
     fn parse_refusal(text: &str) -> String {
-        match Settings::from_str(text) {
+        match parse(text) {
             Err(error @ SettingsError::Parse { .. }) => error.to_string(),
             other => panic!("expected a parse failure, got {other:?}"),
         }
@@ -594,7 +649,7 @@ tables = ["blocks"]
     /// Every sink lists its tables, at least one sink is named, and printing runs alone.
     #[test]
     fn sinks_name_their_tables_and_stdout_runs_alone() {
-        let settings = Settings::from_str(minimal()).expect("stdout alone parses");
+        let settings = parse(minimal()).expect("stdout alone parses");
         assert_eq!(
             settings.sink.tables(),
             [(Backend::Stdout, &tables(&["blocks"]))]
@@ -602,10 +657,7 @@ tables = ["blocks"]
 
         let without_sink = minimal().replace("[sink.stdout]\ntables = [\"blocks\"]\n", "[sink]\n");
         assert!(
-            matches!(
-                Settings::from_str(&without_sink),
-                Err(SettingsError::NoSink)
-            ),
+            matches!(parse(&without_sink), Err(SettingsError::NoSink)),
             "no sink"
         );
         for (case, text, refusal) in [
@@ -649,7 +701,7 @@ tables = ["blocks"]
     /// that source reads.
     #[test]
     fn ingest_names_one_source() {
-        let settings = Settings::from_str(&ingest(RPC)).expect("rpc alone parses");
+        let settings = parse(&ingest(RPC)).expect("rpc alone parses");
         let super::IngestSource::Rpc {
             http_url, ws_url, ..
         } = &settings.ingest.source
@@ -661,7 +713,7 @@ tables = ["blocks"]
             ("https://example.invalid", "wss://example.invalid")
         );
 
-        let settings = Settings::from_str(&ingest(HYPERSYNC)).expect("hypersync alone parses");
+        let settings = parse(&ingest(HYPERSYNC)).expect("hypersync alone parses");
         let super::IngestSource::HyperSync(source) = &settings.ingest.source else {
             panic!("expected HyperSync, got {:?}", settings.ingest.source);
         };
@@ -706,11 +758,11 @@ tables = ["blocks"]
     fn ingest_tuning_is_bounded() {
         let depth = |depth: &str| ingest(&format!("finality_depth = {depth}\n{RPC}"));
         for (written, read) in [("128", 128), ("4096", 4_096)] {
-            let settings = Settings::from_str(&depth(written)).expect(written);
+            let settings = parse(&depth(written)).expect(written);
             assert_eq!(settings.ingest.finality_depth.get(), read, "{written}");
         }
 
-        let settings = Settings::from_str(&ingest(&format!("backfill_concurrency = 2\n{RPC}")))
+        let settings = parse(&ingest(&format!("backfill_concurrency = 2\n{RPC}")))
             .expect("a tuned rpc parses");
         let super::IngestSource::Rpc {
             backfill_concurrency,
@@ -722,7 +774,7 @@ tables = ["blocks"]
         assert_eq!(backfill_concurrency.get(), 2);
 
         let tuned = format!("{HYPERSYNC}span = 500\nconcurrency = 4\n");
-        let settings = Settings::from_str(&ingest(&tuned)).expect("a tuned hypersync parses");
+        let settings = parse(&ingest(&tuned)).expect("a tuned hypersync parses");
         let super::IngestSource::HyperSync(source) = &settings.ingest.source else {
             panic!("expected HyperSync");
         };
@@ -758,7 +810,7 @@ tables = ["blocks"]
     fn stdout_beside_a_store_is_refused() {
         let both = format!("{}\n[sink.duckdb]\ntables = [\"logs\"]\n", minimal());
         assert!(matches!(
-            Settings::from_str(&both),
+            parse(&both),
             Err(SettingsError::StdoutBesideStore)
         ));
     }
@@ -781,7 +833,7 @@ tables = ["logs", "decoded_logs"]
 uri = "/tmp/lake"
 "#,
         );
-        let settings = Settings::from_str(&text).expect("settings parse");
+        let settings = parse(&text).expect("settings parse");
         let (duckdb, postgres, delta) = (
             tables(&["blocks"]),
             tables(&["contract_events"]),
@@ -798,23 +850,28 @@ uri = "/tmp/lake"
     }
 
     /// A secret is the value or the environment variable that holds it, and either way it
-    /// is never printed: a deployment logs its settings whole.
+    /// is never printed: a deployment logs its settings whole. The variable is read from
+    /// the environment the parse is given, and one it lacks is refused by name.
     #[test]
     fn a_secret_is_written_or_read_from_the_environment_and_never_printed() {
-        // `PATH` is set in every test process, and reading it needs no `unsafe` set_var.
-        let path = std::env::var("PATH").expect("PATH is set");
-        let settings = Settings::from_str(
-            r#"
+        /// Only `INDEXER_WS_URL` is set.
+        fn env(name: &str) -> Result<String, VarError> {
+            match name {
+                "INDEXER_WS_URL" => Ok("wss://example.invalid/v2/env-key".to_owned()),
+                _ => Err(VarError::NotPresent),
+            }
+        }
+        let text = r#"
 [ingest]
 chain = "base"
 http_url = "https://example.invalid/v2/literal-key"
-ws_url = { env = "PATH" }
+ws_url = { env = "INDEXER_WS_URL" }
 
 [sink.stdout]
 tables = ["blocks"]
-"#,
-        )
-        .expect("both forms parse");
+"#;
+        let settings = Settings::parse(text, env).expect("both forms parse");
+        let from_env = "wss://example.invalid/v2/env-key";
 
         let super::IngestSource::Rpc {
             http_url, ws_url, ..
@@ -823,11 +880,17 @@ tables = ["blocks"]
             panic!("expected an RPC source");
         };
         assert_eq!(http_url.expose(), "https://example.invalid/v2/literal-key");
-        assert_eq!(ws_url.expose(), path);
+        assert_eq!(ws_url.expose(), from_env);
         let printed = format!("{settings:?}");
         assert!(
-            !printed.contains("literal-key") && !printed.contains(&path),
+            !printed.contains("literal-key") && !printed.contains("env-key"),
             "{printed}"
+        );
+
+        let message = parse_refusal(&text.replace("INDEXER_WS_URL", "INDEXER_UNSET"));
+        assert!(
+            message.contains("environment variable `INDEXER_UNSET` is not set"),
+            "{message}"
         );
     }
 }
