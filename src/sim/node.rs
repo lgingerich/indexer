@@ -101,6 +101,12 @@ fn respond(world: &mut World, view: usize, request: &SerializedRequest) -> Value
     world
         .trace
         .push(format!("rpc {} {params} @{view}", request.method()));
+    let bound = |key: &str| params[0][key].as_str().and_then(quantity);
+    if let (Some(from), Some(to)) = (bound("fromBlock"), bound("toBlock"))
+        && from < to
+    {
+        world.reached("logs fetched over a range");
+    }
     let view = world.view(view);
     let answer = match request.method() {
         "eth_getBlockByNumber" => block_by_number(&view, &params),

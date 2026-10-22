@@ -10,7 +10,7 @@
 //! reorg it has not seen yet — which is how a load-balanced provider disagrees with
 //! itself.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use alloy_primitives::{Address, B256, Bloom, Bytes};
@@ -143,6 +143,9 @@ pub(super) struct World {
     pub(super) trace: Vec<String>,
     /// How often each scenario was reached.
     pub(super) coverage: BTreeMap<&'static str, u64>,
+    /// The scenarios reached in the current process lifetime, which say which stops it
+    /// may end with.
+    pub(super) fired: BTreeSet<&'static str>,
 }
 
 impl World {
@@ -161,6 +164,7 @@ impl World {
             salt: 0,
             trace: vec![format!("{profile:?}")],
             coverage: BTreeMap::new(),
+            fired: BTreeSet::new(),
         };
         let genesis = world.make(None);
         world.views.push(vec![genesis]);
@@ -173,6 +177,7 @@ impl World {
     /// Notes that `scenario` happened.
     pub(super) fn reached(&mut self, scenario: &'static str) {
         *self.coverage.entry(scenario).or_default() += 1;
+        self.fired.insert(scenario);
         self.trace.push(scenario.to_owned());
     }
 
@@ -233,7 +238,8 @@ impl World {
     }
 
     /// Advances the chain one step while the indexer runs: usually a new block,
-    /// sometimes a short reorg.
+    /// sometimes a reorg at most three blocks deep, which the plans' shallowest
+    /// finality depth (`MIN_FINALITY`) is chosen against.
     pub(super) fn step(&mut self) {
         if self.tip() > 4 && self.fault(|p| p.reorg) {
             let depth = 1 + self.index_below(3);
