@@ -348,7 +348,7 @@ fn invalid_json(context: &'static str, source: serde_json::Error) -> SourceError
 
 /// The error for a failed call at `context`, without the request URL a reqwest error
 /// carries: a provider's URL usually holds its API key, and these errors are logged.
-/// [`transport`], for a read of a block, header, or receipt at a height, except that an
+/// [`transport`], for a read of a block, header, receipt, or log at a height, except that an
 /// error response saying the node has not reached that height is [`inconsistent`]: it
 /// is a `null` answer in other words, from a backend behind the one that announced the
 /// block (see [`NOT_SERVED`]). Envio's `HyperRPC` answers so, with `-32602` and "requested
@@ -1169,7 +1169,7 @@ impl<C> EvmSource<C> {
             .client()
             .request(LOGS, (filter,))
             .await
-            .map_err(|source| transport(LOGS, source))
+            .map_err(|source| block_read(LOGS, source))
     }
 
     /// Fetches the heights `from ..= to` in one batch: each height's hashes-only header
@@ -1206,7 +1206,7 @@ impl<C> EvmSource<C> {
             );
         }
         let logs = match logs {
-            Some(logs) => Some(logs.await.map_err(|source| transport(LOGS, source))?),
+            Some(logs) => Some(logs.await.map_err(|source| block_read(LOGS, source))?),
             None => None,
         };
         split_range(from, &blocks, logs.as_deref(), self.plan)
@@ -1579,6 +1579,49 @@ mod tests {
                     "{case}"
                 ),
             }
+        }
+    }
+
+    /// A log query answered by a backend that has not reached the block is a lagging
+    /// node, as a header read's is, so the live loop asks again rather than stopping:
+    /// Geth's `-32000 unknown block` for a hash-pinned query on the live path, and the
+    /// same answer to the log query in a range's batch.
+    #[tokio::test]
+    async fn a_log_query_the_node_does_not_serve_yet_is_inconsistent() {
+        const UNKNOWN: &str = "unknown block";
+        let head = BlockMeta {
+            height: 100,
+            hash: hash(100).parse().expect("hash"),
+            parent_hash: hash(99).parse().expect("hash"),
+            timestamp: TIMESTAMP,
+        };
+        for (case, reused) in [("a hash-pinned query", Some(head)), ("a range", None)] {
+            let (url, server) = rpc_server(1, |request| {
+                let refuse = |call: &Value| {
+                    json!({"jsonrpc": "2.0", "id": call["id"],
+                        "error": {"code": -32000, "message": UNKNOWN}})
+                };
+                let Some(calls) = request.as_array() else {
+                    return refuse(request);
+                };
+                let mut reply = range_reply(request, &[], None);
+                let position = calls
+                    .iter()
+                    .position(|call| call["method"] == "eth_getLogs")
+                    .expect("a log query");
+                reply[position] = refuse(&calls[position]);
+                reply
+            });
+            let error = logs_only(url)
+                .fetch_block(100, reused.as_ref())
+                .await
+                .expect_err(case);
+            assert_eq!(server.join().expect("server").len(), 1, "{case}");
+            assert!(
+                matches!(&error, SourceError::Inconsistent { context, detail }
+                    if context == "eth_getLogs" && *detail == format!("{NOT_SERVED}: {UNKNOWN}")),
+                "{case}: {error:?}"
+            );
         }
     }
 
