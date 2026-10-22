@@ -10,19 +10,21 @@
 //! ```
 //!
 //! Ingest and decode are direct calls in one task; the channel is the only queue, and it
-//! exists so a stalled store does not stall ingest. See `sink::channel`.
+//! exists so a stalled store does not stall ingest. See `sink::channel`. [`runtime`]
+//! assembles the four from the settings and runs them.
 //!
 //! # Layering
 //!
 //! The dependency direction is one-way. [`ingest`] and [`decode`] each depend on
 //! [`sink`] and [`wire`] and not on each other, so neither can reach into the
-//! other's ordering or reorg state. [`sink`] depends only on [`wire`] and [`window`], the
-//! undo window that ingest retracts within and the stores keep a ledger of; [`window`]
-//! depends only on [`wire`], and [`wire`] on nothing. [`config`] sits outside the layers and names each layer's settings; a value
+//! other's ordering or reorg state. [`ingest`] and [`sink`] also depend on [`window`],
+//! the undo window that ingest retracts within and the stores keep a ledger of, which
+//! depends only on [`wire`], and [`wire`] on nothing. [`config`] sits outside the layers
+//! and names each layer's settings, and [`sink`]'s stores read their own from it; a value
 //! that must not be logged is a [`secret::Secret`], which any layer may take, and any
-//! layer may record into [`metrics`]. The layers are modules rather than crates, so that
-//! direction is a convention a reviewer checks rather than one the compiler enforces;
-//! each module documents the direction it may depend in.
+//! layer may record into [`metrics`]. [`runtime`] sits above them all. The layers are
+//! modules rather than crates, so that direction is a convention a reviewer checks rather
+//! than one the compiler enforces; each module documents the direction it may depend in.
 //!
 //! # What works
 //!
