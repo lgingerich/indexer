@@ -3,8 +3,9 @@
 //! A [`Derivation`] reads one or more events of one protocol's contract and writes one
 //! table: rows per decoded record, one for most and one per array entry for some, computed
 //! from that record alone. Nothing is carried from one record to the next, so a derived
-//! row belongs to its log's block like the decoded row it came from. A `reorg` deletes it by that block, a restart has nothing to restore,
-//! and any store, the lake included, can hold it.
+//! row belongs to its log's block like the decoded row it came from. A `reorg` deletes it
+//! by that block, a restart has nothing to restore, and any store, the lake included, can
+//! hold it.
 //!
 //! The [`Catalog`](super::Catalog) declares the table of every derivation whose event's
 //! exact signature a manifest declares, beside the event tables, and the
@@ -23,11 +24,18 @@
 //!
 //! # Removing it
 //!
-//! Derivations are meant to give way to a streaming layer outside the indexer. Taking
-//! them out is this directory and its two callers:
+//! Derivations run in the indexer so app data reaches Postgres within a second of its
+//! block. Should they ever move elsewhere, taking them out is this directory and its
+//! hooks in `decode`:
 //!
-//! - `Catalog::add_derivations`, which declares their tables, in `catalog.rs`.
-//! - The `derive::rows` call in `DecodingSink::decode`, in `sink.rs`.
+//! - `mod derive` in `decode/mod.rs`.
+//! - `Catalog::add_derivations`, which declares their tables, its call in
+//!   `Catalog::load`, and the `Catalog::derivations` field, in `catalog.rs`.
+//! - `Decoder::derivations`, in `decoder.rs`.
+//! - The `derive::rows` call in `DecodingSink::decode`, the last transaction it keeps
+//!   for a row's sender and recipient, and the test using `derive::fixtures`, in
+//!   `sink.rs`.
+//! - `metrics::derive_failed`.
 //!
 //! What carries a derived row to the stores is generic and can go with them:
 //! `Event::Derived` and `DerivedField` in `wire::envelope`; `TableId::Derived`,

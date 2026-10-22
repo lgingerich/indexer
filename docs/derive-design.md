@@ -1,8 +1,8 @@
 # Derived tables, computed in the indexer
 
 Status: per-event derivations are built (`src/decode/derive`): Metric's `metric_v1_swaps`,
-`metric_v1_bin_fills`, `metric_v1_liquidity`, and `metric_v1_pool_bins`. State and aggregate tables are designed below under
-[Later](#later) and not built.
+`metric_v1_bin_fills`, `metric_v1_liquidity`, and `metric_v1_pool_bins`. State and
+aggregate tables are designed below under [Later](#later) and not built.
 
 ## Why in the indexer
 
@@ -34,6 +34,7 @@ pub struct Derivation {
     pub signatures: &'static [&'static str], // ["Swap(address,address,uint256,uint256,uint256)"]
     pub table: &'static str,               // "metric_v1_swaps"
     pub columns: &'static [(&'static str, ColumnType)],
+    pub indexes: &'static [&'static [&'static str]], // [["chain", "address", "block_number", "log_index"]]
     pub derive: fn(&Decoded) -> Result<Vec<Vec<TypedValue>>, DeriveError>, // rows
 }
 ```
@@ -70,8 +71,10 @@ pub struct Derivation {
   first record rather than misread.
 - **When a record cannot be read** (an argument missing, misnamed, or of another type),
   the derivation logs a warning and adds nothing, as a log that fails to decode keeps
-  only its raw record. A row that does not fit its table, by a field's name, type, width,
-  or count, is a bug in the derivation: the store refuses it, which stops the run.
+  only its raw record. A row that does not fit its table is a bug in the derivation and
+  stops the run: one with a value too many or too few is refused as it is derived, and
+  one whose value does not fit its column, checked on the value rather than its width
+  label, is refused by the store.
 - **History.** A derivation covers blocks ingested while it runs. Blocks stored before
   it was enabled are not backfilled; see the README's stored-log replay.
 - **Schema changes.** Changing a derived table's columns makes the store's existing table
@@ -142,9 +145,10 @@ as created; `BinAdditionalFeesUpdated` changes them later, which is state.
 
 ## Removing it
 
-Derivations are meant to give way to a streaming layer outside the indexer when one
-exists. The module doc of `src/decode/derive` lists what to delete: the directory, its two
-callers in `decode`, and the generic support for derived rows in `wire` and `sink`.
+Derivations stay in the indexer, as in-process Rust, for the reasons under
+[Why in the indexer](#why-in-the-indexer). Should that ever change, the module doc of
+`src/decode/derive` lists what to delete: the directory, its hooks in `decode`, and the
+generic support for derived rows in `wire` and `sink`.
 
 ## Adding a derivation
 

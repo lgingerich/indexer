@@ -370,9 +370,13 @@ const fn unsigned(value: U256, bits: u16) -> TypedValue {
     TypedValue::Uint { value, bits }
 }
 
-/// A 16-bit unsigned field, stored in a signed 64-bit column.
+/// A 16-bit unsigned field, stored in a signed 64-bit column beside the signed edges.
+///
+/// As a signed value it needs 17 bits, so it is labelled `int24`, the narrowest signed ABI
+/// width that holds every `uint16`. The store checks the value against the column, not
+/// this label.
 fn unsigned_small(value: U256) -> TypedValue {
-    signed(I256::from_raw(value), 32)
+    signed(I256::from_raw(value), 24)
 }
 
 /// `len` bits of `word` from bit `low`, the least significant being bit 0.
@@ -887,9 +891,9 @@ mod tests {
             vec![
                 pool.clone(),
                 int(index, 16),
-                int(length, 32),
-                int(buy, 32),
-                int(sell, 32),
+                int(length, 24),
+                int(buy, 24),
+                int(sell, 24),
                 int(lower, 64),
                 int(upper, 64),
             ]

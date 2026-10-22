@@ -347,8 +347,10 @@ impl Catalog {
     }
 
     /// Declares the table of every derivation whose events a manifest declares, and keeps
-    /// those derivations. One whose contract is declared without one of its events is
-    /// skipped with a warning: the contract's ABI changed under it.
+    /// those derivations. One whose contract is not loaded, as when the setting names a
+    /// subtree without its protocol, or is declared without one of its events, because
+    /// the contract's ABI changed under it, is skipped with a warning. Neither is an error
+    /// here: a store that lists the skipped table fails at startup for want of it.
     fn add_derivations(&mut self) -> Result<(), CatalogError> {
         for derivation in DERIVATIONS {
             let Derivation {
@@ -361,6 +363,10 @@ impl Catalog {
                 ..
             } = derivation;
             let Some(entry) = self.entry(protocol, contract) else {
+                warn!(
+                    table,
+                    protocol, contract, "the contract this table derives from is not loaded"
+                );
                 continue;
             };
             let abi = &self.entries[entry].abi;
