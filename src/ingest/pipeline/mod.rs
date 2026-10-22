@@ -1,10 +1,10 @@
 //! Reorg-aware, block-at-a-time ingestion that resumes from what the store committed.
 //!
-//! Startup samples the head and splits the work at the reorg window. Heights at or
-//! below `head - window` are buried: they sit a full window behind the sampled head, so
-//! no fork reaches them and backfill indexes them straight through without asking the
-//! source where the chain is. On a chain shorter than the window the bound clamps to
-//! genesis, which is equally unreorgable. Reaching that bound, backfill samples the head
+//! Startup samples the head and splits the work at the source's finality depth, at most
+//! the undo window. Heights at or below `head - finality_depth` are buried: they sit that
+//! far behind the sampled head, so no fork reaches them and backfill indexes them
+//! straight through without asking the source where the chain is. On a chain shorter
+//! than that depth the bound clamps to genesis, which is equally unreorgable. Reaching that bound, backfill samples the head
 //! again and continues while the chain has buried more. Everything above the bound is the
 //! reorgable tail, and startup owns it too — it fills to the last sampled head through
 //! the reorg-aware path before any live head is consumed, so a run never leaves a gap
@@ -14,7 +14,10 @@
 //! window so a fork within it is retracted; deeper forks stop rather than guess.
 //!
 //! A stop height caps startup instead: backfill and the tail fill end at it, and the run
-//! returns without going live. It must be at or below the sampled head.
+//! returns without going live. It must be at or below the sampled head. A source that
+//! does not follow heads always has one: the buried bound under the head it samples at
+//! startup, so a run on it backfills and returns, and a run on a source that does
+//! resumes after it.
 //!
 //! # Resume
 //!
