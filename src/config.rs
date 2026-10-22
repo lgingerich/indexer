@@ -528,9 +528,7 @@ tables = ["blocks"]
 
     /// `indexer.example.toml` documents every key, so it must run as shipped: it parses,
     /// and its sinks' tables resolve against the tables it declares. It names
-    /// `[sink.stdout]`, which every build has, and comments out the stores. It is the
-    /// fixture rather than `indexer.toml`, which is a deployment's own settings and
-    /// changes with it.
+    /// `[sink.stdout]`, which every build has, and comments out the stores.
     #[test]
     fn the_example_settings_file_assembles() {
         let settings = Settings::from_str(include_str!("../indexer.example.toml"))

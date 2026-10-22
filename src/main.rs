@@ -8,12 +8,13 @@
 //!
 //! # Settings
 //!
-//! A TOML file, named by the first argument or `indexer.toml`. Every setting and its
-//! default is documented in [`indexer::config`], and the required ones — the chain and its
-//! endpoints — error at startup naming the field.
+//! A TOML file, named by the first argument; there is no default, so a bare `cargo run`
+//! cannot pick up a file that names production's stores. Every setting and its default is
+//! documented in [`indexer::config`], and the required ones — the chain and its endpoints
+//! — error at startup naming the field. `indexer.example.toml` is the file to copy.
 //!
 //! ```bash
-//! cargo run --release -- indexer.toml
+//! cargo run --release -- indexer.local.toml
 //! ```
 
 use std::process::ExitCode;
@@ -29,8 +30,9 @@ use tracing_subscriber::filter::LevelFilter;
 #[global_allocator]
 static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-/// The settings file used when none is named on the command line.
-const DEFAULT_SETTINGS: &str = "indexer.toml";
+/// The exit code when the command line is wrong — no settings file named: `EX_USAGE` from
+/// `sysexits.h`.
+const EXIT_USAGE: u8 = 64;
 
 /// The exit code when the settings are at fault ([`indexer::runtime::RuntimeError::is_config`]), so a
 /// supervisor can tell "fix the settings" from "try again": `EX_CONFIG` from
@@ -46,11 +48,19 @@ const DEFAULT_LOG_LEVEL: LevelFilter = if cfg!(debug_assertions) {
     LevelFilter::ERROR
 };
 
-/// The settings file's path as given on the command line, or [`DEFAULT_SETTINGS`].
-fn settings_path() -> String {
-    std::env::args()
-        .nth(1)
-        .unwrap_or_else(|| DEFAULT_SETTINGS.to_owned())
+/// How to run the binary, printed when the command line does not name a settings file.
+const USAGE: &str = "usage: indexer <settings.toml>\n\n\
+    Runs the pipeline the settings file describes; indexer.example.toml documents every key.";
+
+/// Prints [`USAGE`] and exits [`EXIT_USAGE`]. Printed rather than logged: it is for the
+/// person at the terminal, and needs no level or timestamp.
+#[expect(
+    clippy::print_stderr,
+    reason = "the usage message is for the terminal, not the log"
+)]
+fn usage() -> ExitCode {
+    eprintln!("{USAGE}");
+    ExitCode::from(EXIT_USAGE)
 }
 
 // Ingest's runtime: each store runs on one of its own (`sink::store_runtime`), which
@@ -67,7 +77,9 @@ async fn main() -> ExitCode {
         )
         .init();
 
-    let path = settings_path();
+    let Some(path) = std::env::args().nth(1) else {
+        return usage();
+    };
     // Boxed: the whole run's state is one future, too large to keep on the stack.
     match Box::pin(indexer::runtime::run(&path)).await {
         Ok(()) => ExitCode::SUCCESS,

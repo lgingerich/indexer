@@ -36,11 +36,11 @@
 //! different contract, list its address in a protocol manifest under `protocols/` and
 //! change `CHAIN` and the fixture below.
 //!
-//! To capture real input for it, run the indexer with `stdout = true` in `[ingest]`,
-//! which prints the stream instead of storing it:
+//! To capture real input for it, run the indexer with `[sink.stdout]` as its only sink,
+//! which prints the stream instead of storing it, as `indexer.example.toml` does:
 //!
 //! ```bash
-//! RUST_LOG=warn cargo run --release 2>/dev/null | head -200 > envelopes.ndjson
+//! RUST_LOG=warn cargo run --release -- indexer.example.toml 2>/dev/null | head -200 > envelopes.ndjson
 //! ```
 //!
 //! This example builds the same `Catalog` and `Decoder` the settings file builds, so it

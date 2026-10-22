@@ -354,8 +354,8 @@ that matters most: `decode` must not depend on `ingest`.
   single-writer, so it is the archive; anything downstream reads from it rather than from
   the live stream.
 
-The default build has only `stdout`, since it needs no engine and no store: a bare
-`cargo run` compiles fast and prints the stream. Add `--features duckdb` for the store, or
+The default build has only `stdout`, since it needs no engine and no store:
+`cargo run -- indexer.example.toml` compiles fast and prints the stream. Add `--features duckdb` for the store, or
 `--features postgres` for a remote one. No broker is involved anywhere.
 
 ## Not built yet
@@ -479,13 +479,15 @@ process, because continuing without it would leave a stream that looks alive but
   the `tables` it writes. With `[sink.stdout]` no store is opened and the stream is
   printed instead.
 
-Settings come from a TOML file, named by the first argument or defaulting to
-`indexer.toml`. `indexer.toml` in the repository is a working example. What decode decodes
+Settings come from a TOML file, named by the first argument. There is no default: a run
+without one prints its usage and exits 64. `indexer.example.toml` documents every key and
+runs as shipped; the `indexer.<chain>.toml` files are production's, and name its stores,
+so a local run uses a gitignored `*.local.toml` such as the one below. What decode decodes
 lives in a directory of protocol manifests, named by `[decode] protocols` and defaulting
 to nothing — `protocols/` is a working example; see [Protocol manifests](#protocol-manifests).
 
 ```bash
-RUST_LOG=info cargo run --release --features duckdb -- indexer.toml
+RUST_LOG=info cargo run --release --features duckdb -- indexer.local.toml
 ```
 
 ```toml
@@ -635,17 +637,19 @@ here talks to Infisical; the CLI injects the variables into one process:
 
 ```bash
 infisical login                                      # once per machine
-infisical run -- cargo run --release -- indexer.ethereum.toml
+infisical run -- cargo run --release --features postgres,delta -- indexer.local.toml
 ```
 
-`.infisical.json` points the CLI at the project and defaults to `dev`. Point `dev`'s
+`indexer.local.toml` here is a copy of a chain's file with its own lake `uri`: the
+`indexer.<chain>.toml` files name production's lake, `s3://blockchain-data`, and a
+second writer to it duplicates rows. `.infisical.json` points the CLI at the project and
+defaults to `dev`. Point `dev`'s
 `INDEXER_POSTGRES_URL` at a local Postgres, never the production database: two
 writers to a chain duplicate rows. The variables the settings files name:
 
 | Variable | What it is |
 | --- | --- |
 | `INDEXER_<CHAIN>_HTTP_URL`, `INDEXER_<CHAIN>_WS_URL` | RPC endpoints per chain, for `indexer.<chain>.toml`. A run with `stop_block` never opens the WebSocket, so `wss://unused.invalid` will do |
-| `INDEXER_ETH_HTTP_URL`, `INDEXER_WS_URL` | The endpoints `indexer.toml` names |
 | `INDEXER_POSTGRES_URL` | The PostgreSQL store |
 | `INDEXER_ENVIO_HYPERSYNC_TOKEN` | The Envio API token a [HyperSync backfill](#backfilling-from-hypersync) names |
 | `S3_ENDPOINT`, `S3_ACCESS_KEY_ID`, `S3_SECRET_ACCESS_KEY` | The R2 lake. In `prod`, the `infra` repo writes all three |
@@ -686,7 +690,7 @@ address would make a series per event.
 ### Protocol manifests
 
 What decode decodes lives in a directory named by `[decode] protocols` — `protocols/` in
-the repository is a working example. It is deliberately not part of `indexer.toml`: the
+the repository is a working example. It is deliberately not part of the settings file: the
 settings file is deployment topology (endpoints, paths), while the manifests are a catalog
 of protocols that grows on its own schedule.
 
@@ -838,7 +842,7 @@ wire rather than re-derived downstream.
 
 ### PostgreSQL 18 sink
 
-Build with `cargo run --release --features postgres -- indexer.toml`
+Build with `cargo run --release --features postgres -- indexer.local.toml`
 (or name both features to keep DuckDB support as well). Replace
 `[sink.duckdb]` with a PostgreSQL sink table, or add one beside it:
 
