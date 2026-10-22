@@ -64,11 +64,11 @@ fn main() -> ExitCode {
     for envelope in envelopes() {
         // The same encoding every sink uses: compact, one envelope per line.
         let line = serde_json::to_string(&envelope)
-            .unwrap_or_else(|error| panic!("{} serializes: {error}", envelope.kind()));
+            .unwrap_or_else(|error| panic!("{} serializes: {error}", envelope.event.kind()));
         writeln!(writer, "{line}").unwrap_or_else(|error| panic!("write {OUTPUT}: {error}"));
         println!(
             "{:<14} {:>5} bytes  dedupe_key={}",
-            envelope.kind(),
+            envelope.event.kind(),
             line.len(),
             envelope.event.dedupe_key()
         );

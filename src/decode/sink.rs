@@ -229,7 +229,11 @@ mod tests {
     }
 
     fn kinds(sink: &DecodingSink<Collect>) -> Vec<&'static str> {
-        sink.inner.records.iter().map(Envelope::kind).collect()
+        sink.inner
+            .records
+            .iter()
+            .map(|envelope| envelope.event.kind())
+            .collect()
     }
 
     /// A log no contract decodes and a control marker are each forwarded once, with

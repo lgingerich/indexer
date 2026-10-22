@@ -102,12 +102,6 @@ impl From<&str> for ChainId {
     }
 }
 
-impl From<String> for ChainId {
-    fn from(value: String) -> Self {
-        Self::new(value)
-    }
-}
-
 /// A discontinuity: published blocks are no longer canonical.
 ///
 /// A control signal rather than a dataset: it describes the indexer's view of the
@@ -244,20 +238,10 @@ impl Decoded {
     pub fn dedupe_key(&self) -> String {
         format!(
             "{}:{}:{}:decoded",
-            self.source_key(),
+            log_key(self.block_hash, self.transaction_hash, self.log_index),
             self.selector,
             self.event_id
         )
-    }
-
-    /// The raw log's natural key, in the same shape [`Log::dedupe_key`] produces:
-    /// `block_hash:transaction_hash:log_index`.
-    ///
-    /// This is the link back to the record the decode read, so a decoded row traces to
-    /// the exact raw log it came from.
-    #[must_use]
-    pub fn source_key(&self) -> String {
-        log_key(self.block_hash, self.transaction_hash, self.log_index)
     }
 }
 
@@ -514,12 +498,6 @@ impl Envelope {
             event,
         }
     }
-
-    /// Names the event kind, for logs and metrics.
-    #[must_use]
-    pub const fn kind(&self) -> &'static str {
-        self.event.kind()
-    }
 }
 
 #[cfg(test)]
@@ -558,11 +536,11 @@ mod tests {
         B256::from([byte; 32])
     }
 
-    /// A decoded record's `source_key` must stay byte-for-byte the raw log's
-    /// `dedupe_key`. Both use the shared `log_key` helper; this test protects the
-    /// join contract if either caller changes.
+    /// A decoded record's key extends its raw log's key, so it traces to the exact log
+    /// it came from, and a later interpretation of the same log is a separate key with
+    /// the same log prefix.
     #[test]
-    fn a_decoded_records_source_key_is_the_raw_logs_dedupe_key() {
+    fn a_decoded_records_key_extends_its_raw_logs_key() {
         let log = Log {
             log_index: 767,
             transaction_hash: TxHash::from([0x2a; 32]),
@@ -588,11 +566,12 @@ mod tests {
             block_hash: hash(0xd4),
             block_timestamp: 1_700_000_000,
         };
-        assert_eq!(decoded.source_key(), log.dedupe_key());
+        let prefix = format!("{}:", log.dedupe_key());
         let mut later_interpretation = decoded.clone();
         later_interpretation.event_id = hash(0x09);
+        assert!(decoded.dedupe_key().starts_with(&prefix));
+        assert!(later_interpretation.dedupe_key().starts_with(&prefix));
         assert_ne!(decoded.dedupe_key(), later_interpretation.dedupe_key());
-        assert_eq!(decoded.source_key(), later_interpretation.source_key());
     }
 
     /// The key is what a store deduplicates on, so its exact shape is a published

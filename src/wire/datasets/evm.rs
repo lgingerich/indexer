@@ -353,9 +353,11 @@ impl Log {
 
 /// The natural key of a log: `block_hash:transaction_hash:log_index`.
 ///
-/// One function rather than a `format!` on [`Log`] and another on
-/// [`Decoded::source_key`](crate::wire::envelope::Decoded::source_key): the two must be
-/// byte-identical for a decoded record to join its raw log, and separate literals drift.
+/// One function rather than a `format!` on [`Log`] and another on each record produced
+/// from a log ([`Decoded`](crate::wire::envelope::Decoded),
+/// [`Contract`](crate::wire::envelope::Contract),
+/// [`Derived`](crate::wire::envelope::Derived)): their keys extend the log's as a prefix,
+/// so the two must be byte-identical, and separate literals drift.
 #[must_use]
 pub fn log_key(block_hash: B256, transaction_hash: TxHash, log_index: u64) -> String {
     format!("{block_hash}:{transaction_hash}:{log_index}")
