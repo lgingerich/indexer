@@ -25,13 +25,13 @@ pub(super) type Stored = BTreeMap<&'static str, Vec<Vec<String>>>;
 const TABLES: &[(&str, &str, usize)] = &[
     (
         "accepted_blocks",
-        "SELECT height::VARCHAR, hash, parent_hash FROM sim.accepted_blocks",
+        "SELECT height::VARCHAR, hash, parent_hash FROM accepted_blocks",
         3,
     ),
     (
         "blocks",
         "SELECT number::VARCHAR, hash, parent_hash, epoch(timestamp)::BIGINT::VARCHAR, \
-         logs_bloom, transaction_count::VARCHAR, extra_data FROM sim.blocks",
+         logs_bloom, transaction_count::VARCHAR, extra_data FROM blocks",
         7,
     ),
     (
@@ -40,45 +40,45 @@ const TABLES: &[(&str, &str, usize)] = &[
          transaction_index::VARCHAR, address, coalesce(topic0, '-'), \
          coalesce(topic1, '-'), coalesce(topic2, '-'), coalesce(topic3, '-'), data, \
          block_number::VARCHAR, epoch(block_timestamp)::BIGINT::VARCHAR, \
-         removed::VARCHAR FROM sim.logs",
+         removed::VARCHAR FROM logs",
         13,
     ),
     (
         "transactions",
         "SELECT block_hash, hash, transaction_index::VARCHAR, from_address, to_address, \
          nonce::VARCHAR, input, receipt_status::VARCHAR, log_count::VARCHAR, \
-         block_number::VARCHAR FROM sim.transactions",
+         block_number::VARCHAR FROM transactions",
         10,
     ),
     (
         "decoded_logs",
         "SELECT block_hash, log_index::VARCHAR, address, transaction_hash, protocol, \
-         contract, name FROM sim.decoded_logs",
+         contract, name FROM decoded_logs",
         7,
     ),
     (
         "contracts",
         "SELECT block_hash, log_index::VARCHAR, address, transaction_hash, protocol, \
-         name, factory_address FROM sim.contracts",
+         name, factory_address FROM contracts",
         7,
     ),
     (
         "metric_v1_factory_pool_created",
         "SELECT block_hash, log_index::VARCHAR, address, transaction_hash, pool_address \
-         FROM sim.metric_v1_factory_pool_created",
+         FROM metric_v1_factory_pool_created",
         5,
     ),
     (
         "metric_v1_pool_swap",
         "SELECT block_hash, log_index::VARCHAR, address, transaction_hash, sender, \
-         recipient FROM sim.metric_v1_pool_swap",
+         recipient FROM metric_v1_pool_swap",
         6,
     ),
     (
         "metric_v1_swaps",
         "SELECT block_hash, log_index::VARCHAR, address, transaction_hash, sender, \
          recipient, coalesce(transaction_from_address, '-'), \
-         coalesce(transaction_to_address, '-') FROM sim.metric_v1_swaps",
+         coalesce(transaction_to_address, '-') FROM metric_v1_swaps",
         8,
     ),
 ];
@@ -202,7 +202,9 @@ pub(super) fn ends(stored: &Stored) -> Option<(B256, u64)> {
 }
 
 /// The rows decode makes of `block`'s logs, given the `pools` discovered before it,
-/// which it adds the block's creations to: a pool decodes from the log after the one
+/// which it adds the block's creations to. A creation publishes a contract once per
+/// pool and block, whether or not an earlier block created the pool too, since a reorg
+/// of either must retract it. A pool decodes from the log after the one
 /// that created it, in the same block too, and a swap from an address not yet created
 /// decodes nothing.
 ///
@@ -214,6 +216,9 @@ fn decode(
     transactions: bool,
 ) -> Vec<(&'static str, Vec<String>)> {
     let mut rows = Vec::new();
+    // The pools this block has already created: a second creation of one in the same
+    // block is decoded, but records nothing new, so it publishes no contract.
+    let mut created = BTreeSet::new();
     let text = |address: &Address| format!("{address:#x}");
     for (log, index) in block.logs.iter().zip(0_u64..) {
         let hash = |table: &'static str, mut own: Vec<String>| {
@@ -241,7 +246,9 @@ fn decode(
                 [own("MetricOmmPool"), vec![text(&log.address)]].concat(),
             );
             row[2] = text(&pool);
-            rows.push((table, row));
+            if created.insert(pool) {
+                rows.push((table, row));
+            }
             pools.insert(pool);
         } else if pools.contains(&log.address) && log.topics.first() == Some(&protocol::swap()) {
             let (Some(sender), Some(recipient)) = (topic(1), topic(2)) else {
@@ -371,6 +378,19 @@ pub(super) fn read(path: &Path) -> Stored {
         .access_mode(duckdb::AccessMode::ReadOnly)
         .expect("read-only mode");
     let connection = duckdb::Connection::open_with_flags(path, config).expect("open store to read");
+    let mut schema_exists = connection
+        .prepare("SELECT count(*) FROM information_schema.schemata WHERE schema_name = ?")
+        .expect("prepare");
+    let schemas: u64 = schema_exists
+        .query_row([CHAIN], |row| row.get(0))
+        .expect("list schemas");
+    if schemas == 0 {
+        return stored;
+    }
+    // The chain's tables live in the database schema named for it.
+    connection
+        .execute_batch(&format!("USE {CHAIN}"))
+        .expect("use the chain's schema");
     for &(table, sql, width) in TABLES {
         let exists: u64 = connection
             .query_row(

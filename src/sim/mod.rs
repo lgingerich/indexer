@@ -65,7 +65,9 @@ use crate::sink::table::{Schema, Table, TableId};
 use crate::sink::{SinkError, SqlStore};
 use crate::wire::envelope::ChainId;
 
-const CHAIN: &str = "sim";
+/// The chain the simulation indexes, named as a real one because the catalog accepts
+/// only the chains the indexer knows. Nothing here talks to that chain.
+const CHAIN: &str = "ethereum";
 
 /// Backfill fetches in flight, as a deployment's default keeps them, so faults land
 /// while several ranges are outstanding.
