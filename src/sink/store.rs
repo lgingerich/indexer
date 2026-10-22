@@ -30,8 +30,12 @@ use std::sync::Arc;
 
 use crate::sink::batch::Batch;
 use crate::sink::sql::{self, Dialect};
-use crate::sink::store_error::{EngineError, InvalidStoredValue, Operation, StoreError};
-use crate::sink::table::{Row, Schema, Table, TableDef, TableError, TableId, Value};
+use crate::sink::store_error::{
+    self, ColumnDrift, EngineError, InvalidStoredValue, Operation, StoreError,
+};
+use crate::sink::table::{
+    CONTRACT_COLUMNS, LEDGER_COLUMNS, Row, Schema, Table, TableDef, TableError, TableId, Value,
+};
 use crate::sink::{EnvelopeSink, Restored, SinkError, Store, StoredContract};
 use crate::window::LEDGER_WINDOW;
 use crate::wire::envelope::{BlockMeta, ChainId, Envelope};
@@ -130,20 +134,10 @@ impl Reads {
         Ok(Self {
             // Ordered, so a restore reads the rows the same way every time; an engine
             // returns an unordered scan in whatever order its threads finish.
-            contracts: sql::select(
-                contracts,
-                &[
-                    "protocol",
-                    "name",
-                    "address",
-                    "block_hash",
-                    "block_number",
-                    "log_index",
-                ],
-            )
-            .ordered_by("dedupe_key")
-            .render()?,
-            ledger: sql::select(ledger, &["height", "hash", "parent_hash", "timestamp"])
+            contracts: sql::select(contracts, &CONTRACT_COLUMNS)
+                .ordered_by("dedupe_key")
+                .render()?,
+            ledger: sql::select(ledger, &LEDGER_COLUMNS)
                 .newest_first("height")
                 .limit()
                 .render()?,
@@ -561,31 +555,21 @@ async fn describe<E: Engine>(
     Ok(stored)
 }
 
-/// Fails when `table` as stored, its `stored` columns, lacks a column, holds one it does
-/// not declare, or types one differently, so a changed definition stops the run at
-/// startup rather than at its first write.
+/// Fails when `table` as stored, its `stored` columns, does not match its definition (see
+/// [`store_error::check_columns`]). Types compare by the name the engine reports, in any
+/// case; nullability is not compared, as the engines do not report it here.
 fn check<D: Dialect>(table: &TableDef, stored: &[(String, String)]) -> Result<(), StoreError> {
-    let drift = |difference: String| StoreError::Drift {
-        table: table.name.clone(),
-        difference,
-    };
-    for column in &table.columns {
-        let expected = D::reported_type(column.kind);
-        match stored.iter().find(|(name, _)| *name == column.name) {
-            None => return Err(drift(format!("it has no {} column", column.name))),
-            Some((_, found)) if !found.eq_ignore_ascii_case(&expected) => {
-                return Err(drift(format!("{} is {found}, not {expected}", column.name)));
-            }
-            Some(_) => {}
-        }
-    }
-    if let Some((name, _)) = stored
+    let expected: Vec<(&str, String)> = table
+        .columns
         .iter()
-        .find(|(name, _)| table.position(name).is_none())
-    {
-        return Err(drift(format!("it has a {name} column it should not")));
-    }
-    Ok(())
+        .map(|column| (column.name.as_ref(), D::reported_type(column.kind)))
+        .collect();
+    store_error::check_columns(&table.name, &expected, stored, |found, expected| {
+        (!found.eq_ignore_ascii_case(expected)).then(|| ColumnDrift::Type {
+            found: found.clone(),
+            expected: expected.clone(),
+        })
+    })
 }
 
 fn chain_param(chain: &ChainId) -> Value {
@@ -610,13 +594,12 @@ fn text<'a>(column: &'static str, value: &'a Value) -> Result<&'a str, InvalidSt
     }
 }
 
+/// A value kept as text, such as a hash, parsed as what it holds.
 fn parse<T: std::str::FromStr>(
     column: &'static str,
     value: &Value,
 ) -> Result<T, InvalidStoredValue> {
-    text(column, value)?
-        .parse()
-        .map_err(|_| invalid(column, value))
+    InvalidStoredValue::parse(column, text(column, value)?)
 }
 
 /// A `Uint` column, which an engine without unsigned integers reads back as a wide one.

@@ -23,8 +23,8 @@ use std::sync::Arc;
 
 use alloy_primitives::B256;
 
-use crate::sink::SinkError;
 use crate::sink::table::{Row, Schema, TableId, Value};
+use crate::sink::{SinkError, hex};
 use crate::wire::envelope::{BlockMeta, Envelope, Event, Reorg};
 
 /// What a store has been handed since its last commit: the rows to write, and the
@@ -120,7 +120,7 @@ impl Batch {
     /// Drops the rows of the block being buffered, `hash`, which the store already
     /// holds. Its rows all came after the last marker, so only those are looked at.
     fn drop_block(&mut self, hash: B256) {
-        let hash = format!("{hash:#x}");
+        let hash = hex(&hash);
         let start = self.block_start.min(self.rows.len());
         let tail = self.rows.split_off(start);
         for row in tail {
@@ -140,11 +140,7 @@ impl Batch {
             && !reorg.orphaned_hashes.is_empty()
         {
             let chain = envelope.chain.as_str();
-            let hashes: BTreeSet<String> = reorg
-                .orphaned_hashes
-                .iter()
-                .map(|hash| format!("{hash:#x}"))
-                .collect();
+            let hashes: BTreeSet<String> = reorg.orphaned_hashes.iter().map(hex).collect();
             self.rows.retain(|row| {
                 row.chain() != chain || !row.block_hash().is_some_and(|h| hashes.contains(h))
             });

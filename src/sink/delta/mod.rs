@@ -77,7 +77,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use alloy_primitives::B256;
 use deltalake::DeltaTable;
 use deltalake::arrow::array::RecordBatch;
 use deltalake::datafusion::prelude::Expr;
@@ -90,7 +89,7 @@ use tracing::info;
 use crate::sink::batch::Batch;
 use crate::sink::store_error::{Operation, StoreError};
 use crate::sink::table::{Row, Schema, Table, TableId};
-use crate::sink::{EnvelopeSink, Restored, SinkError, Store};
+use crate::sink::{EnvelopeSink, Restored, SinkError, Store, millis};
 use crate::window::LEDGER_WINDOW;
 use crate::wire::envelope::{BlockMeta, ChainId, Envelope};
 
@@ -741,16 +740,6 @@ async fn join_every<K: Ord + 'static, T: 'static>(
 async fn timed<T>(future: impl Future<Output = T>) -> (T, Duration) {
     let started = Instant::now();
     (future.await, started.elapsed())
-}
-
-/// A duration in whole milliseconds, for a log field.
-fn millis(duration: Duration) -> u64 {
-    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
-}
-
-/// A hash as the lake stores it: lowercase `0x` hex.
-fn hex(hash: &B256) -> String {
-    format!("{hash:#x}")
 }
 
 #[cfg(test)]

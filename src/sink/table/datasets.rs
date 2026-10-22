@@ -204,6 +204,25 @@ fn decoded_logs() -> Result<Dataset<Decoded>, TableError> {
         .build()
 }
 
+/// The `contracts` columns every store reads back at startup, in the order a restore
+/// takes them: what decode needs to decode a discovered contract again.
+pub const CONTRACT_COLUMNS: [&str; 6] = [
+    "protocol",
+    "name",
+    "address",
+    "block_hash",
+    "block_number",
+    "log_index",
+];
+
+/// The `accepted_blocks` columns every store reads back at startup, in the order a
+/// restore takes them: the whole ledger entry.
+pub const LEDGER_COLUMNS: [&str; 4] = ["height", "hash", "parent_hash", "timestamp"];
+
+/// The `reorgs` columns the lake reads back when it opens, to find a retraction a stopped
+/// commit left unfinished.
+pub const REORG_COLUMNS: [&str; 3] = ["height", "dedupe_key", "orphaned_hashes"];
+
 /// The provenance columns of Allium's `dex.pools`, generalized past pools: what was
 /// created, by which factory, and where its creation log sits.
 fn contracts() -> Result<Dataset<Contract>, TableError> {

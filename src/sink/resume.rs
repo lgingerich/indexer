@@ -57,7 +57,7 @@ use crate::sink::channel::Batching;
 use crate::sink::route::Backend;
 use crate::sink::store_runtime::StoreRuntime;
 use crate::sink::table::TableId;
-use crate::sink::{Restored, Store, StoreError, StoredContract};
+use crate::sink::{Restored, Store, StoreError, StoredContract, millis};
 use crate::window::{LEDGER_WINDOW, Ledger};
 use crate::wire::envelope::BlockMeta;
 
@@ -279,7 +279,7 @@ async fn settle<S: Store>(
         height: common,
         source,
     })?;
-    info!(store = %opened.backend, to = common, elapsed_ms = millis(started),
+    info!(store = %opened.backend, to = common, elapsed_ms = millis(started.elapsed()),
         "store rewound");
     // The contracts it discovered above the block went with their blocks.
     let (opened, back) = restore(opened).await?;
@@ -311,15 +311,10 @@ async fn restore<S: Store>(opened: Opened<S>) -> Result<(Opened<S>, Restored), R
         blocks = restored.ledger.len(),
         tip = ?restored.ledger.last().map(|block| block.height),
         contracts = restored.contracts.len(),
-        elapsed_ms = millis(started),
+        elapsed_ms = millis(started.elapsed()),
         "store read back"
     );
     Ok((opened, restored))
-}
-
-/// Milliseconds since `started`, as the startup logs report them.
-fn millis(started: Instant) -> u64 {
-    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
 /// How far past the slowest store's tip a store whose whole ledger window lies above that

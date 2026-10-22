@@ -21,16 +21,17 @@ use tracing::{info, warn};
 
 use super::arrow::{self, PARTITION};
 use super::lake::{CONCURRENT_CHECKPOINTS, Lake, commit_properties};
-use super::repair::{CONTRACT_COLUMNS, LEDGER_COLUMNS, REORG_COLUMNS};
 use super::{
-    COMMIT_DEADLINE, CONCURRENT_TABLES, DeltaSettings, DeltaSink, PendingLedger, hex, maintenance,
-    millis,
+    COMMIT_DEADLINE, CONCURRENT_TABLES, DeltaSettings, DeltaSink, PendingLedger, maintenance,
 };
 use crate::secret::Secret;
-use crate::sink::Restored;
 use crate::sink::batch::Batch;
-use crate::sink::store_error::{Operation, StoreError};
-use crate::sink::table::{ColumnType, Schema, Table, TableDef, TableError, TableId};
+use crate::sink::store_error::{self, ColumnDrift, Operation, StoreError};
+use crate::sink::table::{
+    CONTRACT_COLUMNS, ColumnType, LEDGER_COLUMNS, REORG_COLUMNS, Schema, Table, TableDef,
+    TableError, TableId,
+};
+use crate::sink::{Restored, hex, millis};
 use crate::wire::envelope::ChainId;
 
 impl DeltaSink {
@@ -376,9 +377,8 @@ async fn last_checkpoint(table: &DeltaTable) -> Result<Option<u64>, DeltaTableEr
         .map(|hint| hint.version))
 }
 
-/// Fails when `table` as stored lacks a column, holds one it does not declare, or types
-/// one differently, so a changed definition stops the run at startup rather than at its
-/// first write.
+/// Fails when `table` as stored does not match `expected`, its definition's Delta schema
+/// (see [`store_error::check_columns`]). Each column's type and nullability are compared.
 fn check(
     table: &DeltaTable,
     expected: &deltalake::kernel::StructType,
@@ -388,37 +388,29 @@ fn check(
         .snapshot()
         .map_err(StoreError::engine(Operation::Open, Some(name)))?
         .schema();
-    let drift = |difference: String| StoreError::Drift {
-        table: name.to_owned(),
-        difference,
+    let columns = |schema: &deltalake::kernel::StructType| {
+        schema
+            .fields()
+            .map(|field| (field.name().clone(), field.clone()))
+            .collect::<Vec<_>>()
     };
-    for field in expected.fields() {
-        match found.field(field.name()) {
-            None => return Err(drift(format!("it has no {} column", field.name()))),
-            Some(stored) if stored.data_type() != field.data_type() => {
-                return Err(drift(format!(
-                    "{} is {}, not {}",
-                    field.name(),
-                    stored.data_type(),
-                    field.data_type()
-                )));
+    store_error::check_columns(
+        name,
+        &columns(expected),
+        &columns(&found),
+        |stored, field| {
+            if stored.data_type() != field.data_type() {
+                Some(ColumnDrift::Type {
+                    found: stored.data_type().to_string(),
+                    expected: field.data_type().to_string(),
+                })
+            } else if stored.is_nullable() != field.is_nullable() {
+                Some(ColumnDrift::Nullability)
+            } else {
+                None
             }
-            Some(stored) if stored.is_nullable() != field.is_nullable() => {
-                return Err(drift(format!("{} differs in nullability", field.name())));
-            }
-            Some(_) => {}
-        }
-    }
-    match found
-        .fields()
-        .find(|field| expected.field(field.name()).is_none())
-    {
-        Some(extra) => Err(drift(format!(
-            "it has a {} column it should not",
-            extra.name()
-        ))),
-        None => Ok(()),
-    }
+        },
+    )
 }
 
 /// Fails when `def` lacks any of `columns`, which a startup read names.

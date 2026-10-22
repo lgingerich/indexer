@@ -174,4 +174,70 @@ impl InvalidStoredValue {
             value: value.into(),
         }
     }
+
+    /// `value`, read back from `column` as text, parsed as what the column holds: a hash,
+    /// an address, or a number a store keeps as text.
+    pub(crate) fn parse<T: std::str::FromStr>(
+        column: &'static str,
+        value: &str,
+    ) -> Result<T, Self> {
+        value.parse().map_err(|_| Self::new(column, value))
+    }
+}
+
+/// How one stored column differs from its definition, besides being absent or extra.
+#[derive(Debug)]
+pub(crate) enum ColumnDrift {
+    /// It holds another type, each as the store names types.
+    Type {
+        /// The stored type.
+        found: String,
+        /// The type its definition maps to.
+        expected: String,
+    },
+    /// It allows nulls where its definition does not, or the other way round.
+    Nullability,
+}
+
+/// Fails with [`StoreError::Drift`] when `stored`, the columns of `table` as the store
+/// reports them, lacks one of `expected`, holds one `expected` does not declare, or holds
+/// one that `differs` from its declaration, so a changed definition stops the run at
+/// startup rather than at its first write.
+///
+/// Every store checks its tables with this, each comparing what its engine reports: a
+/// database its type names, the lake its Arrow fields. The first difference is the one
+/// reported, in the definition's column order.
+pub(crate) fn check_columns<N: AsRef<str>, M: AsRef<str>, T>(
+    table: &str,
+    expected: &[(N, T)],
+    stored: &[(M, T)],
+    differs: impl Fn(&T, &T) -> Option<ColumnDrift>,
+) -> Result<(), StoreError> {
+    let drift = |difference: String| StoreError::Drift {
+        table: table.to_owned(),
+        difference,
+    };
+    for (name, declared) in expected {
+        let name = name.as_ref();
+        let Some((_, found)) = stored.iter().find(|(stored, _)| stored.as_ref() == name) else {
+            return Err(drift(format!("it has no {name} column")));
+        };
+        match differs(found, declared) {
+            Some(ColumnDrift::Type { found, expected }) => {
+                return Err(drift(format!("{name} is {found}, not {expected}")));
+            }
+            Some(ColumnDrift::Nullability) => {
+                return Err(drift(format!("{name} differs in nullability")));
+            }
+            None => {}
+        }
+    }
+    let declared = |name: &str| expected.iter().any(|(column, _)| column.as_ref() == name);
+    match stored.iter().find(|(name, _)| !declared(name.as_ref())) {
+        Some((name, _)) => Err(drift(format!(
+            "it has a {} column it should not",
+            name.as_ref()
+        ))),
+        None => Ok(()),
+    }
 }

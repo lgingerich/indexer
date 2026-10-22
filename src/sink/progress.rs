@@ -57,7 +57,7 @@ impl Progress {
     ) -> Option<u64> {
         let stats = std::mem::take(&mut self.open);
         log_reorgs(&stats);
-        let elapsed_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
+        let elapsed_ms = crate::sink::millis(elapsed);
         let commit = stats.into_commit(rows, elapsed_ms)?;
         let height = commit.to;
         metrics::committed(store.name(), height, commit.blocks, rows, elapsed, head);

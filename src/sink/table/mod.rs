@@ -44,6 +44,7 @@ use crate::wire::datasets::evm::Decoded;
 use crate::wire::envelope::{ChainId, Event};
 
 pub use cell::{Cell, Timestamp, Value};
+pub use datasets::{CONTRACT_COLUMNS, LEDGER_COLUMNS, REORG_COLUMNS};
 pub use events::snake_case;
 
 /// What a column holds, in the vocabulary every target shares.

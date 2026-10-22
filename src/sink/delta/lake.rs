@@ -16,8 +16,7 @@ use tokio::sync::Semaphore;
 use tracing::warn;
 
 use super::arrow::{self, PARTITION};
-use super::expr::parse;
-use crate::sink::store_error::{EngineError, Operation, StoreError};
+use crate::sink::store_error::{EngineError, InvalidStoredValue, Operation, StoreError};
 use crate::sink::table::{Row, TableDef};
 
 /// How many versions of a table pass between the checkpoints the store starts: delta-rs's
@@ -232,7 +231,7 @@ impl Lake {
         for file in files.iter() {
             let values = file.partition_values_map();
             let value = values.get(PARTITION).cloned().flatten().unwrap_or_default();
-            let partition: i64 = parse("accepted_blocks.block_range", &value)?;
+            let partition: i64 = InvalidStoredValue::parse("accepted_blocks.block_range", &value)?;
             newest = newest.max(Some(partition));
         }
         Ok(newest)

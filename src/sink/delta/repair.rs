@@ -12,29 +12,13 @@ use tokio::time::Instant;
 use tracing::{info, warn};
 
 use super::arrow::PARTITION;
-use super::expr::{at_or_above, in_texts, of_blocks, parse, texts, texts_of, uint, uints};
-use super::{CONCURRENT_TABLES, DeltaSink, hex, millis};
-use crate::sink::StoredContract;
+use super::expr::{at_or_above, in_texts, of_blocks, texts, texts_of, uint, uints};
+use super::{CONCURRENT_TABLES, DeltaSink};
 use crate::sink::store_error::{InvalidStoredValue, StoreError};
-use crate::sink::table::{Table, TableId};
+use crate::sink::table::{CONTRACT_COLUMNS, LEDGER_COLUMNS, REORG_COLUMNS, Table, TableId};
+use crate::sink::{StoredContract, hex, millis};
 use crate::window::LEDGER_WINDOW;
 use crate::wire::envelope::BlockMeta;
-
-/// The `contracts` columns a restore reads back.
-pub(super) const CONTRACT_COLUMNS: [&str; 6] = [
-    "protocol",
-    "name",
-    "address",
-    "block_hash",
-    "block_number",
-    "log_index",
-];
-
-/// The `accepted_blocks` columns opening the store reads back.
-pub(super) const LEDGER_COLUMNS: [&str; 4] = ["height", "hash", "parent_hash", "timestamp"];
-
-/// The `reorgs` columns opening the store reads back.
-pub(super) const REORG_COLUMNS: [&str; 3] = ["height", "dedupe_key", "orphaned_hashes"];
 
 impl DeltaSink {
     /// The contracts discovered on this chain that the lake holds, every one canonical:
@@ -62,10 +46,19 @@ impl DeltaSink {
                 contracts.push(StoredContract {
                     protocol: protocol.value(row).to_owned(),
                     name: name.value(row).to_owned(),
-                    address: parse("contracts.address", address.value(row))?,
-                    block_hash: parse("contracts.block_hash", block_hash.value(row))?,
-                    block_number: parse("contracts.block_number", block_number.value(row))?,
-                    log_index: parse("contracts.log_index", log_index.value(row))?,
+                    address: InvalidStoredValue::parse("contracts.address", address.value(row))?,
+                    block_hash: InvalidStoredValue::parse(
+                        "contracts.block_hash",
+                        block_hash.value(row),
+                    )?,
+                    block_number: InvalidStoredValue::parse(
+                        "contracts.block_number",
+                        block_number.value(row),
+                    )?,
+                    log_index: InvalidStoredValue::parse(
+                        "contracts.log_index",
+                        log_index.value(row),
+                    )?,
                 });
             }
         }
@@ -111,8 +104,11 @@ impl DeltaSink {
             for row in 0..batch.num_rows() {
                 ledger.push(BlockMeta {
                     height: heights.value(row),
-                    hash: parse("accepted_blocks.hash", hashes.value(row))?,
-                    parent_hash: parse("accepted_blocks.parent_hash", parents.value(row))?,
+                    hash: InvalidStoredValue::parse("accepted_blocks.hash", hashes.value(row))?,
+                    parent_hash: InvalidStoredValue::parse(
+                        "accepted_blocks.parent_hash",
+                        parents.value(row),
+                    )?,
                     timestamp: times.value(row),
                 });
             }

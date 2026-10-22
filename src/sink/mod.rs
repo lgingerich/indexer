@@ -231,6 +231,19 @@ pub trait Store: EnvelopeSink + 'static {
     fn rewind(&mut self, height: u64) -> impl Future<Output = Result<(), StoreError>> + Send;
 }
 
+/// A block hash as every store keeps it, and as a row's `block_hash` holds it: lowercase
+/// `0x` hex.
+#[cfg(feature = "store")]
+pub(crate) fn hex(hash: &B256) -> String {
+    format!("{hash:#x}")
+}
+
+/// A duration in whole milliseconds, as the stores' log lines report them.
+#[cfg(feature = "store")]
+pub(crate) fn millis(duration: std::time::Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
 /// Why a sink could not accept, render, or deliver an envelope.
 ///
 /// The layer's own error, and the reason [`EnvelopeSink`] is typed rather than generic:

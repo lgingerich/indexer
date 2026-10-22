@@ -57,15 +57,6 @@ pub(super) fn texts_of(columns: &[&str]) -> Vec<Expr> {
         .collect()
 }
 
-pub(super) fn parse<T: std::str::FromStr>(
-    column: &'static str,
-    value: &str,
-) -> Result<T, InvalidStoredValue> {
-    value
-        .parse()
-        .map_err(|_| InvalidStoredValue::new(column, value))
-}
-
 /// Column `index` of a batch read back, which the read cast to text.
 pub(super) fn texts<'a>(
     batch: &'a RecordBatch,
