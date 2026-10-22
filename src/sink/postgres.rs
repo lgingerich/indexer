@@ -997,6 +997,8 @@ mod tests {
                 name: contract.name,
                 address: contract.address,
                 block_hash: contract.block_hash,
+                block_number: contract.block_number,
+                log_index: contract.log_index,
             }]
         );
 

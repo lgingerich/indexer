@@ -126,9 +126,19 @@ impl Reads {
         Ok(Self {
             // Ordered, so a restore reads the rows the same way every time; an engine
             // returns an unordered scan in whatever order its threads finish.
-            contracts: sql::select(contracts, &["protocol", "name", "address", "block_hash"])
-                .ordered_by("dedupe_key")
-                .render()?,
+            contracts: sql::select(
+                contracts,
+                &[
+                    "protocol",
+                    "name",
+                    "address",
+                    "block_hash",
+                    "block_number",
+                    "log_index",
+                ],
+            )
+            .ordered_by("dedupe_key")
+            .render()?,
             ledger: sql::select(ledger, &["height", "hash", "parent_hash", "timestamp"])
                 .newest_first("height")
                 .limit()
@@ -294,6 +304,8 @@ impl<E: Engine> SqlStore<E> {
                     name: text("contracts.name", column(row, 1))?.to_owned(),
                     address: parse("contracts.address", column(row, 2))?,
                     block_hash: parse("contracts.block_hash", column(row, 3))?,
+                    block_number: uint("contracts.block_number", column(row, 4))?,
+                    log_index: uint("contracts.log_index", column(row, 5))?,
                 })
             })
             .collect()

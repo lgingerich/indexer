@@ -441,6 +441,8 @@ pub(in crate::decode) mod fixtures {
             name: "MetricOmmPool".to_owned(),
             address: POOL,
             block_hash: CREATED,
+            block_number: 1,
+            log_index: 0,
         }]);
         decoder
     }

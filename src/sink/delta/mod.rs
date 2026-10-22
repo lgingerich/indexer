@@ -128,7 +128,14 @@ const CHECKPOINT_EVERY: u64 = 100;
 const CONCURRENT_CHECKPOINTS: usize = 2;
 
 /// The `contracts` columns a restore reads back.
-const CONTRACT_COLUMNS: [&str; 4] = ["protocol", "name", "address", "block_hash"];
+const CONTRACT_COLUMNS: [&str; 6] = [
+    "protocol",
+    "name",
+    "address",
+    "block_hash",
+    "block_number",
+    "log_index",
+];
 
 /// The `accepted_blocks` columns opening the store reads back.
 const LEDGER_COLUMNS: [&str; 4] = ["height", "hash", "parent_hash", "timestamp"];
@@ -632,12 +639,16 @@ impl DeltaSink {
             let name = texts(batch, 1, "contracts.name")?;
             let address = texts(batch, 2, "contracts.address")?;
             let block_hash = texts(batch, 3, "contracts.block_hash")?;
+            let block_number = texts(batch, 4, "contracts.block_number")?;
+            let log_index = texts(batch, 5, "contracts.log_index")?;
             for row in 0..batch.num_rows() {
                 contracts.push(StoredContract {
                     protocol: protocol.value(row).to_owned(),
                     name: name.value(row).to_owned(),
                     address: parse("contracts.address", address.value(row))?,
                     block_hash: parse("contracts.block_hash", block_hash.value(row))?,
+                    block_number: parse("contracts.block_number", block_number.value(row))?,
+                    log_index: parse("contracts.log_index", log_index.value(row))?,
                 });
             }
         }

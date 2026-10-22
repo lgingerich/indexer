@@ -367,6 +367,11 @@ pub struct StoredContract {
     /// The hash of the block whose creation log discovered it, so a reorg that orphans
     /// that block after a restart still retracts it.
     pub block_hash: B256,
+    /// The height of that block.
+    pub block_number: u64,
+    /// The creation log's index in its block. With the height, it orders discoveries as
+    /// a run made them, so a restore keeps the claim on an address that the run kept.
+    pub log_index: u64,
 }
 
 impl Contract {

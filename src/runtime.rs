@@ -1009,7 +1009,7 @@ tables = ["blocks", "transactions", "logs", "decoded_logs", "contract_events"]
                 .await
                 .expect("reopen");
         let stored = store.contracts(&chain).await.expect("read back");
-        assert_eq!(stored, [stored_pool(pool, creating)]);
+        assert_eq!(stored, [stored_pool(pool, creating, 10)]);
         let mut restarted = decoder();
         assert_eq!(restarted.restore(stored), 1);
         let Event::Log(log) = swap(pool).event else {
@@ -1147,12 +1147,14 @@ tables = ["blocks", "transactions", "logs", "decoded_logs", "contract_events"]
     }
 
     /// The pool [`pool_created`] names, stored with the block that created it.
-    fn stored_pool(pool: Address, block_hash: B256) -> StoredContract {
+    fn stored_pool(pool: Address, block_hash: B256, block_number: u64) -> StoredContract {
         StoredContract {
             protocol: "uniswap_v3".to_owned(),
             name: "UniswapV3Pool".to_owned(),
             address: pool,
             block_hash,
+            block_number,
+            log_index: 1,
         }
     }
 
@@ -1391,7 +1393,7 @@ tables = ["blocks", "transactions", "logs", "decoded_logs", "contract_events"]
         );
         assert_eq!(
             after.contracts,
-            [stored_pool(pool, block_hash(0xa0, 5))],
+            [stored_pool(pool, block_hash(0xa0, 5), 5)],
             "created while down, discovered"
         );
 
@@ -1562,7 +1564,7 @@ tables = ["blocks", "transactions", "logs", "decoded_logs", "contract_events"]
         );
         assert_eq!(
             lake.contracts,
-            [stored_pool(pool, block_hash(0xa0, 6))],
+            [stored_pool(pool, block_hash(0xa0, 6), 6)],
             "the lake discovered the pool once"
         );
     }
