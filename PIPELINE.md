@@ -1,7 +1,7 @@
 # Ingest pipeline flow
 
 How `ingest::Machine` turns a chain into an ordered stream of envelopes. The code is
-`src/ingest/pipeline.rs`; this is the map.
+`src/ingest/pipeline/`, one file per section below; this is the map.
 
 ## Entry point
 

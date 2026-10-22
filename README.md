@@ -333,7 +333,7 @@ that matters most: `decode` must not depend on `ingest`.
   being canonical, then appends the replacement branch under its own keys. The store
   deletes the orphaned blocks' rows in the same transaction, so its tables hold only the
   current chain and the `reorgs` rows are the history of what was retracted.
-  The sliding window retains up to a fixed 4,096 identities. See `src/ingest/pipeline.rs`.
+  The sliding window retains up to a fixed 4,096 identities. See `src/ingest/pipeline/ring.rs`.
 - **Headless backfill, then live heads.** Startup samples the head once and captures it
   as a backfill target; on an empty store `[ingest] start_block` may request earlier
   inclusive history but defaults to the head. Backfill then reads consecutive concrete
