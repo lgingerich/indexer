@@ -280,15 +280,18 @@ fn block_values(number: u64, hash: B256, timestamp: u64) -> [Value; 3] {
     [Value::Uint(number), hex(hash), Value::Timestamp(timestamp)]
 }
 
-/// A derived value in its column's type, or `None` when it is of another type or wider
-/// than the column, which [`scalar`] would store as null or clipped.
+/// A derived value in its column's type, or `None` when it is of another type or does not
+/// fit the column, which [`scalar`] would store as null.
+///
+/// The fit is checked on the value, not on its `bits` label: a derivation labels widths by
+/// hand, so a label is a claim this does not take on trust.
 fn exact(kind: ColumnType, value: &TypedValue) -> Option<Value> {
     match (kind, value) {
-        (ColumnType::Uint, TypedValue::Uint { bits, .. })
-        | (ColumnType::Int, TypedValue::Int { bits, .. })
-            if *bits > 64 =>
-        {
-            None
+        (ColumnType::Uint, TypedValue::Uint { value, .. }) => {
+            u64::try_from(*value).ok().map(Value::Uint)
+        }
+        (ColumnType::Int, TypedValue::Int { value, .. }) => {
+            i64::try_from(*value).ok().map(Value::Int)
         }
         _ => Some(scalar(kind, value)).filter(|value| *value != Value::Null),
     }
@@ -342,13 +345,20 @@ fn cell(kind: ColumnType, argument: &DecodedArg) -> Result<Value, serde_json::Er
 
 /// One decoded scalar, in the column type its table declares.
 ///
-/// The decoder has already checked each value against its declared width, so a `uint64`
-/// fits [`Value::Uint`] and an `int64` fits [`Value::Int`]. A `string` that is not text
-/// is null; the raw log keeps its bytes.
+/// The decoder has already checked each value against its declared width, and the catalog
+/// gives only a `uint64` or narrower a [`Value::Uint`] column and only an `int64` or
+/// narrower a [`Value::Int`] one, so a decoded argument always fits. A value that does not
+/// is null rather than clipped or a panic; for a derived value, which has no such check,
+/// [`exact`] refuses it first. A `string` that is not text is null; the raw log keeps its
+/// bytes.
 fn scalar(kind: ColumnType, value: &TypedValue) -> Value {
     match (kind, value) {
-        (ColumnType::Uint, TypedValue::Uint { value, .. }) => Value::Uint(value.saturating_to()),
-        (ColumnType::Int, TypedValue::Int { value, .. }) => Value::Int(value.as_i64()),
+        (ColumnType::Uint, TypedValue::Uint { value, .. }) => {
+            u64::try_from(*value).map_or(Value::Null, Value::Uint)
+        }
+        (ColumnType::Int, TypedValue::Int { value, .. }) => {
+            i64::try_from(*value).map_or(Value::Null, Value::Int)
+        }
         (ColumnType::BigInt, TypedValue::Uint { value, .. }) => Value::unsigned(*value),
         (ColumnType::BigInt, TypedValue::Int { value, .. }) => Value::BigInt {
             negative: value.is_negative(),
@@ -856,6 +866,65 @@ mod tests {
         );
     }
 
+    /// A derived integer is checked against its column by its value, whatever width its
+    /// label claims: one that fits is stored even under a wide label, and one that does
+    /// not is refused, not clipped or a panic, even under a narrow one.
+    #[test]
+    fn a_derived_integer_fits_its_column_by_value_not_label() {
+        let mut schema = Schema::new().expect("the dataset tables");
+        schema
+            .add_derived(
+                "p_ints",
+                &[("small", ColumnType::Uint), ("signed", ColumnType::Int)],
+                &[],
+            )
+            .expect("a new table");
+        let record = |small: U256, signed: I256| Derived {
+            table: "p_ints".to_owned(),
+            ..derived(vec![
+                field(
+                    "small",
+                    TypedValue::Uint {
+                        value: small,
+                        bits: 8,
+                    },
+                ),
+                field(
+                    "signed",
+                    TypedValue::Int {
+                        value: signed,
+                        bits: 256,
+                    },
+                ),
+            ])
+        };
+        let row = schema
+            .derived_row(&chain(), &record(U256::from(u64::MAX), I256::MINUS_ONE))
+            .expect("values that fit");
+        assert_eq!(row.value("small"), Some(&Value::Uint(u64::MAX)));
+        assert_eq!(row.value("signed"), Some(&Value::Int(-1)));
+
+        let misfit = "the record's value is not of the column's type, or does not fit it";
+        for (case, record, column) in [
+            (
+                "an unsigned value past u64",
+                record(U256::from(u64::MAX) + U256::ONE, I256::ZERO),
+                "small",
+            ),
+            (
+                "a signed value past i64",
+                record(U256::ZERO, I256::MAX),
+                "signed",
+            ),
+        ] {
+            let error = schema
+                .derived_row(&chain(), &record)
+                .expect_err(case)
+                .to_string();
+            assert_eq!(error, format!("p_ints.{column}: {misfit}"), "{case}");
+        }
+    }
+
     /// A field out of order, of the wrong type, too wide for its column, missing, or
     /// surplus is refused rather than stored, naming the column it did not fit; so is a
     /// record for a table the schema does not have.
@@ -886,11 +955,11 @@ mod tests {
                 format!("p_rows.buy: {misfit}"),
             ),
             (
-                "too wide",
+                "too wide, under a label that claims it fits",
                 with(|fields| {
                     fields[1].value = TypedValue::Int {
-                        value: I256::MINUS_ONE,
-                        bits: 128,
+                        value: I256::try_from(i128::from(i64::MIN) - 1).expect("fits"),
+                        bits: 16,
                     };
                 }),
                 format!("p_rows.bin: {misfit}"),
