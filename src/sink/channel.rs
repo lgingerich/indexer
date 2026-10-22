@@ -96,6 +96,9 @@ const STOP_FLUSH: Duration = Duration::from_secs(15);
 #[derive(Debug)]
 struct Parcel {
     envelopes: Vec<Envelope>,
+    /// When ingest handed the block over, which its [`wait`](Batching::wait) counts from:
+    /// a block queued behind a slow commit has waited already.
+    sent: Instant,
     _room: OwnedSemaphorePermit,
 }
 
@@ -111,8 +114,9 @@ pub(crate) struct Batching {
     pub(crate) records: usize,
     /// The most bytes the store may hold unflushed, as it reports them.
     pub(crate) bytes: usize,
-    /// The longest a gathered block waits for its flush, counted from when it arrived.
-    /// Zero flushes as soon as what is already waiting is gathered.
+    /// The longest a gathered block waits for its flush, counted from when ingest handed
+    /// it over, so time spent queued counts. Zero flushes as soon as what is already
+    /// waiting is gathered.
     pub(crate) wait: Duration,
 }
 
@@ -180,6 +184,7 @@ impl EnvelopeSink for ChannelSink {
         // Hand the buffer over rather than copy it, leaving one already sized for the
         // next block: blocks vary in log count, but not enough for this to lose to
         // regrowing from zero.
+        let sent = Instant::now();
         let next = Vec::with_capacity(self.batch.len());
         let batch = std::mem::replace(&mut self.batch, next);
         // A block over the whole budget takes all of it, and goes alone.
@@ -198,6 +203,7 @@ impl EnvelopeSink for ChannelSink {
         self.sender
             .send(Parcel {
                 envelopes: batch,
+                sent,
                 _room: room,
             })
             .await
@@ -227,7 +233,8 @@ impl ChannelReceiver {
     /// Blocks are gathered into one flush as [`Batching`] says. Each block arrives whole
     /// and is published at once, then whatever else is already waiting joins it while
     /// the flush is under its limits. Waiting for the next block is bounded by the
-    /// oldest gathered block's deadline, so a stalled chain still flushes on time; with
+    /// oldest gathered block's deadline, counted from when ingest sent it, so neither a
+    /// stalled chain nor a slow commit before it holds the block past its wait; with
     /// nothing gathered, it waits for as long as the chain does. When the sending half is
     /// dropped, whatever is gathered is flushed before the drain ends. When `stop` is
     /// requested, a flush under way finishes, what is gathered is flushed within
@@ -269,7 +276,8 @@ impl ChannelReceiver {
             let Some(block) = next else {
                 break;
             };
-            let due = *deadline.get_or_insert_with(|| Instant::now() + batching.wait);
+            // The first block gathered is the oldest: the channel is in order.
+            let due = *deadline.get_or_insert_with(|| block.sent + batching.wait);
             self.publish(sink, block, &mut pending).await?;
             while !full(sink, &pending, batching) {
                 let Ok(block) = self.receiver.try_recv() else {
@@ -608,6 +616,54 @@ mod tests {
         let (stored, flushed) = storage.await.expect("storage ends");
         assert_eq!(stored, 3);
         assert_eq!(flushed, [keys(0..2), keys(2..3)]);
+    }
+
+    /// A block's wait counts from when ingest sent it, so one queued behind a slow commit
+    /// is flushed as soon as that commit ends, rather than waiting its whole wait again.
+    #[tokio::test(start_paused = true)]
+    async fn a_block_queued_behind_a_slow_commit_has_already_waited() {
+        /// Takes five seconds a flush, and records when each began, after `start`.
+        struct Slow {
+            start: tokio::time::Instant,
+            began: Vec<Duration>,
+        }
+
+        impl EnvelopeSink for Slow {
+            async fn publish(&mut self, _envelope: Envelope) -> Result<(), SinkError> {
+                Ok(())
+            }
+
+            async fn flush(&mut self) -> Result<(), SinkError> {
+                self.began.push(self.start.elapsed());
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                Ok(())
+            }
+        }
+
+        let (mut sink, receiver) = ChannelSink::new(Backend::DuckDb);
+        let mut store = Slow {
+            start: tokio::time::Instant::now(),
+            began: Vec::new(),
+        };
+        let storage = tokio::spawn(async move {
+            receiver
+                .drain(&mut store, waiting(Duration::from_secs(1)), Stop::never())
+                .await
+                .expect("drain");
+            store.began
+        });
+        send_block(&mut sink, 0..1).await;
+        // Sent while the first block's commit runs, from 1 s to 6 s.
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        send_block(&mut sink, 1..2).await;
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        drop(sink);
+
+        assert_eq!(
+            storage.await.expect("storage ends"),
+            [Duration::from_secs(1), Duration::from_secs(6)],
+            "the second block was due at 3 s, so it commits once the first commit ends"
+        );
     }
 
     /// Past the store's byte limit, what is gathered flushes at once, long before its
