@@ -101,12 +101,11 @@ const CLOSE_WAIT: Duration = Duration::from_secs(1);
 /// A connected client, and the task driving its connection.
 #[derive(Debug)]
 pub struct Postgres {
-    pub(crate) client: Client,
-    connection_task: Option<tokio::task::JoinHandle<()>>,
-    /// How to connect again when the server closes the connection; `None` for a client
-    /// the caller connected, which it alone can replace. Boxed: the parsed settings are
-    /// most of the store's size, and read only on a reconnect.
-    reconnect: Option<Box<Reconnect>>,
+    client: Client,
+    connection_task: tokio::task::JoinHandle<()>,
+    /// How to connect again when the server closes the connection. Boxed: the parsed
+    /// settings are most of the store's size, and read only on a reconnect.
+    reconnect: Box<Reconnect>,
 }
 
 /// What connecting again needs: the parsed connection settings, and the chain whose
@@ -119,9 +118,7 @@ struct Reconnect {
 
 impl Drop for Postgres {
     fn drop(&mut self) {
-        if let Some(task) = &self.connection_task {
-            task.abort();
-        }
+        self.connection_task.abort();
     }
 }
 
@@ -152,34 +149,15 @@ impl PostgresSink {
         let (client, task) = connect_as_writer(&config, chain).await?;
         let engine = Postgres {
             client,
-            connection_task: Some(task),
-            reconnect: Some(Box::new(Reconnect {
+            connection_task: task,
+            reconnect: Box::new(Reconnect {
                 config,
                 chain: chain.to_owned(),
-            })),
+            }),
         };
         let store = SqlStore::new(engine, schema, chain).await?;
         tracing::info!("PostgreSQL storage opened");
         Ok(store)
-    }
-
-    /// Takes a connected client, whose connection future the caller is already driving,
-    /// and creates every table in `schema` in the database schema named for `chain`.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`StoreError::Engine`] when schema or table creation fails.
-    pub async fn connected(
-        client: Client,
-        schema: Arc<Schema>,
-        chain: &str,
-    ) -> Result<Self, StoreError> {
-        let engine = Postgres {
-            client,
-            connection_task: None,
-            reconnect: None,
-        };
-        SqlStore::new(engine, schema, chain).await
     }
 }
 
@@ -252,19 +230,14 @@ impl Postgres {
     /// database schema the session's default, as opening the store did. The tables are
     /// already there.
     async fn reconnect(&mut self) -> Result<(), StoreError> {
-        let Some(reconnect) = &self.reconnect else {
-            return Ok(());
-        };
-        let Reconnect { config, chain } = &**reconnect;
+        let Reconnect { config, chain } = &*self.reconnect;
         let (client, task) = connect_as_writer(config, chain).await?;
         if let Err(error) = client.batch_execute(&Self::use_schema(chain)).await {
             task.abort();
             return Err(opening(error));
         }
         self.client = client;
-        if let Some(stopped) = self.connection_task.replace(task) {
-            stopped.abort();
-        }
+        std::mem::replace(&mut self.connection_task, task).abort();
         Ok(())
     }
 
@@ -471,7 +444,7 @@ impl Engine for Postgres {
     /// `RECONNECT_FOR`). The failed transaction ended with the session, so the store
     /// is as its last commit left it, and the batch it kept can be written again.
     async fn recover(&mut self) -> Result<bool, StoreError> {
-        if self.reconnect.is_none() || !self.closed().await {
+        if !self.closed().await {
             return Ok(false);
         }
         tracing::warn!("PostgreSQL connection lost; connecting again");

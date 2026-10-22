@@ -129,20 +129,6 @@ impl DuckDbSink {
                 .map_err(StoreError::engine(Operation::Open, Some(&path)))?
         };
         info!(store = %path, "storage opened");
-        Self::connected(connection, schema, chain).await
-    }
-
-    /// Takes an open connection and creates every table in `schema` in the database
-    /// schema named for `chain`.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`StoreError::Engine`] when the schema or a table cannot be created.
-    pub async fn connected(
-        connection: Connection,
-        schema: Arc<Schema>,
-        chain: &str,
-    ) -> Result<Self, StoreError> {
         SqlStore::new(DuckDb { connection }, schema, chain).await
     }
 }
@@ -402,7 +388,7 @@ mod tests {
 
     /// A store of `chain` over `connection`, with the tables of `schema`.
     async fn connect(connection: Connection, schema: Arc<Schema>, chain: &str) -> DuckDbSink {
-        DuckDbSink::connected(connection, schema, chain)
+        DuckDbSink::new(DuckDb { connection }, schema, chain)
             .await
             .expect("create the tables")
     }
@@ -469,7 +455,7 @@ mod tests {
             connection
                 .execute_batch(&format!("CREATE SCHEMA base; USE base; {ddl}"))
                 .expect("an old reorgs table");
-            let error = DuckDbSink::connected(connection, datasets(), "base")
+            let error = DuckDbSink::new(DuckDb { connection }, datasets(), "base")
                 .await
                 .expect_err("the table drifted");
             assert!(

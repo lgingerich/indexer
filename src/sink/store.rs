@@ -159,7 +159,7 @@ impl Reads {
 /// [`EnvelopeSink::flush`].
 #[derive(Debug)]
 pub struct SqlStore<E> {
-    pub(crate) engine: E,
+    engine: E,
     /// The chain a [`restore`](Store::restore) reads back.
     chain: ChainId,
     batch: Batch,

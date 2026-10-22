@@ -17,6 +17,7 @@ use crate::decode::{Catalog, Decoder, DecodingSink};
 use crate::ingest::pipeline::{Machine, PipelineError};
 use crate::ingest::source::{BlockSource, FetchedBlock, HeadStream, SourceError};
 use crate::sink::channel::Batching;
+use crate::sink::duckdb::DuckDb;
 use crate::sink::resume::Opened;
 use crate::sink::route::Backend;
 use crate::sink::stop::Stop;
@@ -156,6 +157,13 @@ fn schema() -> Arc<Schema> {
     sink::fixtures::schema()
 }
 
+/// A `base` store of [`schema`]'s tables over `connection`.
+async fn duckdb_store(connection: duckdb::Connection) -> DuckDbSink {
+    DuckDbSink::new(DuckDb { connection }, schema(), "base")
+        .await
+        .expect("open the store")
+}
+
 /// `store`, writing every table of [`schema`].
 fn every_table<S>(backend: Backend, store: S, batching: Batching) -> Opened<S> {
     Opened {
@@ -234,9 +242,7 @@ async fn a_discovered_contract_is_stored_and_survives_a_restart() {
 
     let connection = duckdb::Connection::open_in_memory().expect("open in-memory DuckDB");
     let reader = connection.try_clone().expect("a second handle");
-    let mut store = DuckDbSink::connected(connection, schema(), "base")
-        .await
-        .expect("create tables");
+    let mut store = duckdb_store(connection).await;
     let (blocks, receiver) = sink::channel::ChannelSink::new(Backend::DuckDb);
     let storage = tokio::spawn(async move {
         receiver
@@ -285,9 +291,7 @@ async fn a_discovered_contract_is_stored_and_survives_a_restart() {
     assert_eq!(orphans, 0);
 
     // A restart: a fresh decoder knows the pool once the store's rows are restored.
-    let mut store = DuckDbSink::connected(reader.try_clone().expect("handle"), schema(), "base")
-        .await
-        .expect("reopen");
+    let mut store = duckdb_store(reader.try_clone().expect("handle")).await;
     let stored = store.contracts(&chain).await.expect("read back");
     assert_eq!(stored, [stored_pool(pool, creating, 10)]);
     let mut restarted = decoder();
@@ -399,9 +403,7 @@ impl BlockSource for FakeChain {
 /// when the head subscription ends and let storage drain, as a crash after the last
 /// commit would leave it.
 async fn run_once(connection: &duckdb::Connection, chain: FakeChain, start: Option<u64>) {
-    let store = DuckDbSink::connected(connection.try_clone().expect("handle"), schema(), "base")
-        .await
-        .expect("open");
+    let store = duckdb_store(connection.try_clone().expect("handle")).await;
     let catalog =
         Catalog::load(protocols(), &ChainId::new("base")).expect("shipped protocols load");
     let result = Pipeline::new(chain, start, None, catalog)
@@ -534,10 +536,7 @@ async fn a_restart_resumes_from_the_store_and_reconciles_a_fork_while_down() {
         chain_through(7, 5),
         "the orphaned blocks left the ledger"
     );
-    let mut store =
-        DuckDbSink::connected(connection.try_clone().expect("handle"), schema(), "base")
-            .await
-            .expect("open");
+    let mut store = duckdb_store(connection.try_clone().expect("handle")).await;
     let restored = store.restore().await.expect("restore");
     assert!(restored.contracts.is_empty());
     assert_eq!(
@@ -562,10 +561,7 @@ async fn a_restart_resumes_from_the_store_and_reconciles_a_fork_while_down() {
 async fn a_start_height_above_a_stored_ledger_is_refused() {
     let connection = duckdb::Connection::open_in_memory().expect("open in-memory DuckDB");
     run_once(&connection, FakeChain::new(3, 0xa0), Some(1)).await;
-    let mut store =
-        DuckDbSink::connected(connection.try_clone().expect("handle"), schema(), "base")
-            .await
-            .expect("open");
+    let mut store = duckdb_store(connection.try_clone().expect("handle")).await;
     let chain = ChainId::new("base");
     let restored = ledger(
         &chain,
@@ -760,9 +756,7 @@ async fn run_both(
 ) {
     use crate::sink::any_store::AnyStore;
 
-    let database = DuckDbSink::connected(connection.try_clone().expect("handle"), schema(), "base")
-        .await
-        .expect("open");
+    let database = duckdb_store(connection.try_clone().expect("handle")).await;
     let lake = sink::DeltaSink::open(settings, schema(), "base")
         .await
         .expect("the lake opens");
