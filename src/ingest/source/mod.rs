@@ -33,12 +33,10 @@ use thiserror::Error;
 
 mod any_source;
 mod assemble;
-mod datasets;
 pub mod evm;
 pub mod hypersync;
 mod retry;
 pub use any_source::AnySource;
-pub use datasets::Datasets;
 pub use evm::EvmSource;
 pub use hypersync::{HyperSyncRanges, HyperSyncSource};
 pub use retry::NetworkError;
@@ -236,7 +234,7 @@ pub trait BlockSource: Send + Sync {
     /// How many blocks under the head a fork may still reach on this source's chain: the
     /// buried heights, below it, are backfilled straight through, and only those above
     /// it go block by block through the reorg-aware path. The pipeline holds it to at
-    /// most [`MAX_UNFINALIZED_BLOCKS`](crate::ingest::pipeline::MAX_UNFINALIZED_BLOCKS),
+    /// most [`MAX_UNFINALIZED_BLOCKS`](crate::window::MAX_UNFINALIZED_BLOCKS),
     /// the deepest fork a run can retract.
     fn finality_depth(&self) -> u64;
 

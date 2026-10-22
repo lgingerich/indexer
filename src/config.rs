@@ -146,7 +146,7 @@ pub struct IngestSettings {
     /// and a `HyperSync` backfill stops there; only the blocks above it go one at a time
     /// through the reorg-aware path, so a shallower depth hands a backfill to the chain's
     /// head sooner. It is not how deep a fork can be retracted: a run retracts up to
-    /// [`MAX_UNFINALIZED_BLOCKS`](crate::ingest::pipeline::MAX_UNFINALIZED_BLOCKS) blocks
+    /// [`MAX_UNFINALIZED_BLOCKS`](crate::window::MAX_UNFINALIZED_BLOCKS) blocks
     /// whatever this is. Omitted is that same 4,096, which suits any chain; zero, or more
     /// than 4,096, is refused.
     pub finality_depth: NonZeroU64,
@@ -235,7 +235,7 @@ impl TryFrom<IngestTable> for IngestSettings {
             }
             _ => return Err("[ingest] http_url and ws_url are named together"),
         };
-        let deepest = crate::ingest::pipeline::MAX_UNFINALIZED_BLOCKS as u64;
+        let deepest = crate::window::MAX_UNFINALIZED_BLOCKS as u64;
         let finality_depth = match table.finality_depth {
             Some(depth) if depth.get() > deepest => {
                 return Err(

@@ -33,6 +33,13 @@
 //!
 //! Stores take a connection or open one from their own settings, so client settings
 //! live beside the backend that knows how to apply them.
+//!
+//! # Dependency direction
+//!
+//! This module depends on [`crate::wire`] for what it stores, [`crate::window`] for how
+//! much ledger a store keeps and hands back, [`crate::metrics`], and the settings helpers
+//! in [`crate::config`] and [`crate::secret`]. It knows nothing about [`crate::ingest`],
+//! and only its tests use [`crate::decode`], to produce decoded records to store.
 
 /// One opened store of any backend the build has.
 #[cfg(feature = "store")]
@@ -183,7 +190,7 @@ pub struct StoredContract {
 pub struct Restored {
     /// Every contract discovered on the store's chain, each from a canonical block.
     pub contracts: Vec<StoredContract>,
-    /// The newest [`LEDGER_WINDOW`](crate::ingest::pipeline::LEDGER_WINDOW) accepted
+    /// The newest [`LEDGER_WINDOW`](crate::window::LEDGER_WINDOW) accepted
     /// blocks, oldest first: the undo window a restart resumes from.
     pub ledger: Vec<BlockMeta>,
 }

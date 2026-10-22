@@ -54,10 +54,9 @@ use futures_util::StreamExt;
 use tracing::warn;
 
 use super::retry::{RetryLayer, os_seed};
-use super::{
-    BlockSource, Datasets, FetchedBlock, HeadStream, SourceError, inconsistent, malformed,
-};
+use super::{BlockSource, FetchedBlock, HeadStream, SourceError, inconsistent, malformed};
 use crate::metrics;
+use crate::wire::datasets::Datasets;
 use crate::wire::envelope::{BlockMeta, ChainId};
 
 use fetch::{RpcBlockMeta, block_read, invalid_json, transport};
@@ -338,7 +337,8 @@ mod tests {
 
     use super::*;
     use crate::ingest::source::evm::testing::*;
-    use crate::ingest::source::{BlockSource, Datasets, SourceError};
+    use crate::ingest::source::{BlockSource, SourceError};
+    use crate::wire::datasets::Datasets;
     use crate::wire::envelope::{BlockMeta, Event};
 
     /// Reads a hex quantity out of a request.

@@ -105,9 +105,9 @@ mod tests {
     use std::sync::atomic::Ordering;
 
     use super::*;
-    use crate::ingest::pipeline::MAX_UNFINALIZED_BLOCKS;
     use crate::ingest::pipeline::testing::*;
     use crate::sink::SinkError;
+    use crate::window::MAX_UNFINALIZED_BLOCKS;
 
     #[tokio::test]
     async fn backfill_covers_buried_heights_and_samples_the_head_again_at_the_bound() {

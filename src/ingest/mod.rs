@@ -7,15 +7,10 @@
 //! # Dependency direction
 //!
 //! This module depends on [`crate::sink`] for the sink it publishes to,
-//! [`crate::wire`] for what it publishes, and [`crate::metrics`]. It knows nothing
-//! about [`crate::decode`]: what happens to an envelope after it is published is not
-//! ingestion's business.
-//!
-//! The direction is not yet one way: [`crate::sink`] and [`crate::config`] import
-//! [`LEDGER_WINDOW`](pipeline::LEDGER_WINDOW),
-//! [`MAX_UNFINALIZED_BLOCKS`](pipeline::MAX_UNFINALIZED_BLOCKS), and
-//! [`Datasets`](source::Datasets) from here, and `crate::sink::resume` builds the
-//! [`Ledger`](pipeline::Ledger) a resumed run starts from.
+//! [`crate::wire`] for what it publishes, [`crate::window`] for the undo window and the
+//! ledger it resumes from, and [`crate::metrics`]. Nothing below it depends on it, and it
+//! knows nothing about [`crate::decode`]: what happens to an envelope after it is
+//! published is not ingestion's business.
 
 pub mod pipeline;
 pub mod source;

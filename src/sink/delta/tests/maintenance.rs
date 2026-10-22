@@ -46,7 +46,7 @@ async fn maintenance_compacts_finished_partitions_and_vacuums_what_they_replaced
     let width = sink.lakes[position].width;
     let writer = sink.writer.clone();
     // Partition 0 ends at 99_999: one height short of the window past it, nothing moves.
-    let short = 100_000 + crate::ingest::pipeline::MAX_UNFINALIZED_BLOCKS as u64 - 1;
+    let short = 100_000 + crate::window::MAX_UNFINALIZED_BLOCKS as u64 - 1;
     assert_eq!(
         maintenance::compact("blocks", &mut table, width, short, &writer)
             .await

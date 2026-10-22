@@ -44,8 +44,8 @@ use tracing::{info, warn};
 
 use super::arrow::PARTITION;
 use super::lake::commit_properties;
-use crate::ingest::pipeline::MAX_UNFINALIZED_BLOCKS;
 use crate::metrics;
+use crate::window::MAX_UNFINALIZED_BLOCKS;
 
 /// How often the task looks for finished partitions to compact.
 const COMPACT_EVERY: Duration = Duration::from_hours(1);

@@ -41,7 +41,6 @@ use self::node::{SimHeads, SimNode};
 use self::store::FaultyEngine;
 use crate::decode::Catalog;
 use crate::ingest::pipeline::PipelineError;
-use crate::ingest::source::Datasets;
 use crate::ingest::source::{EvmSource, RetryLayer};
 use crate::runtime::{Pipeline, RuntimeError};
 use crate::sink::channel::Batching;
@@ -51,6 +50,7 @@ use crate::sink::route::Backend;
 use crate::sink::stop::Stop;
 use crate::sink::store_runtime::StoreRuntime;
 use crate::sink::{SinkError, SqlStore};
+use crate::wire::datasets::Datasets;
 
 const CHAIN: &str = "sim";
 

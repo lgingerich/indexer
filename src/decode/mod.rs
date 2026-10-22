@@ -12,6 +12,13 @@
 //! of ordinary decode failures. Discovered contracts are published as their own dataset,
 //! so the store holds them in the same transaction as the block that created them and a
 //! restart reads them back.
+//!
+//! # Dependency direction
+//!
+//! This module depends on [`crate::sink`] for the sink it wraps, the table schema its
+//! catalog and derivations declare columns in, and the contracts a store restores; on
+//! [`crate::wire`] for what it reads and produces; and on [`crate::metrics`]. It knows
+//! nothing about [`crate::ingest`].
 
 mod abi;
 mod catalog;

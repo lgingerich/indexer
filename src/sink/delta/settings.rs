@@ -6,10 +6,10 @@ use std::time::Duration;
 use serde::Deserialize;
 
 use super::arrow;
-use crate::ingest::pipeline::LEDGER_WINDOW;
 use crate::secret::Secret;
 use crate::sink::channel::Batching;
 use crate::sink::route::Tables;
+use crate::window::LEDGER_WINDOW;
 
 /// The Delta Lake store's settings: where the tables live, how often to commit, and the
 /// object store's own options, passed through.

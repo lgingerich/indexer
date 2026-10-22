@@ -50,7 +50,8 @@ use serde::Deserializer;
 use serde::de::{self, DeserializeOwned};
 
 use super::retry::{Attempt, Backoff, os_seed, transient_status};
-use super::{BlockSource, Datasets, FetchedBlock, HeadStream, SourceError, malformed};
+use super::{BlockSource, FetchedBlock, HeadStream, SourceError, malformed};
+use crate::wire::datasets::Datasets;
 use crate::wire::envelope::{BlockMeta, ChainId};
 
 use assemble::assemble;
@@ -488,7 +489,8 @@ impl BlockSource for HyperSyncSource {
 mod tests {
     use super::*;
     use crate::ingest::source::evm::{http_client, ws_connect};
-    use crate::ingest::source::{BlockSource, Datasets, EvmSource};
+    use crate::ingest::source::{BlockSource, EvmSource};
+    use crate::wire::datasets::Datasets;
     use crate::wire::envelope::Event;
 
     /// The ranges the live comparisons fetch in: one at a time, as many heights as a test

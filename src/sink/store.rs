@@ -28,12 +28,12 @@ pub(crate) mod contract;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::ingest::pipeline::LEDGER_WINDOW;
 use crate::sink::batch::Batch;
 use crate::sink::sql::{self, Dialect};
 use crate::sink::store_error::{EngineError, InvalidStoredValue, Operation, StoreError};
 use crate::sink::table::{Row, Schema, Table, TableDef, TableError, TableId, Value};
 use crate::sink::{EnvelopeSink, Restored, SinkError, Store, StoredContract};
+use crate::window::LEDGER_WINDOW;
 use crate::wire::envelope::{BlockMeta, ChainId, Envelope};
 
 /// What runs a [`SqlStore`]'s statements.

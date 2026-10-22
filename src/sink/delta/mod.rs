@@ -87,11 +87,11 @@ use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::Instant;
 use tracing::info;
 
-use crate::ingest::pipeline::LEDGER_WINDOW;
 use crate::sink::batch::Batch;
 use crate::sink::store_error::{Operation, StoreError};
 use crate::sink::table::{Row, Schema, Table, TableId};
 use crate::sink::{EnvelopeSink, Restored, SinkError, Store};
+use crate::window::LEDGER_WINDOW;
 use crate::wire::envelope::{BlockMeta, ChainId, Envelope};
 
 use self::expr::{at_or_above, of_blocks};

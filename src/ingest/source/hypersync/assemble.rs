@@ -237,7 +237,7 @@ mod tests {
     use super::*;
     use crate::ingest::source::hypersync::TRANSACTION_POSITION_FIELDS;
 
-    use crate::ingest::source::Datasets;
+    use crate::wire::datasets::Datasets;
     use crate::wire::envelope::Event;
 
     /// A block's identity row: `number`'s hash is `0x..number`, and its parent the one

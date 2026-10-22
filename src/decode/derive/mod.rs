@@ -49,7 +49,7 @@
 //! `Schema::derived_table`, `Schema::derived_row`, and the
 //! `UnknownTable`, `Field`, and `NotADataset` table errors in `sink::table`; and the
 //! `Event::Derived` and `TableId::Derived` arms in `sink::route`, `sink::progress`, and
-//! `ingest::source::datasets`.
+//! `sink::table::datasets`.
 
 pub(super) mod metric;
 mod value;

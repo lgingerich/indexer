@@ -9,7 +9,7 @@ use tracing::{Instrument as _, info, info_span};
 
 use crate::config::Settings;
 use crate::decode::{Decoder, DecodingSink};
-use crate::ingest::pipeline::{Ledger, Machine, PipelineError};
+use crate::ingest::pipeline::{Machine, PipelineError};
 use crate::ingest::source::BlockSource;
 use crate::sink::any_store::AnyStore;
 use crate::sink::channel::Batching;
@@ -19,6 +19,7 @@ use crate::sink::stop::Stop;
 use crate::sink::store_runtime::StoreRuntime;
 use crate::sink::table::{Schema, TableId};
 use crate::sink::{self, SinkError, StoredContract};
+use crate::window::Ledger;
 use crate::wire::envelope::ChainId;
 
 use super::{Pipeline, Routes, RuntimeError};

@@ -24,7 +24,7 @@
 //! those of blocks that really left it.
 //!
 //! That needs the store's ledger to name every block it holds above the common block. A
-//! restore reads the newest [`LEDGER_WINDOW`](crate::ingest::pipeline::LEDGER_WINDOW)
+//! restore reads the newest [`LEDGER_WINDOW`](crate::window::LEDGER_WINDOW)
 //! blocks, so a full ledger whose oldest block is above the one after the common block
 //! may leave blocks in between unnamed. Such a store is [rewound](Store::rewind) to the
 //! common block instead, and ingest re-fetches its rows above. A rewind is not a retraction, so it writes no `reorgs` row; see
@@ -53,12 +53,12 @@ use futures_util::FutureExt as _;
 use futures_util::future::BoxFuture;
 use tracing::{info, warn};
 
-use crate::ingest::pipeline::{LEDGER_WINDOW, Ledger};
 use crate::sink::channel::Batching;
 use crate::sink::route::Backend;
 use crate::sink::store_runtime::StoreRuntime;
 use crate::sink::table::TableId;
 use crate::sink::{Restored, Store, StoreError, StoredContract};
+use crate::window::{LEDGER_WINDOW, Ledger};
 use crate::wire::envelope::BlockMeta;
 
 /// A store, opened, with what the run routes to it and the runtime its work runs on.

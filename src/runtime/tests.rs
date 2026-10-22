@@ -414,7 +414,7 @@ impl BlockSource for FakeChain {
         1
     }
     fn finality_depth(&self) -> u64 {
-        crate::ingest::pipeline::MAX_UNFINALIZED_BLOCKS as u64
+        crate::window::MAX_UNFINALIZED_BLOCKS as u64
     }
 }
 

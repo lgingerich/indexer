@@ -20,13 +20,13 @@ use std::sync::Arc;
 
 use alloy_primitives::{Address, B256, TxHash, U256};
 
-use crate::ingest::pipeline::LEDGER_WINDOW;
 use crate::sink::sql::{self, Dialect};
 use crate::sink::store::{Engine, SqlStore};
 use crate::sink::table::{ColumnType, Schema, Table, TableId, Value};
 use crate::sink::{
     EnvelopeSink as _, Operation, SinkError, Store as _, StoreError, StoredContract,
 };
+use crate::window::LEDGER_WINDOW;
 use crate::wire::datasets::evm::{Block, Contract, Log, Transaction};
 use crate::wire::envelope::{BlockMeta, ChainId, Envelope, Event, Reorg};
 

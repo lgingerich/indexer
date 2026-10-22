@@ -251,10 +251,10 @@ mod tests {
     use std::sync::atomic::Ordering;
 
     use super::*;
-    use crate::ingest::pipeline::Ledger;
-    use crate::ingest::pipeline::MAX_UNFINALIZED_BLOCKS;
     use crate::ingest::pipeline::testing::*;
     use crate::ingest::source::SourceError;
+    use crate::window::Ledger;
+    use crate::window::MAX_UNFINALIZED_BLOCKS;
     use crate::wire::envelope::{BlockMeta, Event};
 
     #[tokio::test]

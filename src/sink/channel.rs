@@ -86,7 +86,7 @@ const ENVELOPES: usize = 1 << 17;
 /// Resume needs a block both hand back, within that window; the lake's byte limit alone
 /// let a commit gather over ten thousand of Robinhood's small blocks, and a stop left it
 /// further behind the database than resume could reach.
-const MAX_BLOCKS: usize = crate::ingest::pipeline::LEDGER_WINDOW / 2;
+const MAX_BLOCKS: usize = crate::window::LEDGER_WINDOW / 2;
 
 /// How long a stop gives the drain to commit what it has gathered and wait for what its
 /// commits left running.

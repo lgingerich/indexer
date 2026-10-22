@@ -5,10 +5,11 @@ use std::sync::Arc;
 use tracing::{debug, info};
 
 use super::prefetch::Prefetch;
-use super::{MAX_UNFINALIZED_BLOCKS, Machine, PipelineError};
+use super::{Machine, PipelineError};
 use crate::ingest::source::{BlockSource, FetchedBlock};
 use crate::metrics;
 use crate::sink::EnvelopeSink;
+use crate::window::MAX_UNFINALIZED_BLOCKS;
 use crate::wire::envelope::{BlockMeta, Event, Reorg};
 
 impl<S: BlockSource + 'static, K: EnvelopeSink> Machine<S, K> {
@@ -299,9 +300,9 @@ mod tests {
     use std::sync::atomic::Ordering;
 
     use super::*;
-    use crate::ingest::pipeline::MAX_UNFINALIZED_BLOCKS;
     use crate::ingest::pipeline::testing::*;
     use crate::sink::SinkError;
+    use crate::window::MAX_UNFINALIZED_BLOCKS;
     use crate::wire::envelope::BlockMeta;
 
     /// A gap is fetched ahead, as many heights in flight as the source allows, and still

@@ -2,7 +2,7 @@
 
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
-use crate::ingest::source::Datasets;
+use crate::wire::datasets::Datasets;
 
 /// The most calls one JSON-RPC batch carries.
 ///

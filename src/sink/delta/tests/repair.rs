@@ -477,7 +477,7 @@ fn a_partition_narrower_than_the_ledger_window_is_refused() {
             "tables = [\"blocks\"]\nuri = \"/tmp/lake\"\npartition_blocks = {width}"
         ))
     };
-    let window = crate::ingest::pipeline::LEDGER_WINDOW as u64;
+    let window = crate::window::LEDGER_WINDOW as u64;
     let error = settings(window - 1).expect_err("too narrow");
     assert!(error.to_string().contains("at least 4097"), "{error}");
     assert_eq!(

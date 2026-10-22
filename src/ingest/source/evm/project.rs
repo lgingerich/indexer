@@ -12,7 +12,8 @@ use alloy_serde::OtherFields;
 use super::plan::{FetchPlan, LogSource};
 use super::{BLOCK, LOGS, RECEIPTS};
 use crate::ingest::source::assemble::{BlockRows, check_logs_present};
-use crate::ingest::source::{Datasets, FetchedBlock, SourceError, inconsistent, malformed};
+use crate::ingest::source::{FetchedBlock, SourceError, inconsistent, malformed};
+use crate::wire::datasets::Datasets;
 use crate::wire::datasets::evm::{Block, Log, Transaction};
 use crate::wire::envelope::{BlockMeta, Event};
 

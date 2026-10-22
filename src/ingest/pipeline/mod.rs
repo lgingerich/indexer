@@ -54,21 +54,13 @@ use futures_util::StreamExt as _;
 use tracing::{debug, info, warn};
 
 pub use error::PipelineError;
-pub use ring::Ledger;
 use ring::UndoRing;
 
 use crate::ingest::source::{BlockSource, SourceError};
 use crate::metrics;
 use crate::sink::EnvelopeSink;
+use crate::window::{Ledger, MAX_UNFINALIZED_BLOCKS};
 use crate::wire::envelope::{BlockMeta, Envelope, Event};
-
-/// Hardcoded budget for the recovered undo window.
-///
-/// The window is a recovery floor, not a finality claim: a fork deeper than this
-/// stops with [`PipelineError::UndoWindowExceeded`] rather than retracting a suffix
-/// the pipeline can no longer identify. Identities cost nothing beside the payloads
-/// they describe, so the value is a bounded-memory choice, not a tuning knob.
-pub const MAX_UNFINALIZED_BLOCKS: usize = 4096;
 
 /// How soon a live head the source answered inconsistently is asked about again, and the
 /// longest wait it doubles to while the source keeps answering so. A head arriving first
@@ -106,10 +98,6 @@ async fn retry_after(retry: Option<(BlockMeta, std::time::Duration)>) -> BlockMe
         None => std::future::pending().await,
     }
 }
-
-/// How many accepted blocks a store hands back to a restart: the undo window and the
-/// block below it, which the oldest unfinalized block's parent hash is checked against.
-pub const LEDGER_WINDOW: usize = MAX_UNFINALIZED_BLOCKS + 1;
 
 /// One process-local driver, consumed by its public asynchronous operations.
 #[derive(Debug)]

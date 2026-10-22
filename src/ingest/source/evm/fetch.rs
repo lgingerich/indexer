@@ -255,7 +255,8 @@ mod tests {
 
     use super::*;
     use crate::ingest::source::evm::testing::*;
-    use crate::ingest::source::{BlockSource, Datasets, SourceError};
+    use crate::ingest::source::{BlockSource, SourceError};
+    use crate::wire::datasets::Datasets;
     use crate::wire::envelope::Event;
 
     /// A node behind the one that announced a block answers it `null`. That is a

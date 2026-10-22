@@ -6,34 +6,8 @@ use std::collections::VecDeque;
 use alloy_primitives::B256;
 use tracing::warn;
 
-use super::{LEDGER_WINDOW, MAX_UNFINALIZED_BLOCKS};
+use crate::window::{Ledger, MAX_UNFINALIZED_BLOCKS};
 use crate::wire::envelope::BlockMeta;
-
-/// The accepted blocks a restart resumes from, and whether the stores hold blocks below
-/// the oldest of them.
-///
-/// Which it is decides what a fork replacing the oldest block means: with nothing stored
-/// below, it replaces the first block ever indexed and is adopted; with history below,
-/// it reaches past what the run can retract and stops it.
-#[derive(Debug, Default)]
-pub struct Ledger {
-    /// The accepted blocks, oldest first.
-    pub blocks: Vec<BlockMeta>,
-    /// Whether some store holds blocks below the oldest of [`Self::blocks`].
-    pub history_below: bool,
-}
-
-/// A ledger as one store's restore reads it back: its newest [`LEDGER_WINDOW`] blocks,
-/// so one that long may have history below it, and a shorter one is all the store holds.
-/// A ledger cut any other way — as resuming several stores cuts one — says so itself.
-impl From<Vec<BlockMeta>> for Ledger {
-    fn from(blocks: Vec<BlockMeta>) -> Self {
-        Self {
-            history_below: blocks.len() >= LEDGER_WINDOW,
-            blocks,
-        }
-    }
-}
 
 /// Accepted chain identities: a recovery predecessor and an ordered sliding tail.
 #[derive(Debug, Default)]
@@ -180,7 +154,6 @@ fn linked_suffix(mut ledger: Vec<BlockMeta>) -> Vec<BlockMeta> {
 mod tests {
 
     use super::*;
-    use crate::ingest::pipeline::MAX_UNFINALIZED_BLOCKS;
     use crate::ingest::pipeline::Machine;
     use crate::ingest::pipeline::testing::*;
     use crate::wire::envelope::BlockMeta;

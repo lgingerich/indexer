@@ -22,9 +22,9 @@ use std::sync::Arc;
 use serde::Deserialize;
 use serde::de::{self, Deserializer};
 
-use crate::ingest::source::Datasets;
 use crate::sink::table::{Schema, Table, TableId};
 use crate::sink::{EnvelopeSink, SinkError};
+use crate::wire::datasets::Datasets;
 use crate::wire::envelope::Envelope;
 
 /// The entry in [`Tables`] that names every contract's decoded event tables — one per
@@ -276,10 +276,10 @@ mod tests {
 
     use alloy_primitives::B256;
 
-    use crate::ingest::source::Datasets;
     use crate::sink::fixtures;
     use crate::sink::table::{Schema, Table, TableId};
     use crate::sink::{EnvelopeSink, SinkError};
+    use crate::wire::datasets::Datasets;
     use crate::wire::envelope::{BlockMeta, ChainId, Envelope, Event};
 
     use super::{RouteError, Router, Tables, datasets, glob};

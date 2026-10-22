@@ -9,9 +9,10 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use alloy_primitives::B256;
 use futures_util::stream;
 
-use super::{MAX_UNFINALIZED_BLOCKS, Machine, PipelineError};
+use super::{Machine, PipelineError};
 use crate::ingest::source::{BlockSource, FetchedBlock, HeadStream, SourceError};
 use crate::sink::{EnvelopeSink, SinkError};
+use crate::window::MAX_UNFINALIZED_BLOCKS;
 use crate::wire::datasets::evm::Block;
 use crate::wire::envelope::{BlockMeta, ChainId, Envelope, Event, Reorg};
 

@@ -16,8 +16,9 @@
 //!
 //! The dependency direction is one-way. [`ingest`] and [`decode`] each depend on
 //! [`sink`] and [`wire`] and not on each other, so neither can reach into the
-//! other's ordering or reorg state. [`sink`] depends only on [`wire`], and [`wire`] on
-//! nothing. [`config`] sits outside the layers and names each layer's settings; a value
+//! other's ordering or reorg state. [`sink`] depends only on [`wire`] and [`window`], the
+//! undo window that ingest retracts within and the stores keep a ledger of; [`window`]
+//! depends only on [`wire`], and [`wire`] on nothing. [`config`] sits outside the layers and names each layer's settings; a value
 //! that must not be logged is a [`secret::Secret`], which any layer may take, and any
 //! layer may record into [`metrics`]. The layers are modules rather than crates, so that
 //! direction is a convention a reviewer checks rather than one the compiler enforces;
@@ -65,4 +66,5 @@ pub mod secret;
 #[expect(clippy::expect_used)]
 mod sim;
 pub mod sink;
+pub mod window;
 pub mod wire;
