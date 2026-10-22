@@ -18,9 +18,13 @@
 //! store listing it fails at startup. It reads each argument by position and name, so one
 //! that moved under an unchanged signature is caught at its first record. A record a
 //! derivation cannot read derives nothing and is logged; the decoded record still
-//! commits. A row that does not fit its table is a bug in the derivation, and stops the
-//! run: one with a value too many or too few is refused here, and one whose value does not
-//! fit its column by the store.
+//! commits.
+//!
+//! A derivation writes each value beside its column's name, so two columns of one type
+//! cannot trade values unseen: the pair moves together, or the names give it away. A row
+//! that does not fit its table is a bug in the derivation, and stops the run: one that
+//! does not name the table's columns in order is refused here, and one whose value does
+//! not fit its column by the store.
 //!
 //! # Removing it
 //!
@@ -77,14 +81,18 @@ pub(super) struct Derivation {
     pub(super) signatures: &'static [&'static str],
     /// The table it writes.
     pub(super) table: &'static str,
-    /// The table's own columns, in order: what follows the log's columns.
+    /// The table's own columns, in order: what follows the log's columns. Every row names
+    /// them, in this order.
     pub(super) columns: &'static [(&'static str, ColumnType)],
     /// The indexes the app's reads need, each its columns in order, beside the ones every
     /// table has by block.
     pub(super) indexes: &'static [&'static [&'static str]],
-    /// One record's rows, each a value per column in order. A record may derive none.
-    pub(super) derive: fn(&Decoded) -> Result<Vec<Vec<TypedValue>>, DeriveError>,
+    /// One record's rows. A record may derive none.
+    pub(super) derive: fn(&Decoded) -> Result<Vec<Row>, DeriveError>,
 }
+
+/// One derived row: each of its table's columns, by name, with its value.
+pub(super) type Row = Vec<(&'static str, TypedValue)>;
 
 impl Derivation {
     /// Whether `decoded` is a record of an event this reads.
@@ -94,23 +102,23 @@ impl Derivation {
             && self.signatures.contains(&decoded.signature.as_str())
     }
 
-    /// The rows `decoded` derives, numbered in order, each value named for its column.
+    /// The rows `decoded` derives, numbered in order.
     ///
     /// # Errors
     ///
     /// Returns [`DeriveError::Argument`] when an argument is missing, misnamed, of another
-    /// type, or out of the range the contract keeps it in, and [`DeriveError::Width`] when
-    /// a row has more or fewer values than the table has columns.
+    /// type, or out of the range the contract keeps it in, and [`DeriveError::Columns`]
+    /// when a row does not name the table's columns in order.
     fn rows(&self, decoded: &Decoded, sent: Sent) -> Result<Vec<Derived>, DeriveError> {
         (self.derive)(decoded)?
             .into_iter()
             .zip(0..)
             .map(|(values, row)| {
-                if values.len() != self.columns.len() {
-                    return Err(DeriveError::Width {
+                let names = values.iter().map(|&(name, _)| name);
+                if !names.clone().eq(self.columns.iter().map(|&(name, _)| name)) {
+                    return Err(DeriveError::Columns {
                         table: self.table,
-                        values: values.len(),
-                        columns: self.columns.len(),
+                        names: names.collect(),
                     });
                 }
                 Ok(Derived {
@@ -122,11 +130,9 @@ impl Derivation {
                     row,
                     transaction_from_address: sent.map(|(from, _)| from),
                     transaction_to_address: sent.and_then(|(_, to)| to),
-                    fields: self
-                        .columns
-                        .iter()
-                        .zip(values)
-                        .map(|(&(name, _), value)| DerivedField {
+                    fields: values
+                        .into_iter()
+                        .map(|(name, value)| DerivedField {
                             name: name.to_owned(),
                             value,
                         })
@@ -154,16 +160,15 @@ pub(super) enum DeriveError {
         /// The type the derivation reads there.
         expected: &'static str,
     },
-    /// A row has a different number of values than its table has columns: a bug in the
-    /// derivation, which stops the run rather than storing a row short or shifted.
-    #[error("a {table} row has {values} values for {columns} columns")]
-    Width {
+    /// A row does not name its table's columns in order: one short, one over, or two
+    /// swapped. A bug in the derivation, which stops the run rather than storing a row
+    /// short, shifted, or with values under each other's columns.
+    #[error("a {table} row names columns {names:?}, not its table's in order")]
+    Columns {
         /// The table.
         table: &'static str,
-        /// How many values the row has.
-        values: usize,
-        /// How many columns the derivation declares.
-        columns: usize,
+        /// The columns the row names, in its order.
+        names: Vec<&'static str>,
     },
 }
 
@@ -178,7 +183,7 @@ pub(super) type Sent = Option<(Address, Option<Address>)>;
 ///
 /// # Errors
 ///
-/// Returns [`DeriveError::Width`] when a derivation computes a row that does not match
+/// Returns [`DeriveError::Columns`] when a derivation computes a row that does not match
 /// its table, a bug in it that stops the run.
 pub(super) fn rows(
     derivations: &[Derivation],
@@ -193,7 +198,7 @@ pub(super) fn rows(
     {
         match derivation.rows(decoded, sent) {
             Ok(rows) => derived.extend(rows),
-            Err(error @ DeriveError::Width { .. }) => return Err(error),
+            Err(error @ DeriveError::Columns { .. }) => return Err(error),
             Err(error @ DeriveError::Argument { .. }) => {
                 metrics::derive_failed(derivation.table);
                 warn!(%chain, table = derivation.table, address = %decoded.address,
@@ -287,7 +292,7 @@ mod tests {
     use crate::wire::envelope::{ChainId, Decoded, TypedValue};
 
     use super::metric::{SWAPS, fixtures};
-    use super::{DERIVATIONS, Derivation, DeriveError, rows};
+    use super::{DERIVATIONS, Derivation, DeriveError, Row, rows};
 
     /// Every derivation's pinned signature is declared in the shipped protocols, so the
     /// catalog declares its table: an ABI edit that changes the event fails here, not at
@@ -319,20 +324,30 @@ mod tests {
         );
     }
 
-    /// A row with more or fewer values than its table has columns is refused as a bug in
-    /// the derivation, rather than stored short or with a value past the last column.
+    /// A row that does not name its table's columns in order is refused as a bug in the
+    /// derivation: one value short, one over, or two of one type swapped, rather than
+    /// stored short, shifted, or with values under each other's columns.
     #[test]
-    fn a_row_of_the_wrong_width_is_an_error() {
-        fn short(decoded: &Decoded) -> Result<Vec<Vec<TypedValue>>, DeriveError> {
+    fn a_row_not_naming_its_columns_in_order_is_an_error() {
+        fn short(decoded: &Decoded) -> Result<Vec<Row>, DeriveError> {
             let mut rows = (SWAPS.derive)(decoded)?;
             for row in &mut rows {
                 row.pop();
             }
             Ok(rows)
         }
+        fn swapped(decoded: &Decoded) -> Result<Vec<Row>, DeriveError> {
+            let mut rows = (SWAPS.derive)(decoded)?;
+            for row in &mut rows {
+                row.swap(2, 3);
+            }
+            Ok(rows)
+        }
         let chain = ChainId::new("base");
         let swap = fixtures::swap(U256::ZERO, U256::ZERO, U256::ZERO);
-        let columns = SWAPS.columns.len();
+        let declared: Vec<&str> = SWAPS.columns.iter().map(|&(name, _)| name).collect();
+        let mut exchanged = declared.clone();
+        exchanged.swap(2, 3);
         for (case, derivation, expected) in [
             (
                 "a surplus value",
@@ -340,7 +355,7 @@ mod tests {
                     columns: &SWAPS.columns[1..],
                     ..SWAPS
                 },
-                (columns, columns - 1),
+                declared.clone(),
             ),
             (
                 "a missing value",
@@ -348,19 +363,21 @@ mod tests {
                     derive: short,
                     ..SWAPS
                 },
-                (columns - 1, columns),
+                declared[..declared.len() - 1].to_vec(),
+            ),
+            (
+                "amount0_raw and amount1_raw swapped",
+                Derivation {
+                    derive: swapped,
+                    ..SWAPS
+                },
+                exchanged,
             ),
         ] {
             match rows(&[derivation], &chain, &swap, None) {
-                Err(DeriveError::Width {
-                    table,
-                    values,
-                    columns,
-                }) => assert_eq!(
-                    (table, (values, columns)),
-                    (SWAPS.table, expected),
-                    "{case}"
-                ),
+                Err(DeriveError::Columns { table, names }) => {
+                    assert_eq!((table, names), (SWAPS.table, expected), "{case}");
+                }
                 other => panic!("{case}: {other:?}"),
             }
         }

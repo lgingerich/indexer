@@ -56,7 +56,7 @@ use alloy_primitives::{Bytes, I256, U256};
 use crate::sink::table::ColumnType;
 use crate::wire::envelope::{Decoded, TypedValue};
 
-use super::{Derivation, DeriveError, address, array, int, uint};
+use super::{Derivation, DeriveError, Row, address, array, int, uint};
 
 /// `metric_v1_swaps`: one row per pool `Swap`.
 pub(super) const SWAPS: Derivation = Derivation {
@@ -81,8 +81,8 @@ pub(super) const SWAPS: Derivation = Derivation {
     derive: swap,
 };
 
-/// A `Swap`'s row, in [`SWAPS`]' column order.
-fn swap(decoded: &Decoded) -> Result<Vec<Vec<TypedValue>>, DeriveError> {
+/// A `Swap`'s row.
+fn swap(decoded: &Decoded) -> Result<Vec<Row>, DeriveError> {
     let sender = address(decoded, 0, "sender")?;
     let recipient = address(decoded, 1, "recipient")?;
     let details = uint(decoded, 2, "details", 256)?;
@@ -90,20 +90,32 @@ fn swap(decoded: &Decoded) -> Result<Vec<Vec<TypedValue>>, DeriveError> {
     let fees = uint(decoded, 4, "platformFees", 256)?;
     let amount0 = signed_bits(deltas, 128, 128);
     Ok(vec![vec![
-        TypedValue::Address { value: sender },
-        TypedValue::Address { value: recipient },
-        signed(amount0, 128),
-        signed(signed_bits(deltas, 0, 128), 128),
-        TypedValue::Bool {
-            value: amount0.is_positive(),
-        },
-        TypedValue::Bool {
-            value: details.bit(120),
-        },
-        signed(signed_bits(details, 104, 16), 16),
-        unsigned(bits(details, 0, 104), 104),
-        unsigned(bits(fees, 128, 128), 128),
-        unsigned(bits(fees, 0, 128), 128),
+        ("sender", TypedValue::Address { value: sender }),
+        ("recipient", TypedValue::Address { value: recipient }),
+        ("amount0_raw", signed(amount0, 128)),
+        ("amount1_raw", signed(signed_bits(deltas, 0, 128), 128)),
+        (
+            "zero_for_one",
+            TypedValue::Bool {
+                value: amount0.is_positive(),
+            },
+        ),
+        (
+            "exact_input",
+            TypedValue::Bool {
+                value: details.bit(120),
+            },
+        ),
+        ("bin_idx_after", signed(signed_bits(details, 104, 16), 16)),
+        ("pos_in_bin_after", unsigned(bits(details, 0, 104), 104)),
+        (
+            "platform_spread_fee_scaled",
+            unsigned(bits(fees, 128, 128), 128),
+        ),
+        (
+            "platform_notional_fee_scaled",
+            unsigned(bits(fees, 0, 128), 128),
+        ),
     ]])
 }
 
@@ -125,17 +137,17 @@ pub(super) const BIN_FILLS: Derivation = Derivation {
     derive: bin_fill,
 };
 
-/// A `BinSwapped`'s row, in [`BIN_FILLS`]' column order.
-fn bin_fill(decoded: &Decoded) -> Result<Vec<Vec<TypedValue>>, DeriveError> {
+/// A `BinSwapped`'s row.
+fn bin_fill(decoded: &Decoded) -> Result<Vec<Row>, DeriveError> {
     let bin = bin_index(int(decoded, 0, "binIdx", 256)?, 0, "binIdx")?;
     let deltas = uint(decoded, 1, "binDeltas", 256)?;
     let fees = uint(decoded, 2, "fees", 256)?;
     Ok(vec![vec![
-        bin,
-        signed(signed_bits(deltas, 128, 128), 128),
-        signed(signed_bits(deltas, 0, 128), 128),
-        unsigned(bits(fees, 128, 128), 128),
-        unsigned(bits(fees, 0, 128), 128),
+        ("bin_idx", bin),
+        ("delta0_scaled", signed(signed_bits(deltas, 128, 128), 128)),
+        ("delta1_scaled", signed(signed_bits(deltas, 0, 128), 128)),
+        ("lp_fee_scaled", unsigned(bits(fees, 128, 128), 128)),
+        ("platform_fee_scaled", unsigned(bits(fees, 0, 128), 128)),
     ]])
 }
 
@@ -167,9 +179,8 @@ pub(super) const LIQUIDITY: Derivation = Derivation {
     derive: liquidity,
 };
 
-/// A `LiquidityAdded` or `LiquidityRemoved`'s rows, one per bin, in [`LIQUIDITY`]'
-/// column order.
-fn liquidity(decoded: &Decoded) -> Result<Vec<Vec<TypedValue>>, DeriveError> {
+/// A `LiquidityAdded` or `LiquidityRemoved`'s rows, one per bin.
+fn liquidity(decoded: &Decoded) -> Result<Vec<Row>, DeriveError> {
     let removed = decoded.name == "LiquidityRemoved";
     let direction = if removed { "remove" } else { "add" };
     let owner = address(decoded, 0, "provider")?;
@@ -229,16 +240,19 @@ fn liquidity(decoded: &Decoded) -> Result<Vec<Vec<TypedValue>>, DeriveError> {
             )
             .ok_or_else(|| element(4, "shares", "entries within int256"))?;
             Ok(vec![
-                TypedValue::String {
-                    value: Bytes::from_static(direction.as_bytes()),
-                    text: Some(direction.to_owned()),
-                },
-                TypedValue::Address { value: owner },
-                unsigned(salt, 80),
-                bin,
-                signed(delta0, 256),
-                signed(delta1, 256),
-                signed(shares, 256),
+                (
+                    "direction",
+                    TypedValue::String {
+                        value: Bytes::from_static(direction.as_bytes()),
+                        text: Some(direction.to_owned()),
+                    },
+                ),
+                ("owner", TypedValue::Address { value: owner }),
+                ("salt", unsigned(salt, 80)),
+                ("bin_idx", bin),
+                ("delta0_scaled", signed(delta0, 256)),
+                ("delta1_scaled", signed(delta1, 256)),
+                ("shares", signed(shares, 256)),
             ])
         })
         .collect()
@@ -268,9 +282,8 @@ pub(super) const POOL_BINS: Derivation = Derivation {
     derive: pool_bins,
 };
 
-/// A `PoolCreated`'s rows, one per bin from the lowest to the highest, in [`POOL_BINS`]'
-/// column order.
-fn pool_bins(decoded: &Decoded) -> Result<Vec<Vec<TypedValue>>, DeriveError> {
+/// A `PoolCreated`'s rows, one per bin from the lowest to the highest.
+fn pool_bins(decoded: &Decoded) -> Result<Vec<Row>, DeriveError> {
     let pool = address(decoded, 0, "poolAddress")?;
     let bin0_lower = int(decoded, 18, "curBinDistFromProvidedPriceE6", 24)?;
     let above = ladder_side(
@@ -285,13 +298,13 @@ fn pool_bins(decoded: &Decoded) -> Result<Vec<Vec<TypedValue>>, DeriveError> {
     )?;
     let row = |index: I256, [length, buy, sell]: [U256; 3], lower: I256, upper: I256| {
         vec![
-            TypedValue::Address { value: pool },
-            signed(index, 16),
-            unsigned_small(length),
-            unsigned_small(buy),
-            unsigned_small(sell),
-            signed(lower, 64),
-            signed(upper, 64),
+            ("pool", TypedValue::Address { value: pool }),
+            ("bin_idx", signed(index, 16)),
+            ("length_e6", unsigned_small(length)),
+            ("add_fee_buy_e6", unsigned_small(buy)),
+            ("add_fee_sell_e6", unsigned_small(sell)),
+            ("lower_e6", signed(lower, 64)),
+            ("upper_e6", signed(upper, 64)),
         ]
     };
     let mut rows = Vec::with_capacity(above.len() + below.len());
@@ -621,7 +634,7 @@ mod tests {
 
     use crate::wire::envelope::{ChainId, TypedValue};
 
-    use super::super::DeriveError;
+    use super::super::{DeriveError, Row};
     use super::fixtures::{catalog, details, int128s, uint128s};
     use super::{
         BIN_FILLS, LIQUIDITY, POOL_BINS, SWAPS, bin_fill, fixtures, liquidity, pool_bins, swap,
@@ -642,10 +655,21 @@ mod tests {
         (U256::ONE << 104) - U256::ONE
     }
 
+    /// The values of the rows a derivation computed, in its order. Which column each
+    /// value names is checked against the table by `Derivation::rows`, for every
+    /// derivation in `pool_events_decoded_against_the_shipped_abi_fill_their_tables`.
+    fn unnamed(derived: Result<Vec<Row>, DeriveError>) -> Vec<Vec<TypedValue>> {
+        derived
+            .expect("derives")
+            .into_iter()
+            .map(|row| row.into_iter().map(|(_, value)| value).collect())
+            .collect()
+    }
+
     /// Asserts that `derived` refused argument `position`, `name`, for not holding
     /// `expected`.
     fn refused(
-        derived: Result<Vec<Vec<TypedValue>>, DeriveError>,
+        derived: Result<Vec<Row>, DeriveError>,
         position: usize,
         name: &str,
         expected: &str,
@@ -712,8 +736,7 @@ mod tests {
             ),
         ];
         for (details, amounts, fees, expected) in cases {
-            let [values] = &swap(&fixtures::swap(details, amounts, fees)).expect("derives")[..]
-            else {
+            let [values] = &unnamed(swap(&fixtures::swap(details, amounts, fees)))[..] else {
                 panic!("one row");
             };
             assert_eq!(values.len(), SWAPS.columns.len());
@@ -777,7 +800,7 @@ mod tests {
             ),
         ];
         for (bin_idx, deltas, fees, expected) in cases {
-            let rows = bin_fill(&fixtures::bin_swapped(bin_idx, deltas, fees)).expect("derives");
+            let rows = unnamed(bin_fill(&fixtures::bin_swapped(bin_idx, deltas, fees)));
             assert_eq!(rows, [expected]);
         }
         for outside in [i32::from(i16::MIN) - 1, i32::from(i16::MAX) + 1] {
@@ -803,11 +826,10 @@ mod tests {
             value: Address::repeat_byte(0x0e),
         };
         let salt = uint(U256::from(7), 80);
-        let rows = liquidity(&fixtures::liquidity(
+        let rows = unnamed(liquidity(&fixtures::liquidity(
             false,
             &[(-2, 5, 0), (0, 3, 4)].map(|(bin, d0, d1)| (bin, d0, d1, 10)),
-        ))
-        .expect("derives");
+        )));
         assert_eq!(
             rows,
             [
@@ -831,7 +853,7 @@ mod tests {
                 ],
             ]
         );
-        let rows = liquidity(&fixtures::liquidity(true, &[(1, -5, -6, 10)])).expect("derives");
+        let rows = unnamed(liquidity(&fixtures::liquidity(true, &[(1, -5, -6, 10)])));
         assert_eq!(
             rows,
             [vec![
@@ -898,7 +920,7 @@ mod tests {
                 int(upper, 64),
             ]
         };
-        let rows = pool_bins(&fixtures::pool_created(-50, above, below)).expect("derives");
+        let rows = unnamed(pool_bins(&fixtures::pool_created(-50, above, below)));
         assert_eq!(
             rows,
             [
@@ -912,8 +934,11 @@ mod tests {
                 bin(1, 200, 0, 0, 50, 250),
             ]
         );
-        let rows = pool_bins(&fixtures::pool_created(0, ladder(&[(7, 0, 0)]), Vec::new()))
-            .expect("derives");
+        let rows = unnamed(pool_bins(&fixtures::pool_created(
+            0,
+            ladder(&[(7, 0, 0)]),
+            Vec::new(),
+        )));
         assert_eq!(rows, [bin(0, 7, 0, 0, 0, 7)]);
     }
 

@@ -35,9 +35,15 @@ pub struct Derivation {
     pub table: &'static str,               // "metric_v1_swaps"
     pub columns: &'static [(&'static str, ColumnType)],
     pub indexes: &'static [&'static [&'static str]], // [["chain", "address", "block_number", "log_index"]]
-    pub derive: fn(&Decoded) -> Result<Vec<Vec<TypedValue>>, DeriveError>, // rows
+    pub derive: fn(&Decoded) -> Result<Vec<Row>, DeriveError>, // rows
 }
+
+type Row = Vec<(&'static str, TypedValue)>; // [("amount0_raw", value), ...]
 ```
+
+A row names each value's column beside it, so two columns of one type (`delta0` and
+`delta1`, `lower` and `upper`) cannot trade values unseen: a row must name the table's
+`columns` in order.
 
 - **No state.** `derive` is a plain function of one record. A derived row carries its
   log's block hash, so a `reorg` deletes it with the block's other rows, a rewind deletes
@@ -72,7 +78,8 @@ pub struct Derivation {
 - **When a record cannot be read** (an argument missing, misnamed, or of another type),
   the derivation logs a warning and adds nothing, as a log that fails to decode keeps
   only its raw record. A row that does not fit its table is a bug in the derivation and
-  stops the run: one with a value too many or too few is refused as it is derived, and
+  stops the run: one that does not name its table's columns in order (a value too many,
+  too few, or two swapped) is refused as it is derived, and
   one whose value does not fit its column, checked on the value rather than its width
   label, is refused by the store.
 - **History.** A derivation covers blocks ingested while it runs. Blocks stored before
