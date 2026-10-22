@@ -89,8 +89,13 @@ named by an environment variable.
 (delta-rs's), and two `reqwest`s. Only an upstream release can align them; CI caches the
 build meanwhile.
 
-## Splitting `delta/mod.rs`
+## Splitting `delta/mod.rs` (done)
 
-**What.** The module is about 900 lines. The repair (`read_ledger`, `repair`,
-`repair_reorgs`) and the expression and read-back helpers could move to their own files,
-as `sql.rs` sits beside `store.rs`.
+`mod.rs` holds the commit protocol alone: the ledger's ordered steps, retractions,
+rewinds, and the `Store` and `EnvelopeSink` impls. Beside it, as `sql.rs` sits beside
+`store.rs`: `settings.rs` (`DeltaSettings`), `lake.rs` (the `Lake` table handle, its
+checkpoints, and `commit_properties`, which `maintenance` shares), `open.rs` (the shared
+object store, `open_table`, and the checks an existing table must pass), `repair.rs`
+(what opening reads back and repairs), and `expr.rs` (the filter expressions and
+read-back helpers). `maintenance` takes each table's partition width from the store
+rather than reading it through the parent module.

@@ -17,7 +17,8 @@ use deltalake::datafusion::prelude::ident;
 use deltalake::kernel::{DataType, StructField};
 use deltalake::{DeltaTable, ensure_table_uri};
 
-use super::{DeltaSettings, DeltaSink, in_texts, maintenance, texts, texts_of};
+use super::expr::{in_texts, texts, texts_of};
+use super::{DeltaSettings, DeltaSink, maintenance};
 use crate::sink::table::{Schema, Table, TableId};
 use crate::sink::{EnvelopeSink, Operation, SinkError, Store as _, StoreError, fixtures};
 use crate::wire::envelope::{Block, BlockMeta, ChainId, Envelope, Event, Log, Reorg, Transaction};
@@ -768,7 +769,7 @@ fn files_by_partition(sink: &DeltaSink, table: Table) -> std::collections::BTree
     {
         let partition = file
             .partition_values_map()
-            .remove(super::PARTITION)
+            .remove(super::arrow::PARTITION)
             .flatten()
             .expect("a partition");
         *files.entry(partition).or_default() += 1;
@@ -791,16 +792,17 @@ async fn maintenance_compacts_finished_partitions_and_vacuums_what_they_replaced
 
     let position = sink.positions[&TableId::Dataset(Table::Block)];
     let mut table = sink.lakes[position].table.clone();
+    let width = sink.lakes[position].width;
     let writer = sink.writer.clone();
     // Partition 0 ends at 99_999: one height short of the window past it, nothing moves.
     let short = 100_000 + crate::ingest::pipeline::MAX_UNFINALIZED_BLOCKS as u64 - 1;
     assert_eq!(
-        maintenance::compact("blocks", &mut table, short, &writer)
+        maintenance::compact("blocks", &mut table, width, short, &writer)
             .await
             .expect("compacts"),
         0
     );
-    let compacted = maintenance::compact("blocks", &mut table, short + 1, &writer)
+    let compacted = maintenance::compact("blocks", &mut table, width, short + 1, &writer)
         .await
         .expect("compacts");
     assert_eq!(compacted, 1);
@@ -813,7 +815,7 @@ async fn maintenance_compacts_finished_partitions_and_vacuums_what_they_replaced
     assert_eq!(stored(&sink, Table::Block, "hash").await, expected(&held));
 
     let on_disk = |partition: &str| {
-        std::fs::read_dir(dir.table(&format!("blocks/{}={partition}", super::PARTITION)))
+        std::fs::read_dir(dir.table(&format!("blocks/{}={partition}", super::arrow::PARTITION)))
             .expect("the partition directory")
             .filter(|entry| {
                 entry
@@ -843,9 +845,15 @@ async fn the_writer_commits_past_a_compaction_it_did_not_see() {
     let position = sink.positions[&TableId::Dataset(Table::Block)];
     let mut behind = sink.lakes[position].table.clone();
     let writer = sink.writer.clone();
-    maintenance::compact("blocks", &mut behind, 104_097, &writer)
-        .await
-        .expect("compacts");
+    maintenance::compact(
+        "blocks",
+        &mut behind,
+        sink.lakes[position].width,
+        104_097,
+        &writer,
+    )
+    .await
+    .expect("compacts");
 
     let mut replacement = vec![reorg(104_097..=104_097, 1)];
     replacement.extend(block(104_097, 1));
@@ -987,16 +995,16 @@ fn ledger_version(sink: &DeltaSink) -> u64 {
 async fn the_checkpoint_interval_counts_across_reopens() {
     let dir = Dir::new();
     let log = log_of(&dir, "accepted_blocks");
-    let half = super::CHECKPOINT_EVERY / 2 + 1;
+    let half = super::lake::CHECKPOINT_EVERY / 2 + 1;
     let mut sink = open(&dir).await;
     accept(&mut sink, 1..=half).await;
     drop(sink);
     assert!(!log.join("_last_checkpoint").exists(), "checkpointed early");
     let mut sink = open(&dir).await;
-    accept(&mut sink, half + 1..=super::CHECKPOINT_EVERY).await;
+    accept(&mut sink, half + 1..=super::lake::CHECKPOINT_EVERY).await;
     assert_eq!(
         wait_for_checkpoint(&log).await,
-        super::CHECKPOINT_EVERY,
+        super::lake::CHECKPOINT_EVERY,
         "the version that reached the interval"
     );
 }
@@ -1008,8 +1016,11 @@ async fn opening_starts_a_checkpoint_that_is_due() {
     let dir = Dir::new();
     let log = log_of(&dir, "accepted_blocks");
     let mut sink = open(&dir).await;
-    accept(&mut sink, 1..=super::CHECKPOINT_EVERY + 1).await;
-    assert_eq!(wait_for_checkpoint(&log).await, super::CHECKPOINT_EVERY);
+    accept(&mut sink, 1..=super::lake::CHECKPOINT_EVERY + 1).await;
+    assert_eq!(
+        wait_for_checkpoint(&log).await,
+        super::lake::CHECKPOINT_EVERY
+    );
     drop(sink);
     // As if the process stopped before the checkpoint was written.
     for entry in std::fs::read_dir(&log).expect("the log").flatten() {
@@ -1021,7 +1032,7 @@ async fn opening_starts_a_checkpoint_that_is_due() {
     let _sink = open(&dir).await;
     assert_eq!(
         wait_for_checkpoint(&log).await,
-        super::CHECKPOINT_EVERY + 1,
+        super::lake::CHECKPOINT_EVERY + 1,
         "a checkpoint of the table as it was opened"
     );
 }
@@ -1035,9 +1046,12 @@ async fn an_append_after_a_checkpoint_carries_on_from_it() {
     let dir = Dir::new();
     let log = log_of(&dir, "accepted_blocks");
     let mut sink = open(&dir).await;
-    let last = super::CHECKPOINT_EVERY + 1;
+    let last = super::lake::CHECKPOINT_EVERY + 1;
     accept(&mut sink, 1..=last).await;
-    assert_eq!(wait_for_checkpoint(&log).await, super::CHECKPOINT_EVERY);
+    assert_eq!(
+        wait_for_checkpoint(&log).await,
+        super::lake::CHECKPOINT_EVERY
+    );
     let position = sink.position(Table::AcceptedBlock);
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     while reopened(&sink, position).is_none() {
@@ -1049,7 +1063,7 @@ async fn an_append_after_a_checkpoint_carries_on_from_it() {
     }
     assert_eq!(
         reopened(&sink, position),
-        Some(super::CHECKPOINT_EVERY),
+        Some(super::lake::CHECKPOINT_EVERY),
         "the table as of the checkpoint"
     );
 
@@ -1280,7 +1294,7 @@ async fn keep_stats_on(dir: &Dir, table: Table, columns: &str) {
         .await
         .expect("the table")
         .set_tbl_properties()
-        .with_properties([(super::STATS_COLUMNS.to_owned(), columns.to_owned())].into())
+        .with_properties([(super::open::STATS_COLUMNS.to_owned(), columns.to_owned())].into())
         .await
         .expect("set");
 }
@@ -1291,7 +1305,7 @@ async fn keep_stats_on(dir: &Dir, table: Table, columns: &str) {
 #[tokio::test]
 async fn every_file_keeps_statistics_on_its_height_and_timestamps() {
     assert_eq!(
-        super::STATS_COLUMNS,
+        super::open::STATS_COLUMNS,
         deltalake::TableProperty::DataSkippingStatsColumns.as_ref()
     );
     let dir = Dir::new();

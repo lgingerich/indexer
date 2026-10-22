@@ -16,11 +16,11 @@
 //! - **Log cleanup.** Entries of the transaction log older than the same retention, and
 //!   older than a checkpoint that replaces them, are deleted, once a day. delta-rs would
 //!   otherwise do it after every commit, listing the whole log each time (see
-//!   [`commit_properties`](super::commit_properties)).
+//!   [`commit_properties`](super::lake::commit_properties)).
 //!
 //! Each pass reads every table afresh from its newest checkpoint and lets it go once
 //! done: a table kept from one pass to the next grows by a batch for every commit it is
-//! brought up to date with (see [`Lake::checkpoint_if_due`](super::Lake::checkpoint_if_due)).
+//! brought up to date with (see [`Lake::checkpoint_if_due`](super::lake::Lake::checkpoint_if_due)).
 //!
 //! It is a second writer to the same tables, which the lake's one-writer rule allows
 //! because the two never touch the same file: the writer appends to the newest partition
@@ -43,7 +43,7 @@ use tokio::time::{Instant, MissedTickBehavior};
 use tracing::{info, warn};
 
 use super::arrow::PARTITION;
-use super::{commit_properties, partition_width};
+use super::lake::commit_properties;
 use crate::ingest::pipeline::MAX_UNFINALIZED_BLOCKS;
 use crate::metrics;
 
@@ -79,10 +79,11 @@ impl Drop for Maintenance {
     }
 }
 
-/// Starts maintaining `tables`, each by name and the log store it is read through,
-/// against the committed tip the writer publishes in `tip`. Files go after `retention`.
+/// Starts maintaining `tables`, each by name, the log store it is read through, and the
+/// partition width it was opened with, against the committed tip the writer publishes in
+/// `tip`. Files go after `retention`.
 pub(super) fn spawn(
-    tables: Vec<(String, LogStoreRef)>,
+    tables: Vec<(String, LogStoreRef, u64)>,
     tip: Arc<AtomicU64>,
     retention: Duration,
     writer: WriterProperties,
@@ -91,7 +92,7 @@ pub(super) fn spawn(
 }
 
 async fn run(
-    tables: Vec<(String, LogStoreRef)>,
+    tables: Vec<(String, LogStoreRef, u64)>,
     tip: Arc<AtomicU64>,
     retention: Duration,
     writer: WriterProperties,
@@ -102,15 +103,21 @@ async fn run(
     loop {
         passes.tick().await;
         let vacuum = vacuumed.elapsed() >= VACUUM_EVERY;
-        for (name, log_store) in &tables {
+        for (name, log_store, width) in &tables {
             let mut table = DeltaTable::new(Arc::clone(log_store));
             if let Err(error) = table.load().await {
                 metrics::lake_maintenance_failed("load");
                 warn!(table = %name, %error, "lake table unreadable for maintenance; retrying next pass");
                 continue;
             }
-            if let Err(error) =
-                compact(name, &mut table, tip.load(Ordering::Acquire), &writer).await
+            if let Err(error) = compact(
+                name,
+                &mut table,
+                *width,
+                tip.load(Ordering::Acquire),
+                &writer,
+            )
+            .await
             {
                 metrics::lake_maintenance_failed("compact");
                 warn!(table = %name, %error, "lake compaction failed; retrying next pass");
@@ -130,18 +137,19 @@ async fn run(
     }
 }
 
-/// Compacts every partition of the table `name` the committed `tip` has finished that
-/// still holds small files, returning how many it compacted. A table with no partition
-/// has none to compact.
+/// Compacts every partition of the table `name`, `width` heights wide, the committed
+/// `tip` has finished that still holds small files, returning how many it compacted. A
+/// table with no partition has none to compact.
+///
+/// The width is the one opening checked the table records, so it is not read again here.
 pub(super) async fn compact(
     name: &str,
     table: &mut DeltaTable,
+    width: u64,
     tip: u64,
     writer: &WriterProperties,
 ) -> Result<usize, DeltaTableError> {
     table.update_state().await?;
-    let width = partition_width(table, name)
-        .map_err(|error| DeltaTableError::Generic(error.to_string()))?;
     let mut small: BTreeMap<i64, usize> = BTreeMap::new();
     for file in table.snapshot()?.snapshot().try_log_data()?.iter() {
         let Some(Some(partition)) = file.partition_values_map().remove(PARTITION) else {
