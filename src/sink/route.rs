@@ -23,9 +23,9 @@ use serde::Deserialize;
 use serde::de::{self, Deserializer};
 
 use crate::ingest::source::Datasets;
-use crate::sink::table::{Schema, Table, TableError, TableId};
+use crate::sink::table::{Schema, Table, TableId};
 use crate::sink::{EnvelopeSink, SinkError};
-use crate::wire::envelope::{Envelope, Event};
+use crate::wire::envelope::Envelope;
 
 /// The entry in [`Tables`] that names every contract's decoded event tables — one per
 /// event of every protocol manifest, such as `uniswap_v3_pool_swap` — including those of
@@ -233,34 +233,12 @@ impl<K> Router<K> {
 
 impl<K: EnvelopeSink> EnvelopeSink for Router<K> {
     async fn publish(&mut self, envelope: Envelope) -> Result<(), SinkError> {
-        let tables: [Option<TableId>; 2] = match &envelope.event {
-            Event::Block(_) => [Some(Table::Block.into()), None],
-            Event::Transaction(_) => [Some(Table::Transaction.into()), None],
-            Event::Log(_) => [Some(Table::Log.into()), None],
-            Event::Decoded(decoded) => {
-                let table =
-                    self.schema
-                        .event_table(decoded)
-                        .ok_or_else(|| SinkError::UnknownEvent {
-                            protocol: decoded.protocol.clone(),
-                            contract: decoded.contract.clone(),
-                            event: decoded.name.clone(),
-                        })?;
-                [Some(Table::Decoded.into()), Some(table.id)]
-            }
-            Event::Derived(derived) => {
-                let table = self.schema.derived_table(&derived.table).ok_or_else(|| {
-                    TableError::UnknownTable {
-                        table: derived.table.clone(),
-                    }
-                })?;
-                [Some(table.id), None]
-            }
-            Event::Contract(_) | Event::Reorg(_) | Event::AcceptedBlock(_) => [None, None],
-        };
-        let everywhere = tables == [None, None];
+        let (table, typed) = self.schema.tables_for(&envelope.event)?;
+        let everywhere = matches!(table, TableId::Dataset(table) if table.is_bookkeeping());
         let takes = |written: &HashSet<TableId>| {
-            everywhere || tables.iter().flatten().any(|id| written.contains(id))
+            everywhere
+                || written.contains(&table)
+                || typed.is_some_and(|typed| written.contains(&typed))
         };
         let Some(last) = self.sinks.iter().rposition(|(_, written)| takes(written)) else {
             return Ok(());

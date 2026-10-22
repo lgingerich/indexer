@@ -88,9 +88,9 @@ impl Batch {
     ///
     /// # Errors
     ///
-    /// Returns [`SinkError::UnknownEvent`] for a decoded record no event table holds,
-    /// which means it was decoded against a different catalog than the store opened with,
-    /// and [`SinkError::Table`] when a row cannot be built.
+    /// Returns [`SinkError::Table`] for a decoded record no event table holds, which
+    /// means it was decoded against a different catalog than the store opened with, and
+    /// when a row cannot be built.
     pub(super) fn push(&mut self, envelope: &Envelope) -> Result<(), SinkError> {
         if let Event::AcceptedBlock(block) = &envelope.event
             && let Some(held) = self.held.remove(&block.height)
@@ -157,26 +157,22 @@ impl Batch {
             *height = (*height).min(reorg.height);
             orphaned.extend(hashes);
         }
-        if let Event::Decoded(decoded) = &envelope.event {
-            let row = self
-                .schema
-                .event_row(&envelope.chain, decoded)?
-                .ok_or_else(|| SinkError::UnknownEvent {
-                    protocol: decoded.protocol.clone(),
-                    contract: decoded.contract.clone(),
-                    event: decoded.name.clone(),
-                })?;
+        // Only the rows of tables this store writes are rendered.
+        let (table, typed) = self.schema.tables_for(&envelope.event)?;
+        if let Event::Decoded(decoded) = &envelope.event
+            && typed.is_some_and(|typed| self.schema.writes(typed))
+            && let Some(row) = self.schema.event_row(&envelope.chain, decoded)?
+        {
             self.keep(row);
         }
-        let row = self.schema.row(&envelope.chain, &envelope.event)?;
-        self.keep(row);
+        if self.schema.writes(table) {
+            let row = self.schema.row(&envelope.chain, &envelope.event)?;
+            self.keep(row);
+        }
         Ok(())
     }
 
     fn keep(&mut self, row: Row) {
-        if !self.schema.writes(row.table().id) {
-            return;
-        }
         self.bytes += row_size(&row);
         self.rows.push(row);
     }
@@ -275,8 +271,12 @@ fn value_size(value: &Value) -> usize {
 mod tests {
     use alloy_primitives::B256;
 
+    use std::collections::HashSet;
+    use std::sync::Arc;
+
     use super::Batch;
-    use crate::sink::table::{Table, TableId};
+    use crate::sink::SinkError;
+    use crate::sink::table::{Table, TableError, TableId};
     use crate::wire::envelope::{Block, BlockMeta, ChainId, Envelope, Event};
 
     fn meta(height: u64, tag: u8) -> BlockMeta {
@@ -346,6 +346,34 @@ mod tests {
                 Table::AcceptedBlock.into()
             ]
         );
+    }
+
+    /// A decoded record keeps only the rows of the tables the store writes, and one whose
+    /// event no table holds is refused, whether or not the store writes event tables.
+    #[test]
+    fn a_decoded_record_keeps_the_rows_its_store_writes() {
+        let schema = crate::sink::fixtures::schema();
+        let swap = crate::sink::fixtures::decoded_swap();
+        let typed = schema.event_table(&swap).expect("the swap's table").id;
+        let only_decoded = HashSet::from([Table::Decoded.into()]);
+        for (written, expected) in [
+            (HashSet::from([typed]), typed),
+            (only_decoded, Table::Decoded.into()),
+        ] {
+            let mut batch = Batch::new(Arc::new(schema.select(&written)));
+            let envelope =
+                Envelope::new(ChainId::new("base"), Event::Decoded(Box::new(swap.clone())));
+            batch.push(&envelope).expect("buffered");
+            assert_eq!(tables(&batch), [expected]);
+
+            let mut unknown = swap.clone();
+            unknown.event_id = B256::repeat_byte(0xee);
+            let unknown = Envelope::new(ChainId::new("base"), Event::Decoded(Box::new(unknown)));
+            assert!(matches!(
+                batch.push(&unknown),
+                Err(SinkError::Table(TableError::UnknownEvent { .. }))
+            ));
+        }
     }
 
     /// What is still to reconcile outlives a commit: the drain commits on its own

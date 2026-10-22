@@ -328,6 +328,17 @@ pub enum TableError {
         /// The event's kind.
         kind: &'static str,
     },
+    /// A decoded record names an event no event table holds: it was decoded against a
+    /// different catalog than the schema was built from.
+    #[error("no event table holds {protocol}.{contract}.{event}")]
+    UnknownEvent {
+        /// The record's protocol.
+        protocol: String,
+        /// The record's contract.
+        contract: String,
+        /// The record's event name.
+        event: String,
+    },
     /// A derived record names a table the schema does not have.
     #[error("no derived table is named {table}")]
     UnknownTable {
@@ -619,6 +630,43 @@ impl Schema {
             decoded.contract.clone(),
             decoded.event_id,
         ))
+    }
+
+    /// The tables `event`'s rows go to, written or not: its own table, and for a decoded
+    /// record, its event's typed table beside `decoded_logs`. What the router hands each
+    /// store and what a store buffers are both decided here, so they cannot disagree.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TableError::UnknownEvent`] for a decoded record no event table holds, and
+    /// [`TableError::UnknownTable`] for a derived record no derived table is named for.
+    pub fn tables_for(&self, event: &Event) -> Result<(TableId, Option<TableId>), TableError> {
+        Ok(match event {
+            Event::Block(_) => (Table::Block.into(), None),
+            Event::Transaction(_) => (Table::Transaction.into(), None),
+            Event::Log(_) => (Table::Log.into(), None),
+            Event::Decoded(decoded) => {
+                let table = self
+                    .event_table(decoded)
+                    .ok_or_else(|| TableError::UnknownEvent {
+                        protocol: decoded.protocol.clone(),
+                        contract: decoded.contract.clone(),
+                        event: decoded.name.clone(),
+                    })?;
+                (Table::Decoded.into(), Some(table.id))
+            }
+            Event::Derived(derived) => {
+                let table =
+                    self.derived_table(&derived.table)
+                        .ok_or_else(|| TableError::UnknownTable {
+                            table: derived.table.clone(),
+                        })?;
+                (table.id, None)
+            }
+            Event::Contract(_) => (Table::Contract.into(), None),
+            Event::Reorg(_) => (Table::Reorg.into(), None),
+            Event::AcceptedBlock(_) => (Table::AcceptedBlock.into(), None),
+        })
     }
 
     /// A dataset table's definition.

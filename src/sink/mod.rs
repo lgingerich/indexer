@@ -223,17 +223,6 @@ pub enum SinkError {
     /// gone. A channel sink reports this when the receiving half was dropped.
     #[error("storage has stopped, so the batch cannot be delivered")]
     StorageClosed,
-    /// A decoded record names an event no event table holds: it was decoded against a
-    /// different catalog than the store was opened with.
-    #[error("no event table holds {protocol}.{contract}.{event}")]
-    UnknownEvent {
-        /// The record's protocol.
-        protocol: String,
-        /// The record's contract.
-        contract: String,
-        /// The record's event name.
-        event: String,
-    },
     /// Rendering the envelope for a transport failed.
     #[error("serialize envelope: {0}")]
     Serialize(#[from] serde_json::Error),
