@@ -25,20 +25,29 @@
 //!
 //! # What works
 //!
-//! - EVM live heads over WebSocket and full blocks over JSON-RPC (see
-//!   [`ingest::source::EvmSource`]).
+//! - EVM live heads over WebSocket and blocks, receipts, and logs over JSON-RPC (see
+//!   [`ingest::source::EvmSource`]), fetching only the datasets the sinks' tables need
+//!   — `eth_getLogs` over a range of heights in backfill when logs are all they need —
+//!   or a backfill of the buried heights from Envio `HyperSync` (see
+//!   [`ingest::source::HyperSyncSource`]).
 //! - Per-chain ordering by each dataset's own natural key and reorg
 //!   retraction with a bounded sliding undo window (see [`ingest::Machine`]), resumed
-//!   from the store's ledger of committed blocks after a restart.
+//!   from the stores' ledgers of committed blocks after a restart, every store brought
+//!   to the newest block they all hold.
 //! - Decoding a log against a contract ABI into typed, named arguments, as a
 //!   stateless transform (see [`decode::Decoder`]), and deriving a table from one decoded
 //!   event, a row per record, in the same step.
-//! - A local `DuckDB` store of typed per-dataset tables, behind the `duckdb` feature.
+//! - Any combination of stores, each writing the tables it lists: an embedded `DuckDB`
+//!   database (the `duckdb` feature), `PostgreSQL` over binary COPY (`postgres`), and a
+//!   Delta Lake on S3-compatible storage, written as Parquet (`delta`); or the stream
+//!   printed as NDJSON with no store. See [`sink`].
+//! - Prometheus metrics for heads, commits, lag, and failures (see [`metrics`]).
 //!
 //! # Not built yet
 //!
-//! Mempool, cross-block batching and range logs, aggregation and windowing, filtered
-//! subscriptions, derived state, and the Parquet archiver.
+//! Mempool, re-decoding stored logs, streaming aggregation and windowing, filtered
+//! subscriptions, cross-block transaction batching, and decoding by event signature
+//! alone. The README's "Not built yet" has the detail.
 
 // The EVM source tests nest JSON objects deep enough to exceed the default macro
 // recursion budget.
