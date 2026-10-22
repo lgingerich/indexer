@@ -62,15 +62,15 @@ argument names are sanitized.
 
 **Recommendation.** Keep it: it fails clearly, at startup, for the one store it concerns.
 
-## Compacting `contracts` and `reorgs`
+## Compacting `reorgs`
 
-**What.** Maintenance compacts only partitioned tables. `contracts` and `reorgs` have no
-block partition, and a reorg can delete from any of their files, so a compaction there
-could conflict with the writer's delete. Both grow by a file per commit that touches
-them, which is a discovery or a reorg, so they stay small.
+**What.** Maintenance compacts only partitioned tables. `contracts` declares a block, so
+it is partitioned by `block_range` like the data tables and compacted with them;
+`reorgs` belongs to no block, so it has no partition and is never compacted. It grows by
+a file per reorg, so it stays small.
 
-**Option if it matters.** Compact them from the writer itself, between commits, once
-their file count passes a bound.
+**Option if it matters.** Compact it from the writer itself, between commits, once its
+file count passes a bound.
 
 ## Not tested against S3
 
