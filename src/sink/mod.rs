@@ -22,7 +22,7 @@
 //! - `duckdb` — an embedded `DuckDB` database.
 //! - `postgres` — a remote `PostgreSQL` 18 database with asynchronous transactional COPY.
 //! - [`table`] — the tables a store persists, declared once; `sql` renders their
-//!   statements, and [`store`] is the write path both stores share. Both upsert on
+//!   statements, and `store` is the write path both stores share. Both upsert on
 //!   `(chain, dedupe_key)`.
 //! - [`stdout`] — newline-delimited JSON, for watching the stream.
 //! - `delta` — Delta Lake tables on object storage: the cheap raw-data lake. Not a SQL

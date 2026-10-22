@@ -2,7 +2,7 @@
 //!
 //! Beside the sink rather than in [`crate::config`] because it is the `[sink.stdout]`
 //! table's payload, and every sink keeps its own there: `DuckDB`'s are
-//! [`DuckDbSettings`](crate::sink::duckdb::DuckDbSettings), so where a backend's
+//! `sink::duckdb::DuckDbSettings`, so where a backend's
 //! settings live is one rule rather than one case and one exception.
 
 use crate::wire::envelope::Envelope;
