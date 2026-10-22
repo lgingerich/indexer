@@ -8,6 +8,7 @@ use alloy_json_abi::{Event, JsonAbi};
 use alloy_primitives::{B256, Bytes, keccak256};
 use thiserror::Error;
 
+use super::param::abi_type;
 use crate::wire::datasets::evm::{DecodedArg, Log};
 use crate::wire::typed::{AbiType, TypedValue};
 
@@ -313,7 +314,7 @@ impl PreparedEvent {
             let argument = Argument {
                 name: param.name.clone(),
                 position,
-                schema: AbiType::from(param),
+                schema: abi_type(&param.ty, &param.components),
                 ty,
             };
             if param.indexed {

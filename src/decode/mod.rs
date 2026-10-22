@@ -19,6 +19,7 @@ mod decoder;
 mod derive;
 #[cfg(test)]
 mod fixtures;
+pub(crate) mod param;
 mod sink;
 
 pub use abi::{AbiError, DecodeError};

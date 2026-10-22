@@ -33,7 +33,6 @@
 //! they are our own metadata and not a chain field — the same treatment
 //! [`SCHEMA_VERSION`](crate::wire::envelope::SCHEMA_VERSION) gets.
 
-use alloy_json_abi::{EventParam, Param};
 use alloy_primitives::{Address, B256, Bytes, Function, I256, U256};
 use serde::{Deserialize, Serialize};
 
@@ -57,33 +56,6 @@ pub struct AbiComponent {
     pub name: String,
     /// The component's declared type, including any nested tuple components.
     pub abi_type: AbiType,
-}
-
-impl From<&EventParam> for AbiType {
-    fn from(param: &EventParam) -> Self {
-        Self {
-            kind: param.ty.clone(),
-            components: param.components.iter().map(AbiComponent::from).collect(),
-        }
-    }
-}
-
-impl From<&Param> for AbiType {
-    fn from(param: &Param) -> Self {
-        Self {
-            kind: param.ty.clone(),
-            components: param.components.iter().map(AbiComponent::from).collect(),
-        }
-    }
-}
-
-impl From<&Param> for AbiComponent {
-    fn from(param: &Param) -> Self {
-        Self {
-            name: param.name.clone(),
-            abi_type: AbiType::from(param),
-        }
-    }
 }
 
 /// One decoded ABI value, tagged by its Solidity type.

@@ -454,6 +454,7 @@ impl serde::Serialize for Params<'_> {
 mod tests {
     use alloy_primitives::{Address, B256, Bytes, I256, TxHash, U256};
 
+    use crate::decode::param::abi_type;
     use crate::sink::table::{
         Column, ColumnType, MAX_IDENTIFIER, Schema, TableError, TableId, Value,
     };
@@ -542,7 +543,7 @@ mod tests {
         DecodedArg {
             position: 6,
             name: param.name.clone(),
-            abi_type: AbiType::from(&param),
+            abi_type: abi_type(&param.ty, &param.components),
             value: TypedValue::Array {
                 value: vec![TypedValue::Tuple {
                     value: vec![
