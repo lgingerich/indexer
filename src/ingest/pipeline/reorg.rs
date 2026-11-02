@@ -98,24 +98,24 @@ impl<S: BlockSource + 'static, K: EnvelopeSink> Machine<S, K> {
     ) -> Result<(), PipelineError> {
         let source = Arc::clone(&self.source);
         let mut fetches = Prefetch::new(Self::next(tip.height)?, source.backfill_concurrency());
+        let mut fetch = |height, _| {
+            let source = Arc::clone(&source);
+            async move {
+                let head = (height == target.height).then_some(&target);
+                source.fetch_block(height, head).await
+            }
+        };
         while tip.height < target.height {
-            fetches.fill(
-                target.height,
-                || 1,
-                |height, _| {
-                    let source = Arc::clone(&source);
-                    async move {
-                        let head = (height == target.height).then_some(&target);
-                        source.fetch_block(height, head).await
-                    }
-                },
-            )?;
+            fetches.fill(target.height, || 1, &mut fetch)?;
             let Some((next, _, block)) = fetches.next().await else {
                 break;
             };
             let block = block?;
             let meta = Self::marker(block.meta, next)?;
             if Self::validate_link(tip, meta).is_ok() {
+                // The answered height's slot is requested again before the block is
+                // committed, so the source reads a full set while the sink writes.
+                fetches.fill(target.height, || 1, &mut fetch)?;
                 self.commit(meta, block.events).await?;
                 tip = meta;
                 continue;
@@ -204,7 +204,8 @@ impl<S: BlockSource + 'static, K: EnvelopeSink> Machine<S, K> {
         // The source may change branches during discovery. Recheck the candidate, and the
         // block the walk started from, at their fixed heights before publishing any
         // retraction: both canonical now puts them on the one branch the walk followed.
-        // The two reads are independent, so they share one round trip.
+        // The two reads and the first replacement's fetch are independent, so they share
+        // one round trip; a failed recheck discards the replacement unpublished.
         let at_start = async {
             if start == target {
                 Ok(start)
@@ -212,11 +213,14 @@ impl<S: BlockSource + 'static, K: EnvelopeSink> Machine<S, K> {
                 self.header(start.height).await
             }
         };
-        let (at_target, at_start) = tokio::try_join!(self.header(target.height), at_start)?;
+        let (at_target, at_start, block) = tokio::try_join!(
+            self.header(target.height),
+            at_start,
+            self.replacement(lowest)
+        )?;
         if at_target != target || at_start != start {
             return Err(PipelineError::UnstableSource);
         }
-        let block = self.replacement(lowest).await?;
 
         self.observe_head(target.height);
         let orphaned = self.ring.orphaned(from);
@@ -258,17 +262,13 @@ impl<S: BlockSource + 'static, K: EnvelopeSink> Machine<S, K> {
         let walked_at = |height: u64| walked.get(usize::try_from(height - first).ok()?).copied();
         let source = Arc::clone(&self.source);
         let mut fetches = Prefetch::new(first, source.backfill_concurrency());
+        let mut fetch = |height, _| {
+            let source = Arc::clone(&source);
+            let head = walked_at(height).or_else(|| (height == target.height).then_some(target));
+            async move { source.fetch_block(height, head.as_ref()).await }
+        };
         while tip.height < target.height {
-            fetches.fill(
-                target.height,
-                || 1,
-                |height, _| {
-                    let source = Arc::clone(&source);
-                    let head =
-                        walked_at(height).or_else(|| (height == target.height).then_some(target));
-                    async move { source.fetch_block(height, head.as_ref()).await }
-                },
-            )?;
+            fetches.fill(target.height, || 1, &mut fetch)?;
             let Some((height, _, block)) = fetches.next().await else {
                 break;
             };
@@ -284,6 +284,7 @@ impl<S: BlockSource + 'static, K: EnvelopeSink> Machine<S, K> {
             if !expected {
                 return Err(PipelineError::UnstableSource);
             }
+            fetches.fill(target.height, || 1, &mut fetch)?;
             self.commit(meta, block.events).await?;
             tip = meta;
         }

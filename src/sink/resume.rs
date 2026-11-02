@@ -50,7 +50,7 @@ use std::time::Instant;
 
 use alloy_primitives::B256;
 use futures_util::FutureExt as _;
-use futures_util::future::BoxFuture;
+use futures_util::future::{BoxFuture, try_join_all};
 use tracing::{info, warn};
 
 use crate::sink::channel::Batching;
@@ -180,10 +180,9 @@ pub(crate) struct Resumed {
 pub(crate) async fn resume<S: Store>(
     stores: Vec<Opened<S>>,
 ) -> Result<(Vec<Opened<S>>, Resumed), ResumeError> {
-    let mut read = Vec::with_capacity(stores.len());
-    for opened in stores {
-        read.push(restore(opened).await?);
-    }
+    // Each store reads back on its own runtime, so they read at once rather than each
+    // waiting out the last: a lake's read is a scan of object storage.
+    let read = try_join_all(stores.into_iter().map(restore)).await?;
     let (stores, mut restored): (Vec<_>, Vec<_>) = read.into_iter().unzip();
     let ledgers: Vec<&[BlockMeta]> = restored.iter().map(|r| r.ledger.as_slice()).collect();
     let common = common_block(&ledgers).map_err(|Disjoint| ResumeError::NoCommonBlock {

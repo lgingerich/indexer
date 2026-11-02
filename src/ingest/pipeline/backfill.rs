@@ -62,15 +62,13 @@ impl<S: BlockSource + 'static, K: EnvelopeSink> Machine<S, K> {
         let source = Arc::clone(&self.source);
         // `next` is the first height not yet accepted.
         let mut fetches = Prefetch::new(next, source.backfill_concurrency());
+        let span = || source.backfill_span();
+        let mut fetch = |from, to| {
+            let source = Arc::clone(&source);
+            async move { source.fetch_blocks(from, to).await }
+        };
         loop {
-            fetches.fill(
-                end,
-                || source.backfill_span(),
-                |from, to| {
-                    let source = Arc::clone(&source);
-                    async move { source.fetch_blocks(from, to).await }
-                },
-            )?;
+            fetches.fill(end, span, &mut fetch)?;
             let Some((from, to, answer)) = fetches.next().await else {
                 // Everything requested is accepted, through `end`.
                 if stop == Some(end) {
@@ -91,6 +89,9 @@ impl<S: BlockSource + 'static, K: EnvelopeSink> Machine<S, K> {
                     returned: blocks.len(),
                 });
             }
+            // The answered range's slot is requested again before its blocks are
+            // accepted, so the source reads a full set of ranges while the sink writes.
+            fetches.fill(end, span, &mut fetch)?;
             for (height, block) in (from..=to).zip(blocks) {
                 self.accept(height, block).await?;
             }

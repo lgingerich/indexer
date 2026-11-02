@@ -4,6 +4,7 @@
 
 use std::sync::Arc;
 
+use futures_util::future::try_join_all;
 use tracing::{Instrument as _, info, info_span};
 
 use crate::decode::{Catalog, Decoder, DecodingSink};
@@ -31,30 +32,34 @@ impl<B: BlockSource + 'static> Pipeline<B> {
         routes: Vec<StoreRoute>,
     ) -> Result<Vec<Opened<AnyStore>>, RuntimeError> {
         let chain = self.source.chain().as_str().to_owned();
-        let mut stores = Vec::with_capacity(routes.len());
-        for StoreRoute { settings, tables } in routes {
+        // Each store opens on its own runtime, so they open at once rather than each
+        // waiting out the last.
+        let opens = routes.into_iter().map(|StoreRoute { settings, tables }| {
             let backend = settings.backend();
             let batching = settings.batching();
             let schema = Arc::new(self.schema.select(&tables));
-            let runtime =
-                StoreRuntime::dedicated(backend).map_err(|source| RuntimeError::StoreRuntime {
-                    store: backend,
-                    source,
-                })?;
             let chain = chain.clone();
-            let store = runtime
-                .run(async move { AnyStore::open(settings, schema, &chain).await })
-                .await
-                .map_err(opening(backend))?;
-            stores.push(Opened {
-                backend,
-                store,
-                batching,
-                tables,
-                runtime,
-            });
-        }
-        Ok(stores)
+            async move {
+                let runtime = StoreRuntime::dedicated(backend).map_err(|source| {
+                    RuntimeError::StoreRuntime {
+                        store: backend,
+                        source,
+                    }
+                })?;
+                let store = runtime
+                    .run(async move { AnyStore::open(settings, schema, &chain).await })
+                    .await
+                    .map_err(opening(backend))?;
+                Ok(Opened {
+                    backend,
+                    store,
+                    batching,
+                    tables,
+                    runtime,
+                })
+            }
+        });
+        try_join_all(opens).await
     }
 
     /// Runs against open `stores`: brings them to one block, then ingests into each the
