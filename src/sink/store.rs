@@ -337,7 +337,7 @@ impl<E: Engine> SqlStore<E> {
     /// How many rows are buffered for the next flush.
     #[cfg(test)]
     pub(crate) fn buffered(&self) -> usize {
-        self.batch.rows.len()
+        self.batch.len()
     }
 
     /// Writes the batch in one transaction, clears it, then vacuums the staging tables that
@@ -456,8 +456,8 @@ impl<E: Engine + 'static> Store for SqlStore<E> {
         })
     }
 
-    fn reconcile(&mut self, held: &[BlockMeta]) {
-        self.batch.reconcile(held);
+    fn reconcile(&mut self, held: &[BlockMeta]) -> Result<(), StoreError> {
+        self.batch.reconcile(held)
     }
 
     /// One transaction, so a stop part-way leaves the store as it was.

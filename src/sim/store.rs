@@ -332,12 +332,12 @@ impl Store for SimStore {
         Ok(restored)
     }
 
-    fn reconcile(&mut self, held: &[BlockMeta]) {
+    fn reconcile(&mut self, held: &[BlockMeta]) -> Result<(), StoreError> {
         self.held = held
             .iter()
             .map(|block| (block.height, block.hash))
             .collect();
-        self.inner.reconcile(held);
+        self.inner.reconcile(held)
     }
 
     async fn rewind(&mut self, height: u64) -> Result<(), StoreError> {

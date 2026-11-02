@@ -1,11 +1,12 @@
 //! Log decoding and factory discovery for ingestion.
 //!
 //! The decoder holds the catalog and the *contract set*: every address it decodes, mapped
-//! to its catalog entry. Seeds come from the manifests; discovered contracts join the set the
-//! moment their creation log is seen, so a child that emits later in the same block —
-//! even the same transaction, as a pool's `Initialize` follows its `PoolCreated` — is
-//! decoded too. A reorg retracts the children created in orphaned blocks; the replacement
-//! block's creation log re-adds them.
+//! to its catalog entry. Seeds come from the manifests, and the contracts a previous run
+//! discovered are restored as the decoder is built, before it decodes anything. A
+//! discovered contract joins the set once its creation log is published, so a child that
+//! emits later in the same block — even the same transaction, as a pool's `Initialize`
+//! follows its `PoolCreated` — is decoded too. A reorg retracts the children created in
+//! orphaned blocks; the replacement block's creation log re-adds them.
 //!
 //! A child is read from its creation log's address argument alone, so an unrelated
 //! argument that fails to decode still discovers it, and only that log's record is lost.
@@ -21,28 +22,58 @@ use super::catalog::{Catalog, EntryId};
 use crate::sink::StoredContract;
 use crate::wire::datasets::evm::{Contract, Decoded, Log};
 
-/// What one log produced: its decoded record, and any contracts its event created.
+/// A log's decoded record, with the catalog entry and event it decoded as.
 #[derive(Debug)]
-pub struct Decoding {
-    /// The decoded record, or why the log did not decode. A caller may skip a bad log and
-    /// keep its raw record, but must stop on an internal invariant failure.
-    pub decoded: Result<Decoded, DecodeError>,
-    /// The contracts this log created, in rule order.
-    pub discovered: Vec<Contract>,
+pub struct Record {
+    /// The record.
+    pub decoded: Decoded,
     /// The catalog entry and event the record decoded as, which its derivations are bound
-    /// to; `None` when it did not decode.
-    pub(crate) event: Option<(EntryId, EventKey)>,
+    /// to.
+    pub(super) event: (EntryId, EventKey),
+}
+
+/// The contracts one creation log discovered, not yet in the set.
+///
+/// [`Decoder::decode`] leaves the set as it was, so a log whose records are never
+/// published, because the sink after it failed, discovers nothing: the same log seen
+/// again claims its contracts again and publishes them. [`Decoder::admit`] records them
+/// once they are published.
+#[derive(Debug)]
+#[must_use = "a discovered contract decodes only once its claim is admitted"]
+pub struct Claims {
+    /// Each contract the log created, in rule order, with the catalog entry it decodes
+    /// as.
+    contracts: Vec<(EntryId, Contract)>,
+}
+
+impl Claims {
+    /// The contracts claimed, in rule order: the rows to publish before
+    /// [`Decoder::admit`].
+    #[must_use]
+    pub fn contracts(&self) -> impl ExactSizeIterator<Item = &Contract> {
+        self.contracts.iter().map(|(_, contract)| contract)
+    }
 }
 
 /// One address in the contract set.
 #[derive(Debug, Clone)]
 struct Member {
     entry: EntryId,
-    /// The block hashes of its creation logs, which a reorg can orphan; it leaves the set
-    /// once all are. `None` for a seed. A restored contract keeps its stored block hashes:
-    /// a restart resumes with the previous run's undo window, so a reorg can still orphan
-    /// a block that created it.
-    created: Option<Vec<B256>>,
+    origin: Origin,
+}
+
+/// How an address joined the contract set.
+#[derive(Debug, Clone)]
+enum Origin {
+    /// A manifest lists it. A seed is never retracted.
+    Seed,
+    /// A creation log discovered it, in this run or a previous one. A restored contract
+    /// keeps its stored block hashes: a restart resumes with the previous run's undo
+    /// window, so a reorg can still orphan a block that created it.
+    ///
+    /// It holds the block hashes of its creation logs, which a reorg can orphan: never
+    /// empty, since [`Decoder::retract`] drops the contract once all are orphaned.
+    Created(Vec<B256>),
 }
 
 /// A log decoder over a catalog and a growing set of contracts.
@@ -53,9 +84,19 @@ pub struct Decoder {
 }
 
 impl Decoder {
-    /// Starts with the catalog's seed addresses.
+    /// Starts with the catalog's seed addresses and the contracts a previous run
+    /// discovered, `restored`, as the stores read them back.
+    ///
+    /// The restored contracts are added in the order the run discovered them, by creation
+    /// block and log, so when two claim one address the first keeps it, as it did in that
+    /// run, whatever order the stores read them back in. They are added here, before the
+    /// decoder decodes anything, so no claim this run makes can come before them.
+    ///
+    /// A contract whose `protocol.name` the catalog no longer declares is skipped with a
+    /// warning: its manifest or ABI file was removed or renamed, so it has nothing to
+    /// decode with.
     #[must_use]
-    pub fn new(catalog: Catalog) -> Self {
+    pub fn new(catalog: Catalog, restored: impl IntoIterator<Item = StoredContract>) -> Self {
         let contracts = catalog
             .seeds
             .iter()
@@ -64,36 +105,23 @@ impl Decoder {
                     address,
                     Member {
                         entry,
-                        created: None,
+                        origin: Origin::Seed,
                     },
                 )
             })
             .collect();
-        Self { catalog, contracts }
-    }
-
-    /// Adds contracts a previous run discovered, returning how many addresses were new.
-    ///
-    /// They are added in the order the run discovered them, by creation block and log, so
-    /// when two claim one address the first keeps it, as it did in that run, whatever
-    /// order the stores read them back in.
-    ///
-    /// A contract whose `protocol.name` the catalog no longer declares is skipped with a
-    /// warning: its manifest or ABI file was removed or renamed, so it has nothing to
-    /// decode with.
-    pub fn restore(&mut self, contracts: impl IntoIterator<Item = StoredContract>) -> usize {
-        let mut contracts: Vec<StoredContract> = contracts.into_iter().collect();
-        contracts.sort_by_key(|contract| (contract.block_number, contract.log_index));
-        let before = self.contracts.len();
-        for contract in contracts {
-            let Some(entry) = self.catalog.entry(&contract.protocol, &contract.name) else {
+        let mut decoder = Self { catalog, contracts };
+        let mut restored: Vec<StoredContract> = restored.into_iter().collect();
+        restored.sort_by_key(|contract| (contract.block_number, contract.log_index));
+        for contract in restored {
+            let Some(entry) = decoder.catalog.entry(&contract.protocol, &contract.name) else {
                 warn!(protocol = %contract.protocol, name = %contract.name,
                     address = %contract.address, "stored contract is no longer declared");
                 continue;
             };
-            self.insert(contract.address, entry, contract.block_hash);
+            decoder.insert(contract.address, entry, contract.block_hash);
         }
-        self.contracts.len() - before
+        decoder
     }
 
     /// The catalog it decodes with.
@@ -107,6 +135,15 @@ impl Decoder {
         self.contracts.len()
     }
 
+    /// How many of [`Self::contracts`] were discovered rather than seeded.
+    #[must_use]
+    pub fn discovered(&self) -> usize {
+        self.contracts
+            .values()
+            .filter(|member| matches!(member.origin, Origin::Created(_)))
+            .count()
+    }
+
     /// The identity of the event a log would decode as, for caller-owned diagnostics.
     #[must_use]
     pub fn event_id(&self, log: &Log) -> Option<B256> {
@@ -114,54 +151,51 @@ impl Decoder {
         self.catalog.entries[member.entry].abi.event_id(log)
     }
 
-    /// Decodes a log from a contract in the set, adding any contract it creates.
+    /// Decodes a log from a contract in the set into its record, or why it did not
+    /// decode, and the claims on any contract it creates.
     ///
     /// `None` means the address is not in the set or its ABI has no matching event. A
     /// log that matches an event but does not decode still discovers the contracts it
-    /// names, since each is read from its own argument.
+    /// names, since each is read from its own argument. A caller may skip a log that did
+    /// not decode and keep its raw record, but must stop on an internal invariant failure.
+    ///
+    /// The set is left as it was: a discovered contract decodes once the caller has
+    /// published [`Claims::contracts`] and passed the claims to [`Self::admit`].
     ///
     /// A child's logs from before its creation log, such as those its constructor emits,
-    /// are never decoded: the child joins the set only once that log is seen, after them.
-    pub fn decode(&mut self, log: &Log) -> Option<Decoding> {
+    /// are never decoded: the child joins the set only once that log is admitted, after
+    /// them.
+    pub fn decode(&self, log: &Log) -> Option<(Result<Record, DecodeError>, Claims)> {
         let id = self.contracts.get(&log.address)?.entry;
         let entry = &self.catalog.entries[id];
         let decoded = entry.abi.decode_log(log).transpose()?;
-        let event = decoded.as_ref().ok().map(|event| (id, event.key));
         // The rules' key is the log's own, not the decoded event's, so a log that does not
         // decode still discovers its children.
-        let mut children: Vec<(EntryId, Address)> = event_key(log)
+        let named = event_key(log)
             .and_then(|key| entry.rules.get(&key))
             .into_iter()
             .flatten()
-            .filter_map(|rule| Some((rule.child, rule.slot.read(log)?)))
-            .collect();
-        let decoded = decoded.map(|event| Decoded {
-            name: event.name,
-            address: log.address,
-            protocol: entry.protocol.clone(),
-            contract: entry.name.clone(),
-            event_id: event.id,
-            selector: event.key.0,
-            signature: event.signature,
-            anonymous: false,
-            transaction_hash: log.transaction_hash,
-            transaction_index: log.transaction_index,
-            log_index: log.log_index,
-            indexed: event.indexed,
-            body: event.body,
-            block_number: log.block_number,
-            block_hash: log.block_hash,
-            block_timestamp: log.block_timestamp,
-        });
-        // Only a claim the set records is published: one naming a seed, or an address
-        // already registered as another contract, or named twice by this log, would be a
-        // row restoring nothing, or a second row under one key.
-        children.retain(|&(child, address)| self.insert(address, child, log.block_hash));
-        let discovered = children
-            .into_iter()
-            .map(|(child, address)| {
+            .filter_map(|rule| Some((rule.child, rule.slot.read(log)?)));
+        // Only a claim the set would record is published: one naming a seed, or an
+        // address already registered as another contract, or named twice by this log,
+        // would be a row restoring nothing, or a second row under one key.
+        let mut contracts: Vec<(EntryId, Contract)> = Vec::new();
+        for (child, address) in named {
+            let claimed = contracts
+                .iter()
+                .find(|(_, contract)| contract.address == address);
+            let recorded = match claimed {
+                Some(&(kept, _)) => {
+                    if kept != child {
+                        conflict(&self.catalog, address, kept, child);
+                    }
+                    false
+                }
+                None => self.records(address, child, log.block_hash),
+            };
+            if recorded {
                 let entry = &self.catalog.entries[child];
-                Contract {
+                let contract = Contract {
                     protocol: entry.protocol.clone(),
                     name: entry.name.clone(),
                     address,
@@ -172,14 +206,42 @@ impl Decoder {
                     block_number: log.block_number,
                     block_hash: log.block_hash,
                     block_timestamp: log.block_timestamp,
-                }
-            })
-            .collect();
-        Some(Decoding {
-            decoded,
-            discovered,
-            event,
-        })
+                };
+                contracts.push((child, contract));
+            }
+        }
+        let decoded = decoded.map(|event| Record {
+            event: (id, event.key),
+            decoded: Decoded {
+                name: event.name,
+                address: log.address,
+                protocol: entry.protocol.clone(),
+                contract: entry.name.clone(),
+                event_id: event.id,
+                selector: event.key.0,
+                signature: event.signature,
+                anonymous: false,
+                transaction_hash: log.transaction_hash,
+                transaction_index: log.transaction_index,
+                log_index: log.log_index,
+                indexed: event.indexed,
+                body: event.body,
+                block_number: log.block_number,
+                block_hash: log.block_hash,
+                block_timestamp: log.block_timestamp,
+            },
+        });
+        Some((decoded, Claims { contracts }))
+    }
+
+    /// Adds the contracts a decoded log discovered, once they are published, returning
+    /// how many the set recorded.
+    pub fn admit(&mut self, claims: Claims) -> usize {
+        claims
+            .contracts
+            .into_iter()
+            .filter(|(entry, contract)| self.insert(contract.address, *entry, contract.block_hash))
+            .count()
     }
 
     /// Forgets creations in `orphaned` blocks, dropping contracts left with none, and
@@ -189,48 +251,69 @@ impl Decoder {
     /// reorgs are rare and the set is a hash map of a few hundred thousand entries at most.
     pub fn retract(&mut self, orphaned: &[B256]) -> usize {
         let before = self.contracts.len();
-        self.contracts.retain(|_, member| {
-            member.created.as_mut().is_none_or(|created| {
-                created.retain(|hash| !orphaned.contains(hash));
+        self.contracts.retain(|_, member| match &mut member.origin {
+            Origin::Seed => true,
+            Origin::Created(created) => {
+                created.retain(|block| !orphaned.contains(block));
                 !created.is_empty()
-            })
+            }
         });
         before - self.contracts.len()
     }
 
-    /// Adds `address` as an instance of `entry`, created in block `created`, returning
-    /// whether the set recorded it: a new address, or a new creation block of a
-    /// discovered one, which a reorg of either block must see.
+    /// Whether [`Self::insert`] would record `address` as an instance of `entry`, created
+    /// in block `created`: a new address, or a new creation block of a discovered one,
+    /// which a reorg of either block must see.
     ///
     /// An address already in the set keeps its first entry: a seed stays a seed, and a
     /// contract a second rule also names keeps the entry it was first discovered as. A
     /// claim as another entry records nothing.
+    fn records(&self, address: Address, entry: EntryId, created: B256) -> bool {
+        let Some(member) = self.contracts.get(&address) else {
+            return true;
+        };
+        if member.entry != entry {
+            conflict(&self.catalog, address, member.entry, entry);
+            return false;
+        }
+        match &member.origin {
+            Origin::Seed => false,
+            Origin::Created(creations) => !creations.contains(&created),
+        }
+    }
+
+    /// Adds `address` as an instance of `entry`, created in block `created`, by the rules
+    /// [`Self::records`] states, returning whether the set recorded it.
     fn insert(&mut self, address: Address, entry: EntryId, created: B256) -> bool {
-        match self.contracts.entry(address) {
+        let member = match self.contracts.entry(address) {
             Entry::Vacant(vacant) => {
                 vacant.insert(Member {
                     entry,
-                    created: Some(vec![created]),
+                    origin: Origin::Created(vec![created]),
                 });
+                return true;
+            }
+            Entry::Occupied(occupied) => occupied.into_mut(),
+        };
+        if member.entry != entry {
+            conflict(&self.catalog, address, member.entry, entry);
+            return false;
+        }
+        match &mut member.origin {
+            Origin::Created(creations) if !creations.contains(&created) => {
+                creations.push(created);
                 true
             }
-            Entry::Occupied(mut occupied) => {
-                let member = occupied.get_mut();
-                if member.entry != entry {
-                    warn!(%address, kept = %self.catalog.label(member.entry),
-                        ignored = %self.catalog.label(entry), "contract already registered as another contract");
-                    return false;
-                }
-                match &mut member.created {
-                    Some(blocks) if !blocks.contains(&created) => {
-                        blocks.push(created);
-                        true
-                    }
-                    _ => false,
-                }
-            }
+            Origin::Seed | Origin::Created(_) => false,
         }
     }
+}
+
+/// Warns that a claim on `address` as `ignored` is refused, since the set holds it as
+/// `kept`.
+fn conflict(catalog: &Catalog, address: Address, kept: EntryId, ignored: EntryId) {
+    warn!(%address, kept = %catalog.label(kept),
+        ignored = %catalog.label(ignored), "contract already registered as another contract");
 }
 
 #[cfg(test)]
@@ -239,15 +322,32 @@ mod tests {
     use alloy_dyn_abi::DynSolValue;
     use alloy_primitives::{Address, B256, keccak256};
 
-    use super::Decoder;
+    use super::{Decoder, Record};
     use crate::decode::DecodeError;
     use crate::decode::fixtures::uniswap_v3::{FACTORY, pool_created, swap};
     use crate::decode::fixtures::{protocol, shipped};
     use crate::sink::StoredContract;
-    use crate::wire::datasets::evm::Log;
+    use crate::wire::datasets::evm::{Contract, Log};
 
     fn decoder() -> Decoder {
-        Decoder::new(shipped("base"))
+        restored([])
+    }
+
+    /// A decoder over the shipped Base catalog that restored `stored`.
+    fn restored(stored: impl IntoIterator<Item = StoredContract>) -> Decoder {
+        Decoder::new(shipped("base"), stored)
+    }
+
+    /// Decodes `log` and admits the contracts it discovered, as the sink does once it
+    /// has published them.
+    fn publish(
+        decoder: &mut Decoder,
+        log: &Log,
+    ) -> Option<(Result<Record, DecodeError>, Vec<Contract>)> {
+        let (outcome, claims) = decoder.decode(log)?;
+        let published = claims.contracts().cloned().collect();
+        decoder.admit(claims);
+        Some((outcome, published))
     }
 
     fn stored(address: Address) -> StoredContract {
@@ -263,7 +363,7 @@ mod tests {
 
     /// A protocol `p` on Base: a seeded `Parent` whose `Made(address child)` names a
     /// `Child` by two rules and an `Other` by a third, and `Child` seeded at [`SEEDED`].
-    fn claims() -> Decoder {
+    fn claims(stored: impl IntoIterator<Item = StoredContract>) -> Decoder {
         let made = r#"[{"type":"event","name":"Made","anonymous":false,"inputs":[
             {"name":"child","type":"address","indexed":false}]}]"#;
         let rule = r#"{ contract = "Parent", event = "Made", param = "child" }"#;
@@ -280,7 +380,7 @@ mod tests {
             ("Other.json", "[]"),
             ("protocol.toml", &manifest),
         ]);
-        Decoder::new(catalog.expect("the protocol loads"))
+        Decoder::new(catalog.expect("the protocol loads"), stored)
     }
 
     const PARENT: Address = Address::repeat_byte(0x0a);
@@ -302,18 +402,38 @@ mod tests {
     /// publishes nothing.
     #[test]
     fn only_a_recorded_claim_is_published() {
-        let mut decoder = claims();
+        let mut decoder = claims([]);
         let child = Address::repeat_byte(0xc0);
-        let created = decoder.decode(&made(child)).expect("the parent is a seed");
+        let (_, created) = publish(&mut decoder, &made(child)).expect("the parent is a seed");
         let published: Vec<_> = created
-            .discovered
             .iter()
             .map(|contract| (contract.address, contract.name.as_str()))
             .collect();
         assert_eq!(published, [(child, "Child")]);
 
-        let seed = decoder.decode(&made(SEEDED)).expect("the parent is a seed");
-        assert!(seed.discovered.is_empty(), "{:?}", seed.discovered);
+        let (_, seed) = decoder.decode(&made(SEEDED)).expect("the parent is a seed");
+        assert_eq!(seed.contracts().len(), 0, "{seed:?}");
+        let (_, again) = decoder.decode(&made(child)).expect("the parent is a seed");
+        assert_eq!(again.contracts().len(), 0, "{again:?}");
+    }
+
+    /// A decode leaves the set as it was: until its claims are admitted, the child does
+    /// not decode, and the same log claims it again.
+    #[test]
+    fn a_claim_joins_the_set_only_once_admitted() {
+        let mut decoder = decoder();
+        let pool = Address::from([0xd0; 20]);
+        let creation = pool_created(pool, B256::with_last_byte(1));
+        let (_, unpublished) = decoder.decode(&creation).expect("the factory is a seed");
+        assert_eq!(unpublished.contracts().len(), 1);
+        drop(unpublished);
+        assert!(decoder.decode(&swap(pool)).is_none());
+
+        let (_, retried) = decoder.decode(&creation).expect("the factory is a seed");
+        assert_eq!(retried.contracts().len(), 1);
+        assert_eq!(decoder.admit(retried), 1);
+        assert!(decoder.decode(&swap(pool)).is_some());
+        assert_eq!(decoder.discovered(), 1);
     }
 
     /// Two stored claims on one address restore as the run kept them: the first by
@@ -331,8 +451,8 @@ mod tests {
         };
         let first = [claim("Other", 4, 0), claim("Child", 3, 9)];
         for stored in [first.clone(), [first[1].clone(), first[0].clone()]] {
-            let mut decoder = claims();
-            assert_eq!(decoder.restore(stored), 1);
+            let decoder = claims(stored);
+            assert_eq!(decoder.discovered(), 1);
             let kept = decoder.contracts[&address].entry;
             assert_eq!(decoder.catalog.label(kept), "p.Child");
         }
@@ -346,14 +466,11 @@ mod tests {
         let pool = Address::from([0xd0; 20]);
         assert!(decoder.decode(&swap(pool)).is_none());
 
-        let created = decoder
-            .decode(&pool_created(pool, B256::with_last_byte(1)))
-            .expect("the factory is a seed");
-        assert_eq!(
-            created.decoded.as_ref().expect("decodes").name,
-            "PoolCreated"
-        );
-        let [contract] = &created.discovered[..] else {
+        let (outcome, created) =
+            publish(&mut decoder, &pool_created(pool, B256::with_last_byte(1)))
+                .expect("the factory is a seed");
+        assert_eq!(outcome.expect("decodes").decoded.name, "PoolCreated");
+        let [contract] = &created[..] else {
             panic!("one child");
         };
         assert_eq!(
@@ -366,13 +483,13 @@ mod tests {
         );
         assert_eq!((contract.block_number, contract.log_index), (10, 4));
 
-        let swap = decoder.decode(&swap(pool)).expect("now known");
-        let record = swap.decoded.as_ref().expect("decodes");
+        let (outcome, claims) = decoder.decode(&swap(pool)).expect("now known");
+        let record = outcome.expect("decodes").decoded;
         assert_eq!(
             (record.name.as_str(), record.protocol.as_str()),
             ("Swap", "uniswap_v3")
         );
-        assert!(swap.discovered.is_empty());
+        assert_eq!(claims.contracts().len(), 0);
     }
 
     /// A creation log whose unrelated argument fails validation still discovers its
@@ -389,14 +506,13 @@ mod tests {
         ])
         .abi_encode_params()
         .into();
-        let decoding = decoder.decode(&created).expect("the factory is a seed");
+        let (outcome, discovered) = publish(&mut decoder, &created).expect("the factory is a seed");
         assert!(
-            matches!(decoding.decoded, Err(DecodeError::Value { .. })),
-            "{:?}",
-            decoding.decoded
+            matches!(outcome, Err(DecodeError::Value { .. })),
+            "{outcome:?}"
         );
-        let [contract] = &decoding.discovered[..] else {
-            panic!("one child: {:?}", decoding.discovered);
+        let [contract] = &discovered[..] else {
+            panic!("one child: {discovered:?}");
         };
         assert_eq!(contract.address, pool);
         assert!(
@@ -410,8 +526,7 @@ mod tests {
     /// discovered, since its creating block may sit in the resumed undo window.
     #[test]
     fn a_reorg_retracts_children_of_orphaned_blocks() {
-        let mut decoder = decoder();
-        let (kept, dropped, restored, restored_orphan, twice) = (
+        let (kept, dropped, restored_canonical, restored_orphan, twice) = (
             Address::from([0x01; 20]),
             Address::from([0x02; 20]),
             Address::from([0x03; 20]),
@@ -419,17 +534,17 @@ mod tests {
             Address::from([0x05; 20]),
         );
         let (canonical, orphaned) = (B256::with_last_byte(1), B256::with_last_byte(2));
-        decoder.restore([
-            stored(restored),
+        let mut decoder = restored([
+            stored(restored_canonical),
             StoredContract {
                 block_hash: orphaned,
                 ..stored(restored_orphan)
             },
         ]);
-        decoder.decode(&pool_created(kept, canonical));
-        decoder.decode(&pool_created(dropped, orphaned));
+        publish(&mut decoder, &pool_created(kept, canonical));
+        publish(&mut decoder, &pool_created(dropped, orphaned));
         for block in [orphaned, canonical] {
-            decoder.decode(&pool_created(twice, block));
+            publish(&mut decoder, &pool_created(twice, block));
         }
         let before = decoder.contracts();
 
@@ -438,7 +553,7 @@ mod tests {
         for (case, pool, decodes) in [
             ("created in a canonical block", kept, true),
             ("created in an orphaned block", dropped, false),
-            ("restored from a canonical block", restored, true),
+            ("restored from a canonical block", restored_canonical, true),
             ("restored from an orphaned block", restored_orphan, false),
             ("created in both", twice, true),
         ] {
@@ -446,18 +561,18 @@ mod tests {
         }
     }
 
-    /// Restored contracts decode; one no longer declared is skipped, and
-    /// restoring twice adds nothing.
+    /// Restored contracts decode; one no longer declared is skipped, and one stored
+    /// twice is restored once.
     #[test]
     fn restored_contracts_decode() {
-        let mut decoder = decoder();
         let pool = Address::from([0xd0; 20]);
         let retired = StoredContract {
             protocol: "retired".to_owned(),
+            address: Address::from([0xd1; 20]),
             ..stored(pool)
         };
-        assert_eq!(decoder.restore([stored(pool), retired]), 1);
+        let decoder = restored([stored(pool), retired, stored(pool)]);
+        assert_eq!(decoder.discovered(), 1);
         assert!(decoder.decode(&swap(pool)).is_some());
-        assert_eq!(decoder.restore([stored(pool)]), 0);
     }
 }

@@ -38,6 +38,9 @@
 //! before ingest resumes. A reader that must never see such rows reads up to the
 //! ledger's tip, or joins on it.
 //!
+//! The steps a commit takes in that order, and what a stop before each leaves for the
+//! repair, are listed once, on `Step`.
+//!
 //! `reorgs` rows belong to no block, so they follow the mirror of that rule:
 //!
 //! > A retraction counts only once the blocks it orphans are out of `accepted_blocks`.
@@ -85,7 +88,7 @@ use deltalake::parquet::file::properties::WriterProperties;
 use futures_util::stream::{self, StreamExt as _, TryStreamExt as _};
 use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::Instant;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::sink::batch::Batch;
 use crate::sink::store_error::{Operation, StoreError};
@@ -134,23 +137,96 @@ pub struct DeltaSink {
     batch: Batch,
     /// The committed blocks a reorg could still orphan, by hash, with their heights.
     committed: HashMap<String, u64>,
-    /// Whether a commit failed part-way. The failed batch is gone, so every later write
-    /// is refused until a reopen repairs the lake.
-    failed: bool,
     writer: WriterProperties,
     /// The highest committed height, as maintenance reads it; zero before the first.
     published_tip: Arc<AtomicU64>,
     /// The background compaction and vacuum, when the settings ask for it. Held, never
     /// read: dropping the store stops the task.
     maintenance: Option<Maintenance>,
-    /// The last commit's ledger append, while it runs on beside the next commit.
-    ledger: PendingLedger,
+    /// Where the store is between writes.
+    phase: Phase,
+    /// The last commit's ledger append, while it runs on (see [`PendingLedger`]).
+    ///
+    /// Held here, not by the write that waits for it, so a write cut off part-way leaves
+    /// it running for [`finish`](EnvelopeSink::finish) to wait for, rather than taking
+    /// it down: the commit it belongs to was already reported as committed.
+    appending: Option<PendingLedger>,
     /// How long one write may take: [`COMMIT_DEADLINE`], which a test shortens.
     deadline: Duration,
-    /// What opening read back, for the first [`restore`](Store::restore) to hand on
-    /// rather than read again: the ledger and the contracts take tens of seconds on a
-    /// large lake. Dropped once anything is written or rewound.
-    opened: Option<Restored>,
+    /// The step a write fails at rather than take, so that a test can leave the lake as
+    /// a stop there would (see [`Stopped`]).
+    #[cfg(test)]
+    stop_before: Option<Step>,
+}
+
+/// Where the store is between writes. Only [`guarded`](DeltaSink::guarded) moves the
+/// store from one phase to another around a write, and only
+/// [`finish`](EnvelopeSink::finish) moves it on from a write the caller cut off.
+#[derive(Debug)]
+enum Phase {
+    /// Opened, with nothing written or rewound since: what opening read back, for the
+    /// first [`restore`](Store::restore) to hand on rather than read again, as the
+    /// ledger and the contracts take tens of seconds on a large lake.
+    Opened(Restored),
+    /// Every write so far has succeeded.
+    Ready,
+    /// A write is under way, at the step it last began, if any. Entered before the
+    /// write starts and left only once it ends, so a write dropped part-way, cut off
+    /// by a caller's timeout as a stop cuts one, leaves the store here: as broken as
+    /// a failed write leaves it, since what it had written is only repaired by a
+    /// reopen.
+    ///
+    /// The step is what a failure is logged against, which tells an operator what the
+    /// next open repairs (see [`Step`]); for a write the caller cut off, which ends in
+    /// no error at all, it is the only record of how far the write got.
+    Writing(Option<Step>),
+    /// A write failed part-way, missed its deadline, or was cut off. The batch is gone,
+    /// so every later write is refused with [`StoreError::Failed`] until a reopen
+    /// repairs the lake.
+    Failed,
+}
+
+/// The steps a commit writes to the lake in, in the order the ledger's rules (see the
+/// module docs) put them; the one list [`write_in_order`](DeltaSink::write_in_order),
+/// [`rewind`](Store::rewind), and [`repair`](DeltaSink::repair) all follow.
+///
+/// A rewind takes the two deletes alone, of every block above its height. A
+/// retraction or a rewind waits for the last commit's ledger append before its first
+/// step, since both change the ledger; a commit without one waits for it after
+/// [`AppendRows`](Self::AppendRows) instead, which the append overlaps.
+///
+/// A process can stop before any step, or part-way through one that writes several
+/// tables. What each stop leaves, and what the next open's repair does with it:
+///
+/// - Before [`RecordRetractions`](Self::RecordRetractions): nothing of the commit.
+/// - Before [`DeleteFromLedger`](Self::DeleteFromLedger): a `reorgs` row whose orphans
+///   the ledger still names, which the repair deletes; the restart, on top of the
+///   orphans, detects the reorg again and records it once.
+/// - Before or during [`DeleteFromRest`](Self::DeleteFromRest): rows of the orphans,
+///   which the ledger no longer names, which the repair deletes.
+/// - Before [`AppendRows`](Self::AppendRows): nothing to repair; the retraction is
+///   whole.
+/// - During it, or before [`AppendLedger`](Self::AppendLedger) lands: rows of the new
+///   blocks, which the ledger does not name yet, which the repair deletes; the restart
+///   fetches them again.
+///
+/// Every row a stop leaves unnamed is above the ledger's tip as the stop left it, or
+/// at the height of an orphan the ledger no longer names, which is above it too; that
+/// is why the repair needs to look no lower than the ledger's oldest block.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Step {
+    /// The retractions' rows into `reorgs`, while the ledger still names their orphans.
+    RecordRetractions,
+    /// The orphaned blocks out of the ledger, before their rows go.
+    DeleteFromLedger,
+    /// The orphaned blocks out of every other table, all at once.
+    DeleteFromRest,
+    /// Every table's rows, all at once: each table has its own log, and no rule orders
+    /// one table's rows against another's.
+    AppendRows,
+    /// The new blocks into the ledger, once their rows are all present, running on
+    /// beside the next commit (see [`PendingLedger`]).
+    AppendLedger,
 }
 
 impl DeltaSink {
@@ -199,61 +275,105 @@ impl DeltaSink {
             .await
     }
 
-    /// Writes the batch in the ledger's order, one step per rule in the module docs:
+    /// Writes the batch in the ledger's order, one [`Step`] at a time.
     ///
-    /// 1. retractions into `reorgs`, while the ledger still names their orphans;
-    /// 2. the orphans out of the ledger, then out of every other table;
-    /// 3. every table's rows, all at once: each table has its own log, and no rule orders
-    ///    one table's rows against another's;
-    /// 4. the new blocks into the ledger, once their rows are all present, running on
-    ///    while the next commit's rows are appended (see [`PendingLedger`]).
-    ///
-    /// A failure part-way, or a write cut off at [`COMMIT_DEADLINE`], leaves the lake as
-    /// the next open repairs it. The batch is not kept for a retry: the store refuses
-    /// every later write with [`StoreError::Failed`], and a restart resumes from the
-    /// ledger.
+    /// A failure part-way, or a write cut off at [`COMMIT_DEADLINE`] or by the caller,
+    /// leaves the lake as the next open repairs it. The batch is not kept for a retry:
+    /// the store refuses every later write with [`StoreError::Failed`], and a restart
+    /// resumes from the ledger.
     async fn commit(&mut self) -> Result<(), StoreError> {
-        self.guarded(async |sink| {
-            if sink.batch.is_empty() {
-                return Ok(());
-            }
-            sink.write().await
-        })
-        .await
+        self.guarded(Self::write).await
     }
 
-    /// Runs `step`, a write to the lake, unless an earlier one failed, and refuses every
-    /// later one if this one fails: a write that stopped part-way leaves what only a
-    /// reopen repairs.
+    /// Runs `write`, a write to the lake, unless an earlier one failed, and refuses every
+    /// later one unless this one succeeds: a write that stopped part-way leaves what only
+    /// a reopen repairs.
     ///
-    /// A step still running at the [`deadline`](Self::deadline) fails with
-    /// [`StoreError::Stalled`]. It is dropped where it stands, which stops the tasks it
-    /// was waiting on (see [`join_every`]); what it had committed by then is what a stop
-    /// at that moment would have left.
+    /// The store is [`Writing`](Phase::Writing) from before `write` starts until it
+    /// ends, so a write the caller drops part-way leaves it refusing as a failed one
+    /// does. `write` takes the last commit's ledger append from the store as it needs it
+    /// (see [`settle_ledger`](Self::settle_ledger)), and may leave one of its own there.
+    /// If it fails, this waits for whatever it left before returning: the last commit,
+    /// already reported as committed, is not left to the abort that dropping the store
+    /// would make of its append. Should that append fail too, the write's error is
+    /// returned, as what failed first, and the append's logged.
+    ///
+    /// A write still running at the [`deadline`](Self::deadline), wait included, fails
+    /// with [`StoreError::Stalled`]. It is dropped where it stands, which stops the
+    /// tasks it was waiting on (see [`join_every`]); what it had committed by then is
+    /// what a stop at that moment would have left. A ledger append still running is not
+    /// waited for any longer, since it may be what hangs: it stays with the store,
+    /// for a [`finish`](EnvelopeSink::finish) the caller bounds, and is aborted if the
+    /// store is dropped first, which costs the restart a refetch of its blocks.
     async fn guarded<T>(
         &mut self,
-        step: impl AsyncFnOnce(&mut Self) -> Result<T, StoreError>,
+        write: impl AsyncFnOnce(&mut Self) -> Result<T, StoreError>,
     ) -> Result<T, StoreError> {
         self.refuse_if_failed()?;
-        let deadline = self.deadline;
-        let result = tokio::time::timeout(deadline, step(self))
-            .await
-            .unwrap_or(Err(StoreError::Stalled { after: deadline }));
-        self.failed = result.is_err();
-        result
+        self.phase = Phase::Writing(None);
+        let result = within(self.deadline, async {
+            let result = write(self).await;
+            if result.is_err()
+                && let Err(settling) = self.settle_ledger().await
+            {
+                warn!(%settling, "lake ledger append failed beside a failed write");
+            }
+            result
+        })
+        .await;
+        match result {
+            Ok(value) => {
+                self.phase = Phase::Ready;
+                Ok(value)
+            }
+            Err(error) => {
+                if let Phase::Writing(step) = self.phase {
+                    warn!(?step, %error, "lake write failed part-way; the store must be reopened");
+                }
+                self.phase = Phase::Failed;
+                Err(error)
+            }
+        }
     }
 
-    /// Refuses with [`StoreError::Failed`] once a write has failed.
-    fn refuse_if_failed(&self) -> Result<(), StoreError> {
-        if self.failed {
-            return Err(StoreError::Failed);
+    /// Marks the start of `step` of the write under way, which a failure is logged
+    /// against. In a test, fails with `Stopped` before the step writes anything, where
+    /// the test stops the write (see `stop_before`); it cannot fail otherwise.
+    #[cfg_attr(
+        not(test),
+        expect(
+            clippy::unnecessary_wraps,
+            reason = "it fails where a test stops the write"
+        )
+    )]
+    fn begin(&mut self, step: Step) -> Result<(), StoreError> {
+        #[cfg(test)]
+        if self.stop_before == Some(step) {
+            return Err(StoreError::Engine {
+                operation: Operation::Commit,
+                target: None,
+                source: Box::new(Stopped(step)),
+            });
         }
+        self.phase = Phase::Writing(Some(step));
         Ok(())
     }
 
-    /// Writes the batch for [`commit`](Self::commit), and logs what it wrote.
+    /// Refuses with [`StoreError::Failed`] once a write has failed, or was dropped
+    /// part-way.
+    fn refuse_if_failed(&self) -> Result<(), StoreError> {
+        match self.phase {
+            Phase::Writing(_) | Phase::Failed => Err(StoreError::Failed),
+            Phase::Opened(_) | Phase::Ready => Ok(()),
+        }
+    }
+
+    /// Writes the batch for [`commit`](Self::commit), if it holds anything, and logs what
+    /// it wrote.
     async fn write(&mut self) -> Result<(), StoreError> {
-        self.opened = None;
+        if self.batch.is_empty() {
+            return Ok(());
+        }
         self.refuse_replays()?;
         let started = Instant::now();
         // Taken out so the commit can take its rows while it writes, and put back cleared.
@@ -318,8 +438,15 @@ impl DeltaSink {
         })
     }
 
-    /// Writes `commit` in the ledger's order (see [`commit`](Self::commit)), and returns
-    /// how long its slow parts took.
+    /// Writes `commit` in the ledger's order, one [`Step`] at a time, returning how long
+    /// its slow parts took. It waits for the last commit's ledger append where its steps
+    /// need it, and leaves its own running on the store.
+    ///
+    /// Every way it ends short of its deadline leaves the last commit's append to land:
+    /// waited for here, by [`guarded`](Self::guarded) when this fails, or by
+    /// [`finish`](EnvelopeSink::finish) when the caller cuts this off. The last commit,
+    /// already logged and counted as committed, is never undone by an append left to be
+    /// aborted, unless the store itself is dropped first.
     async fn write_in_order(&mut self, commit: Commit) -> Result<Timings, StoreError> {
         let Commit {
             reorgs,
@@ -330,30 +457,27 @@ impl DeltaSink {
             summary: _,
         } = commit;
         // A retraction's steps are ordered against the ledger, so it waits for the last
-        // one; a commit without one never does.
+        // append before its first; a commit without one waits after its rows instead.
         if !reorgs.is_empty() || orphans.is_some() {
             self.settle_ledger().await?;
+            self.begin(Step::RecordRetractions)?;
+            let position = self.position(Table::Reorg);
+            self.append_some(position, &reorgs.iter().collect::<Vec<_>>())
+                .await?;
+            drop(reorgs);
+            if let Some((floor, hashes)) = &orphans {
+                self.retract(*floor, hashes).await?;
+            }
         }
-        // 1. Retractions into `reorgs`, while the ledger still names their orphans.
-        let position = self.position(Table::Reorg);
-        self.append_some(position, &reorgs.iter().collect::<Vec<_>>())
-            .await?;
-        drop(reorgs);
-        // 2. The orphans out of the ledger, then out of every other table.
-        if let Some((floor, hashes)) = &orphans {
-            self.retract(*floor, hashes).await?;
-        }
-        // 3. Every table's rows, all at once.
-        let (batches, build) = timed(self.record_batches(appends)).await;
-        let (appended, write) = timed(self.append_all(batches?)).await;
+        let (build, write) = self.append_rows(appends).await?;
         // The last commit's ledger append ran beside these appends; this waits out what is
-        // left of it, which is usually nothing. Waited for even when an append failed, so
-        // it is not left running.
+        // left of it, which is usually nothing.
         let (settled, ledger_wait) = timed(self.settle_ledger()).await;
-        appended?;
         settled?;
-        // 4. The new blocks into the ledger, running on beside the next commit.
-        self.start_ledger(ledger);
+        self.begin(Step::AppendLedger)?;
+        self.appending = ledger.map(|batch| {
+            PendingLedger::start(self.lake(Table::AcceptedBlock), &self.writer, batch)
+        });
         let orphaned = orphans.map(|(_, hashes)| hashes).unwrap_or_default();
         self.advance(&orphaned, accepted);
         Ok(Timings {
@@ -363,18 +487,22 @@ impl DeltaSink {
         })
     }
 
-    /// Starts appending `batch`, the accepted blocks, to the ledger (see
-    /// [`PendingLedger`]); nothing when the commit accepts no block.
-    fn start_ledger(&mut self, batch: Option<RecordBatch>) {
-        let Some(batch) = batch else {
-            return;
-        };
-        let lake = &self.lakes[self.positions[&TableId::Dataset(Table::AcceptedBlock)]];
-        self.ledger.start(lake, &self.writer, batch);
+    /// Builds every table's Arrow batches and appends them, the
+    /// [`AppendRows`](Step::AppendRows) step, returning how long the build and the
+    /// appends took.
+    async fn append_rows(
+        &mut self,
+        appends: Vec<(usize, Vec<Row>)>,
+    ) -> Result<(Duration, Duration), StoreError> {
+        self.begin(Step::AppendRows)?;
+        let (batches, build) = timed(self.record_batches(appends)).await;
+        let (appended, write) = timed(self.append_all(batches?)).await;
+        appended?;
+        Ok((build, write))
     }
 
-    /// `accepted` as the ledger's Arrow batch, for [`start_ledger`](Self::start_ledger);
-    /// `None` when the commit accepts no block.
+    /// `accepted` as the ledger's Arrow batch, for the
+    /// [`AppendLedger`](Step::AppendLedger) step; `None` when the commit accepts no block.
     fn ledger_batch(&self, accepted: &[&Row]) -> Result<Option<RecordBatch>, StoreError> {
         if accepted.is_empty() {
             return Ok(None);
@@ -383,13 +511,20 @@ impl DeltaSink {
         lake.record_batch(accepted).map(Some)
     }
 
-    /// Waits for the ledger append [`start_ledger`](Self::start_ledger) left running, if
-    /// any, and takes the ledger as of it.
+    /// Waits for the ledger append the last commit left running, if any, and takes the
+    /// ledger as of it.
+    ///
+    /// The append stays on the store until it has ended, so a wait cut off part-way
+    /// leaves it running, to be waited for again.
     async fn settle_ledger(&mut self) -> Result<(), StoreError> {
-        if let Some(table) = self.ledger.settle().await? {
-            let position = self.position(Table::AcceptedBlock);
-            self.lakes[position].committed(table);
-        }
+        let Some(appending) = &mut self.appending else {
+            return Ok(());
+        };
+        let landed = appending.join().await;
+        self.appending = None;
+        let table = landed?;
+        let position = self.position(Table::AcceptedBlock);
+        self.lakes[position].committed(table);
         Ok(())
     }
 
@@ -473,8 +608,7 @@ impl DeltaSink {
     fn refuse_replays(&self) -> Result<(), StoreError> {
         let replayed = self
             .batch
-            .rows
-            .iter()
+            .rows()
             .filter(|row| row.table().id == TableId::Dataset(Table::AcceptedBlock))
             .filter_map(Row::block_hash)
             .find(|hash| {
@@ -529,15 +663,19 @@ impl DeltaSink {
         self.delete_from_the_ledger_then_the_rest(above).await
     }
 
-    /// Deletes what `predicate` names from the ledger, then from every other table.
+    /// Deletes what `predicate` names from the ledger, then from every other table: the
+    /// [`DeleteFromLedger`](Step::DeleteFromLedger) and
+    /// [`DeleteFromRest`](Step::DeleteFromRest) steps.
     async fn delete_from_the_ledger_then_the_rest(
         &mut self,
         predicate: impl Fn(&Lake) -> Option<Expr>,
     ) -> Result<(), StoreError> {
+        self.begin(Step::DeleteFromLedger)?;
         let ledger = &mut self.lakes[self.positions[&TableId::Dataset(Table::AcceptedBlock)]];
         if let Some(predicate) = predicate(ledger) {
             ledger.delete(&self.writer, predicate).await?;
         }
+        self.begin(Step::DeleteFromRest)?;
         self.delete_from_the_rest(predicate).await
     }
 
@@ -573,29 +711,33 @@ impl Store for DeltaSink {
     /// The first restore after opening hands on what opening read, which nothing has
     /// changed since; a later one reads both again, at once.
     async fn restore(&mut self) -> Result<Restored, StoreError> {
-        self.settle_ledger().await?;
-        if let Some(opened) = self.opened.take() {
-            return Ok(opened);
+        match std::mem::replace(&mut self.phase, Phase::Ready) {
+            Phase::Opened(opened) => return Ok(opened),
+            phase => self.phase = phase,
         }
+        // A wait of its own, so a failed or hung append fails the store as a failed
+        // commit does.
+        self.guarded(Self::settle_ledger).await?;
         let (contracts, ledger) = tokio::try_join!(self.contracts(), self.read_ledger())?;
         Ok(Restored { contracts, ledger })
     }
 
     /// A held block whose hash changed is retracted at the next commit like any orphan:
     /// it is among the committed blocks opening read from the ledger.
-    fn reconcile(&mut self, held: &[BlockMeta]) {
-        self.batch.reconcile(held);
+    fn reconcile(&mut self, held: &[BlockMeta]) -> Result<(), StoreError> {
+        self.batch.reconcile(held)
     }
 
-    /// Deletes in the order a retraction does: the blocks out of the ledger first, then
-    /// out of every other table. A stop part-way leaves rows of blocks the ledger no
-    /// longer names, which the next open deletes.
+    /// Deletes in the order a retraction does, the `Step::DeleteFromLedger` and
+    /// `Step::DeleteFromRest` steps: the blocks out of the ledger first, then out of
+    /// every other table, once the last commit's ledger append has landed. A stop
+    /// part-way leaves rows of blocks the ledger no longer names, which the next open
+    /// deletes.
     ///
     /// Final on failure, as a commit is: every later write is refused with
     /// [`StoreError::Failed`] until the store is reopened.
     async fn rewind(&mut self, height: u64) -> Result<(), StoreError> {
         self.guarded(async |sink| {
-            sink.opened = None;
             sink.settle_ledger().await?;
             sink.delete_above(height).await?;
             sink.committed.retain(|_, committed| *committed <= height);
@@ -633,10 +775,22 @@ impl EnvelopeSink for DeltaSink {
 
     /// Waits for the last commit's ledger append, so its blocks count once the stream
     /// ends. Final on failure, as a commit is.
+    ///
+    /// After a write that failed, missed its deadline, or was dropped part-way by the
+    /// caller, as a stop drops a commit that runs out of time, it still waits for the
+    /// append left running, if any, within the store's deadline: that is the last
+    /// commit's, which the dropped write had not yet waited for, and its blocks were
+    /// already reported as committed. The store stays failed, and the next open repairs
+    /// what the write left.
     async fn finish(&mut self) -> Result<(), SinkError> {
-        self.guarded(async |sink| sink.settle_ledger().await)
-            .await?;
-        Ok(())
+        match self.phase {
+            Phase::Opened(_) => Ok(()),
+            Phase::Ready => Ok(self.guarded(Self::settle_ledger).await?),
+            Phase::Writing(_) | Phase::Failed => {
+                self.phase = Phase::Failed;
+                Ok(within(self.deadline, self.settle_ledger()).await?)
+            }
+        }
     }
 }
 
@@ -649,32 +803,35 @@ impl EnvelopeSink for DeltaSink {
 /// Safe for the reason the ledger is written last at all: until an entry lands, its
 /// block's rows are rows the ledger does not name, which a reopen deletes and ingest
 /// fetches again. Every later commit's rows are, too, until its own entry lands.
-#[derive(Debug, Default)]
-struct PendingLedger(Option<JoinHandle<Result<DeltaTable, StoreError>>>);
+///
+/// At most one runs, held by the store (see [`DeltaSink::appending`]): one is only
+/// started once the last has been waited for. Dropped unsettled, with the store, it is
+/// aborted, so it never lands behind a reopen's repair: that deletes the rows of blocks
+/// the ledger does not name, and an entry landing after it would name a block whose rows
+/// are gone.
+#[derive(Debug)]
+struct PendingLedger(JoinHandle<Result<DeltaTable, StoreError>>);
 
 impl PendingLedger {
-    /// Starts appending `batch` to `ledger`, once the last append is settled.
-    fn start(&mut self, ledger: &Lake, writer: &WriterProperties, batch: RecordBatch) {
-        debug_assert!(self.0.is_none(), "the last ledger append is settled first");
-        self.0 = Some(tokio::spawn(ledger.append(writer, vec![batch])));
+    /// Starts appending `batch` to `ledger`.
+    fn start(ledger: &Lake, writer: &WriterProperties, batch: RecordBatch) -> Self {
+        Self(tokio::spawn(ledger.append(writer, vec![batch])))
     }
 
-    /// Waits for the running append, if any, and hands back the ledger as of it.
-    async fn settle(&mut self) -> Result<Option<DeltaTable>, StoreError> {
-        let Some(task) = self.0.as_mut() else {
-            return Ok(None);
-        };
-        let appended = task
+    /// Waits for the append to end, and hands back the ledger as of it. Cut off
+    /// part-way, the wait leaves the append running; once it has returned, it must not
+    /// be waited for again.
+    async fn join(&mut self) -> Result<DeltaTable, StoreError> {
+        (&mut self.0)
             .await
-            .unwrap_or_else(|join| std::panic::resume_unwind(join.into_panic()));
-        self.0 = None;
-        appended.map(Some)
+            .unwrap_or_else(|join| std::panic::resume_unwind(join.into_panic()))
     }
+}
 
-    /// Whether an append is still to be settled.
-    #[cfg(test)]
-    fn is_running(&self) -> bool {
-        self.0.is_some()
+impl Drop for PendingLedger {
+    /// Aborts the append unless it has finished, which leaves a finished one as it is.
+    fn drop(&mut self) {
+        self.0.abort();
     }
 }
 
@@ -735,6 +892,25 @@ async fn join_every<K: Ord + 'static, T: 'static>(
     done.sort_by(|(left, _), (right, _)| left.cmp(right));
     (done, failure)
 }
+
+/// Runs `write`, failing it with [`StoreError::Stalled`] if it is still running after
+/// `deadline`, when it is dropped where it stands.
+async fn within<T>(
+    deadline: Duration,
+    write: impl Future<Output = Result<T, StoreError>>,
+) -> Result<T, StoreError> {
+    tokio::time::timeout(deadline, write)
+        .await
+        .unwrap_or(Err(StoreError::Stalled { after: deadline }))
+}
+
+/// A test's stop before a [`Step`], which the write fails with in place of the step: as
+/// the source of a [`StoreError::Engine`], so a test tells it from a genuine failure, and
+/// from the [`StoreError::Failed`] of a write refused after it.
+#[cfg(test)]
+#[derive(Debug, PartialEq, Eq, thiserror::Error)]
+#[error("a test stopped the write before {0:?}")]
+struct Stopped(Step);
 
 /// Runs `future`, and returns what it resolved to with how long it took.
 async fn timed<T>(future: impl Future<Output = T>) -> (T, Duration) {

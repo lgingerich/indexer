@@ -183,16 +183,17 @@ pub(super) mod metric {
     /// A decoder over the shipped catalog that knows [`POOL`], as a previous run would
     /// have discovered it.
     pub(in crate::decode) fn decoder() -> Decoder {
-        let mut decoder = Decoder::new(shipped("robinhood"));
-        decoder.restore([StoredContract {
-            protocol: "metric_v1".to_owned(),
-            name: "MetricOmmPool".to_owned(),
-            address: POOL,
-            block_hash: CREATED,
-            block_number: 1,
-            log_index: 0,
-        }]);
-        decoder
+        Decoder::new(
+            shipped("robinhood"),
+            [StoredContract {
+                protocol: "metric_v1".to_owned(),
+                name: "MetricOmmPool".to_owned(),
+                address: POOL,
+                block_hash: CREATED,
+                block_number: 1,
+                log_index: 0,
+            }],
+        )
     }
 
     /// A log of [`POOL`], in the block that created it.
@@ -332,7 +333,8 @@ pub(super) mod metric {
         decoder()
             .decode(log)
             .expect("a known pool's event")
-            .decoded
+            .0
             .expect("decodes")
+            .decoded
     }
 }

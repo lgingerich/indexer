@@ -5,8 +5,9 @@
 //! # Blocks a store already holds
 //!
 //! A restart resumes ingest from the slowest store's tip, so a faster store is handed
-//! again blocks it committed before the stop. [`Batch::reconcile`] names them, and each
-//! is settled when its `accepted_block` marker arrives, the last envelope of its block:
+//! again blocks it committed before the stop. [`Batch::reconcile`] names them, before
+//! the first envelope, and each is settled when its `accepted_block` marker arrives, the
+//! last envelope of its block:
 //!
 //! - the same hash at that height: the store holds this block, so its rows are dropped
 //!   from the buffer and nothing is written for it;
@@ -38,7 +39,7 @@ use crate::wire::envelope::{BlockMeta, ChainId, Envelope, Event, Reorg};
 /// already committed or still in this buffer — blocks are published in order and the
 /// storage channel is FIFO, so an orphaned block can never arrive after its `reorg`.
 /// [`push`](Self::push) drops the buffered ones at once, and the store deletes the
-/// committed ones when it commits [`rows`](Self::rows), before writing them.
+/// committed ones when it commits the buffered rows, before writing them.
 ///
 /// A store holds one chain, the one it was opened for, and so does its batch: an
 /// envelope of another chain is refused rather than written beside it.
@@ -46,20 +47,21 @@ use crate::wire::envelope::{BlockMeta, ChainId, Envelope, Event, Reorg};
 pub(super) struct Batch {
     /// The chain the store was opened for.
     chain: ChainId,
-    /// Rows to write, in publish order.
-    pub(super) rows: Vec<Row>,
+    /// The rows published up to the last `accepted_block` marker, in publish order.
+    rows: Vec<Row>,
+    /// The rows published since the last marker, in publish order: those of the block
+    /// being buffered, and any published between two blocks, such as a `reorg`'s. They
+    /// join `rows` at the next marker, except the rows of a block the store holds, which
+    /// are dropped instead.
+    block: Vec<Row>,
     /// The blocks buffered `reorg`s orphaned, to delete from the store at the commit;
     /// `None` when no `reorg` is buffered that orphans any.
     pub(super) orphaned: Option<Orphaned>,
-    /// Roughly how many bytes `rows` hold in memory.
+    /// Roughly how many bytes `rows` and `block` hold in memory.
     bytes: usize,
-    /// Where the rows of the block being buffered start in `rows`: every row from here
-    /// on came after the last `accepted_block` marker.
-    block_start: usize,
-    /// The blocks the store committed above where ingest resumed, by height, each
-    /// forgotten once ingest hands that height again (see the module docs). Kept across
-    /// commits.
-    held: BTreeMap<u64, B256>,
+    /// The blocks the store committed above where ingest resumed, each settled as its
+    /// height arrives (see the module docs). Kept across commits.
+    held: Held,
     /// Every table the run writes, which renders each decoded record's typed row.
     schema: Arc<Schema>,
 }
@@ -73,16 +75,70 @@ pub(super) struct Orphaned {
     pub(super) hashes: BTreeSet<String>,
 }
 
+/// The blocks a store committed above where ingest resumed, which ingest hands it again.
+///
+/// They can be named only before the first envelope: a block handed earlier would have
+/// been settled against nothing, so a later [`Batch::reconcile`] is refused rather than
+/// applied to some heights and not others.
+#[derive(Debug)]
+enum Held {
+    /// Nothing has been pushed or named yet.
+    Unnamed,
+    /// What is left to settle, by height: the blocks [`Batch::reconcile`] named, or none
+    /// when the first envelope came before any were. Each is forgotten once ingest hands
+    /// its height or one above it.
+    Settling(BTreeMap<u64, B256>),
+}
+
+/// How a block ingest hands relates to what the store holds at its height.
+#[derive(Debug, PartialEq, Eq)]
+enum Arrival {
+    /// The store holds no block there, so this one is written.
+    New,
+    /// The store holds this very block, so its rows are dropped and nothing is written.
+    Same,
+    /// The store holds this other block there, on a branch that lost while the store was
+    /// ahead, so it is retracted before this one is written.
+    Replaces(B256),
+}
+
+impl Held {
+    /// Closes naming: from the first envelope on, the store holds only what was named.
+    fn seal(&mut self) {
+        if matches!(self, Self::Unnamed) {
+            *self = Self::Settling(BTreeMap::new());
+        }
+    }
+
+    /// Settles `block`, which ingest is handing: what the store holds at its height, which
+    /// is then forgotten. Ingest hands heights in order, so a held height below this one
+    /// was passed over and is never handed: it is forgotten too, rather than kept for the
+    /// rest of the run.
+    fn arrive(&mut self, block: &BlockMeta) -> Arrival {
+        let Self::Settling(held) = self else {
+            return Arrival::New;
+        };
+        let mut above = held.split_off(&block.height);
+        let at = above.remove(&block.height);
+        *held = above;
+        match at {
+            None => Arrival::New,
+            Some(hash) if hash == block.hash => Arrival::Same,
+            Some(hash) => Arrival::Replaces(hash),
+        }
+    }
+}
+
 impl Batch {
     /// An empty batch of `schema`'s tables, for a store of `chain`.
     pub(super) fn new(schema: Arc<Schema>, chain: ChainId) -> Self {
         Self {
             chain,
             rows: Vec::new(),
+            block: Vec::new(),
             orphaned: None,
             bytes: 0,
-            block_start: 0,
-            held: BTreeMap::new(),
+            held: Held::Unnamed,
             schema,
         }
     }
@@ -95,11 +151,22 @@ impl Batch {
     /// Names the blocks the store already holds that ingest will hand it again: those
     /// above the block every store holds, where ingest resumes. Each is settled when its
     /// height arrives; see the module docs.
-    pub(super) fn reconcile(&mut self, held: &[BlockMeta]) {
-        self.held = held
-            .iter()
-            .map(|block| (block.height, block.hash))
-            .collect();
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::LateReconcile`] once an envelope has been pushed or the
+    /// blocks were named already: settling only the heights still to come would leave
+    /// the others unchecked.
+    pub(super) fn reconcile(&mut self, held: &[BlockMeta]) -> Result<(), StoreError> {
+        let Held::Unnamed = self.held else {
+            return Err(StoreError::LateReconcile);
+        };
+        self.held = Held::Settling(
+            held.iter()
+                .map(|block| (block.height, block.hash))
+                .collect(),
+        );
+        Ok(())
     }
 
     /// Buffers one envelope's rows. A `reorg` first drops every buffered row of the
@@ -121,45 +188,44 @@ impl Batch {
             }
             .into());
         }
-        if let Event::AcceptedBlock(block) = &envelope.event
-            && let Some(held) = self.held.remove(&block.height)
-        {
-            if held == block.hash {
+        self.held.seal();
+        let Event::AcceptedBlock(block) = &envelope.event else {
+            return self.buffer(envelope);
+        };
+        match self.held.arrive(block) {
+            Arrival::New => {}
+            Arrival::Same => {
                 self.drop_block(block.hash);
                 return Ok(());
             }
             // The store's copy of this height is on a branch that lost while it was
             // ahead: retract it as a reorg at the tip would, before this block lands.
-            self.push(&Envelope::new(
+            Arrival::Replaces(held) => self.buffer(&Envelope::new(
                 envelope.chain.clone(),
                 Event::Reorg(Reorg {
                     height: block.height,
                     new_head_hash: block.hash,
                     orphaned_hashes: vec![held],
                 }),
-            ))?;
+            ))?,
         }
         self.buffer(envelope)?;
-        if matches!(envelope.event, Event::AcceptedBlock(_)) {
-            self.block_start = self.rows.len();
-        }
+        self.rows.append(&mut self.block);
         Ok(())
     }
 
     /// Drops the rows of the block being buffered, `hash`, which the store already
-    /// holds. Its rows all came after the last marker, so only those are looked at.
+    /// holds, and closes it. Its rows all came after the last marker, so only those are
+    /// looked at; any other row among them, such as a `reorg`'s, is kept.
     fn drop_block(&mut self, hash: B256) {
         let hash = hex(&hash);
-        let start = self.block_start.min(self.rows.len());
-        let tail = self.rows.split_off(start);
-        for row in tail {
+        for row in std::mem::take(&mut self.block) {
             if row.block_hash() == Some(hash.as_str()) {
                 self.bytes = self.bytes.saturating_sub(row_size(&row));
             } else {
                 self.rows.push(row);
             }
         }
-        self.block_start = self.rows.len();
     }
 
     /// Buffers one envelope's rows, as [`push`](Self::push) describes, once any block the
@@ -169,10 +235,10 @@ impl Batch {
             && !reorg.orphaned_hashes.is_empty()
         {
             let hashes: BTreeSet<String> = reorg.orphaned_hashes.iter().map(hex).collect();
-            self.rows
-                .retain(|row| !row.block_hash().is_some_and(|h| hashes.contains(h)));
-            self.block_start = self.block_start.min(self.rows.len());
-            self.bytes = self.rows.iter().map(row_size).sum();
+            let kept = |row: &Row| !row.block_hash().is_some_and(|h| hashes.contains(h));
+            self.rows.retain(kept);
+            self.block.retain(kept);
+            self.bytes = self.rows().map(row_size).sum();
             let orphaned = self.orphaned.get_or_insert(Orphaned {
                 floor: reorg.height,
                 hashes: BTreeSet::new(),
@@ -197,7 +263,17 @@ impl Batch {
 
     fn keep(&mut self, row: Row) {
         self.bytes += row_size(&row);
-        self.rows.push(row);
+        self.block.push(row);
+    }
+
+    /// Every buffered row, in publish order.
+    pub(super) fn rows(&self) -> impl DoubleEndedIterator<Item = &Row> {
+        self.rows.iter().chain(&self.block)
+    }
+
+    /// How many rows are buffered.
+    pub(super) fn len(&self) -> usize {
+        self.rows.len() + self.block.len()
     }
 
     /// The rows each table should write: the last buffered copy of each `dedupe_key`, in
@@ -209,21 +285,23 @@ impl Batch {
     /// knows; a staging table's physical order does not promise it.
     #[cfg(any(feature = "duckdb", feature = "postgres"))]
     pub(super) fn by_table(&self) -> HashMap<TableId, Vec<&Row>> {
-        grouped(self.rows.iter().zip(last_copies(&self.rows)))
+        grouped(self.rows().zip(last_copies(self.rows(), self.len())))
     }
 
     /// [`by_table`](Self::by_table)'s rows, owned: taken out of the batch, so whoever
     /// writes them can free each as soon as it is written rather than all at the end.
     #[cfg(feature = "delta")]
     pub(super) fn take_tables(&mut self) -> HashMap<TableId, Vec<Row>> {
-        let last = last_copies(&self.rows);
-        grouped(std::mem::take(&mut self.rows).into_iter().zip(last))
+        let last = last_copies(self.rows(), self.len());
+        let rows = std::mem::take(&mut self.rows);
+        let block = std::mem::take(&mut self.block);
+        grouped(rows.into_iter().chain(block).zip(last))
     }
 
     /// Whether there is nothing to commit. A `reorg` always buffers its own row, so a
     /// batch with deletions is never empty.
     pub(super) fn is_empty(&self) -> bool {
-        self.rows.is_empty()
+        self.rows.is_empty() && self.block.is_empty()
     }
 
     /// Roughly how many bytes the buffered rows hold in memory.
@@ -235,19 +313,19 @@ impl Batch {
     /// to reconcile are kept: ingest has not reached them yet.
     pub(super) fn clear(&mut self) {
         self.rows.clear();
+        self.block.clear();
         self.orphaned = None;
-        self.block_start = 0;
         self.bytes = 0;
     }
 }
 
-/// Whether each of `rows` is the last copy of its `(table, dedupe_key)`, by
+/// Whether each of the `len` `rows` is the last copy of its `(table, dedupe_key)`, by
 /// position: what both [`Batch::by_table`] and [`Batch::take_tables`] keep.
-fn last_copies(rows: &[Row]) -> Vec<bool> {
-    let mut last = vec![false; rows.len()];
+fn last_copies<'a>(rows: impl DoubleEndedIterator<Item = &'a Row>, len: usize) -> Vec<bool> {
+    let mut last = vec![false; len];
     // Sized up front: growing a set of half a million keys rehashes it again and again.
-    let mut seen = HashSet::with_capacity(rows.len());
-    for (position, row) in rows.iter().enumerate().rev() {
+    let mut seen = HashSet::with_capacity(len);
+    for (position, row) in (0..len).rev().zip(rows.rev()) {
         last[position] = seen.insert((row.table().id, row.dedupe_key()));
     }
     last
@@ -298,11 +376,11 @@ mod tests {
     use std::collections::HashSet;
     use std::sync::Arc;
 
-    use super::Batch;
+    use super::{Batch, Held};
     use crate::sink::table::{Schema, Table, TableError, TableId};
     use crate::sink::{SinkError, StoreError};
-    use crate::wire::datasets::evm::Block;
-    use crate::wire::envelope::{BlockMeta, ChainId, Envelope, Event};
+    use crate::wire::datasets::evm::{Block, Contract, Log, Transaction};
+    use crate::wire::envelope::{BlockMeta, ChainId, Envelope, Event, Reorg};
 
     fn meta(height: u64, tag: u8) -> BlockMeta {
         BlockMeta {
@@ -334,7 +412,7 @@ mod tests {
     }
 
     fn tables(batch: &Batch) -> Vec<TableId> {
-        batch.rows.iter().map(|row| row.table().id).collect()
+        batch.rows().map(|row| row.table().id).collect()
     }
 
     /// A block the store already holds, handed again with the same hash, leaves nothing
@@ -342,7 +420,7 @@ mod tests {
     #[test]
     fn a_held_block_handed_again_is_not_written() {
         let mut batch = on_base(crate::sink::fixtures::schema());
-        batch.reconcile(&[meta(5, 0xa0)]);
+        batch.reconcile(&[meta(5, 0xa0)]).expect("named first");
         block(&mut batch, meta(5, 0xa0));
         assert!(batch.is_empty(), "{:?}", tables(&batch));
         assert!(batch.orphaned.is_none());
@@ -359,7 +437,7 @@ mod tests {
     #[test]
     fn a_held_block_whose_hash_changed_is_retracted() {
         let mut batch = on_base(crate::sink::fixtures::schema());
-        batch.reconcile(&[meta(5, 0xa0)]);
+        batch.reconcile(&[meta(5, 0xa0)]).expect("named first");
         block(&mut batch, meta(5, 0xb0));
         let orphaned = batch.orphaned.as_ref().expect("the old copy is orphaned");
         assert_eq!(orphaned.floor, 5);
@@ -410,12 +488,147 @@ mod tests {
     #[test]
     fn held_blocks_outlive_a_commit() {
         let mut batch = on_base(crate::sink::fixtures::schema());
-        batch.reconcile(&[meta(5, 0xa0), meta(6, 0xa1)]);
+        batch
+            .reconcile(&[meta(5, 0xa0), meta(6, 0xa1)])
+            .expect("named first");
         block(&mut batch, meta(5, 0xa0));
         batch.clear();
         block(&mut batch, meta(6, 0xa1));
         assert!(batch.is_empty(), "{:?}", tables(&batch));
         assert!(batch.orphaned.is_none());
+    }
+
+    /// Every row a held block publishes names it, whatever its table — the dataset
+    /// tables, a decoded record's two, a discovered contract's, a derived row's — so all
+    /// of them are dropped with it. Only a `reorg` belongs to no block, and one published
+    /// before the block's rows is kept, as the record of a retraction.
+    #[test]
+    fn every_row_of_a_held_block_is_dropped() {
+        let (schema, mut derived) = crate::sink::fixtures::derived();
+        let mut batch = on_base(schema);
+        let held = meta(5, 0xa0);
+        batch.reconcile(&[held]).expect("named first");
+        let mut decoded = crate::sink::fixtures::decoded_swap();
+        decoded.block_number = held.height;
+        decoded.block_hash = held.hash;
+        derived.block_number = held.height;
+        derived.block_hash = held.hash;
+        let events = [
+            Event::Reorg(Reorg {
+                height: held.height,
+                new_head_hash: held.hash,
+                orphaned_hashes: vec![B256::repeat_byte(0xcc)],
+            }),
+            Event::Block(Box::new(Block {
+                number: held.height,
+                hash: held.hash,
+                ..Block::default()
+            })),
+            Event::Transaction(Box::new(Transaction {
+                block_number: held.height,
+                block_hash: held.hash,
+                ..Transaction::default()
+            })),
+            Event::Log(Box::new(Log {
+                block_number: held.height,
+                block_hash: held.hash,
+                ..Log::default()
+            })),
+            Event::Decoded(Box::new(decoded)),
+            Event::Contract(Box::new(Contract {
+                protocol: "uniswap_v3".to_owned(),
+                name: "UniswapV3Pool".to_owned(),
+                address: alloy_primitives::Address::repeat_byte(0xc0),
+                factory_address: alloy_primitives::Address::repeat_byte(0xf0),
+                transaction_hash: B256::repeat_byte(0x11),
+                transaction_index: 0,
+                log_index: 0,
+                block_number: held.height,
+                block_hash: held.hash,
+                block_timestamp: held.timestamp,
+            })),
+            Event::Derived(Box::new(derived)),
+        ];
+        for event in events {
+            batch
+                .push(&Envelope::new(ChainId::new("base"), event))
+                .expect("buffered");
+        }
+        assert_eq!(batch.len(), 8, "a decoded record is two rows");
+        batch
+            .push(&Envelope::new(
+                ChainId::new("base"),
+                Event::AcceptedBlock(held),
+            ))
+            .expect("settled");
+        assert_eq!(tables(&batch), [Table::Reorg.into()]);
+        assert_eq!(
+            batch.bytes,
+            batch.rows().map(super::row_size).sum::<usize>()
+        );
+    }
+
+    /// A `reorg` part-way through a held block drops rows from before the block as well
+    /// as from it, and the block is still dropped whole at its marker.
+    #[test]
+    fn a_reorg_inside_a_held_block_leaves_it_droppable() {
+        let mut batch = on_base(crate::sink::fixtures::schema());
+        batch.reconcile(&[meta(6, 0xa1)]).expect("named first");
+        block(&mut batch, meta(5, 0xa0));
+        let chain = ChainId::new("base");
+        for event in [
+            Event::Block(Box::new(Block {
+                number: 6,
+                hash: B256::repeat_byte(0xa1),
+                ..Block::default()
+            })),
+            Event::Reorg(Reorg {
+                height: 5,
+                new_head_hash: B256::repeat_byte(0xb0),
+                orphaned_hashes: vec![B256::repeat_byte(0xa0)],
+            }),
+            Event::AcceptedBlock(meta(6, 0xa1)),
+        ] {
+            batch
+                .push(&Envelope::new(chain.clone(), event))
+                .expect("buffered");
+        }
+        assert_eq!(tables(&batch), [Table::Reorg.into()]);
+    }
+
+    /// The blocks a store holds are named before its first envelope, once: naming them
+    /// later would leave the heights already handed unchecked.
+    #[test]
+    fn a_late_reconcile_is_refused() {
+        let mut batch = on_base(crate::sink::fixtures::schema());
+        block(&mut batch, meta(5, 0xa0));
+        assert!(matches!(
+            batch.reconcile(&[meta(6, 0xa1)]),
+            Err(StoreError::LateReconcile)
+        ));
+
+        let mut batch = on_base(crate::sink::fixtures::schema());
+        batch.reconcile(&[]).expect("named first");
+        assert!(matches!(
+            batch.reconcile(&[meta(6, 0xa1)]),
+            Err(StoreError::LateReconcile)
+        ));
+    }
+
+    /// A held height below the one ingest hands is never handed, so it is forgotten
+    /// rather than kept for the rest of the run.
+    #[test]
+    fn held_heights_ingest_passes_over_are_forgotten() {
+        let mut batch = on_base(crate::sink::fixtures::schema());
+        batch
+            .reconcile(&[meta(5, 0xa0), meta(6, 0xa1), meta(7, 0xa2)])
+            .expect("named first");
+        block(&mut batch, meta(6, 0xa1));
+        let Held::Settling(held) = &batch.held else {
+            panic!("an envelope seals the held blocks");
+        };
+        assert_eq!(held.keys().copied().collect::<Vec<_>>(), [7]);
+        assert!(batch.is_empty(), "{:?}", tables(&batch));
     }
 
     /// A store holds one chain: an envelope of another is refused, not written beside

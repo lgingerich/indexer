@@ -129,7 +129,7 @@ fn check_block(
     placed: &[PlacedLog],
     plan: Plan,
 ) -> Result<(), SourceError> {
-    if plan.reads_logs {
+    if plan.reads_logs() {
         check_logs_present(CONTEXT, meta.height, !placed.is_empty(), &block.logs_bloom)?;
     }
     for (position, transaction) in transactions.iter().enumerate() {
@@ -143,7 +143,7 @@ fn check_block(
             ));
         }
     }
-    if plan.reads_transactions {
+    if plan.reads_transactions() {
         let cumulative = match transactions.last() {
             Some(last) => required(last.cumulative_gas_used, "cumulative_gas_used")?
                 .to_u64("cumulative_gas_used")?,
@@ -160,7 +160,7 @@ fn check_block(
             ));
         }
     }
-    if plan.reads_transactions
+    if plan.reads_transactions()
         && let Some(log) = placed
             .iter()
             .find(|log| log.transaction_index >= transactions.len() as u64)

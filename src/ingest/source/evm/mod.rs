@@ -197,7 +197,7 @@ impl<C: PubSubConnect + Clone> BlockSource for EvmSource<C> {
         // read entirely. A head for a different height is no use, so it is ignored
         // rather than mistrusted.
         // An empty answer is not trusted without the header's bloom, so it falls through.
-        if let Some(meta) = head.filter(|meta| meta.height == height && self.plan.reuse_head) {
+        if let Some(meta) = head.filter(|meta| meta.height == height && self.plan.reuse_head()) {
             let logs = self.fetch_logs(meta.hash).await?;
             if !logs.is_empty() {
                 return Ok(FetchedBlock {
@@ -233,11 +233,13 @@ impl<C: PubSubConnect + Clone> BlockSource for EvmSource<C> {
     ///
     /// Logs per block vary widely, so a range a provider cannot serve is not the end: a
     /// transport failure — a refusal of the range's size, a timeout, or an error that
-    /// outlasted the retry layer — splits the range in halves, the first rounded up,
-    /// and fetches both, down to one height; only a single height's failure is
-    /// returned. The span shrinks to the half, so the ranges after it start at a size
-    /// that works. A range that comes back but fails its checks is returned as is: a
-    /// smaller range would not fix data the node got wrong.
+    /// outlasted the retry layer — is `Span::refused`, and the range is fetched again
+    /// in pieces of the size that returns, down to one height; only a single height's
+    /// failure is returned. The span is the one ladder: a failed range no wider than it
+    /// halves it, the first half rounded up, so the ranges after it start at a size that
+    /// works, and one wider, cut before another failure shrank it, is fetched in pieces
+    /// of it without shrinking it again. A range that comes back but fails its checks is
+    /// returned as is: a smaller range would not fix data the node got wrong.
     async fn fetch_blocks(&self, from: u64, to: u64) -> Result<Vec<FetchedBlock>, SourceError> {
         let mut blocks = Vec::new();
         if !self.plan.ranged() {
@@ -263,10 +265,10 @@ impl<C: PubSubConnect + Clone> BlockSource for EvmSource<C> {
                     blocks.append(&mut fetched);
                 }
                 Err(error @ SourceError::Transport { .. }) if high > low => {
-                    let cut = low + (high - low) / 2;
                     metrics::rpc_range_split();
                     warn!(from = low, to = high, %error, "range fetch failed; fetching it in halves");
-                    self.span.shrink(cut - low + 1);
+                    // Fewer than the range, so the split always makes progress.
+                    let cut = low + (self.span.refused(high - low + 1) - 1);
                     pending.extend([(cut + 1, high), (low, cut)]);
                 }
                 Err(error) => return Err(error),

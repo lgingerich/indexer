@@ -36,7 +36,7 @@
 //! - `mod derive` in `decode/mod.rs`.
 //! - `Catalog::add_derivations`, which declares their tables and binds them, its call
 //!   in `Catalog::load`, and the `Catalog::derivations` field, in `catalog/mod.rs`.
-//! - `Decoding::event`, which names the event a record decoded as, in `decoder.rs`.
+//! - `Record::event`, which names the event a record decoded as, in `decoder.rs`.
 //! - The `derivations` field of `DecodingSink` and its `rows` call, the last
 //!   transaction it keeps for a row's sender and recipient, and the test of a derived
 //!   row, in `sink.rs`.
@@ -185,7 +185,11 @@ pub(super) struct Sent {
     pub(super) hash: TxHash,
     /// The account that sent it.
     pub(super) from: Address,
-    /// Its recipient, `None` for a contract deployment.
+    /// Its recipient, `None` for a contract creation, as Allium's `to_address` is.
+    ///
+    /// A derived row's `transaction_to_address` is also `None` when the transaction was
+    /// not fetched, which an `Option<Sent>` of `None` stands for; its
+    /// `transaction_from_address`, set for every fetched transaction, tells the two apart.
     pub(super) to: Option<Address>,
 }
 

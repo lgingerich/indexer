@@ -238,9 +238,12 @@ pub(crate) struct Pipeline<B = AnySource> {
     source: B,
     /// A fresh run's first height; `None` starts at the head.
     start_block: Option<u64>,
-    /// The last height to index; `None` follows live heads.
+    /// The last height to index. Without one, a run on a source that follows heads
+    /// follows them, and one on a source that only backfills stops at the buried heights.
     stop_block: Option<u64>,
-    decoder: Decoder,
+    /// What the run decodes with. The decoder is built from it once the stores have read
+    /// back the contracts a previous run discovered.
+    catalog: Catalog,
     /// Every table the run has: the dataset tables and each decoded event's.
     schema: Arc<Schema>,
 }
@@ -358,7 +361,10 @@ impl Routes {
 }
 
 impl<B: BlockSource + 'static> Pipeline<B> {
-    /// Assembles a pipeline reading `source` and decoding what `catalog` declares.
+    /// Assembles a pipeline reading `source` from `start_block` and decoding what
+    /// `catalog` declares. `stop_block` is the last height to index; without one, the
+    /// run follows live heads on a source that follows them, and stops at the buried
+    /// heights on one that only backfills.
     pub(crate) fn new(
         source: B,
         start_block: Option<u64>,
@@ -370,7 +376,7 @@ impl<B: BlockSource + 'static> Pipeline<B> {
             start_block,
             stop_block,
             schema: Arc::new(catalog.schema().clone()),
-            decoder: Decoder::new(catalog),
+            catalog,
         }
     }
 
@@ -414,11 +420,11 @@ impl<B: BlockSource + 'static> Pipeline<B> {
             source,
             start_block,
             stop_block,
-            decoder,
+            catalog,
             schema,
         } = self;
         let sinks = vec![(StdoutJsonSink::new(), tables)];
-        let sink = DecodingSink::new(decoder, Router::new(schema, sinks));
+        let sink = DecodingSink::new(Decoder::new(catalog, []), Router::new(schema, sinks));
         Machine::new(source, sink, Vec::new())
             .run(start_block, stop_block)
             .await?;

@@ -283,84 +283,120 @@ impl ChannelReceiver {
         mut stop: Stop,
     ) -> Result<u64, SinkError> {
         let mut stored = 0_u64;
-        let mut pending = Pending::default();
-        // When the oldest gathered block must be flushed; `None` with nothing gathered.
-        let mut deadline: Option<Instant> = None;
-        loop {
+        // What is gathered since the last flush, with when it is due; `None` with nothing
+        // gathered, so there is no deadline without a block to flush by it.
+        let mut gathered: Option<Gathered> = None;
+        let exit = loop {
             // A stop is checked first, so once it is requested neither a backlog nor a
             // due flush is worked off.
+            let due = gathered.as_ref().map(|gathered| gathered.due);
             let next = tokio::select! {
                 biased;
-                () = stop.wait() => break,
-                next = recv_until(&mut self.receiver, deadline) => next,
+                () = stop.wait() => break Exit::Stopped,
+                next = recv_until(&mut self.receiver, due) => next,
             };
             let block = match next {
                 Received::Block(block) => block,
-                Received::Closed => break,
+                Received::Closed => break Exit::Closed,
                 Received::Due => {
-                    stored += self.flush(sink, &mut pending).await?;
-                    deadline = None;
+                    // Only waited for with something gathered.
+                    if let Some(due) = gathered.take() {
+                        stored += self.flush(sink, due.pending).await?;
+                    }
                     continue;
                 }
             };
             // The first block gathered is the oldest: the channel is in order.
-            let due = *deadline.get_or_insert_with(|| block.sent + batching.wait);
-            self.publish(sink, block, &mut pending).await?;
-            while !full(sink, &pending, batching) {
+            let mut batch = gathered.take().unwrap_or_else(|| Gathered {
+                due: block.sent + batching.wait,
+                pending: Pending::default(),
+            });
+            self.publish(sink, block, &mut batch.pending).await?;
+            while !full(sink, &batch.pending, batching) {
                 let Ok(block) = self.receiver.try_recv() else {
                     break;
                 };
-                self.publish(sink, block, &mut pending).await?;
+                self.publish(sink, block, &mut batch.pending).await?;
             }
             if stop.requested() {
-                break;
+                gathered = Some(batch);
+                break Exit::Stopped;
             }
-            if full(sink, &pending, batching) || Instant::now() >= due {
-                stored += self.flush(sink, &mut pending).await?;
-                deadline = None;
-            }
-        }
-        if stop.requested() {
-            // The last commit and what it leaves running share one deadline, so a store
-            // that hangs in either still lets the process exit before the host kills it.
-            let deadline = Instant::now() + STOP_FLUSH;
-            let gathered = pending.envelopes;
-            if pending.blocks > 0 {
-                if let Ok(flushed) =
-                    tokio::time::timeout_at(deadline, self.flush(sink, &mut pending)).await
-                {
-                    stored += flushed?;
-                } else {
-                    info!(
-                        uncommitted = gathered,
-                        seconds = STOP_FLUSH.as_secs(),
-                        "storage stopping on request; the last commit did not finish in time, and its blocks are fetched again on the next start"
-                    );
-                }
-            }
-            info!(
-                committed = gathered - pending.envelopes,
-                "storage stopping on request; blocks still queued are fetched again on the next start"
-            );
-            if let Ok(finished) = tokio::time::timeout_at(deadline, sink.finish()).await {
-                finished?;
+            if full(sink, &batch.pending, batching) || Instant::now() >= batch.due {
+                stored += self.flush(sink, batch.pending).await?;
             } else {
-                warn!(
-                    seconds = STOP_FLUSH.as_secs(),
-                    "storage stopping on request; what the last commit left running did not finish in time, and its blocks are fetched again on the next start"
-                );
+                gathered = Some(batch);
             }
-        } else {
-            if pending.blocks > 0 {
-                stored += self.flush(sink, &mut pending).await?;
-            }
-            sink.finish().await?;
-        }
+        };
+        stored += match exit {
+            Exit::Closed => self.close(sink, gathered).await?,
+            Exit::Stopped => self.stop(sink, gathered).await?,
+        };
         self.progress.finish(
             progress::sampled_head(self.head.load(Ordering::Acquire)),
             Instant::now(),
         );
         Ok(stored)
+    }
+
+    /// Ends the drain once the sending half is dropped: flushes what is `gathered` and
+    /// waits for what the flushes left running, returning how many envelopes it stored.
+    async fn close<K: EnvelopeSink>(
+        &mut self,
+        sink: &mut K,
+        gathered: Option<Gathered>,
+    ) -> Result<u64, SinkError> {
+        let stored = match gathered {
+            Some(last) => self.flush(sink, last.pending).await?,
+            None => 0,
+        };
+        sink.finish().await?;
+        Ok(stored)
+    }
+
+    /// Ends the drain on a stop: flushes what is `gathered` and waits for what the
+    /// flushes left running, within [`STOP_FLUSH`] together, returning how many
+    /// envelopes it stored.
+    ///
+    /// A flush that runs out of time is dropped part-way, and the sink is still asked to
+    /// [`finish`](EnvelopeSink::finish): it waits only for what the flushes before that
+    /// one left running, if it still holds any, and stays failed.
+    async fn stop<K: EnvelopeSink>(
+        &mut self,
+        sink: &mut K,
+        gathered: Option<Gathered>,
+    ) -> Result<u64, SinkError> {
+        // The last commit and what it leaves running share one deadline, so a store that
+        // hangs in either still lets the process exit before the host kills it.
+        let deadline = Instant::now() + STOP_FLUSH;
+        let mut committed = 0;
+        if let Some(last) = gathered {
+            let uncommitted = last.pending.envelopes;
+            if let Ok(flushed) =
+                tokio::time::timeout_at(deadline, self.flush(sink, last.pending)).await
+            {
+                committed = flushed?;
+            } else {
+                info!(
+                    uncommitted,
+                    seconds = STOP_FLUSH.as_secs(),
+                    "storage stopping on request; the last commit did not finish in time, and its blocks are fetched again on the next start"
+                );
+            }
+        }
+        info!(
+            committed,
+            "storage stopping on request; blocks still queued are fetched again on the next start"
+        );
+        if let Ok(finished) = tokio::time::timeout_at(deadline, sink.finish()).await {
+            finished?;
+        } else {
+            warn!(
+                seconds = STOP_FLUSH.as_secs(),
+                "storage stopping on request; what the last commit left running did not finish in time, and its blocks are fetched again on the next start"
+            );
+        }
+        Ok(committed)
     }
 
     /// Hands one block's envelopes to `sink`, which buffers them against its own limits;
@@ -380,18 +416,18 @@ impl ChannelReceiver {
         Ok(())
     }
 
-    /// Flushes what is gathered and reports the commit, returning how many envelopes it
-    /// held.
+    /// Flushes `pending`, what is gathered, and reports the commit, returning how many
+    /// envelopes it held.
     async fn flush<K: EnvelopeSink>(
         &mut self,
         sink: &mut K,
-        pending: &mut Pending,
+        pending: Pending,
     ) -> Result<u64, SinkError> {
         let started = Instant::now();
         sink.flush().await?;
         let elapsed = started.elapsed();
         let head = progress::sampled_head(self.head.load(Ordering::Acquire));
-        let records = std::mem::take(pending).envelopes as u64;
+        let records = pending.envelopes as u64;
         if let Some(height) =
             self.progress
                 .committed(self.store, records, elapsed, head, Instant::now())
@@ -429,6 +465,24 @@ fn full<K: EnvelopeSink>(sink: &K, pending: &Pending, batching: Batching) -> boo
     pending.envelopes >= batching.records
         || pending.blocks >= MAX_BLOCKS
         || sink.buffered_bytes() >= batching.bytes
+}
+
+/// Why the drain stopped taking blocks, recorded where it did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Exit {
+    /// The sending half was dropped, and every block it sent was taken.
+    Closed,
+    /// A stop was requested.
+    Stopped,
+}
+
+/// What the drain has gathered since its last flush, at least one block, with when it
+/// must be flushed: made with the first block, and consumed by the flush.
+#[derive(Debug)]
+struct Gathered {
+    /// When the oldest gathered block has waited [`Batching::wait`].
+    due: Instant,
+    pending: Pending,
 }
 
 /// What the drain has gathered since its last flush.

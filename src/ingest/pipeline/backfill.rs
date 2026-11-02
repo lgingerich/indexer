@@ -160,7 +160,7 @@ mod tests {
         source.short = true;
         let mut machine = Machine::new(source, Sink::default(), Vec::new());
         fails_with(
-            machine.sync(Some(0), None).await,
+            machine.sync_settled(Some(0), None).await,
             &PipelineError::InvalidRange {
                 from: 0,
                 to: 3,
@@ -178,7 +178,7 @@ mod tests {
         source.blocks.remove(&3);
         let mut machine = Machine::new(source, Sink::default(), Vec::new());
         fails_with(
-            machine.sync(Some(0), None).await,
+            machine.sync_settled(Some(0), None).await,
             &malformed("missing block"),
         );
         assert_eq!(heights(&machine), [0, 1, 2]);
@@ -217,7 +217,7 @@ mod tests {
         source.blocks.remove(&3);
         let mut machine = Machine::new(source, Sink::default(), Vec::new());
         fails_with(
-            machine.sync(Some(0), None).await,
+            machine.sync_settled(Some(0), None).await,
             &malformed("missing block"),
         );
         assert_eq!(heights(&machine), [0, 1]);
@@ -230,7 +230,7 @@ mod tests {
         let mut machine = Machine::new(Source::linear(head), Sink::default(), Vec::new());
         machine.sink.fail = true;
         fails_with(
-            machine.sync(Some(0), None).await,
+            machine.sync_settled(Some(0), None).await,
             &PipelineError::Sink(SinkError::StorageClosed),
         );
         assert_eq!(machine.tip(), None);

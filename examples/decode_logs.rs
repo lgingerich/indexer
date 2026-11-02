@@ -74,7 +74,7 @@ fn main() -> ExitCode {
         &CHAIN.into(),
     )
     .expect("the shipped protocols load");
-    let mut decoder = Decoder::new(catalog);
+    let decoder = Decoder::new(catalog, []);
     let mut decoded_count = 0_usize;
     for (number, line) in SWAPS.lines().enumerate() {
         if line.trim().is_empty() {
@@ -85,12 +85,12 @@ fn main() -> ExitCode {
         let indexer::wire::envelope::Event::Log(log) = &envelope.event else {
             continue;
         };
-        match decoder.decode(log).map(|decoding| decoding.decoded) {
+        match decoder.decode(log).map(|(decoded, _)| decoded) {
             Some(Ok(record)) => {
                 decoded_count += 1;
                 let out = Envelope::new(
                     envelope.chain,
-                    indexer::wire::envelope::Event::Decoded(Box::new(record)),
+                    indexer::wire::envelope::Event::Decoded(Box::new(record.decoded)),
                 );
                 println!(
                     "{}",

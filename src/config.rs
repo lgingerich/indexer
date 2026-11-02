@@ -131,11 +131,15 @@ pub struct IngestSettings {
     /// after them instead: a value at or below the block after the stored tip is
     /// ignored, and one above it is a startup error, since it would leave a gap.
     /// A `HyperSync` backfill on an empty store needs it, since a backfill that starts at
-    /// the head has nothing to do.
+    /// the head has nothing to do; one that only prints to `[sink.stdout]` always starts
+    /// empty, so omitting it there is refused as the file loads.
     pub start_block: Option<u64>,
-    /// The last height to index. Omitted follows live heads without end; a value indexes
-    /// through that height and exits instead of following the chain. A value above the
-    /// sampled head, or below where the run starts, is a startup error. A store that
+    /// The last height to index. Omitted follows live heads without end on `http_url`
+    /// and `ws_url`, and on `HyperSync` stops at the buried heights under the head it
+    /// samples first; a value indexes through that height, no further than those on
+    /// `HyperSync`, and exits instead of following the chain. A value below
+    /// `start_block` is refused as the file loads; one above the sampled head, or below
+    /// the head where a run without a start begins, is a startup error. A store that
     /// already holds it has nothing to do, and the run exits without indexing.
     ///
     /// A stop inside the reorg window under the head is indexed as the chain stood then:
@@ -411,11 +415,6 @@ impl Sinks {
         stores.extend(self.delta.clone().map(StoreSettings::Delta));
         stores
     }
-
-    /// Refuses a file that names no sink, or `stdout` beside a store.
-    fn check(&self) -> Result<(), SettingsError> {
-        self.destination().map(drop)
-    }
 }
 
 /// Where the stream goes, as [`Sinks::destination`] resolves it: a run prints or stores,
@@ -531,6 +530,23 @@ pub enum SettingsError {
     /// `[sink.stdout]` is named beside a store.
     #[error("invalid settings: [sink.stdout] cannot be named beside a store")]
     StdoutBesideStore,
+    /// `stop_block` is below `start_block`. A fresh run would index nothing, and a
+    /// resumed one could only find the stop already stored or the start past its tip.
+    #[error("invalid settings: [ingest] stop_block {stop} is below start_block {start}")]
+    StopBelowStart {
+        /// `stop_block`.
+        stop: u64,
+        /// `start_block`.
+        start: u64,
+    },
+    /// `[ingest.hypersync]` with no `start_block` and only `[sink.stdout]`. A backfill
+    /// without a start begins after the blocks its stores hold, and printing keeps none,
+    /// so it would begin at the head, where nothing is buried.
+    #[error(
+        "invalid settings: [ingest.hypersync] beside only [sink.stdout] needs \
+         [ingest] start_block, since printing keeps no blocks to resume after"
+    )]
+    BackfillWithoutStart,
 }
 
 impl Settings {
@@ -546,16 +562,45 @@ impl Settings {
     /// # Errors
     ///
     /// Returns [`SettingsError::Parse`] when the text does not parse, a required value
-    /// or a named variable is absent, or `[ingest]` does not name one source, and
+    /// or a named variable is absent, or `[ingest]` does not name one source,
     /// [`SettingsError::NoSink`] or [`SettingsError::StdoutBesideStore`] when its sinks
-    /// cannot run. A malformed document reports its line and column; an unknown field is
-    /// an error rather than being ignored, so a misspelled key is caught at startup
-    /// instead of silently leaving a setting at its default.
+    /// cannot run, and [`SettingsError::StopBelowStart`] or
+    /// [`SettingsError::BackfillWithoutStart`] when its heights
+    /// cannot run whatever the chain and the stores hold. A malformed document reports
+    /// its line and column; an unknown field is an error rather than being ignored, so a
+    /// misspelled key is caught at startup instead of silently leaving a setting at its
+    /// default.
     pub fn parse(text: &str, env: Env) -> Result<Self, SettingsError> {
         let settings: Self = secret::reading(env, || toml::from_str(text))
             .map_err(|source| SettingsError::Parse { source })?;
-        settings.sink.check()?;
+        settings.check()?;
         Ok(settings)
+    }
+
+    /// Refuses settings that can only fail once run, whatever the chain and the stores
+    /// hold: no sink, `stdout` beside a store, a `stop_block` below the `start_block`,
+    /// and a `HyperSync` backfill with no `start_block` that only prints, which has no
+    /// stored blocks to begin after. What depends on the chain's head or the stores'
+    /// history is left to the run.
+    fn check(&self) -> Result<(), SettingsError> {
+        let destination = self.sink.destination()?;
+        let IngestSettings {
+            source,
+            start_block,
+            stop_block,
+            ..
+        } = &self.ingest;
+        if let (Some(start), Some(stop)) = (*start_block, *stop_block)
+            && stop < start
+        {
+            return Err(SettingsError::StopBelowStart { stop, start });
+        }
+        if let (IngestSource::HyperSync(_), None, Destination::Print(_)) =
+            (source, start_block, destination)
+        {
+            return Err(SettingsError::BackfillWithoutStart);
+        }
+        Ok(())
     }
 
     /// Reads settings from a TOML file, as [`Settings::parse`] does, and resolves the

@@ -436,7 +436,7 @@ impl Live {
 /// Starts a machine at `from` and syncs it to the sampled head, as `run` does before
 /// going live.
 pub(super) async fn settle(machine: &mut Machine<Source, Sink>, from: Option<u64>) {
-    machine.sync(from, None).await.expect("sync");
+    machine.sync_settled(from, None).await.expect("sync");
 }
 
 /// Moves the fake chain to `height` and feeds that head to the live phase, as a

@@ -152,41 +152,39 @@ impl<S: BlockSource + 'static, K: EnvelopeSink> Machine<S, K> {
         target: BlockMeta,
         start: BlockMeta,
     ) -> Result<(), PipelineError> {
-        // The walk's oldest block so far, and the branch above it, newest first.
+        // The walk's oldest block so far, and the branch above it, newest first. The walk
+        // ends at the first height the branch replaces, which is the oldest block's.
         let mut lowest = start;
         let mut above = Vec::new();
-        let ancestor = loop {
+        loop {
             let meta = lowest;
-            let parent_height =
-                meta.height
-                    .checked_sub(1)
-                    .ok_or(PipelineError::UndoWindowExceeded {
-                        floor: Box::new(self.ring.oldest().unwrap_or(meta)),
-                        actual: Box::new(meta),
-                    })?;
-            if let Some(parent) = self.accepted(parent_height)
-                && parent.hash == meta.parent_hash
-            {
-                break parent.height;
-            }
             // The branch replaces the first block ever indexed. Nothing was stored below
             // it, so there is no older ancestor to find or retract: adopt the branch from
-            // here, as that first block was adopted.
+            // here, as that first block was adopted. Checked before the parent's height,
+            // which a first block at genesis does not have.
             if self.ring.holds_whole_history()
                 && self
                     .ring
                     .oldest()
                     .is_some_and(|oldest| oldest.height == meta.height)
             {
-                break parent_height;
+                break;
+            }
+            let floor = self.ring.oldest().unwrap_or(meta);
+            let exceeded = move || PipelineError::UndoWindowExceeded {
+                floor: Box::new(floor),
+                actual: Box::new(meta),
+            };
+            let parent_height = meta.height.checked_sub(1).ok_or_else(exceeded)?;
+            if let Some(parent) = self.accepted(parent_height)
+                && parent.hash == meta.parent_hash
+            {
+                break;
             }
             // The common ancestor is below the retained window: stop before any partial
             // retraction rather than guess.
             if !self.ring.retains(parent_height) {
-                return Err(PipelineError::UndoWindowExceeded {
-                    floor: Box::new(self.ring.oldest().unwrap_or(meta)),
-                    actual: Box::new(meta),
-                });
+                return Err(exceeded());
             }
             debug!(
                 depth = above.len() + 1,
@@ -200,7 +198,8 @@ impl<S: BlockSource + 'static, K: EnvelopeSink> Machine<S, K> {
             Self::validate_link(below, meta)?;
             above.push(meta);
             lowest = below;
-        };
+        }
+        let from = lowest.height;
 
         // The source may change branches during discovery. Recheck the candidate, and the
         // block the walk started from, at their fixed heights before publishing any
@@ -213,22 +212,22 @@ impl<S: BlockSource + 'static, K: EnvelopeSink> Machine<S, K> {
         let block = self.replacement(lowest).await?;
 
         self.observe_head(target.height);
-        let orphaned = self.ring.orphaned(ancestor);
+        let orphaned = self.ring.orphaned(from);
         if !orphaned.is_empty() {
             info!(
-                ancestor,
+                from,
                 orphaned = orphaned.len(),
                 head = target.height,
                 "retracting the blocks a fork orphaned"
             );
             metrics::reorg(orphaned.len());
             self.deliver(vec![Event::Reorg(Reorg {
-                height: Self::next(ancestor)?,
+                height: from,
                 new_head_hash: target.hash,
                 orphaned_hashes: orphaned,
             })])
             .await?;
-            self.ring.rewind(ancestor);
+            self.ring.rewind(from);
         }
         self.commit(lowest, block.events).await?;
         above.reverse();
@@ -302,7 +301,7 @@ mod tests {
     use super::*;
     use crate::ingest::pipeline::testing::*;
     use crate::sink::SinkError;
-    use crate::window::MAX_UNFINALIZED_BLOCKS;
+    use crate::window::{Ledger, MAX_UNFINALIZED_BLOCKS};
     use crate::wire::envelope::BlockMeta;
 
     /// A gap is fetched ahead, as many heights in flight as the source allows, and still
@@ -418,7 +417,7 @@ mod tests {
         source.head = 11;
         let mut machine = Machine::new(source, Sink::default(), ledger(12..=13));
         machine
-            .sync(None, None)
+            .sync_settled(None, None)
             .await
             .expect("a lagging head is not a fork");
         assert!(machine.sink.events.is_empty());
@@ -434,7 +433,7 @@ mod tests {
         source.blocks.insert(11, (hash(111), hash(10)));
         let mut machine = Machine::new(source, Sink::default(), ledger(12..=13));
         fails_with(
-            machine.sync(None, None).await,
+            machine.sync_settled(None, None).await,
             &PipelineError::UndoWindowExceeded {
                 floor: Box::new(meta(12)),
                 actual: Box::new(BlockMeta {
@@ -527,6 +526,44 @@ mod tests {
             "the first block, then its replacement"
         );
         assert_eq!(machine.tip().expect("tip").hash, hash(103));
+    }
+
+    /// A first block at genesis has no parent height, and a fork replacing it is still
+    /// adopted rather than taken for one below the window: nothing is stored below it.
+    #[tokio::test]
+    async fn a_fork_replacing_a_first_block_at_genesis_adopts_the_new_branch() {
+        let mut machine = Machine::new(Source::linear(2), Sink::default(), Vec::new());
+        settle(&mut machine, Some(0)).await;
+        assert_eq!(heights(&machine), [0, 1, 2]);
+        let source = chain(&mut machine);
+        source.blocks.insert(0, (hash(100), hash(0)));
+        source.blocks.insert(1, (hash(101), hash(100)));
+        source.blocks.insert(2, (hash(102), hash(101)));
+        observe(&mut machine, 2).await;
+        let markers = reorgs(&machine);
+        assert_eq!(markers.len(), 1);
+        assert_eq!(markers[0].height, 0);
+        assert_eq!(markers[0].orphaned_hashes, [hash(2), hash(1), hash(0)]);
+        assert_eq!(heights(&machine), [0, 1, 2, 0, 1, 2]);
+        assert_eq!(machine.tip().expect("tip").hash, hash(102));
+        assert!(machine.ring.holds_whole_history());
+    }
+
+    /// A fork whose common ancestor is the floor retracts everything above it and leaves
+    /// the floor as the tip until the first replacement is accepted.
+    #[tokio::test]
+    async fn a_fork_down_to_the_floor_replays_on_top_of_it() {
+        let mut source = Source::linear(5);
+        fork(&mut source, 3, 5);
+        let mut machine = Machine::new(source, Sink::default(), Ledger::new(ledger(2..=4), true));
+        observe(&mut machine, 5).await;
+        let markers = reorgs(&machine);
+        assert_eq!(markers.len(), 1);
+        assert_eq!(markers[0].height, 3);
+        assert_eq!(markers[0].orphaned_hashes, [hash(4), hash(3)]);
+        assert_eq!(heights(&machine), [3, 4, 5]);
+        assert_eq!(machine.ring.oldest(), Some(meta(2)));
+        assert_eq!(machine.tip().expect("tip").hash, hash(105));
     }
 
     #[tokio::test]

@@ -117,6 +117,14 @@ pub enum ResumeError {
         /// What failed.
         source: StoreError,
     },
+    /// A store could not be told which of its blocks ingest hands it again.
+    #[error("{store} could not reconcile the blocks it holds: {source}")]
+    Reconcile {
+        /// The store.
+        store: StoreBackend,
+        /// What failed.
+        source: StoreError,
+    },
     /// The stores' ledgers share no block, so no height is safe to resume every one
     /// from: one store is further behind than the others' ledgers reach back, or they
     /// hold different chains.
@@ -135,7 +143,9 @@ impl ResumeError {
     pub fn is_permanent(&self) -> bool {
         match self {
             Self::NoCommonBlock { .. } => true,
-            Self::Restore { source, .. } | Self::Rewind { source, .. } => source.is_permanent(),
+            Self::Restore { source, .. }
+            | Self::Rewind { source, .. }
+            | Self::Reconcile { source, .. } => source.is_permanent(),
         }
     }
 }
@@ -212,10 +222,7 @@ pub(crate) async fn resume<S: Store>(
             .flat_map(|r| r.contracts)
             .filter(|contract| !held.contains(&contract.block_hash))
             .collect(),
-        ledger: Ledger {
-            blocks,
-            history_below,
-        },
+        ledger: Ledger::new(blocks, history_below),
     };
     Ok((settled, resumed))
 }
@@ -265,7 +272,13 @@ async fn settle<S: Store>(
         info!(store = %opened.backend, from = common + 1, to = tip,
             "store committed past the others; it keeps its blocks and is handed each again");
         held.extend(above.iter().map(|block| block.hash));
-        opened.store.reconcile(&above);
+        opened
+            .store
+            .reconcile(&above)
+            .map_err(|source| ResumeError::Reconcile {
+                store: opened.backend,
+                source,
+            })?;
         return Ok(opened);
     }
     warn!(store = %opened.backend, from = tip, to = common,
@@ -421,7 +434,9 @@ mod tests {
             })
         }
 
-        fn reconcile(&mut self, _held: &[BlockMeta]) {}
+        fn reconcile(&mut self, _held: &[BlockMeta]) -> Result<(), StoreError> {
+            Ok(())
+        }
 
         async fn rewind(&mut self, height: u64) -> Result<(), StoreError> {
             self.note("rewind");
@@ -457,12 +472,12 @@ mod tests {
         ];
         let (stores, restored) = resume(stores).await.expect("resumed");
         assert_eq!(
-            restored.ledger.blocks,
+            restored.ledger.blocks(),
             ledger(0xa0, 1..=5),
             "the slowest store's ledger"
         );
         assert!(
-            !restored.ledger.history_below,
+            !restored.ledger.history_below(),
             "the rewound store holds nothing below it"
         );
         assert_eq!(
@@ -644,8 +659,8 @@ mod tests {
             let (_, resumed) = resume(stores).await.expect(label);
             let mut expected = slow;
             expected.retain(|block| block.height <= common);
-            assert_eq!(resumed.ledger.blocks, expected, "{label}");
-            assert_eq!(resumed.ledger.history_below, below, "{label}");
+            assert_eq!(resumed.ledger.blocks(), expected, "{label}");
+            assert_eq!(resumed.ledger.history_below(), below, "{label}");
         }
     }
 

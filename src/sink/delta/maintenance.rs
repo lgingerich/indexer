@@ -18,6 +18,11 @@
 //!   otherwise do it after every commit, listing the whole log each time (see
 //!   [`commit_properties`](super::lake::commit_properties)).
 //!
+//! Vacuum and log cleanup are due a table once a day since they last both succeeded on
+//! it, as the table itself records (see [`VACUUMED`]), so neither a restart nor a
+//! failure on another table moves the day on; a table they fail on is tried again on
+//! the next pass.
+//!
 //! Each pass reads every table afresh from its newest checkpoint and lets it go once
 //! done: a table kept from one pass to the next grows by a batch for every commit it is
 //! brought up to date with (see [`Lake::checkpoint_if_due`](super::lake::Lake::checkpoint_if_due)).
@@ -36,8 +41,10 @@ use std::time::{Duration, SystemTime};
 
 use deltalake::checkpoints::cleanup_expired_logs_for;
 use deltalake::logstore::LogStoreRef;
+use deltalake::logstore::object_store::path::Path as ObjectPath;
+use deltalake::logstore::object_store::{ObjectStoreExt as _, PutPayload};
 use deltalake::parquet::file::properties::WriterProperties;
-use deltalake::{DeltaTable, DeltaTableError, FilterOp, FilterValue};
+use deltalake::{DeltaTable, DeltaTableError, FilterOp, FilterValue, ObjectStoreError};
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, MissedTickBehavior};
 use tracing::{info, warn};
@@ -50,7 +57,8 @@ use crate::window::MAX_UNFINALIZED_BLOCKS;
 /// How often the task looks for finished partitions to compact.
 const COMPACT_EVERY: Duration = Duration::from_hours(1);
 
-/// How often the task vacuums every table and cleans its log.
+/// How often each table is vacuumed and its log cleaned, counted from the last time both
+/// succeeded on it.
 const VACUUM_EVERY: Duration = Duration::from_hours(24);
 
 /// The file size compaction writes towards.
@@ -99,42 +107,106 @@ async fn run(
 ) {
     let mut passes = tokio::time::interval_at(Instant::now() + COMPACT_EVERY, COMPACT_EVERY);
     passes.set_missed_tick_behavior(MissedTickBehavior::Delay);
-    let mut vacuumed = Instant::now();
     loop {
         passes.tick().await;
-        let vacuum = vacuumed.elapsed() >= VACUUM_EVERY;
         for (name, log_store, width) in &tables {
-            let mut table = DeltaTable::new(Arc::clone(log_store));
-            if let Err(error) = table.load().await {
-                metrics::lake_maintenance_failed("load");
-                warn!(table = %name, %error, "lake table unreadable for maintenance; retrying next pass");
-                continue;
-            }
-            if let Err(error) = compact(
-                name,
-                &mut table,
-                *width,
-                tip.load(Ordering::Acquire),
-                &writer,
-            )
-            .await
-            {
-                metrics::lake_maintenance_failed("compact");
-                warn!(table = %name, %error, "lake compaction failed; retrying next pass");
-            }
-            if vacuum && let Err(error) = self::vacuum(name, &mut table, retention).await {
-                metrics::lake_maintenance_failed("vacuum");
-                warn!(table = %name, %error, "lake vacuum failed; retrying next pass");
-            }
-            if vacuum && let Err(error) = clean_log(name, &mut table, retention).await {
-                metrics::lake_maintenance_failed("log_cleanup");
-                warn!(table = %name, %error, "lake log cleanup failed; retrying next pass");
-            }
-        }
-        if vacuum {
-            vacuumed = Instant::now();
+            let tip = tip.load(Ordering::Acquire);
+            maintain(name, log_store, *width, tip, retention, &writer).await;
         }
     }
+}
+
+/// One pass over the table `name`, read through `log_store` and `width` heights a
+/// partition: compacts what the committed `tip` has finished, and vacuums and cleans
+/// its log when they are [due](vacuum_due), recording when both succeed. A failure is
+/// logged and counted, and the step tried again on the next pass.
+pub(super) async fn maintain(
+    name: &str,
+    log_store: &LogStoreRef,
+    width: u64,
+    tip: u64,
+    retention: Duration,
+    writer: &WriterProperties,
+) {
+    let mut table = DeltaTable::new(Arc::clone(log_store));
+    if let Err(error) = table.load().await {
+        metrics::lake_maintenance_failed("load");
+        warn!(table = %name, %error, "lake table unreadable for maintenance; retrying next pass");
+        return;
+    }
+    if let Err(error) = compact(name, &mut table, width, tip, writer).await {
+        metrics::lake_maintenance_failed("compact");
+        warn!(table = %name, %error, "lake compaction failed; retrying next pass");
+    }
+    match vacuum_due(log_store).await {
+        Ok(true) => {}
+        Ok(false) => return,
+        Err(error) => {
+            metrics::lake_maintenance_failed("vacuum");
+            warn!(table = %name, %error, "lake vacuum record unreadable; retrying next pass");
+            return;
+        }
+    }
+    let vacuumed = vacuum(name, &mut table, retention).await;
+    if let Err(error) = &vacuumed {
+        metrics::lake_maintenance_failed("vacuum");
+        warn!(table = %name, %error, "lake vacuum failed; retrying next pass");
+    }
+    let cleaned = clean_log(name, &mut table, retention).await;
+    if let Err(error) = &cleaned {
+        metrics::lake_maintenance_failed("log_cleanup");
+        warn!(table = %name, %error, "lake log cleanup failed; retrying next pass");
+    }
+    if vacuumed.is_ok()
+        && cleaned.is_ok()
+        && let Err(error) = record_vacuumed(log_store).await
+    {
+        metrics::lake_maintenance_failed("vacuum");
+        warn!(table = %name, %error, "lake vacuum not recorded; repeating it next pass");
+    }
+}
+
+/// Where a table records when vacuum and log cleanup last both succeeded on it: an
+/// empty object at the table's root, whose modification time is that moment, put by
+/// the object store's own clock.
+///
+/// Delta's own history cannot tell it: a vacuum with nothing to delete commits
+/// nothing, and log cleanup never commits. The name starts with `_`, which Delta
+/// readers skip and vacuum leaves alone.
+pub(super) const VACUUMED: &str = "_vacuumed";
+
+/// Whether the table read through `log_store` is due a vacuum and log cleanup: it has
+/// never recorded one (see [`VACUUMED`]), or recorded one [`VACUUM_EVERY`] ago or more.
+pub(super) async fn vacuum_due(log_store: &LogStoreRef) -> Result<bool, DeltaTableError> {
+    let recorded = match log_store
+        .object_store(None)
+        .head(&ObjectPath::from(VACUUMED))
+        .await
+    {
+        Ok(meta) => Some(SystemTime::from(meta.last_modified)),
+        Err(ObjectStoreError::NotFound { .. }) => None,
+        Err(error) => return Err(error.into()),
+    };
+    Ok(due(recorded, SystemTime::now()))
+}
+
+/// Whether a vacuum last recorded at `recorded`, if ever, is due again at `now`. One
+/// recorded after `now`, by a store clock ahead of this one, is not.
+pub(super) fn due(recorded: Option<SystemTime>, now: SystemTime) -> bool {
+    recorded.is_none_or(|recorded| {
+        now.duration_since(recorded)
+            .is_ok_and(|elapsed| elapsed >= VACUUM_EVERY)
+    })
+}
+
+/// Records that vacuum and log cleanup both succeeded on the table read through
+/// `log_store`, now (see [`VACUUMED`]).
+async fn record_vacuumed(log_store: &LogStoreRef) -> Result<(), DeltaTableError> {
+    log_store
+        .object_store(None)
+        .put(&ObjectPath::from(VACUUMED), PutPayload::new())
+        .await?;
+    Ok(())
 }
 
 /// Compacts every partition of the table `name`, `width` heights wide, the committed

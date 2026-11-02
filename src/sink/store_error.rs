@@ -121,6 +121,12 @@ pub enum StoreError {
         /// The envelope's chain.
         envelope: String,
     },
+    /// A store was told which blocks it already holds after it had been handed an
+    /// envelope, or a second time. Those blocks are settled as ingest hands their heights
+    /// again, so they must be named before the first, or some would go unchecked; this
+    /// never happens unless an invariant upstream broke.
+    #[error("a store was told which blocks it holds after its first envelope, or twice")]
+    LateReconcile,
     /// An existing table does not match its definition. Tables are not migrated, so the
     /// store needs a fresh location or the table dropped.
     #[error("table {table} does not match its definition: {difference}")]
@@ -135,15 +141,20 @@ pub enum StoreError {
 impl StoreError {
     /// Whether opening the store again fails the same way, so a supervisor should stop
     /// restarting it: a table whose stored shape or declaration is wrong, or a stored
-    /// value that does not parse. Each needs an operator — a table dropped, a definition
-    /// fixed — not another try.
+    /// value that does not parse, or a [`LateReconcile`](Self::LateReconcile), which is a
+    /// bug the same code meets again. Each needs an operator — a table dropped, a
+    /// definition or the code fixed — not another try.
     ///
     /// An engine failure may pass, and so may [`Locked`](Self::Locked): during a deploy
     /// the old process can hold the lock for a moment after the new one starts.
     #[must_use]
     pub fn is_permanent(&self) -> bool {
         match self {
-            Self::Drift { .. } | Self::Reserved { .. } | Self::Table(_) | Self::Restore(_) => true,
+            Self::Drift { .. }
+            | Self::Reserved { .. }
+            | Self::Table(_)
+            | Self::Restore(_)
+            | Self::LateReconcile => true,
             Self::Engine { .. }
             | Self::Locked { .. }
             | Self::Failed

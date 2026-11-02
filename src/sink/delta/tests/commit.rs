@@ -5,7 +5,7 @@ use deltalake::arrow::util::display::{ArrayFormatter, FormatOptions};
 use deltalake::datafusion::prelude::ident;
 
 use super::*;
-use crate::sink::delta::ROWS_PER_BATCH;
+use crate::sink::delta::{Phase, ROWS_PER_BATCH};
 use crate::sink::fixtures;
 
 /// Committed blocks survive a reopen, the ledger comes back oldest first, and wide
@@ -359,7 +359,7 @@ async fn a_ledger_append_overlaps_the_next_commit() {
         buffer(&mut sink, block(height, 0)).await;
         sink.flush().await.expect("flushed");
         assert!(
-            sink.ledger.is_running(),
+            sink.appending.is_some(),
             "{height}: the flush left its append running"
         );
         assert_eq!(
@@ -370,11 +370,40 @@ async fn a_ledger_append_overlaps_the_next_commit() {
     }
     assert_eq!(ledger_heights(&mut sink).await, [1, 2, 3]);
     assert!(
-        !sink.ledger.is_running(),
+        sink.appending.is_none(),
         "the restore waited for the append"
     );
     assert_eq!(ledger_version(&sink), opened + 3);
     assert_eq!(blocks(&sink).await, expected(&[(1, 0), (2, 0), (3, 0)]));
+}
+
+/// A commit that fails part-way still waits for the last commit's ledger append before
+/// it returns, so that commit, already reported as committed, is never undone by an
+/// append left to be aborted.
+#[tokio::test]
+async fn a_failed_commit_waits_for_the_last_ledger_append() {
+    let dir = Dir::new();
+    let mut sink = open(&dir).await;
+    let opened = ledger_version(&sink);
+    buffer(&mut sink, block(1, 0)).await;
+    sink.flush().await.expect("flushed");
+    assert!(sink.appending.is_some());
+    buffer(&mut sink, broken(2)).await;
+    sink.flush()
+        .await
+        .expect_err("the commit fails building its rows");
+    assert!(matches!(sink.phase, Phase::Failed));
+    assert!(sink.appending.is_none());
+    assert_eq!(
+        ledger_version(&sink),
+        opened + 1,
+        "the last append was waited for and taken in"
+    );
+    drop(sink);
+
+    let mut sink = open(&dir).await;
+    assert_eq!(blocks(&sink).await, expected(&[(1, 0)]));
+    assert_eq!(ledger_heights(&mut sink).await, [1]);
 }
 
 /// The ledger's version as of the last append the sink has taken in.

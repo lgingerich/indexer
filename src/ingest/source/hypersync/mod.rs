@@ -115,13 +115,8 @@ const LOG_POSITION_FIELDS: &[&str] = &[
 struct Plan {
     /// The rows projected.
     datasets: Datasets,
-    /// The columns queried for them.
+    /// The columns queried for them, which also say which tables the query reads.
     fields: FieldSelection,
-    /// Whether the query reads transactions, which are then checked for a gap and
-    /// against the block's gas.
-    reads_transactions: bool,
-    /// Whether the query reads logs, which are then checked against the block's bloom.
-    reads_logs: bool,
 }
 
 impl Plan {
@@ -155,12 +150,19 @@ impl Plan {
                 &[]
             },
         };
-        Self {
-            datasets,
-            fields,
-            reads_transactions,
-            reads_logs,
-        }
+        Self { datasets, fields }
+    }
+
+    /// Whether the query reads transactions, which are then checked for a gap and
+    /// against the block's gas: whenever it selects any of their columns.
+    const fn reads_transactions(&self) -> bool {
+        !self.fields.transaction.is_empty()
+    }
+
+    /// Whether the query reads logs, which are then checked against the block's bloom:
+    /// whenever it selects any of their columns.
+    const fn reads_logs(&self) -> bool {
+        !self.fields.log.is_empty()
     }
 
     /// A header read: each block's identity, and no rows.
@@ -176,8 +178,6 @@ impl Plan {
                 transaction: &[],
                 log: &[],
             },
-            reads_transactions: false,
-            reads_logs: false,
         }
     }
 }
@@ -308,8 +308,8 @@ impl HyperSyncSource {
             to_block: to.saturating_add(1),
             include_all_blocks: true,
             join_mode: "JoinNothing",
-            transactions: plan.reads_transactions.then_some([All {}]),
-            logs: plan.reads_logs.then_some([All {}]),
+            transactions: plan.reads_transactions().then_some([All {}]),
+            logs: plan.reads_logs().then_some([All {}]),
             field_selection: plan.fields,
         };
         self.send(|client| client.post(self.query_url.clone()).json(&query))

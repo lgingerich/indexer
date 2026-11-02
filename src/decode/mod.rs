@@ -31,5 +31,5 @@ mod sink;
 
 pub use abi::{AbiError, DecodeError};
 pub use catalog::{Catalog, CatalogError};
-pub use decoder::{Decoder, Decoding};
+pub use decoder::{Claims, Decoder, Record};
 pub use sink::DecodingSink;

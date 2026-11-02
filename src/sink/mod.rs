@@ -135,6 +135,11 @@ pub trait EnvelopeSink: Send {
     /// Waits for what a flush left running, once nothing more will be published. A sink
     /// whose flush is whole when it returns has nothing to wait for, which is the default.
     ///
+    /// The storage drain calls it after a flush it dropped part-way too, as a stop drops
+    /// one that runs out of time. A sink then waits only for what the flushes before that
+    /// one left running, if it still holds any, and does not take itself for healthy:
+    /// what the dropped flush wrote is repaired, if at all, by reopening the store.
+    ///
     /// # Errors
     ///
     /// Returns an error if what was left running failed.
@@ -213,7 +218,12 @@ pub trait Store: EnvelopeSink + 'static {
     /// same hash is not written again, and one with another hash retracts the store's
     /// copy as a reorg would. Called at startup, before the first envelope, for a store
     /// whose ledger reaches down to where ingest resumes (see `sink::resume`).
-    fn reconcile(&mut self, held: &[BlockMeta]);
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::LateReconcile`] when called after the first envelope or a
+    /// second time, rather than settle only the heights still to come.
+    fn reconcile(&mut self, held: &[BlockMeta]) -> Result<(), StoreError>;
 
     /// Deletes every block above `height` — its rows and its ledger entry — so the store
     /// holds the chain up to `height` and nothing after it. Run at startup, before the
@@ -356,11 +366,12 @@ pub(crate) mod fixtures {
         let Event::Log(log) = envelope.event else {
             panic!("the fixture is a log");
         };
-        Decoder::new(catalog("base"))
+        Decoder::new(catalog("base"), [])
             .decode(&log)
             .expect("a seeded pool's swap")
-            .decoded
+            .0
             .expect("decodes")
+            .decoded
     }
 
     /// A Metric `PoolCreated` carrying a real Base pool's arguments, decoded against the
@@ -418,10 +429,11 @@ pub(crate) mod fixtures {
             block_hash: B256::with_last_byte(0x0b),
             ..crate::wire::datasets::evm::Log::default()
         };
-        Decoder::new(catalog("robinhood"))
+        Decoder::new(catalog("robinhood"), [])
             .decode(&log)
             .expect("the seeded factory's event")
-            .decoded
+            .0
             .expect("decodes")
+            .decoded
     }
 }

@@ -126,13 +126,13 @@ pub(super) fn project(
     // Anything but logs is projected from the block body, and receipts are validated
     // against its transaction identities, so a missing body is an error rather than a
     // silently empty projection. Logs alone need no body.
-    if (plan.block_row || plan.transactions) && block.is_none() {
+    if (plan.block_row() || plan.transactions()) && block.is_none() {
         return Err(malformed(BLOCK, "block was not fetched"));
     }
-    if plan.transactions && receipts.is_none() {
+    if plan.transactions() && receipts.is_none() {
         return Err(malformed(RECEIPTS, "receipts were not fetched"));
     }
-    if plan.logs == LogSource::GetLogs && logs.is_none() {
+    if plan.logs() == LogSource::GetLogs && logs.is_none() {
         return Err(malformed(LOGS, "logs were not fetched"));
     }
 
@@ -145,7 +145,7 @@ pub(super) fn project(
                 format!("block {} at {} is not {meta:?}", header.hash, header.number),
             ));
         }
-        if plan.block_row {
+        if plan.block_row() {
             rows.block = Some(decode_header(block));
         }
         append_body(&mut rows, block, receipts, plan, meta)?;
@@ -182,7 +182,7 @@ fn append_body(
     plan: FetchPlan,
     meta: BlockMeta,
 ) -> Result<(), SourceError> {
-    if !plan.transactions {
+    if !plan.transactions() {
         return Ok(());
     }
     let transactions = block
@@ -207,7 +207,7 @@ fn append_body(
             ));
         }
         let mut own = Vec::new();
-        if plan.logs == LogSource::Receipts {
+        if plan.logs() == LogSource::Receipts {
             for log in receipt.logs() {
                 // Logs nested in this receipt, as opposed to a separate `eth_getLogs`
                 // query; the label names the boundary an error at this site reports.

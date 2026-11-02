@@ -1,5 +1,19 @@
 //! Maintenance: compaction, vacuum, log cleanup, and checkpoints.
 
+use std::time::{Duration, SystemTime};
+
+use deltalake::logstore::LogStoreRef;
+use deltalake::logstore::object_store::local::LocalFileSystem;
+use deltalake::logstore::object_store::path::Path as ObjectPath;
+use deltalake::logstore::object_store::{
+    CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
+    PutMultipartOptions, PutOptions, PutPayload, PutResult, Result as ObjectResult,
+};
+use deltalake::{DeltaTableBuilder, ObjectStoreError, ensure_table_uri};
+use futures_util::StreamExt as _;
+use futures_util::future::BoxFuture;
+use futures_util::stream::BoxStream;
+
 use super::*;
 use crate::sink::delta::arrow::PARTITION;
 use crate::sink::delta::lake::CHECKPOINT_EVERY;
@@ -76,7 +90,7 @@ async fn maintenance_compacts_finished_partitions_and_vacuums_what_they_replaced
             .count()
     };
     assert_eq!(on_disk("0"), 4, "the replaced files stay until a vacuum");
-    let vacuumed = maintenance::vacuum("blocks", &mut table, std::time::Duration::ZERO)
+    let vacuumed = maintenance::vacuum("blocks", &mut table, Duration::ZERO)
         .await
         .expect("vacuums");
     assert_eq!(vacuumed, 3);
@@ -150,7 +164,7 @@ async fn log_cleanup_keeps_what_a_checkpoint_does_not_replace() {
     assert_eq!(entries(), (0..=checkpoint + 1).collect::<Vec<_>>());
 
     let mut table = sink.lakes[position].table.clone();
-    let cleaned = maintenance::clean_log("blocks", &mut table, std::time::Duration::ZERO)
+    let cleaned = maintenance::clean_log("blocks", &mut table, Duration::ZERO)
         .await
         .expect("cleans");
     assert_eq!(
@@ -226,13 +240,13 @@ async fn an_append_after_a_checkpoint_carries_on_from_it() {
     accept(&mut sink, 1..=last).await;
     assert_eq!(wait_for_checkpoint(&log).await, CHECKPOINT_EVERY);
     let position = sink.position(Table::AcceptedBlock);
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
     while reopened(&sink, position).is_none() {
         assert!(
             std::time::Instant::now() < deadline,
             "the checkpoint was not read back"
         );
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        tokio::time::sleep(Duration::from_millis(10)).await;
     }
     assert_eq!(
         reopened(&sink, position),
@@ -279,7 +293,7 @@ fn log_of(dir: &Dir, table: &str) -> PathBuf {
 /// a task the sink does not hand out, so this polls; the deadline only bounds a
 /// failure, and is far past how long a checkpoint of a small table takes.
 async fn wait_for_checkpoint(log: &std::path::Path) -> u64 {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
     let hint = log.join("_last_checkpoint");
     loop {
         // Read whole or not at all: a hint half-written reads as no hint yet.
@@ -294,6 +308,177 @@ async fn wait_for_checkpoint(log: &std::path::Path) -> u64 {
             std::time::Instant::now() < deadline,
             "no checkpoint was written"
         );
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// A vacuum is due a table that never recorded one, or recorded one a day ago or more;
+/// not one recorded since, nor one a store clock ahead of this one recorded.
+#[test]
+fn a_vacuum_is_due_a_day_after_the_last_that_succeeded() {
+    let now = SystemTime::now();
+    assert!(maintenance::due(None, now));
+    assert!(!maintenance::due(Some(now - Duration::from_hours(23)), now));
+    assert!(maintenance::due(Some(now - Duration::from_hours(24)), now));
+    assert!(!maintenance::due(Some(now + Duration::from_hours(1)), now));
+}
+
+/// A pass records a table's vacuum on the table itself, and only once the vacuum and
+/// the log cleanup succeed: one that failed is due again on the next pass, and one that
+/// succeeded is not due again until a day later by the record, however often the
+/// process restarts in between.
+#[tokio::test]
+async fn a_vacuum_is_recorded_on_its_table_only_once_it_succeeds() {
+    let dir = Dir::new();
+    let mut sink = open(&dir).await;
+    for height in [1, 2, 3, 100_001, 100_002] {
+        publish(&mut sink, block(height, 0)).await;
+    }
+    let position = sink.positions[&TableId::Dataset(Table::Block)];
+    let width = sink.lakes[position].width;
+    let log_store = sink.lakes[position].table.log_store();
+    let writer = sink.writer.clone();
+    // Partition 0 is finished, so compaction replaces its files, and a vacuum with no
+    // retention deletes the files it replaced.
+    let tip = 100_000 + crate::window::MAX_UNFINALIZED_BLOCKS as u64;
+    let record = PathBuf::from(dir.table("blocks")).join(maintenance::VACUUMED);
+    let due = async |log_store| {
+        maintenance::vacuum_due(log_store)
+            .await
+            .expect("the record reads")
+    };
+
+    let undeletable = undeletable(&dir, "blocks").await;
+    maintenance::maintain("blocks", &undeletable, width, tip, Duration::ZERO, &writer).await;
+    assert!(!record.exists(), "a failed vacuum is not recorded");
+    assert!(due(&log_store).await, "and is due again");
+
+    maintenance::maintain("blocks", &log_store, width, tip, Duration::ZERO, &writer).await;
+    assert!(record.exists(), "a vacuum that succeeded is recorded");
+    assert!(!due(&log_store).await, "and not due again the same day");
+    drop(sink);
+
+    let sink = open(&dir).await;
+    let log_store = sink.lakes[position].table.log_store();
+    assert!(!due(&log_store).await, "a restart does not make it due");
+    std::fs::File::options()
+        .write(true)
+        .open(&record)
+        .expect("the record")
+        .set_modified(SystemTime::now() - Duration::from_hours(25))
+        .expect("backdated");
+    assert!(due(&log_store).await, "a day after the record, it is due");
+}
+
+/// The log store of `table` in the lake at `dir`, through [`Undeletable`].
+async fn undeletable(dir: &Dir, table: &str) -> LogStoreRef {
+    let store = Arc::new(Undeletable(LocalFileSystem::new()));
+    let url = ensure_table_uri(dir.table(table)).expect("a table url");
+    let mut undeletable = DeltaTableBuilder::from_url(url.clone())
+        .expect("a table builder")
+        .with_storage_backend(store, url)
+        .build()
+        .expect("the table builds");
+    undeletable.load().await.expect("the table loads");
+    undeletable.log_store()
+}
+
+/// The local filesystem, except that every delete fails, as a vacuum's do on a store
+/// that refuses them.
+#[derive(Debug)]
+struct Undeletable(LocalFileSystem);
+
+impl std::fmt::Display for Undeletable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Undeletable({})", self.0)
+    }
+}
+
+// `ObjectStore` is declared with `async_trait`, whose signatures are spelled out here
+// rather than taking the macro on as a dependency for one fake.
+impl ObjectStore for Undeletable {
+    fn put_opts<'life0, 'life1, 'async_trait>(
+        &'life0 self,
+        location: &'life1 ObjectPath,
+        payload: PutPayload,
+        options: PutOptions,
+    ) -> BoxFuture<'async_trait, ObjectResult<PutResult>>
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        Self: 'async_trait,
+    {
+        self.0.put_opts(location, payload, options)
+    }
+
+    fn put_multipart_opts<'life0, 'life1, 'async_trait>(
+        &'life0 self,
+        location: &'life1 ObjectPath,
+        options: PutMultipartOptions,
+    ) -> BoxFuture<'async_trait, ObjectResult<Box<dyn MultipartUpload>>>
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        Self: 'async_trait,
+    {
+        self.0.put_multipart_opts(location, options)
+    }
+
+    fn get_opts<'life0, 'life1, 'async_trait>(
+        &'life0 self,
+        location: &'life1 ObjectPath,
+        options: GetOptions,
+    ) -> BoxFuture<'async_trait, ObjectResult<GetResult>>
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        Self: 'async_trait,
+    {
+        self.0.get_opts(location, options)
+    }
+
+    fn delete_stream(
+        &self,
+        locations: BoxStream<'static, ObjectResult<ObjectPath>>,
+    ) -> BoxStream<'static, ObjectResult<ObjectPath>> {
+        locations
+            .map(|_| {
+                Err(ObjectStoreError::Generic {
+                    store: "Undeletable",
+                    source: "deletes are refused".into(),
+                })
+            })
+            .boxed()
+    }
+
+    fn list(&self, prefix: Option<&ObjectPath>) -> BoxStream<'static, ObjectResult<ObjectMeta>> {
+        self.0.list(prefix)
+    }
+
+    fn list_with_delimiter<'life0, 'life1, 'async_trait>(
+        &'life0 self,
+        prefix: Option<&'life1 ObjectPath>,
+    ) -> BoxFuture<'async_trait, ObjectResult<ListResult>>
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        Self: 'async_trait,
+    {
+        self.0.list_with_delimiter(prefix)
+    }
+
+    fn copy_opts<'life0, 'life1, 'life2, 'async_trait>(
+        &'life0 self,
+        from: &'life1 ObjectPath,
+        to: &'life2 ObjectPath,
+        options: CopyOptions,
+    ) -> BoxFuture<'async_trait, ObjectResult<()>>
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        'life2: 'async_trait,
+        Self: 'async_trait,
+    {
+        self.0.copy_opts(from, to, options)
     }
 }

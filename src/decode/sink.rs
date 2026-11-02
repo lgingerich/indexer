@@ -2,8 +2,8 @@
 
 use tracing::{info, warn};
 
-use super::Decoder;
 use super::derive::{Derivations, Sent};
+use super::{Claims, Decoder, Record};
 use crate::metrics;
 use crate::sink::{EnvelopeSink, SinkError};
 use crate::wire::datasets::evm::Log;
@@ -16,14 +16,22 @@ use crate::wire::envelope::{ChainId, Envelope, Event};
 /// derivations compute from it, then any contract the log created. A reorg marker is
 /// forwarded unchanged and retracts the contracts created in the orphaned blocks.
 ///
+/// The contract set changes only once the inner sink has taken what changes it: a
+/// discovered contract joins it once the log and everything after it are published, and
+/// a reorg retracts once its marker is. So when the inner sink fails, the set is as it
+/// was before the envelope, and the same envelope published again publishes the same
+/// records, its contracts among them.
+///
 /// A derived row carries its transaction's sender and recipient. Ingest publishes each
-/// transaction just before its logs, so the sink remembers the last one it forwarded; a
-/// log whose transaction was not fetched derives rows without them.
+/// transaction just before its logs, so the sink remembers the last one it forwarded in
+/// the current block; a log whose transaction was not fetched derives rows without them.
 pub struct DecodingSink<K> {
     decoder: Decoder,
     /// The derivations the catalog bound, run on every record decoded.
     derivations: Derivations,
-    /// The last transaction forwarded.
+    /// The last transaction forwarded in the current block, `None` before its first. A
+    /// block's batch ends with its accepted-block marker, and a reorg marker starts
+    /// another branch, so either clears it.
     transaction: Option<Sent>,
     /// Logs decoded since the last flush, recorded once a block rather than per log, so
     /// the ingest task pays no metric call per envelope.
@@ -55,31 +63,30 @@ impl<K: EnvelopeSink> DecodingSink<K> {
         }
     }
 
-    /// Decodes one log into the records to publish after it.
+    /// Decodes one log into the records to publish after it, and the claims on the
+    /// contracts among them, to admit once they are published.
     ///
     /// Ordinary decode failures are logged and skipped, leaving the raw log and any
     /// contract the log still discovered; an internal invariant failure stops the run.
-    fn decode(&mut self, chain: &ChainId, log: &Log) -> Result<Vec<Event>, SinkError> {
-        let Some(decoding) = self.decoder.decode(log) else {
-            return Ok(Vec::new());
+    fn decode(
+        &mut self,
+        chain: &ChainId,
+        log: &Log,
+    ) -> Result<(Vec<Event>, Option<Claims>), SinkError> {
+        let Some((decoded, claims)) = self.decoder.decode(log) else {
+            return Ok((Vec::new(), None));
         };
-        if !decoding.discovered.is_empty() {
-            metrics::contracts_discovered(decoding.discovered.len());
-        }
-        let mut events = Vec::with_capacity(2 + decoding.discovered.len());
-        match decoding.decoded {
-            Ok(decoded) => {
+        let mut events = Vec::with_capacity(2 + claims.contracts().len());
+        match decoded {
+            Ok(Record { decoded, event }) => {
                 self.decoded += 1;
                 let sent = self
                     .transaction
                     .filter(|sent| sent.hash == log.transaction_hash);
-                let derived = match decoding.event {
-                    Some(event) => self
-                        .derivations
-                        .rows(chain, event, &decoded, sent)
-                        .map_err(|error| SinkError::Decode(Box::new(error)))?,
-                    None => Vec::new(),
-                };
+                let derived = self
+                    .derivations
+                    .rows(chain, event, &decoded, sent)
+                    .map_err(|error| SinkError::Decode(Box::new(error)))?;
                 events.push(Event::Decoded(Box::new(decoded)));
                 events.extend(derived.into_iter().map(|row| Event::Derived(Box::new(row))));
             }
@@ -96,43 +103,54 @@ impl<K: EnvelopeSink> DecodingSink<K> {
             }
         }
         events.extend(
-            decoding
-                .discovered
-                .into_iter()
-                .map(|contract| Event::Contract(Box::new(contract))),
+            claims
+                .contracts()
+                .map(|contract| Event::Contract(Box::new(contract.clone()))),
         );
-        Ok(events)
+        Ok((events, Some(claims)))
     }
 }
 
 impl<K: EnvelopeSink> EnvelopeSink for DecodingSink<K> {
     async fn publish(&mut self, envelope: Envelope) -> Result<(), SinkError> {
-        let added = match &envelope.event {
+        let (added, claims) = match &envelope.event {
             Event::Transaction(transaction) => {
                 self.transaction = Some(Sent {
                     hash: transaction.hash,
                     from: transaction.from,
                     to: transaction.to,
                 });
-                Vec::new()
+                (Vec::new(), None)
             }
             Event::Log(log) => self.decode(&envelope.chain, log)?,
-            Event::Reorg(reorg) => {
-                let retracted = self.decoder.retract(&reorg.orphaned_hashes);
-                if retracted > 0 {
-                    info!(chain = %envelope.chain, retracted,
-                        "retracted contracts created in orphaned blocks");
-                }
-                Vec::new()
+            Event::AcceptedBlock(_) | Event::Reorg(_) => {
+                self.transaction = None;
+                (Vec::new(), None)
             }
-            _ => Vec::new(),
+            _ => (Vec::new(), None),
         };
         let chain = envelope.chain.clone();
+        let orphaned = match &envelope.event {
+            Event::Reorg(reorg) => Some(reorg.orphaned_hashes.clone()),
+            _ => None,
+        };
         self.inner.publish(envelope).await?;
         for event in added {
             self.inner
                 .publish(Envelope::new(chain.clone(), event))
                 .await?;
+        }
+        if let Some(claims) = claims {
+            let admitted = self.decoder.admit(claims);
+            if admitted > 0 {
+                metrics::contracts_discovered(admitted);
+            }
+        }
+        if let Some(orphaned) = orphaned {
+            let retracted = self.decoder.retract(&orphaned);
+            if retracted > 0 {
+                info!(%chain, retracted, "retracted contracts created in orphaned blocks");
+            }
         }
         Ok(())
     }
@@ -163,9 +181,15 @@ mod tests {
     struct Collect {
         records: Vec<Envelope>,
         flushes: usize,
+        /// The kind of the next envelope to refuse, once, as a closed channel would.
+        refuse: Option<&'static str>,
     }
     impl EnvelopeSink for Collect {
         async fn publish(&mut self, envelope: Envelope) -> Result<(), SinkError> {
+            if self.refuse == Some(envelope.event.kind()) {
+                self.refuse = None;
+                return Err(SinkError::StorageClosed);
+            }
             self.records.push(envelope);
             Ok(())
         }
@@ -180,7 +204,7 @@ mod tests {
     }
 
     fn sink() -> DecodingSink<Collect> {
-        DecodingSink::new(Decoder::new(shipped("base")), Collect::default())
+        DecodingSink::new(Decoder::new(shipped("base"), []), Collect::default())
     }
 
     fn log(log: Log) -> Envelope {
@@ -245,6 +269,41 @@ mod tests {
         sink.publish(reorg(block)).await.expect("reorg");
         sink.publish(log(swap(pool))).await.expect("swap");
         assert_eq!(kinds(&sink)[6..], ["reorg", "log"]);
+    }
+
+    /// A creation log whose contract the inner sink refused leaves the contract set as it
+    /// was: the child does not decode, and the same log published again publishes the
+    /// contract. A reorg the inner sink refused retracts nothing until it is published.
+    #[tokio::test]
+    async fn a_refused_publish_leaves_the_contract_set_as_it_was() {
+        let pool = Address::from([0xd0; 20]);
+        let block = B256::with_last_byte(9);
+        let mut sink = sink();
+        sink.inner.refuse = Some("contract");
+        sink.publish(log(pool_created(pool, block)))
+            .await
+            .expect_err("the contract is refused");
+        sink.publish(log(swap(pool))).await.expect("swap");
+        assert_eq!(kinds(&sink), ["log", "decoded", "log"]);
+
+        sink.publish(log(pool_created(pool, block)))
+            .await
+            .expect("the creation again");
+        sink.publish(log(swap(pool))).await.expect("swap");
+        assert_eq!(
+            kinds(&sink)[3..],
+            ["log", "decoded", "contract", "log", "decoded"]
+        );
+
+        sink.inner.refuse = Some("reorg");
+        sink.publish(reorg(block))
+            .await
+            .expect_err("the reorg is refused");
+        sink.publish(log(swap(pool))).await.expect("swap");
+        assert_eq!(kinds(&sink)[8..], ["log", "decoded"]);
+        sink.publish(reorg(block)).await.expect("the reorg again");
+        sink.publish(log(swap(pool))).await.expect("swap");
+        assert_eq!(kinds(&sink)[10..], ["reorg", "log"]);
     }
 
     /// A record a derivation reads is followed by its derived row, before anything else

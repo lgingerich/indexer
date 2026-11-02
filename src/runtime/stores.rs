@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use tracing::{Instrument as _, info, info_span};
 
-use crate::decode::{Decoder, DecodingSink};
+use crate::decode::{Catalog, Decoder, DecodingSink};
 use crate::ingest::pipeline::{Machine, PipelineError};
 use crate::ingest::source::BlockSource;
 use crate::sink::any_store::AnyStore;
@@ -73,7 +73,7 @@ impl<B: BlockSource + 'static> Pipeline<B> {
             source,
             start_block,
             stop_block,
-            decoder,
+            catalog,
             schema,
             ..
         } = self;
@@ -84,7 +84,7 @@ impl<B: BlockSource + 'static> Pipeline<B> {
             () = stop.wait() => return Ok(()),
             resumed = sink::resume::resume(stores) => resumed?,
         };
-        let decoder = restore(decoder, &chain, resumed.contracts);
+        let decoder = restore(catalog, &chain, resumed.contracts);
         let ledger = ledger(&chain, resumed.ledger);
 
         let mut sinks = Vec::with_capacity(stores.len());
@@ -133,16 +133,18 @@ impl<B: BlockSource + 'static> Pipeline<B> {
     }
 }
 
-/// Adds the contracts a previous run discovered, as the stores read them back.
-fn restore(mut decoder: Decoder, chain: &ChainId, stored: Vec<StoredContract>) -> Decoder {
-    let restored = decoder.restore(stored);
-    info!(%chain, restored, contracts = decoder.contracts(), "discovered contracts restored");
+/// The decoder over `catalog` with the contracts a previous run discovered, as the
+/// stores read them back.
+fn restore(catalog: Catalog, chain: &ChainId, stored: Vec<StoredContract>) -> Decoder {
+    let decoder = Decoder::new(catalog, stored);
+    info!(%chain, restored = decoder.discovered(), contracts = decoder.contracts(),
+        "discovered contracts restored");
     decoder
 }
 
 /// The accepted blocks a previous run committed, as ingest takes them.
 pub(super) fn ledger(chain: &ChainId, stored: Ledger) -> Ledger {
-    if let (Some(oldest), Some(tip)) = (stored.blocks.first(), stored.blocks.last()) {
+    if let (Some(oldest), Some(tip)) = (stored.blocks().first(), stored.blocks().last()) {
         info!(%chain, from = oldest.height, tip = tip.height, hash = %tip.hash,
             "accepted blocks restored");
     } else {

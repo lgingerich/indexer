@@ -100,8 +100,8 @@ impl Store for AnyStore {
         each!(self, sink => sink.restore().await)
     }
 
-    fn reconcile(&mut self, held: &[BlockMeta]) {
-        each!(self, sink => sink.reconcile(held));
+    fn reconcile(&mut self, held: &[BlockMeta]) -> Result<(), StoreError> {
+        each!(self, sink => sink.reconcile(held))
     }
 
     async fn rewind(&mut self, height: u64) -> Result<(), StoreError> {

@@ -219,7 +219,7 @@ impl<C> EvmSource<C> {
             })
             .collect::<Result<Vec<_>, _>>()
             .map_err(|source| transport(BLOCK, source))?;
-        let logs = (self.plan.logs == LogSource::GetLogs)
+        let logs = (self.plan.logs() == LogSource::GetLogs)
             .then(|| {
                 let filter = Filter::new().from_block(from).to_block(to);
                 batch.add_call::<_, Vec<RpcLog>>(LOGS, &(filter,))

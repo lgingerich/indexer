@@ -118,8 +118,20 @@ impl DeltaSink {
     }
 
     /// Deletes the rows of blocks `ledger` does not name, at or above its oldest height:
-    /// what a commit that stopped part-way appended before its ledger entry. With no
-    /// ledger at all, every block row is such a row.
+    /// what a commit that stopped part-way appended before its ledger entry, or a
+    /// retraction or rewind left once its blocks were out of the ledger (see [`Step`]).
+    /// With no ledger at all, every block row is such a row.
+    ///
+    /// Looking no lower than the ledger's oldest block misses none. Every row a stop
+    /// leaves unnamed is above the ledger's tip as the stop left it: a commit's new
+    /// blocks are above the tip it started from, or at the heights of orphans it took
+    /// out of the ledger first, which leaves the tip below them; a rewind's blocks are
+    /// above the height it took the tip to. And the ledger does not move on before the
+    /// rows are deleted, since this runs at every open, before anything is written: the
+    /// window the ledger is read in only slides with later commits' entries, and each of
+    /// those follows an open that already deleted what the stop left.
+    ///
+    /// [`Step`]: super::Step
     ///
     /// Every block table is read, so the reads overlap; a stray row is rare, and its
     /// delete runs once they are done.

@@ -15,9 +15,9 @@
 //!
 //! A stop height caps startup instead: backfill and the tail fill end at it, and the run
 //! returns without going live. It must be at or below the sampled head. A source that
-//! does not follow heads always has one: the buried bound under the head it samples at
-//! startup, so a run on it backfills and returns, and a run on a source that does
-//! resumes after it.
+//! does not follow heads always has one: the buried bound under the head it samples
+//! first, fixed for the run, so a run on it backfills and returns, and a run on a source
+//! that does resumes after it.
 //!
 //! # Resume
 //!
@@ -192,8 +192,8 @@ impl<S: BlockSource + 'static, K: EnvelopeSink> Machine<S, K> {
     /// Indexes from `start` through the sampled head, then follows live heads; or, given a
     /// `stop`, indexes through `stop` and returns. A source that does not
     /// [follow heads](BlockSource::follows_heads) only backfills: the run indexes the
-    /// buried heights, no further than `stop`, and returns, leaving the rest to a run on a
-    /// source that does, which resumes after it.
+    /// buried heights under the head it samples first, no further than `stop`, and
+    /// returns, leaving the rest to a run on a source that does, which resumes after it.
     ///
     /// `start` is a fresh run's first height; `None` starts at the sampled head. A machine
     /// built with a ledger resumes after its tip instead: a `start` the stored history

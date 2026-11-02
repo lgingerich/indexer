@@ -141,6 +141,21 @@ fn block(height: u64, branch: u8) -> Vec<Envelope> {
         .collect()
 }
 
+/// [`block`], with a timestamp too large for the lake's microseconds, which fails the
+/// commit that builds its rows part-way.
+fn broken(height: u64) -> Vec<Envelope> {
+    let mut envelopes = block(height, 0);
+    for envelope in &mut envelopes {
+        match &mut envelope.event {
+            Event::Block(block) => block.timestamp = u64::MAX,
+            Event::Transaction(transaction) => transaction.block_timestamp = u64::MAX,
+            Event::Log(log) => log.block_timestamp = u64::MAX,
+            _ => {}
+        }
+    }
+    envelopes
+}
+
 /// The ledger a restart resumes from, as the lake restores it.
 async fn ledger(sink: &mut DeltaSink) -> Vec<BlockMeta> {
     sink.restore().await.expect("the lake restores").ledger
@@ -259,3 +274,4 @@ async fn delete_only(sink: &mut DeltaSink, table: Table, column: &str, hash: B25
 mod commit;
 mod maintenance;
 mod repair;
+mod steps;

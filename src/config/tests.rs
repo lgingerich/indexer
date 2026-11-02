@@ -228,7 +228,8 @@ fn ingest_names_one_source() {
         ("https://example.invalid", "wss://example.invalid")
     );
 
-    let settings = parse(&ingest(HYPERSYNC)).expect("hypersync alone parses");
+    let settings =
+        parse(&ingest(&format!("start_block = 1\n{HYPERSYNC}"))).expect("hypersync alone parses");
     let super::IngestSource::HyperSync(source) = &settings.ingest.source else {
         panic!("expected HyperSync, got {:?}", settings.ingest.source);
     };
@@ -288,7 +289,7 @@ fn ingest_tuning_is_bounded() {
     };
     assert_eq!(backfill_concurrency.get(), 2);
 
-    let tuned = format!("{HYPERSYNC}span = 500\nconcurrency = 4\n");
+    let tuned = format!("start_block = 1\n{HYPERSYNC}span = 500\nconcurrency = 4\n");
     let settings = parse(&ingest(&tuned)).expect("a tuned hypersync parses");
     let super::IngestSource::HyperSync(source) = &settings.ingest.source else {
         panic!("expected HyperSync");
@@ -328,6 +329,53 @@ fn stdout_beside_a_store_is_refused() {
         parse(&both),
         Err(SettingsError::StdoutBesideStore)
     ));
+}
+
+/// Heights that can only fail once run are refused as the file loads: a stop below the
+/// start, and a `HyperSync` backfill with no start that only prints, which keeps no
+/// blocks to begin after. A stop at the start, or a start for that backfill, parses.
+#[test]
+fn heights_that_cannot_run_are_refused() {
+    let heights = |keys: &str, source: &str| parse(&ingest(&format!("{keys}{source}")));
+    assert!(matches!(
+        heights("start_block = 10\nstop_block = 9\n", RPC),
+        Err(SettingsError::StopBelowStart { stop: 9, start: 10 })
+    ));
+    assert!(matches!(
+        heights("start_block = 10\nstop_block = 9\n", HYPERSYNC),
+        Err(SettingsError::StopBelowStart { stop: 9, start: 10 })
+    ));
+    assert!(matches!(
+        heights("", HYPERSYNC),
+        Err(SettingsError::BackfillWithoutStart)
+    ));
+    assert!(matches!(
+        heights("stop_block = 9\n", HYPERSYNC),
+        Err(SettingsError::BackfillWithoutStart)
+    ));
+    for (case, keys, source) in [
+        (
+            "a stop at the start",
+            "start_block = 9\nstop_block = 9\n",
+            RPC,
+        ),
+        ("a backfill with a start", "start_block = 9\n", HYPERSYNC),
+        ("a stop alone", "stop_block = 9\n", RPC),
+    ] {
+        heights(keys, source).expect(case);
+    }
+}
+
+/// A `HyperSync` backfill with no start into a store may resume after the blocks the
+/// store holds, so only the run can tell whether it has somewhere to begin.
+#[cfg(feature = "duckdb")]
+#[test]
+fn a_backfill_without_a_start_into_a_store_parses() {
+    let text = format!(
+        "[ingest]\nchain = \"base\"\n{HYPERSYNC}\n[sink.duckdb]\ntables = [\"blocks\"]\n\
+         path = \":memory:\"\n"
+    );
+    parse(&text).expect("a store may hold blocks to resume after");
 }
 
 /// Any combination of stores parses, each with its own tables.

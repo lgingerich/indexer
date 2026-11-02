@@ -21,9 +21,7 @@ use tracing::{info, warn};
 
 use super::arrow::{self, PARTITION};
 use super::lake::{CONCURRENT_CHECKPOINTS, Lake, commit_properties};
-use super::{
-    COMMIT_DEADLINE, CONCURRENT_TABLES, DeltaSettings, DeltaSink, PendingLedger, maintenance,
-};
+use super::{COMMIT_DEADLINE, CONCURRENT_TABLES, DeltaSettings, DeltaSink, Phase, maintenance};
 use crate::secret::Secret;
 use crate::sink::batch::Batch;
 use crate::sink::store_error::{self, ColumnDrift, Operation, StoreError};
@@ -93,15 +91,16 @@ impl DeltaSink {
             batch: Batch::new(Arc::clone(&schema), ChainId::new(chain)),
             schema,
             committed: HashMap::new(),
-            failed: false,
             writer: WriterProperties::builder()
                 .set_compression(Compression::ZSTD(ZstdLevel::default()))
                 .build(),
             published_tip: Arc::new(AtomicU64::new(0)),
             maintenance: None,
-            ledger: PendingLedger::default(),
+            phase: Phase::Ready,
+            appending: None,
             deadline: COMMIT_DEADLINE,
-            opened: None,
+            #[cfg(test)]
+            stop_before: None,
         };
         let read = Instant::now();
         let ledger = sink.read_ledger().await?;
@@ -113,7 +112,7 @@ impl DeltaSink {
             .iter()
             .map(|block| (hex(&block.hash), block.height))
             .collect();
-        sink.opened = Some(Restored { contracts, ledger });
+        sink.phase = Phase::Opened(Restored { contracts, ledger });
         sink.publish_tip();
         if settings.maintenance {
             // Started after the repair, so it never compacts what the repair deletes.

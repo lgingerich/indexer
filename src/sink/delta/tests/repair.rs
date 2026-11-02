@@ -11,10 +11,12 @@ use deltalake::logstore::object_store::{
 use deltalake::{DeltaTableBuilder, ensure_table_uri};
 use futures_util::future::BoxFuture;
 use futures_util::stream::BoxStream;
+use tokio::sync::Semaphore;
 
 use super::*;
 use crate::sink::Operation;
 use crate::sink::delta::open::STATS_COLUMNS;
+use crate::sink::delta::{Phase, Step};
 
 /// A commit that stopped after recording a retraction but before taking its orphans out
 /// of the ledger leaves a record of a retraction that did not happen. Opening the lake
@@ -124,17 +126,7 @@ async fn a_failed_commit_refuses_every_later_write() {
     let dir = Dir::new();
     let mut sink = open(&dir).await;
     publish(&mut sink, block(1, 0)).await;
-    // A timestamp too large for the lake's microseconds fails the commit part-way.
-    let mut broken = block(2, 0);
-    for envelope in &mut broken {
-        match &mut envelope.event {
-            Event::Block(block) => block.timestamp = u64::MAX,
-            Event::Transaction(transaction) => transaction.block_timestamp = u64::MAX,
-            Event::Log(log) => log.block_timestamp = u64::MAX,
-            _ => {}
-        }
-    }
-    buffer(&mut sink, broken).await;
+    buffer(&mut sink, broken(2)).await;
     let error = sink.flush().await.expect_err("the commit fails");
     assert!(
         matches!(
@@ -163,14 +155,28 @@ async fn a_failed_commit_refuses_every_later_write() {
     assert_eq!(ledger_heights(&mut sink).await, [1]);
 }
 
-/// The local filesystem, except that no write ever completes: an object store whose
-/// requests hang without failing.
+/// The local filesystem, except that no write completes until `release` is closed: an
+/// object store whose requests hang without failing, until a test lets them through.
 #[derive(Debug)]
-struct Hanging(LocalFileSystem);
+struct Hanging {
+    local: LocalFileSystem,
+    release: Arc<Semaphore>,
+}
+
+impl Hanging {
+    /// Waits until the writes are released, which may be never.
+    async fn released(&self) {
+        // The semaphore holds no permits, so this ends only once it is closed.
+        self.release
+            .acquire()
+            .await
+            .expect_err("the semaphore holds no permits");
+    }
+}
 
 impl std::fmt::Display for Hanging {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "Hanging({})", self.0)
+        write!(f, "Hanging({})", self.local)
     }
 }
 
@@ -179,29 +185,35 @@ impl std::fmt::Display for Hanging {
 impl ObjectStore for Hanging {
     fn put_opts<'life0, 'life1, 'async_trait>(
         &'life0 self,
-        _: &'life1 ObjectPath,
-        _: PutPayload,
-        _: PutOptions,
+        location: &'life1 ObjectPath,
+        payload: PutPayload,
+        options: PutOptions,
     ) -> BoxFuture<'async_trait, ObjectResult<PutResult>>
     where
         'life0: 'async_trait,
         'life1: 'async_trait,
         Self: 'async_trait,
     {
-        Box::pin(std::future::pending())
+        Box::pin(async move {
+            self.released().await;
+            self.local.put_opts(location, payload, options).await
+        })
     }
 
     fn put_multipart_opts<'life0, 'life1, 'async_trait>(
         &'life0 self,
-        _: &'life1 ObjectPath,
-        _: PutMultipartOptions,
+        location: &'life1 ObjectPath,
+        options: PutMultipartOptions,
     ) -> BoxFuture<'async_trait, ObjectResult<Box<dyn MultipartUpload>>>
     where
         'life0: 'async_trait,
         'life1: 'async_trait,
         Self: 'async_trait,
     {
-        Box::pin(std::future::pending())
+        Box::pin(async move {
+            self.released().await;
+            self.local.put_multipart_opts(location, options).await
+        })
     }
 
     fn get_opts<'life0, 'life1, 'async_trait>(
@@ -214,18 +226,18 @@ impl ObjectStore for Hanging {
         'life1: 'async_trait,
         Self: 'async_trait,
     {
-        self.0.get_opts(location, options)
+        self.local.get_opts(location, options)
     }
 
     fn delete_stream(
         &self,
         locations: BoxStream<'static, ObjectResult<ObjectPath>>,
     ) -> BoxStream<'static, ObjectResult<ObjectPath>> {
-        self.0.delete_stream(locations)
+        self.local.delete_stream(locations)
     }
 
     fn list(&self, prefix: Option<&ObjectPath>) -> BoxStream<'static, ObjectResult<ObjectMeta>> {
-        self.0.list(prefix)
+        self.local.list(prefix)
     }
 
     fn list_with_delimiter<'life0, 'life1, 'async_trait>(
@@ -237,14 +249,14 @@ impl ObjectStore for Hanging {
         'life1: 'async_trait,
         Self: 'async_trait,
     {
-        self.0.list_with_delimiter(prefix)
+        self.local.list_with_delimiter(prefix)
     }
 
     fn copy_opts<'life0, 'life1, 'life2, 'async_trait>(
         &'life0 self,
-        _: &'life1 ObjectPath,
-        _: &'life2 ObjectPath,
-        _: CopyOptions,
+        from: &'life1 ObjectPath,
+        to: &'life2 ObjectPath,
+        options: CopyOptions,
     ) -> BoxFuture<'async_trait, ObjectResult<()>>
     where
         'life0: 'async_trait,
@@ -252,14 +264,21 @@ impl ObjectStore for Hanging {
         'life2: 'async_trait,
         Self: 'async_trait,
     {
-        Box::pin(std::future::pending())
+        Box::pin(async move {
+            self.released().await;
+            self.local.copy_opts(from, to, options).await
+        })
     }
 }
 
 /// Makes every write to `table` of the lake in `dir` hang (see [`Hanging`]), while
-/// reads still go through.
-async fn hang(dir: &Dir, sink: &mut DeltaSink, table: Table) {
-    let store = Arc::new(Hanging(LocalFileSystem::new()));
+/// reads still go through, until the semaphore it returns is closed.
+async fn hang(dir: &Dir, sink: &mut DeltaSink, table: Table) -> Arc<Semaphore> {
+    let release = Arc::new(Semaphore::new(0));
+    let store = Arc::new(Hanging {
+        local: LocalFileSystem::new(),
+        release: Arc::clone(&release),
+    });
     let position = sink.positions[&TableId::Dataset(table)];
     let url = ensure_table_uri(dir.table(&sink.lakes[position].def.name)).expect("a table url");
     let mut hanging = DeltaTableBuilder::from_url(url.clone())
@@ -269,6 +288,7 @@ async fn hang(dir: &Dir, sink: &mut DeltaSink, table: Table) {
         .expect("the table builds");
     hanging.load().await.expect("the table loads");
     sink.lakes[position].table = hanging;
+    release
 }
 
 /// A write that hangs without failing fails the store at its deadline rather than
@@ -299,6 +319,10 @@ async fn a_write_past_its_deadline_fails_the_store_and_the_reopen_repairs_it() {
         ),
         "{error:?}"
     );
+    assert!(
+        sink.appending.is_some(),
+        "the hung append is left on the store, not waited for past the deadline"
+    );
     assert!(matches!(
         sink.publish(block(4, 0).remove(0)).await,
         Err(SinkError::Store(StoreError::Failed))
@@ -308,6 +332,86 @@ async fn a_write_past_its_deadline_fails_the_store_and_the_reopen_repairs_it() {
     let mut sink = open(&dir).await;
     assert_eq!(blocks(&sink).await, expected(&[(1, 0)]));
     assert_eq!(ledger_heights(&mut sink).await, [1]);
+}
+
+/// A commit the caller cuts off part-way, as a stop cuts one that runs out of time,
+/// leaves the store failed rather than healthy: the next write is refused, finishing
+/// waits for nothing, since the commit before it had landed whole, and leaves the store
+/// failed, and the next open repairs what the cut commit left.
+#[tokio::test]
+async fn a_commit_the_caller_cuts_off_leaves_the_store_failed() {
+    let dir = Dir::new();
+    let mut sink = open(&dir).await;
+    publish(&mut sink, block(1, 0)).await;
+    hang(&dir, &mut sink, Table::Log).await;
+    buffer(&mut sink, block(2, 0)).await;
+    tokio::time::timeout(std::time::Duration::from_millis(500), sink.flush())
+        .await
+        .expect_err("the commit hangs, and is cut off");
+    assert!(
+        matches!(sink.phase, Phase::Writing(Some(Step::AppendRows))),
+        "{:?}",
+        sink.phase
+    );
+    assert!(sink.appending.is_none(), "the last commit had landed whole");
+    assert!(matches!(
+        sink.publish(block(3, 0).remove(0)).await,
+        Err(SinkError::Store(StoreError::Failed))
+    ));
+    sink.finish().await.expect("nothing is left to wait for");
+    assert!(matches!(sink.phase, Phase::Failed));
+    assert!(matches!(
+        sink.flush().await,
+        Err(SinkError::Store(StoreError::Failed))
+    ));
+    drop(sink);
+
+    let mut sink = open(&dir).await;
+    assert_eq!(blocks(&sink).await, expected(&[(1, 0)]));
+    assert_eq!(ledger_heights(&mut sink).await, [1]);
+}
+
+/// A commit the caller cuts off while the last commit's ledger append still runs leaves
+/// that append running, and finishing waits for it: the last commit, already reported
+/// as committed, keeps its blocks through the next open's repair, which deletes only
+/// the cut commit's rows.
+#[tokio::test]
+async fn a_cut_off_commit_leaves_the_last_ledger_append_to_finish() {
+    let dir = Dir::new();
+    let mut sink = open(&dir).await;
+    publish(&mut sink, block(1, 0)).await;
+    // Block 2's rows commit, and its ledger append starts and is held.
+    let ledger = hang(&dir, &mut sink, Table::AcceptedBlock).await;
+    buffer(&mut sink, block(2, 0)).await;
+    sink.flush().await.expect("block 2 is committed");
+    // Block 3's rows commit, and the commit is cut off waiting for block 2's append.
+    buffer(&mut sink, block(3, 0)).await;
+    tokio::time::timeout(std::time::Duration::from_millis(500), sink.flush())
+        .await
+        .expect_err("the commit waits on the held append, and is cut off");
+    assert!(
+        matches!(sink.phase, Phase::Writing(Some(Step::AppendRows))),
+        "{:?}",
+        sink.phase
+    );
+    assert!(
+        sink.appending.is_some(),
+        "block 2's append outlives the commit that was waiting on it"
+    );
+
+    ledger.close();
+    sink.finish().await.expect("block 2's append lands");
+    assert!(sink.appending.is_none());
+    assert!(matches!(sink.phase, Phase::Failed));
+    assert!(matches!(
+        sink.flush().await,
+        Err(SinkError::Store(StoreError::Failed))
+    ));
+    drop(sink);
+
+    let mut sink = open(&dir).await;
+    assert_eq!(blocks(&sink).await, expected(&[(1, 0), (2, 0)]));
+    assert_eq!(ledger_heights(&mut sink).await, [1, 2]);
 }
 
 /// A commit that stopped part-way through deleting a retraction's orphans — out of the

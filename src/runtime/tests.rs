@@ -177,7 +177,14 @@ fn every_table<S>(backend: StoreBackend, store: S, batching: Batching) -> Opened
 }
 
 fn decoder() -> Decoder {
-    Decoder::new(Catalog::load(protocols(), &ChainId::new("base")).expect("shipped protocols load"))
+    restarted([])
+}
+
+/// A decoder over the shipped protocols that restored `stored`, as a restart builds it.
+fn restarted(stored: impl IntoIterator<Item = StoredContract>) -> Decoder {
+    let catalog =
+        Catalog::load(protocols(), &ChainId::new("base")).expect("shipped protocols load");
+    Decoder::new(catalog, stored)
 }
 
 /// A Uniswap V3 `PoolCreated` from the Base factory naming `pool`, in `block`.
@@ -295,8 +302,8 @@ async fn a_discovered_contract_is_stored_and_survives_a_restart() {
     let mut store = duckdb_store(reader.try_clone().expect("handle")).await;
     let stored = store.contracts().await.expect("read back");
     assert_eq!(stored, [stored_pool(pool, creating, 10)]);
-    let mut restarted = decoder();
-    assert_eq!(restarted.restore(stored), 1);
+    let restarted = restarted(stored);
+    assert_eq!(restarted.discovered(), 1);
     let Event::Log(log) = swap(pool).event else {
         panic!("log");
     };
