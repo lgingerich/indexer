@@ -19,6 +19,7 @@ use std::collections::HashSet;
 use std::fmt;
 use std::sync::Arc;
 
+use futures_util::future::try_join_all;
 use serde::Deserialize;
 use serde::de::{self, Deserializer};
 
@@ -298,10 +299,10 @@ impl<K: EnvelopeSink> EnvelopeSink for Router<K> {
         self.sinks[last].0.publish(envelope).await
     }
 
+    /// Flushes every sink at once, so one whose channel is full — a store behind on its
+    /// commits — does not hold the block back from the others.
     async fn flush(&mut self) -> Result<(), SinkError> {
-        for (sink, _) in &mut self.sinks {
-            sink.flush().await?;
-        }
+        try_join_all(self.sinks.iter_mut().map(|(sink, _)| sink.flush())).await?;
         Ok(())
     }
 
@@ -556,5 +557,42 @@ mod tests {
                 .collect::<Vec<_>>(),
             [1, 1, 1]
         );
+    }
+
+    /// A sink whose flush waits on a shared gate, or opens it.
+    struct Gate {
+        opens: bool,
+        gate: Arc<tokio::sync::Semaphore>,
+    }
+
+    impl EnvelopeSink for Gate {
+        async fn publish(&mut self, _: Envelope) -> Result<(), SinkError> {
+            Ok(())
+        }
+
+        async fn flush(&mut self) -> Result<(), SinkError> {
+            if self.opens {
+                self.gate.add_permits(1);
+            } else {
+                let _permit = self.gate.acquire().await.expect("gate stays open");
+            }
+            Ok(())
+        }
+    }
+
+    /// A sink stuck in its flush, as a store with a full channel is, does not hold the
+    /// block back from the sinks after it.
+    #[tokio::test]
+    async fn a_blocked_sink_does_not_hold_back_the_others_flush() {
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let sink = |opens| {
+            let gate = Arc::clone(&gate);
+            (Gate { opens, gate }, HashSet::new())
+        };
+        let mut router = Router::new(fixtures::schema(), vec![sink(false), sink(true)]);
+        tokio::time::timeout(std::time::Duration::from_secs(5), router.flush())
+            .await
+            .expect("the second sink's flush opens the first's gate")
+            .expect("flush");
     }
 }

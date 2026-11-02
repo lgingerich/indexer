@@ -204,9 +204,16 @@ impl<S: BlockSource + 'static, K: EnvelopeSink> Machine<S, K> {
         // The source may change branches during discovery. Recheck the candidate, and the
         // block the walk started from, at their fixed heights before publishing any
         // retraction: both canonical now puts them on the one branch the walk followed.
-        if self.header(target.height).await? != target
-            || (start != target && self.header(start.height).await? != start)
-        {
+        // The two reads are independent, so they share one round trip.
+        let at_start = async {
+            if start == target {
+                Ok(start)
+            } else {
+                self.header(start.height).await
+            }
+        };
+        let (at_target, at_start) = tokio::try_join!(self.header(target.height), at_start)?;
+        if at_target != target || at_start != start {
             return Err(PipelineError::UnstableSource);
         }
         let block = self.replacement(lowest).await?;
