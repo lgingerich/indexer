@@ -64,21 +64,21 @@ impl DeltaSink {
         // Boxed, as is the repair's scan: the compiler cannot otherwise prove the open
         // `Send` through these closures' borrowed arguments, which running it on the
         // store's own runtime needs (rust-lang/rust#102211).
-        let lakes: Vec<Lake> = stream::iter(schema.tables())
+        let mut lakes: Vec<Lake> = stream::iter(schema.tables())
             .map(|def| {
                 let uri = format!("{root}/{chain}/{}", def.name);
-                open_table(
-                    &storage,
-                    uri,
-                    def,
-                    settings.partition_blocks,
-                    Arc::clone(&checkpoints),
-                )
+                let missing = Missing::Create {
+                    width: settings.partition_blocks,
+                };
+                open_table(&storage, uri, def, missing, Arc::clone(&checkpoints))
             })
             .boxed()
             .buffered(CONCURRENT_TABLES)
             .try_collect()
             .await?;
+        for lake in &mut lakes {
+            lake.checkpoint_if_due();
+        }
         let opened = started.elapsed();
         let positions = lakes
             .iter()
@@ -103,7 +103,7 @@ impl DeltaSink {
             stop_before: None,
         };
         let read = Instant::now();
-        let ledger = sink.read_ledger().await?;
+        let ledger = sink.lake(Table::AcceptedBlock).read_ledger().await?;
         let read = read.elapsed();
         let repaired = Instant::now();
         let contracts = sink.repair(&ledger).await?;
@@ -112,7 +112,15 @@ impl DeltaSink {
             .iter()
             .map(|block| (hex(&block.hash), block.height))
             .collect();
-        sink.phase = Phase::Opened(Restored { contracts, ledger });
+        // After the repair, which deletes a stopped commit's handoffs with its other rows.
+        let handoffs = sink.handoffs().await?;
+        let matched = super::matched::matched(sink.lake(Table::Matched)).await?;
+        sink.phase = Phase::Opened(Restored {
+            contracts,
+            handoffs,
+            matched,
+            ledger,
+        });
         sink.publish_tip();
         if settings.maintenance {
             // Started after the repair, so it never compacts what the repair deletes.
@@ -147,7 +155,7 @@ impl DeltaSink {
 
 /// The object store every table of the lake is opened through: one client, so one
 /// credential chain and one connection pool, rather than one of each per table.
-struct Storage {
+pub(super) struct Storage {
     /// The store, rooted at the bucket (or the filesystem root), as delta-rs scopes a
     /// shared store to each table's path itself.
     root: ObjectStoreRef,
@@ -156,7 +164,7 @@ struct Storage {
 }
 
 impl Storage {
-    fn new(uri: &str, options: &BTreeMap<String, Secret>) -> Result<Self, StoreError> {
+    pub(super) fn new(uri: &str, options: &BTreeMap<String, Secret>) -> Result<Self, StoreError> {
         deltalake::aws::register_handlers(None);
         let options: HashMap<String, String> = options
             .iter()
@@ -170,7 +178,7 @@ impl Storage {
     }
 
     /// The table at `uri`, loaded, or not yet created there.
-    async fn table(&self, uri: &str) -> Result<DeltaTable, DeltaTableError> {
+    pub(super) async fn table(&self, uri: &str) -> Result<DeltaTable, DeltaTableError> {
         let url = ensure_table_uri(uri)?;
         let mut table = DeltaTableBuilder::from_url(url.clone())?
             .with_storage_backend(Arc::clone(&self.root), url)
@@ -183,14 +191,24 @@ impl Storage {
     }
 }
 
-/// Opens the table of `def` at `uri`, creating it `width` heights to a partition when it
-/// does not exist, checks an existing one against its definition and `width`, and
-/// starts its checkpoint if one is due.
-async fn open_table(
+/// What opening a table that does not exist does, and how many heights one of its
+/// partitions covers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Missing {
+    /// Creates it, `width` heights to a partition; an existing table must be as wide.
+    Create { width: u64 },
+    /// Fails: the table is only read, and is as wide as it records.
+    Refuse,
+}
+
+/// Opens the table of `def` at `uri`, creating it when it does not exist as `missing`
+/// says, and checks an existing one against its definition and width. Starts no
+/// checkpoint: the store starts those for the tables it writes.
+pub(super) async fn open_table(
     storage: &Storage,
     uri: String,
     def: &Arc<TableDef>,
-    width: u64,
+    missing: Missing,
     checkpoints: Arc<Semaphore>,
 ) -> Result<Lake, StoreError> {
     let name = def.name.as_str();
@@ -207,7 +225,12 @@ async fn open_table(
         .await
         .map_err(StoreError::engine(Operation::Open, Some(name)))?;
     let partitioned = arrow::partitioned(def).is_some();
-    let checkpointed = if table.version().is_none() {
+    let (checkpointed, width) = if table.version().is_none() {
+        let Missing::Create { width } = missing else {
+            return Err(StoreError::engine(Operation::Open, Some(name))(format!(
+                "no table at {uri}"
+            )));
+        };
         let partitions = partitioned.then(|| PARTITION.to_owned());
         let mut recorded = vec![(STATS_COLUMNS.to_owned(), Some(stats_columns(def)))];
         if partitioned {
@@ -223,26 +246,33 @@ async fn open_table(
             .with_configuration(recorded)
             .await
             .map_err(StoreError::engine(Operation::Create, Some(name)))?;
-        0
+        (0, width)
     } else {
         check(&table, &expected, name)?;
-        if partitioned {
-            check_width(&table, width, name)?;
-        }
+        let width = match missing {
+            Missing::Create { width } => {
+                if partitioned {
+                    check_width(&table, width, name)?;
+                }
+                width
+            }
+            Missing::Refuse => partition_width(&table, name)?,
+        };
         keep_stats(&mut table, def).await?;
         // Only a hint: without it the next checkpoint comes early, which is no reason to
         // stop the run.
-        match last_checkpoint(&table).await {
+        let checkpointed = match last_checkpoint(&table).await {
             Ok(version) => version.unwrap_or_default(),
             Err(error) => {
                 warn!(table = name, %error, "lake checkpoint hint unreadable; counting from zero");
                 0
             }
-        }
+        };
+        (checkpointed, width)
     };
     let arrow =
         arrow::arrow_schema(def).map_err(StoreError::engine(Operation::Create, Some(name)))?;
-    let mut lake = Lake {
+    Ok(Lake {
         def: Arc::clone(def),
         arrow,
         table,
@@ -250,9 +280,7 @@ async fn open_table(
         checkpointed,
         checkpoints,
         reopened: Arc::default(),
-    };
-    lake.checkpoint_if_due();
-    Ok(lake)
+    })
 }
 
 /// How many heights one partition of the table `name` covers, as its

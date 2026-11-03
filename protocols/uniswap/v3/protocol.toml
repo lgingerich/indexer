@@ -10,14 +10,18 @@ protocol = "uniswap_v3"
 
 [[contract]]
 abi = ["UniswapV3Factory.json"]
-addresses = { base = ["0x33128a8fC17869897dcE68Ed026d694621f6FDfD"] }
+# The factory on each chain, from Uniswap's v3 deployments pages. On Ethereum, BNB Smart
+# Chain, and Robinhood Chain each is verified on Sourcify against these ABIs, as is one
+# of its pools.
+addresses = { base = ["0x33128a8fC17869897dcE68Ed026d694621f6FDfD"], bsc = ["0xdb1d10011ad0ff90774d0c6bb92e5c5c8b4461f7"], ethereum = ["0x1F98431c8aD98523631AE4a59f267346ea31F984"], robinhood = ["0x1f7d7550b1b028f7571e69a784071f0205fd2efa"] }
 
 [[contract]]
 abi = ["UniswapV3Pool.json"]
 table = "pool"
 created_by = [{ contract = "UniswapV3Factory", event = "PoolCreated", param = "pool" }]
 # Seeds: busy pools created before any run, so a short run decodes swaps out of the box.
-# The second is the pool `examples/decode_logs.rs` decodes.
+# The second is the pool `examples/decode_logs.rs` decodes. On the chains Metric runs on,
+# the pools compared with Metric's are matched to its pairs instead (`[decode.pairs]`).
 addresses = { base = [
     "0x2df380544b88adb3ad0a94100dcc45fd705aae2d",
     "0xd0b53D9277642d899DF5C87A3966A349A798F224",

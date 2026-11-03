@@ -30,12 +30,58 @@ addresses = { bsc = ["0x02201E6f13c41506c7Bb635d7543F98826229aB7", "0x3c6c4fC94f
 abi = ["MetricOmmSwapQuoter.json"]
 
 [[contract]]
-abi = ["OracleProvider.json"]
+abi = ["OracleProvider.json", "ChainlinkOracle.json"]
 # The oracles pools' price providers read, each registering pools against a feed: the
-# first verifies Pyth Lazer updates. Seeded, since nothing onchain announces them: they
-# were deployed through CreateX. Both also emit events this ABI does not declare, which
-# stay undecoded until Metric publishes their ABIs.
+# first, `PythOracle`, verifies Pyth Lazer updates, the second, `ChainlinkOracle`,
+# Chainlink Data Streams reports. Seeded, since nothing onchain announces them: they
+# were deployed through CreateX. Their ABIs as verified on Sourcify, merged: they share
+# every event but the Chainlink verifier's two. Each emits `FeedUpdated` when it stores a
+# newer price, and the price travels only in the update's calldata, so
+# `metric_v1_oracle_prices` reads it from there (`src/decode/derive/metric`).
 addresses = { bsc = ["0x30a88bf894D1b806125a23ebf23D715496fD7102", "0x810A649974f21bB6D3b2E781597EdBDAabe82228"], ethereum = ["0x30a88bf894D1b806125a23ebf23D715496fD7102", "0x810A649974f21bB6D3b2E781597EdBDAabe82228"], robinhood = ["0x30a88bf894D1b806125a23ebf23D715496fD7102", "0x810A649974f21bB6D3b2E781597EdBDAabe82228"] }
+
+[[contract]]
+abi = ["MultiplierOracle.json"]
+# Prices Robinhood stock tokens: a Pyth feed (its `UNDERLYING`, `PythOracle` above) times
+# the token's multiplier, the shares one token redeems for. It stores no prices; each
+# `FeedCreated` binds a feed to its underlying feed and token, and stock tokens come from
+# there. Two on Robinhood Chain, the second unused since its integrator whitelisting
+# lapsed; the first on BNB Smart Chain too, with no pools yet. Not on Ethereum.
+addresses = { bsc = ["0x6c38232B0597ef335bCdC86029cDc9e23A17F166"], robinhood = ["0x6c38232B0597ef335bCdC86029cDc9e23A17F166", "0x448d67117763B8ED3aa2af2b864fAeE83E88efB5"] }
+
+[[contract]]
+abi = ["RobinhoodStockToken.json"]
+table = "stock_token"
+# A Robinhood stock token's multiplier and its issuer's pause, which `MultiplierOracle`
+# reads with each price: a change is scheduled, taking effect at `effectiveAtTimestamp`.
+# Only those three events: the ABI is cut from the beacon implementation verified on
+# Robinhood Chain, leaving out every transfer. A passthrough feed's token is zero, which
+# discovers nothing.
+created_by = [{ contract = "MultiplierOracle", event = "FeedCreated", param = "token" }]
+
+[[contract]]
+abi = ["CompressedOracle.json"]
+# Prices market makers push into packed storage slots, four feeds to a slot; the
+# "regular" providers read it. Its ABI as verified on Sourcify (`CompressedOracleV1`).
+# Each push emits `FeedUpdated` per feed it wrote and carries the prices only in its
+# calldata, so `metric_v1_compressed_oracle_prices` reads them from there
+# (`src/decode/derive/metric`).
+addresses = { bsc = ["0xE844701934D9C6085B292e428F41b911cC0b3872"], ethereum = ["0xE844701934D9C6085B292e428F41b911cC0b3872"], robinhood = ["0xE844701934D9C6085B292e428F41b911cC0b3872"] }
+
+[[contract]]
+abi = ["AnchoredProviderFactory.json"]
+table = "anchored_factory"
+# Deploys the anchored price providers most pools quote from: each `ProviderDeployed`
+# names its oracle, its base feed and, for a synthetic pair, its quote feed. A provider's
+# reference price is its oracle's mid, or the base mid over the quote mid.
+addresses = { bsc = ["0xb0eAE19259500Ac4Ca59b9a5cb8cDB2Da8076F0A"], ethereum = ["0xb0eAE19259500Ac4Ca59b9a5cb8cDB2Da8076F0A"], robinhood = ["0xb0eAE19259500Ac4Ca59b9a5cb8cDB2Da8076F0A"] }
+
+[[contract]]
+abi = ["PriceProviderFactory.json"]
+table = "provider_factory"
+# Deploys the "regular" price providers, each on one feed of an oracle, the compressed
+# oracle so far.
+addresses = { bsc = ["0x050502eE4Da0eE2a9D44eE6046310F9f1532aCF2"], ethereum = ["0x050502eE4Da0eE2a9D44eE6046310F9f1532aCF2"], robinhood = ["0x050502eE4Da0eE2a9D44eE6046310F9f1532aCF2"] }
 
 [[contract]]
 abi = ["PriceProvider.json"]

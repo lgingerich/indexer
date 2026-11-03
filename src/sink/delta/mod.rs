@@ -70,10 +70,14 @@
 
 mod arrow;
 mod expr;
+mod handoff;
 mod lake;
+mod lock;
 mod maintenance;
+mod matched;
 mod open;
 mod repair;
+mod replay;
 mod settings;
 
 use std::collections::HashMap;
@@ -98,8 +102,11 @@ use crate::window::LEDGER_WINDOW;
 use crate::wire::envelope::{BlockMeta, Envelope};
 
 use self::expr::{at_or_above, of_blocks};
+pub use self::handoff::{HandoffQueue, HandoffWatch, recorded};
 use self::lake::Lake;
+pub use self::lock::{LockError, RunLock};
 use self::maintenance::Maintenance;
+pub use self::replay::{DecodedTables, LedgerEnds, LogReader, ledger_ends};
 pub use self::settings::DeltaSettings;
 
 /// How many tables an open, a repair, or a delete across the lake works on at once:
@@ -495,7 +502,7 @@ impl DeltaSink {
         appends: Vec<(usize, Vec<Row>)>,
     ) -> Result<(Duration, Duration), StoreError> {
         self.begin(Step::AppendRows)?;
-        let (batches, build) = timed(self.record_batches(appends)).await;
+        let (batches, build) = timed(record_batches(&self.lakes, appends)).await;
         let (appended, write) = timed(self.append_all(batches?)).await;
         appended?;
         Ok((build, write))
@@ -528,74 +535,21 @@ impl DeltaSink {
         Ok(())
     }
 
-    /// Each table's rows as Arrow batches, built in parallel: a task per table, and per
-    /// [`ROWS_PER_BATCH`] rows of a large one, since one table, the logs, usually holds
-    /// most of a commit's rows. Building them is the CPU half of a commit.
-    ///
-    /// The tasks run on the store's own runtime, so as many build at once as it has
-    /// workers and no more. Threads of their own would each take a share of the cores
-    /// beside them, and a large commit made over a hundred, crowding out every other
-    /// part of the process (see `sink::store_runtime`).
-    ///
-    /// Each task owns its rows and frees them once their batch is built, so the rows
-    /// go as the batches come: a commit never holds every row and every batch at once,
-    /// which at the end of the build was its largest moment.
-    async fn record_batches(
-        &self,
-        appends: Vec<(usize, Vec<Row>)>,
-    ) -> Result<Vec<(usize, Vec<RecordBatch>)>, StoreError> {
-        let tables = appends.len();
-        // Every build starts before any is waited for.
-        let mut builds = JoinSet::new();
-        for (position, rows) in appends {
-            let lake = &self.lakes[position];
-            let mut rows = rows.into_iter();
-            for chunk in 0_usize.. {
-                let part: Vec<Row> = rows.by_ref().take(ROWS_PER_BATCH).collect();
-                if part.is_empty() {
-                    break;
-                }
-                let (arrow, def, width) =
-                    (Arc::clone(&lake.arrow), Arc::clone(&lake.def), lake.width);
-                builds.spawn(async move {
-                    let built =
-                        arrow::record_batch(&arrow, &def, width, &part.iter().collect::<Vec<_>>())
-                            .map_err(StoreError::engine(Operation::Append, Some(&def.name)));
-                    ((position, chunk), built)
-                });
-            }
-        }
-        let (built, failure) = join_every(builds).await;
-        if let Some(error) = failure {
-            return Err(error);
-        }
-        let mut batches: Vec<(usize, Vec<RecordBatch>)> = Vec::with_capacity(tables);
-        for ((position, _), batch) in built {
-            match batches.last_mut() {
-                Some((last, table)) if *last == position => table.push(batch),
-                _ => batches.push((position, vec![batch])),
-            }
-        }
-        Ok(batches)
-    }
-
-    /// Appends each table's batch as a commit of its own log, every table on its own task
-    /// so their Parquet encoding spreads over the store runtime's workers. Each table has
-    /// its own log and no rule orders one table's rows against another's, so they go at
-    /// once: most tables' appends are small, and their time is the store's round trips,
-    /// which overlap only when they run together.
+    /// Appends each table's batches as a commit of its own log, all at once (see
+    /// [`append_all`]), and takes each table as of its commit. Every append is waited
+    /// for, failed or not, before the first failure is returned.
     async fn append_all(
         &mut self,
         batches: Vec<(usize, Vec<RecordBatch>)>,
     ) -> Result<(), StoreError> {
-        let mut appends = JoinSet::new();
-        for (position, batches) in batches {
-            let append = self.lakes[position].append(&self.writer, batches);
-            appends.spawn(async move { (position, append.await) });
-        }
-        let (appended, failure) = join_every(appends).await;
-        for (position, table) in appended {
-            self.lakes[position].committed(table);
+        let mut failure = None;
+        for (position, appended) in append_all(&self.lakes, &self.writer, batches).await {
+            match appended {
+                Ok(table) => self.lakes[position].committed(table),
+                Err(error) => {
+                    failure.get_or_insert(error);
+                }
+            }
         }
         failure.map_or(Ok(()), Err)
     }
@@ -718,8 +672,18 @@ impl Store for DeltaSink {
         // A wait of its own, so a failed or hung append fails the store as a failed
         // commit does.
         self.guarded(Self::settle_ledger).await?;
-        let (contracts, ledger) = tokio::try_join!(self.contracts(), self.read_ledger())?;
-        Ok(Restored { contracts, ledger })
+        let (contracts, handoffs, matched, ledger) = tokio::try_join!(
+            self.contracts(),
+            self.handoffs(),
+            matched::matched(self.lake(Table::Matched)),
+            self.lake(Table::AcceptedBlock).read_ledger()
+        )?;
+        Ok(Restored {
+            contracts,
+            handoffs,
+            matched,
+            ledger,
+        })
     }
 
     /// A held block whose hash changed is retracted at the next commit like any orphan:
@@ -870,6 +834,84 @@ struct Timings {
     write: Duration,
     /// Waiting out the last commit's ledger append once they were appended.
     ledger_wait: Duration,
+}
+
+/// Each table's rows as Arrow batches, built in parallel: a task per table, and per
+/// [`ROWS_PER_BATCH`] rows of a large one, since one table, the logs, usually holds
+/// most of a commit's rows. Building them is the CPU half of a commit. `appends` names
+/// each table by its position in `lakes`.
+///
+/// The tasks run on the caller's runtime, so as many build at once as it has workers
+/// and no more. Threads of their own would each take a share of the cores beside them,
+/// and a large commit made over a hundred, crowding out every other part of the process
+/// (see `sink::store_runtime`).
+///
+/// Each task owns its rows and frees them once their batch is built, so the rows go as
+/// the batches come: a commit never holds every row and every batch at once, which at
+/// the end of the build was its largest moment.
+async fn record_batches(
+    lakes: &[Lake],
+    appends: Vec<(usize, Vec<Row>)>,
+) -> Result<Vec<(usize, Vec<RecordBatch>)>, StoreError> {
+    let tables = appends.len();
+    // Every build starts before any is waited for.
+    let mut builds = JoinSet::new();
+    for (position, rows) in appends {
+        let lake = &lakes[position];
+        let mut rows = rows.into_iter();
+        for chunk in 0_usize.. {
+            let part: Vec<Row> = rows.by_ref().take(ROWS_PER_BATCH).collect();
+            if part.is_empty() {
+                break;
+            }
+            let (arrow, def, width) = (Arc::clone(&lake.arrow), Arc::clone(&lake.def), lake.width);
+            builds.spawn(async move {
+                let built =
+                    arrow::record_batch(&arrow, &def, width, &part.iter().collect::<Vec<_>>())
+                        .map_err(StoreError::engine(Operation::Append, Some(&def.name)));
+                ((position, chunk), built)
+            });
+        }
+    }
+    let (built, failure) = join_every(builds).await;
+    if let Some(error) = failure {
+        return Err(error);
+    }
+    let mut batches: Vec<(usize, Vec<RecordBatch>)> = Vec::with_capacity(tables);
+    for ((position, _), batch) in built {
+        match batches.last_mut() {
+            Some((last, table)) if *last == position => table.push(batch),
+            _ => batches.push((position, vec![batch])),
+        }
+    }
+    Ok(batches)
+}
+
+/// Appends each table's batches as a commit of its own log, every table on its own task
+/// so their Parquet encoding spreads over the runtime's workers. Each table has its own
+/// log and no rule orders one table's rows against another's, so they go at once: most
+/// tables' appends are small, and their time is the store's round trips, which overlap
+/// only when they run together.
+///
+/// Returns each table's outcome, by its position in `lakes`, in position order, once
+/// every append has finished: none is left running to commit after the caller has given
+/// up. A task that panicked panics here too.
+async fn append_all(
+    lakes: &[Lake],
+    writer: &WriterProperties,
+    batches: Vec<(usize, Vec<RecordBatch>)>,
+) -> Vec<(usize, Result<DeltaTable, StoreError>)> {
+    let mut appends = JoinSet::new();
+    for (position, batches) in batches {
+        let append = lakes[position].append(writer, batches);
+        appends.spawn(async move { (position, append.await) });
+    }
+    let mut appended = Vec::with_capacity(appends.len());
+    while let Some(joined) = appends.join_next().await {
+        appended.push(joined.unwrap_or_else(|join| std::panic::resume_unwind(join.into_panic())));
+    }
+    appended.sort_by_key(|&(position, _)| position);
+    appended
 }
 
 /// Waits for every task, failed or not, and returns what each succeeded with, in the

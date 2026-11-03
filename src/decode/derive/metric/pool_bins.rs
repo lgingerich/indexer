@@ -41,7 +41,7 @@ pub(in crate::decode) const POOL_BINS: Derivation = Derivation {
 };
 
 /// A `PoolCreated`'s rows, one per bin from the lowest to the highest.
-fn pool_bins(decoded: &Decoded, _: usize) -> Result<Vec<Row>, DeriveError> {
+fn pool_bins(decoded: &Decoded, _: usize, _: Option<&[u8]>) -> Result<Vec<Row>, DeriveError> {
     let pool = address(decoded, 0, "poolAddress")?;
     let bin0_lower = int(decoded, 18, "curBinDistFromProvidedPriceE6", 24)?;
     let above = ladder_side(
@@ -163,7 +163,7 @@ mod tests {
                 int(upper, 64),
             ]
         };
-        let rows = unnamed(pool_bins(&pool_created(-50, above, below), 0));
+        let rows = unnamed(pool_bins(&pool_created(-50, above, below), 0, None));
         assert_eq!(
             rows,
             [
@@ -180,6 +180,7 @@ mod tests {
         let rows = unnamed(pool_bins(
             &pool_created(0, ladder(&[(7, 0, 0)]), Vec::new()),
             0,
+            None,
         ));
         assert_eq!(rows, [bin(0, 7, 0, 0, 0, 7)]);
     }

@@ -21,6 +21,9 @@
 //! running it: no store is opened and the network is not touched, so a file — and the
 //! environment variables it names — can be checked before a deploy restarts a chain on
 //! it. It exits as a run that failed there would, and 0 when they assemble.
+//!
+//! `indexer backfill indexer.<chain>.backfill.toml` instead decodes manifests added after
+//! their blocks were indexed, from the logs the lake holds (see [`indexer::backfill`]).
 
 use std::process::ExitCode;
 
@@ -83,6 +86,9 @@ async fn main() -> ExitCode {
         )
         .init();
 
+    if std::env::args().nth(1).as_deref() == Some("backfill") {
+        return backfill().await;
+    }
     let mut args = std::env::args().skip(1);
     let (check, path) = match (args.next(), args.next(), args.next()) {
         (Some(flag), Some(path), None) if flag == "--check" => (true, path),
@@ -117,6 +123,41 @@ async fn main() -> ExitCode {
             }
         }
     }
+}
+
+/// `indexer backfill`: decodes manifests added later from the lake's logs; see
+/// [`indexer::backfill`].
+#[cfg(feature = "delta")]
+async fn backfill() -> ExitCode {
+    let mut args = std::env::args().skip(2);
+    let ran = match (args.next(), args.next()) {
+        (Some(path), None) => indexer::backfill::run(std::path::Path::new(&path)).await,
+        _ => Err(indexer::backfill::BackfillError::Usage {
+            problem: "name one settings file".to_owned(),
+        }),
+    };
+    match ran {
+        Ok(_) => ExitCode::SUCCESS,
+        Err(error) => {
+            error!(%error, "backfill stopped");
+            if error.is_config() {
+                ExitCode::from(EXIT_CONFIG)
+            } else {
+                ExitCode::FAILURE
+            }
+        }
+    }
+}
+
+/// Without the lake there is nothing to backfill from.
+#[cfg(not(feature = "delta"))]
+#[expect(
+    clippy::unused_async,
+    reason = "the same signature as the `delta` build's, which awaits the backfill"
+)]
+async fn backfill() -> ExitCode {
+    error!("backfill reads the Delta lake; build with the `delta` feature");
+    ExitCode::from(EXIT_CONFIG)
 }
 
 #[cfg(test)]

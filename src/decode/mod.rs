@@ -26,10 +26,23 @@ mod decoder;
 mod derive;
 #[cfg(test)]
 mod fixtures;
+mod pairs;
 pub(crate) mod param;
 mod sink;
 
 pub use abi::{AbiError, DecodeError};
 pub use catalog::{Catalog, CatalogError};
+#[cfg(feature = "delta")]
+pub(crate) use decoder::DecodedAs;
 pub use decoder::{Claims, Decoder, Record};
+pub use derive::DeriveError;
+#[cfg(feature = "delta")]
+pub(crate) use derive::Sent;
+#[cfg(test)]
+pub(crate) use pairs::Kept;
+pub(crate) use pairs::SharedKept;
+#[cfg(feature = "store")]
+pub(crate) use pairs::{Fill, Matching, PoolIds, Query, pool_contract};
 pub use sink::DecodingSink;
+#[cfg(feature = "store")]
+pub(crate) use sink::MatchingLinks;

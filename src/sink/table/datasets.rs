@@ -3,10 +3,11 @@
 use std::sync::Arc;
 
 use crate::wire::datasets::evm::{Block, Contract, Decoded, Log, Transaction};
-use crate::wire::envelope::{BlockMeta, ChainId, Event, Reorg};
+use crate::wire::envelope::{BlockMeta, ChainId, Event, Handoff, Matched, Reorg};
 
 use super::{
-    Cell, Column, Row, Table, TableBuilder, TableDef, TableError, TableId, Timestamp, Value,
+    Cell, Column, Row, Session, Table, TableBuilder, TableDef, TableError, TableId, Timestamp,
+    Value,
 };
 
 /// Reads one column's value from a record.
@@ -215,6 +216,35 @@ pub const CONTRACT_COLUMNS: [&str; 6] = [
     "log_index",
 ];
 
+/// The `handoffs` columns every store reads back at startup, in the order a restore
+/// takes them: the whole record, so the decode stage can write one again after a reorg.
+pub const HANDOFF_COLUMNS: [&str; 6] = [
+    "protocol",
+    "name",
+    "address",
+    "block_number",
+    "block_hash",
+    "block_timestamp",
+];
+
+/// The `matched_pools` columns every store reads back at startup, in the order a restore
+/// takes them: the whole record, so the decode stage can write one again after a reorg.
+pub const MATCHED_COLUMNS: [&str; 13] = [
+    "protocol",
+    "contract",
+    "pool_id",
+    "token0",
+    "token1",
+    "fee",
+    "hooks",
+    "created_block",
+    "from_timestamp",
+    "filled",
+    "block_number",
+    "block_hash",
+    "block_timestamp",
+];
+
 /// The `accepted_blocks` columns every store reads back at startup, in the order a
 /// restore takes them: the whole ledger entry.
 pub const LEDGER_COLUMNS: [&str; 4] = ["height", "hash", "parent_hash", "timestamp"];
@@ -261,6 +291,51 @@ fn accepted_blocks() -> Result<Dataset<BlockMeta>, TableError> {
         .build()
 }
 
+/// A run of the store, from the first block it wrote.
+fn sessions() -> Result<Dataset<Session>, TableError> {
+    DatasetBuilder::<Session>::new(Table::Session)
+        .col("block_number", |s| s.block_number)
+        .col("block_hash", |s| s.block_hash)
+        .col("block_timestamp", |s| Timestamp(s.block_timestamp))
+        .col_ref("events", |s| &s.events)
+        .reorg_by("block_hash", "block_number")
+        .build()
+}
+
+/// A contract a backfill handed over, from the first block decoded with it.
+fn handoffs() -> Result<Dataset<Handoff>, TableError> {
+    DatasetBuilder::<Handoff>::new(Table::Handoff)
+        .col_ref("protocol", |h| &h.protocol)
+        .col_ref("name", |h| &h.name)
+        .col("address", |h| h.address)
+        .col("block_number", |h| h.block_number)
+        .col("block_hash", |h| h.block_hash)
+        .col("block_timestamp", |h| Timestamp(h.block_timestamp))
+        .reorg_by("block_hash", "block_number")
+        .build()
+}
+
+/// A pool matched to a Metric pool's pair, from the block the run keeps its rows, and
+/// once filled from the block its earlier rows were written.
+fn matched_pools() -> Result<Dataset<Matched>, TableError> {
+    DatasetBuilder::<Matched>::new(Table::Matched)
+        .col_ref("protocol", |m| &m.protocol)
+        .col("contract", |m| m.contract)
+        .col("pool_id", |m| m.pool_id)
+        .col("token0", |m| m.token0)
+        .col("token1", |m| m.token1)
+        .col("fee", |m| m.fee)
+        .col("hooks", |m| m.hooks)
+        .col("created_block", |m| m.created_block)
+        .col("from_timestamp", |m| Timestamp(m.from_timestamp))
+        .col("filled", |m| m.filled)
+        .col("block_number", |m| m.block_number)
+        .col("block_hash", |m| m.block_hash)
+        .col("block_timestamp", |m| Timestamp(m.block_timestamp))
+        .reorg_by("block_hash", "block_number")
+        .build()
+}
+
 /// Every dataset table, declared once per run.
 pub(super) struct DatasetTables {
     blocks: Dataset<Block>,
@@ -270,6 +345,9 @@ pub(super) struct DatasetTables {
     contracts: Dataset<Contract>,
     reorgs: Dataset<Reorg>,
     accepted_blocks: Dataset<BlockMeta>,
+    sessions: Dataset<Session>,
+    handoffs: Dataset<Handoff>,
+    matched_pools: Dataset<Matched>,
 }
 
 impl std::fmt::Debug for DatasetTables {
@@ -289,6 +367,9 @@ impl DatasetTables {
             contracts: contracts()?,
             reorgs: reorgs()?,
             accepted_blocks: accepted_blocks()?,
+            sessions: sessions()?,
+            handoffs: handoffs()?,
+            matched_pools: matched_pools()?,
         })
     }
 
@@ -302,7 +383,19 @@ impl DatasetTables {
             Table::Contract => &self.contracts.def,
             Table::Reorg => &self.reorgs.def,
             Table::AcceptedBlock => &self.accepted_blocks.def,
+            Table::Session => &self.sessions.def,
+            Table::Handoff => &self.handoffs.def,
+            Table::Matched => &self.matched_pools.def,
         }
+    }
+
+    /// A session's row in `sessions`.
+    pub(super) fn session_row(
+        &self,
+        chain: &ChainId,
+        session: &Session,
+    ) -> Result<Row, TableError> {
+        self.sessions.row(session, chain, session.dedupe_key())
     }
 
     /// An event's row in its dataset table. A derived record has none: its table is the
@@ -315,6 +408,8 @@ impl DatasetTables {
             Event::Log(l) => self.logs.row(l, chain, key),
             Event::Decoded(d) => self.decoded_logs.row(d, chain, key),
             Event::Contract(c) => self.contracts.row(c, chain, key),
+            Event::Handoff(h) => self.handoffs.row(h, chain, key),
+            Event::Matched(m) => self.matched_pools.row(m, chain, key),
             Event::Derived(_) => Err(TableError::NotADataset { kind: event.kind() }),
             Event::Reorg(r) => self.reorgs.row(r, chain, key),
             Event::AcceptedBlock(a) => self.accepted_blocks.row(a, chain, key),
@@ -328,7 +423,7 @@ mod tests {
     use alloy_primitives::{Address, B256, TxHash, U256};
 
     use crate::wire::datasets::evm::{Block, Contract, Decoded, Log, Transaction};
-    use crate::wire::envelope::{BlockMeta, ChainId, Event, Reorg};
+    use crate::wire::envelope::{BlockMeta, ChainId, Event, Handoff, Matched, Reorg};
 
     use std::sync::Arc;
 
@@ -418,6 +513,29 @@ mod tests {
                 parent_hash: hash(0x02),
                 timestamp: 1_700_000_000,
             }),
+            Event::Handoff(Box::new(Handoff {
+                protocol: "uniswap_v3".to_owned(),
+                name: "UniswapV3Pool".to_owned(),
+                address: Address::from([0xd0; 20]),
+                block_number: 100,
+                block_hash: hash(0x01),
+                block_timestamp: 1_700_000_000,
+            })),
+            Event::Matched(Box::new(Matched {
+                protocol: "uniswap_v4".to_owned(),
+                contract: Address::from([0xd4; 20]),
+                pool_id: Some(hash(0x04)),
+                token0: Address::ZERO,
+                token1: Address::from([0xc1; 20]),
+                fee: 500,
+                hooks: None,
+                created_block: 90,
+                from_timestamp: 1_699_000_000,
+                filled: false,
+                block_number: 100,
+                block_hash: hash(0x01),
+                block_timestamp: 1_700_000_000,
+            })),
         ]
     }
 
@@ -434,9 +552,14 @@ mod tests {
             assert_eq!(row.dedupe_key(), event.dedupe_key(), "{label}");
             tables.push(row.table().id);
         }
+        // Every table but `sessions`, which a store writes itself rather than from an event.
+        let expected: Vec<TableId> = Table::ALL
+            .into_iter()
+            .filter(|&table| table != Table::Session)
+            .map(TableId::from)
+            .collect();
         assert_eq!(
-            tables,
-            Table::ALL.map(TableId::from),
+            tables, expected,
             "one fixture per table, each landing in its own"
         );
     }

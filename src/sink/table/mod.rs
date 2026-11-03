@@ -33,6 +33,7 @@
 mod cell;
 mod datasets;
 mod events;
+mod session;
 
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
@@ -41,11 +42,14 @@ use std::sync::Arc;
 use alloy_primitives::B256;
 
 use crate::wire::datasets::evm::Decoded;
-use crate::wire::envelope::{ChainId, Event};
+use crate::wire::envelope::{BlockMeta, ChainId, Event};
 
 pub use cell::{Cell, Timestamp, Value};
-pub use datasets::{CONTRACT_COLUMNS, LEDGER_COLUMNS, REORG_COLUMNS};
+pub use datasets::{
+    CONTRACT_COLUMNS, HANDOFF_COLUMNS, LEDGER_COLUMNS, MATCHED_COLUMNS, REORG_COLUMNS,
+};
 pub use events::snake_case;
+pub use session::{Session, SessionEvent};
 
 /// What a column holds, in the vocabulary every target shares.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -126,11 +130,20 @@ pub enum Table {
     Reorg,
     /// Accepted block identities: the ledger a restart resumes from.
     AcceptedBlock,
+    /// What each run of the store decoded, from the first block it wrote: see
+    /// [`Session`].
+    Session,
+    /// The contracts a backfill handed the running indexer, each with the first block it
+    /// decoded them in: see [`Handoff`](crate::wire::envelope::Handoff).
+    Handoff,
+    /// The pools matched to Metric pools' pairs, which the stores keeping only matched
+    /// pools take: see [`Matched`](crate::wire::envelope::Matched).
+    Matched,
 }
 
 impl Table {
     /// Every dataset table, in the order a store creates them.
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 10] = [
         Self::Block,
         Self::Transaction,
         Self::Log,
@@ -138,6 +151,9 @@ impl Table {
         Self::Contract,
         Self::Reorg,
         Self::AcceptedBlock,
+        Self::Session,
+        Self::Handoff,
+        Self::Matched,
     ];
 
     /// The table's name. Plural, as Allium names its tables.
@@ -151,15 +167,26 @@ impl Table {
             Self::Contract => "contracts",
             Self::Reorg => "reorgs",
             Self::AcceptedBlock => "accepted_blocks",
+            Self::Session => "sessions",
+            Self::Handoff => "handoffs",
+            Self::Matched => "matched_pools",
         }
     }
 
     /// Whether every store writes this table, whatever it is routed: the ledger a
-    /// restart resumes from, the retractions it applied, and the contracts decode
-    /// restores.
+    /// restart resumes from, the retractions it applied, the contracts decode restores,
+    /// what each run decoded, the contracts backfills handed it, and the pools it matched.
     #[must_use]
     pub const fn is_bookkeeping(self) -> bool {
-        matches!(self, Self::Contract | Self::Reorg | Self::AcceptedBlock)
+        matches!(
+            self,
+            Self::Contract
+                | Self::Reorg
+                | Self::AcceptedBlock
+                | Self::Session
+                | Self::Handoff
+                | Self::Matched
+        )
     }
 }
 
@@ -666,6 +693,8 @@ impl Schema {
                 (table.id, None)
             }
             Event::Contract(_) => (Table::Contract.into(), None),
+            Event::Handoff(_) => (Table::Handoff.into(), None),
+            Event::Matched(_) => (Table::Matched.into(), None),
             Event::Reorg(_) => (Table::Reorg.into(), None),
             Event::AcceptedBlock(_) => (Table::AcceptedBlock.into(), None),
         })
@@ -675,6 +704,43 @@ impl Schema {
     #[must_use]
     pub fn dataset(&self, table: Table) -> &Arc<TableDef> {
         self.datasets.def(table)
+    }
+
+    /// Every event definition this schema decodes, sorted.
+    #[must_use]
+    pub fn decoded_events(&self) -> Vec<SessionEvent> {
+        let mut events: Vec<SessionEvent> = self
+            .events
+            .iter()
+            .map(|((protocol, contract, event_id), def)| SessionEvent {
+                protocol: protocol.clone(),
+                contract: contract.clone(),
+                event_id: *event_id,
+                table: def.name.clone(),
+            })
+            .collect();
+        events.sort();
+        events
+    }
+
+    /// The session a store starts by writing `block` with this schema.
+    #[must_use]
+    pub fn session(&self, block: &BlockMeta) -> Session {
+        Session {
+            block_number: block.height,
+            block_hash: block.hash,
+            block_timestamp: block.timestamp,
+            events: self.decoded_events(),
+        }
+    }
+
+    /// A session's row in `sessions`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TableError::Json`] when the event list does not render.
+    pub fn session_row(&self, chain: &ChainId, session: &Session) -> Result<Row, TableError> {
+        self.datasets.session_row(chain, session)
     }
 
     /// An event's row in its dataset table, or a derived record's in its derived table.

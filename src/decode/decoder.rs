@@ -19,8 +19,30 @@ use tracing::warn;
 
 use super::abi::{DecodeError, EventKey, event_key};
 use super::catalog::{Catalog, EntryId};
+#[cfg(feature = "delta")]
+use super::derive::{DeriveError, Sent};
 use crate::sink::StoredContract;
+#[cfg(feature = "delta")]
+use crate::wire::datasets::evm::Derived;
 use crate::wire::datasets::evm::{Contract, Decoded, Log};
+#[cfg(feature = "delta")]
+use crate::wire::envelope::ChainId;
+
+/// What [`Decoder::adopt`] did with a handed-over contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Adopted {
+    /// It joined the set.
+    Added,
+    /// The set already decoded it as that contract: a seed, one this run discovered, or
+    /// one a previous run's stores restored.
+    Known,
+    /// It is not decoded: the catalog does not declare it, or the address is another
+    /// contract.
+    Refused,
+}
+
+/// The catalog entry and event a record decoded as, which its derivations are bound to.
+pub(crate) type DecodedAs = (EntryId, EventKey);
 
 /// A log's decoded record, with the catalog entry and event it decoded as.
 #[derive(Debug)]
@@ -29,7 +51,7 @@ pub struct Record {
     pub decoded: Decoded,
     /// The catalog entry and event the record decoded as, which its derivations are bound
     /// to.
-    pub(super) event: (EntryId, EventKey),
+    pub(crate) event: DecodedAs,
 }
 
 /// The contracts one creation log discovered, not yet in the set.
@@ -124,9 +146,66 @@ impl Decoder {
         decoder
     }
 
+    /// Adds `contract`, which a backfill discovered below this run's restart and handed
+    /// over, so its logs decode from the next one on.
+    ///
+    /// One whose `protocol.name` the catalog does not declare is refused, as is an address
+    /// the set holds as another contract.
+    pub(crate) fn adopt(&mut self, contract: &Contract) -> Adopted {
+        let Some(entry) = self.catalog.entry(&contract.protocol, &contract.name) else {
+            warn!(protocol = %contract.protocol, name = %contract.name,
+                address = %contract.address, "handed-over contract is not declared; not decoded");
+            return Adopted::Refused;
+        };
+        match self.contracts.get(&contract.address) {
+            Some(member) if member.entry == entry => Adopted::Known,
+            Some(member) => {
+                conflict(&self.catalog, contract.address, member.entry, entry);
+                Adopted::Refused
+            }
+            None => {
+                self.insert(contract.address, entry, contract.block_hash);
+                Adopted::Added
+            }
+        }
+    }
+
+    /// Every address in the set whose contract's events discover others: the factories,
+    /// seeds or discovered, whose creation logs a backfill reads to find their children.
+    #[cfg(feature = "delta")]
+    pub(crate) fn parents(&self) -> Vec<Address> {
+        let mut parents: Vec<Address> = self
+            .contracts
+            .iter()
+            .filter(|(_, member)| !self.catalog.entries[member.entry].rules.is_empty())
+            .map(|(&address, _)| address)
+            .collect();
+        parents.sort_unstable();
+        parents
+    }
+
     /// The catalog it decodes with.
     pub(super) const fn catalog(&self) -> &Catalog {
         &self.catalog
+    }
+
+    /// The rows `decoded` derives, as the running indexer's decode stage derives them:
+    /// `event` is the [`Record::event`] it decoded as, and `sent` its transaction, whose
+    /// sender and recipient each row carries, `None` when it is not known.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DeriveError::Columns`] when a derivation computes a row that does not
+    /// match its table, a bug in it that stops the run.
+    #[cfg(feature = "delta")]
+    pub(crate) fn derive(
+        &self,
+        chain: &ChainId,
+        event: DecodedAs,
+        decoded: &Decoded,
+        sent: Option<&Sent>,
+    ) -> Result<Vec<Derived>, DeriveError> {
+        self.catalog.derivations.rows(chain, event, decoded, sent)
     }
 
     /// How many addresses decode: seeds plus discovered contracts.
@@ -170,12 +249,15 @@ impl Decoder {
         let entry = &self.catalog.entries[id];
         let decoded = entry.abi.decode_log(log).transpose()?;
         // The rules' key is the log's own, not the decoded event's, so a log that does not
-        // decode still discovers its children.
+        // decode still discovers its children. The zero address is no contract: an event
+        // names it where it has none to name, as a multiplier oracle's passthrough feed
+        // names no token.
         let named = event_key(log)
             .and_then(|key| entry.rules.get(&key))
             .into_iter()
             .flatten()
-            .filter_map(|rule| Some((rule.child, rule.slot.read(log)?)));
+            .filter_map(|rule| Some((rule.child, rule.slot.read(log)?)))
+            .filter(|(_, address)| !address.is_zero());
         // Only a claim the set would record is published: one naming a seed, or an
         // address already registered as another contract, or named twice by this log,
         // would be a row restoring nothing, or a second row under one key.
@@ -415,6 +497,16 @@ mod tests {
         assert_eq!(seed.contracts().len(), 0, "{seed:?}");
         let (_, again) = decoder.decode(&made(child)).expect("the parent is a seed");
         assert_eq!(again.contracts().len(), 0, "{again:?}");
+    }
+
+    /// The zero address is never claimed: a parent naming none discovers nothing.
+    #[test]
+    fn the_zero_address_is_not_claimed() {
+        let decoder = claims([]);
+        let (_, none) = decoder
+            .decode(&made(Address::ZERO))
+            .expect("the parent is a seed");
+        assert_eq!(none.contracts().len(), 0, "{none:?}");
     }
 
     /// A decode leaves the set as it was: until its claims are admitted, the child does

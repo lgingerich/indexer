@@ -472,6 +472,44 @@ impl StoreSettings {
         }
     }
 
+    /// The database's settings, when this is `[sink.postgres]`.
+    #[cfg(feature = "postgres")]
+    #[cfg_attr(
+        not(any(feature = "duckdb", feature = "delta")),
+        expect(
+            clippy::unnecessary_wraps,
+            reason = "a build with other stores has settings that are not the database's"
+        )
+    )]
+    pub(crate) const fn postgres(&self) -> Option<&crate::sink::postgres::PostgresSettings> {
+        match self {
+            #[cfg(feature = "duckdb")]
+            Self::DuckDb(_) => None,
+            Self::Postgres(postgres) => Some(postgres),
+            #[cfg(feature = "delta")]
+            Self::Delta(_) => None,
+        }
+    }
+
+    /// The lake's settings, when this is `[sink.delta]`.
+    #[cfg(feature = "delta")]
+    #[cfg_attr(
+        not(any(feature = "duckdb", feature = "postgres")),
+        expect(
+            clippy::unnecessary_wraps,
+            reason = "a build with other stores has settings that are not the lake's"
+        )
+    )]
+    pub(crate) const fn delta(&self) -> Option<&crate::sink::delta::DeltaSettings> {
+        match self {
+            #[cfg(feature = "duckdb")]
+            Self::DuckDb(_) => None,
+            #[cfg(feature = "postgres")]
+            Self::Postgres(_) => None,
+            Self::Delta(delta) => Some(delta),
+        }
+    }
+
     /// When the store's drain commits, as its settings say.
     pub(crate) fn batching(&self) -> crate::sink::channel::Batching {
         match self {
@@ -500,6 +538,50 @@ pub struct DecodeSettings {
     /// The protocols directory, relative to the settings file's directory. Absent means
     /// an empty catalog.
     pub protocols: Option<PathBuf>,
+    /// `[decode.pairs]`: match other protocols' pools to the pairs Metric's pools trade,
+    /// so a store routing tables as `{ matched = "…" }` keeps only those pools' rows.
+    /// Absent, nothing is matched and such a store keeps none.
+    pub pairs: Option<PairsSettings>,
+}
+
+/// `[decode.pairs]`: see `crate::decode::pairs`.
+///
+/// ```toml
+/// [decode.pairs]
+/// lookback_days = 30
+/// ```
+///
+/// The pools created before a pair was known are found in the chain's whole history over
+/// `HyperSync`, which a node's `eth_getLogs`, a few hundred heights a request on most
+/// plans, cannot search. Their earlier rows are filled from the lake, which a run without
+/// `[sink.delta]` does not have.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PairsSettings {
+    /// How many days before the first Metric pool on a pair a matched pool's rows are kept
+    /// from, so its figures over a window that long exist from the day the Metric pool
+    /// opens. 30 by default.
+    #[serde(default = "default_lookback_days")]
+    pub lookback_days: u64,
+    /// The chain's `HyperSync` endpoint, such as `https://1.hypersync.xyz`, searched for
+    /// pools' creation logs. Required.
+    #[serde(deserialize_with = "non_empty")]
+    pub hypersync_url: String,
+    /// The Envio API token. Required; a [`Secret`].
+    pub hypersync_token: Secret,
+}
+
+impl PairsSettings {
+    /// The lookback in seconds.
+    #[must_use]
+    pub const fn lookback(&self) -> u64 {
+        self.lookback_days.saturating_mul(86_400)
+    }
+}
+
+/// A month, a fee APR's usual longest window.
+const fn default_lookback_days() -> u64 {
+    30
 }
 
 /// Why a settings file could not be turned into [`Settings`].

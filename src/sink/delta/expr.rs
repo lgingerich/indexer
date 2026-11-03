@@ -1,6 +1,8 @@
 //! The `DataFusion` expressions the lake's reads and deletes filter by, and the columns
 //! of the batches a read hands back.
 
+use std::ops::RangeInclusive;
+
 use deltalake::arrow::array::{AsArray as _, RecordBatch, StringArray, UInt64Array};
 use deltalake::arrow::datatypes::{DataType as ArrowType, UInt64Type};
 use deltalake::datafusion::prelude::{Expr, cast, ident, lit};
@@ -15,6 +17,26 @@ pub(super) fn at_or_above(column: &str, height: u64, width: u64) -> Expr {
     ident(PARTITION)
         .gt_eq(lit(arrow::partition_of(height, width)))
         .and(ident(column).gt_eq(uint(height)))
+}
+
+/// `column` within `blocks`, with the partition column bounding it too, `width` heights
+/// to a partition, so a scan or delete skips every other partition without opening a
+/// file.
+pub(super) fn within(column: &str, blocks: &RangeInclusive<u64>, width: u64) -> Expr {
+    ident(PARTITION)
+        .gt_eq(lit(arrow::partition_of(*blocks.start(), width)))
+        .and(ident(PARTITION).lt_eq(lit(arrow::partition_of(*blocks.end(), width))))
+        .and(ident(column).gt_eq(uint(*blocks.start())))
+        .and(ident(column).lt_eq(uint(*blocks.end())))
+}
+
+/// A `Timestamp` column, which the lake stores in microseconds, as whole seconds.
+pub(super) fn seconds(column: &str) -> Expr {
+    cast(
+        cast(ident(column), ArrowType::Int64) / lit(1_000_000_i64),
+        ArrowType::UInt64,
+    )
+    .alias(column)
 }
 
 /// The rows of the blocks `hashes`, by a table's `(hash, height)` columns, none of them

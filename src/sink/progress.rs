@@ -121,6 +121,8 @@ impl CommitStats {
                 self.observe_block(contract.block_number, contract.block_hash);
             }
             Event::Derived(derived) => self.observe_block(derived.block_number, derived.block_hash),
+            Event::Handoff(handoff) => self.observe_block(handoff.block_number, handoff.block_hash),
+            Event::Matched(matched) => self.observe_block(matched.block_number, matched.block_hash),
             Event::AcceptedBlock(accepted) => self.observe_block(accepted.height, accepted.hash),
             Event::Reorg(reorg) => self.reorgs.push(LoggedReorg {
                 height: reorg.height,

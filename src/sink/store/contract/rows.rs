@@ -105,9 +105,14 @@ pub(crate) async fn an_absent_optional_column_is_null<H: Harness>() {
 pub(crate) async fn nothing_is_durable_until_the_flush<H: Harness>() {
     let (mut sink, mut harness) = H::open(datasets()).await;
     let envelopes = every_kind(&harness.chain());
-    let buffered = envelopes.len();
+    // The run's session row is buffered with its first block.
+    let buffered = envelopes.len() + 1;
     buffer(&mut sink, envelopes).await;
-    assert_eq!(sink.buffered(), buffered, "buffered but not written");
+    assert_eq!(
+        sink.buffered(),
+        buffered,
+        "buffered, the run's session with them, but not written"
+    );
     assert!(sink.buffered_bytes() > 0, "the drain sees what is buffered");
     for table in Table::ALL {
         assert_eq!(
@@ -135,12 +140,17 @@ pub(crate) async fn nothing_is_durable_until_the_flush<H: Harness>() {
 pub(crate) async fn a_late_table_failure_rolls_back_and_a_retry_writes_each_row_once<H: Harness>() {
     let (mut sink, mut harness) = H::open(datasets()).await;
     let envelopes = every_kind(&harness.chain());
-    let buffered = envelopes.len();
+    // The run's session row is buffered with its first block.
+    let buffered = envelopes.len() + 1;
     buffer(&mut sink, envelopes).await;
     harness.execute("DROP TABLE reorgs").await;
 
     assert_failed(sink.flush().await, Operation::Merge, "reorgs");
-    assert_eq!(sink.buffered(), buffered, "failed batch stays buffered");
+    assert_eq!(
+        sink.buffered(),
+        buffered,
+        "failed batch stays buffered, the run's session with it"
+    );
     for (table, rows) in block_tables(&mut harness).await {
         assert_eq!(rows, 0, "{table} rolls back");
     }
@@ -270,7 +280,17 @@ pub(crate) async fn a_store_writes_only_the_tables_routed_to_it<H: Harness>() {
         .filter(|def| matches!(def.id, TableId::Event(_)))
         .map(|def| (def.id, def.name.clone()))
         .unzip();
-    expected.extend(["accepted_blocks", "contracts", "reorgs"].map(str::to_owned));
+    expected.extend(
+        [
+            "accepted_blocks",
+            "contracts",
+            "reorgs",
+            "sessions",
+            "handoffs",
+            "matched_pools",
+        ]
+        .map(str::to_owned),
+    );
     let (mut sink, mut harness) = H::open(Arc::new(schema.select(&events))).await;
     let chain = harness.chain();
     let swap = crate::sink::fixtures::decoded_swap();
@@ -298,7 +318,14 @@ pub(crate) async fn a_store_writes_only_the_tables_routed_to_it<H: Harness>() {
     .collect();
     assert_eq!(created, expected, "only the routed and bookkeeping tables");
     assert_eq!(row_count(&mut harness, "uniswap_v3_pool_swap").await, 1);
-    for table in ["accepted_blocks", "reorgs", "contracts"] {
+    for table in [
+        "accepted_blocks",
+        "reorgs",
+        "contracts",
+        "sessions",
+        "handoffs",
+        "matched_pools",
+    ] {
         assert_eq!(row_count(&mut harness, table).await, 0, "{table} is empty");
     }
     harness.remove().await;

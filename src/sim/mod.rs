@@ -57,7 +57,7 @@ use crate::runtime::{Pipeline, RuntimeError};
 use crate::sink::channel::Batching;
 use crate::sink::duckdb::DuckDb;
 use crate::sink::resume::{Opened, ResumeError};
-use crate::sink::route::StoreBackend;
+use crate::sink::route::{Selection, StoreBackend};
 use crate::sink::stop::Stop;
 use crate::sink::store_runtime::StoreRuntime;
 use crate::sink::table::{Schema, Table, TableId};
@@ -204,7 +204,14 @@ impl StorePlan {
                 TableId::Dataset(Table::Decoded) | TableId::Event(_) | TableId::Derived(_) => {
                     self.decoded
                 }
-                TableId::Dataset(Table::Contract | Table::Reorg | Table::AcceptedBlock) => true,
+                TableId::Dataset(
+                    Table::Contract
+                    | Table::Reorg
+                    | Table::AcceptedBlock
+                    | Table::Session
+                    | Table::Handoff
+                    | Table::Matched,
+                ) => true,
             })
             .collect()
     }
@@ -419,7 +426,7 @@ async fn open(
         landed: false,
     };
     let tables = store.tables(schema);
-    let inner = SqlStore::new(engine, Arc::new(schema.select(&tables)), CHAIN)
+    let inner = SqlStore::new(engine, Arc::new(schema.select(&tables)), CHAIN, CHAIN)
         .await
         .map_err(|source| RuntimeError::OpenStore {
             store: store.backend,
@@ -437,7 +444,10 @@ async fn open(
             held: BTreeMap::new(),
         },
         batching: store.batching,
-        tables,
+        tables: Selection {
+            tables,
+            matched: HashSet::new(),
+        },
         // The simulation runs on one thread to stay deterministic.
         runtime: StoreRuntime::current(),
     })

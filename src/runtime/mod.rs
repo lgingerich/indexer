@@ -88,7 +88,6 @@
 //! but a `SIGTERM` from anything else, such as an operator's `docker stop`, also leaves
 //! the chain down until something starts it again.
 
-use std::collections::HashSet;
 use std::sync::Arc;
 
 use thiserror::Error;
@@ -101,12 +100,14 @@ use crate::ingest::source::evm::{http_client, ws_connect};
 use crate::ingest::source::{
     AnySource, BlockSource, EvmSource, HyperSyncRanges, HyperSyncSource, SourceError,
 };
-use crate::sink::route::{self, Backend, RouteError, Router, StoreBackend};
+use crate::sink::route::{self, Backend, RouteError, Router, Selection, StoreBackend};
 use crate::sink::stop::Stop;
-use crate::sink::table::{Schema, TableId};
+use crate::sink::table::Schema;
 use crate::sink::{SinkError, StdoutJsonSink};
 use crate::wire::envelope::ChainId;
 
+#[cfg(feature = "store")]
+mod pairs;
 #[cfg(feature = "store")]
 mod stores;
 
@@ -246,6 +247,13 @@ pub(crate) struct Pipeline<B = AnySource> {
     catalog: Catalog,
     /// Every table the run has: the dataset tables and each decoded event's.
     schema: Arc<Schema>,
+    /// The lake whose backfills hand the run contracts, when it writes one (see
+    /// `crate::sink::delta::HandoffWatch`).
+    #[cfg(feature = "delta")]
+    watch: Option<crate::sink::delta::HandoffWatch>,
+    /// The pools to match to Metric's pairs, when `[decode.pairs]` asks for them.
+    #[cfg(feature = "store")]
+    pairs: Option<pairs::Pairs>,
 }
 
 /// Where [`Pipeline::run`] sends the stream, resolved from the settings once: the tables
@@ -258,7 +266,7 @@ pub(crate) struct Pipeline<B = AnySource> {
 #[derive(Debug)]
 pub(crate) enum Routes {
     /// `[sink.stdout]`, and the tables it prints.
-    Print(HashSet<TableId>),
+    Print(Selection),
     /// Every store named, in a fixed order. Never empty.
     #[cfg(feature = "store")]
     Store(Vec<StoreRoute>),
@@ -269,7 +277,7 @@ pub(crate) enum Routes {
 #[derive(Debug)]
 pub(crate) struct StoreRoute {
     settings: crate::config::StoreSettings,
-    tables: HashSet<TableId>,
+    tables: Selection,
 }
 
 impl Pipeline {
@@ -339,19 +347,27 @@ impl Pipeline {
                 )?)
             }
         };
-        let pipeline = Self::new(
+        #[cfg_attr(
+            not(feature = "store"),
+            expect(unused_mut, reason = "only a run that stores matches pools")
+        )]
+        let mut pipeline = Self::new(
             source,
             settings.ingest.start_block,
             settings.ingest.stop_block,
             catalog,
         );
+        #[cfg(feature = "store")]
+        {
+            pipeline.pairs = pairs::Pairs::from_settings(settings, &routes, &pipeline.catalog)?;
+        }
         Ok((pipeline, routes))
     }
 }
 
 impl Routes {
     /// The tables each sink writes, whose union ingest fetches.
-    fn tables(&self) -> Vec<&HashSet<TableId>> {
+    fn tables(&self) -> Vec<&Selection> {
         match self {
             Self::Print(tables) => vec![tables],
             #[cfg(feature = "store")]
@@ -377,6 +393,10 @@ impl<B: BlockSource + 'static> Pipeline<B> {
             stop_block,
             schema: Arc::new(catalog.schema().clone()),
             catalog,
+            #[cfg(feature = "delta")]
+            watch: None,
+            #[cfg(feature = "store")]
+            pairs: None,
         }
     }
 
@@ -396,13 +416,24 @@ impl<B: BlockSource + 'static> Pipeline<B> {
             Routes::Print(tables) => tables,
             #[cfg(feature = "store")]
             Routes::Store(routes) => {
+                #[cfg(feature = "delta")]
+                let mut this = self;
+                #[cfg(not(feature = "delta"))]
+                let this = self;
+                #[cfg(feature = "delta")]
+                {
+                    this.watch = routes
+                        .iter()
+                        .find_map(|route| route.settings.delta())
+                        .map(crate::sink::delta::HandoffWatch::new);
+                }
                 // A stop while opening drops what is open; see "Shutdown" in the module docs.
                 let stores = tokio::select! {
                     biased;
                     () = stop.wait() => return Ok(()),
-                    stores = self.open(routes) => stores?,
+                    stores = this.open(routes) => stores?,
                 };
-                return Box::pin(self.run_with_stores(stores, stop)).await;
+                return Box::pin(this.run_with_stores(stores, stop)).await;
             }
         };
         // A stop drops ingest; stdout has nothing to finish.
@@ -415,16 +446,21 @@ impl<B: BlockSource + 'static> Pipeline<B> {
 
     /// Prints `tables`, as `[sink.stdout]` names them. No store, so nothing to restore: a
     /// run starts fresh from the manifests' seeds.
-    async fn print(self, tables: HashSet<TableId>) -> Result<(), RuntimeError> {
+    async fn print(self, tables: Selection) -> Result<(), RuntimeError> {
         let Self {
             source,
             start_block,
             stop_block,
             catalog,
             schema,
+            ..
         } = self;
+        // Printing keeps no store to record a match in, so it matches nothing.
         let sinks = vec![(StdoutJsonSink::new(), tables)];
-        let sink = DecodingSink::new(Decoder::new(catalog, []), Router::new(schema, sinks));
+        let sink = DecodingSink::new(
+            Decoder::new(catalog, []),
+            Router::new(schema, crate::decode::SharedKept::default(), sinks),
+        );
         Machine::new(source, sink, Vec::new())
             .run(start_block, stop_block)
             .await?;
@@ -465,7 +501,7 @@ pub async fn run(path: &str) -> Result<(), RuntimeError> {
         let _ = request.send(true);
     });
     let (pipeline, routes) = Pipeline::from_settings(&settings)?;
-    let ran = pipeline.run(routes, stop.clone()).await;
+    let ran = Box::pin(pipeline.run(routes, stop.clone())).await;
     if ran.is_ok() && stop.requested() {
         info!("stopped on request");
     }

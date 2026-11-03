@@ -95,9 +95,9 @@ pub use store_error::{InvalidStoredValue, Operation, StoreError};
 use alloy_primitives::{Address, B256};
 use thiserror::Error;
 
-#[cfg(feature = "store")]
-use crate::wire::envelope::BlockMeta;
 use crate::wire::envelope::Envelope;
+#[cfg(feature = "store")]
+use crate::wire::envelope::{BlockMeta, Handoff, Matched};
 
 /// Receives envelopes in per-chain order, as the pipeline publishes them.
 ///
@@ -195,6 +195,10 @@ pub struct StoredContract {
 pub struct Restored {
     /// Every contract discovered on the store's chain, each from a canonical block.
     pub contracts: Vec<StoredContract>,
+    /// Every contract a backfill handed over, each from a canonical block.
+    pub handoffs: Vec<Handoff>,
+    /// Every pool matched to a Metric pool's pair, each record from a canonical block.
+    pub matched: Vec<Matched>,
     /// The newest [`LEDGER_WINDOW`](crate::window::LEDGER_WINDOW) accepted
     /// blocks, oldest first: the undo window a restart resumes from.
     pub ledger: Vec<BlockMeta>,
@@ -379,6 +383,26 @@ pub(crate) mod fixtures {
     /// words beside scalars up to `type(uint256).max`.
     #[cfg(feature = "store")]
     pub(crate) fn decoded_pool_created() -> Decoded {
+        use alloy_primitives::address;
+
+        let log = metric_pool_created(
+            address!("0x0b3e328455c4059eeb9e3f84b5543f74e24e7e1b"),
+            address!("0x833589fcd6edb6e08f4c7c32d4f71b54bda02913"),
+        );
+        Decoder::new(catalog("robinhood"), [])
+            .decode(&log)
+            .expect("the seeded factory's event")
+            .0
+            .expect("decodes")
+            .decoded
+    }
+
+    /// The log of [`decoded_pool_created`]'s pool, its tokens `token0` and `token1`, from
+    /// the factory Metric runs at one address on every chain.
+    pub(crate) fn metric_pool_created(
+        token0: alloy_primitives::Address,
+        token1: alloy_primitives::Address,
+    ) -> crate::wire::datasets::evm::Log {
         use alloy_dyn_abi::DynSolValue;
         use alloy_json_abi::JsonAbi;
         use alloy_primitives::{Address, B256, U256, address};
@@ -394,12 +418,12 @@ pub(crate) mod fixtures {
             U256::from_str_radix("190000000000190000000000190000000000190000000000190", 16)
                 .expect("a packed word");
         let words = DynSolValue::Array(vec![DynSolValue::Uint(packed, 256); 4]);
-        let log = crate::wire::datasets::evm::Log {
+        crate::wire::datasets::evm::Log {
             address: address!("0x2a53833cc95548cf52c7b159110e22d3a9018f32"),
             topic0: Some(event.selector()),
             topic1: topic(address!("0xb030150465b706f81eecc453ba5e9bae7b06e50d")),
-            topic2: topic(address!("0x0b3e328455c4059eeb9e3f84b5543f74e24e7e1b")),
-            topic3: topic(address!("0x833589fcd6edb6e08f4c7c32d4f71b54bda02913")),
+            topic2: topic(token0),
+            topic3: topic(token1),
             data: DynSolValue::Tuple(vec![
                 uint(92),
                 DynSolValue::Address(address!("0x2a53833cc95548cf52c7b159110e22d3a9018f32")),
@@ -428,12 +452,6 @@ pub(crate) mod fixtures {
             .into(),
             block_hash: B256::with_last_byte(0x0b),
             ..crate::wire::datasets::evm::Log::default()
-        };
-        Decoder::new(catalog("robinhood"), [])
-            .decode(&log)
-            .expect("the seeded factory's event")
-            .0
-            .expect("decodes")
-            .decoded
+        }
     }
 }

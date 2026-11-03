@@ -5,20 +5,18 @@
 use std::collections::HashSet;
 
 use alloy_primitives::B256;
-use deltalake::arrow::datatypes::DataType as ArrowType;
-use deltalake::datafusion::prelude::{cast, ident, lit};
+use deltalake::datafusion::prelude::ident;
 use futures_util::stream::{self, StreamExt as _, TryStreamExt as _};
 use tokio::time::Instant;
 use tracing::{info, warn};
 
-use super::arrow::PARTITION;
-use super::expr::{at_or_above, in_texts, of_blocks, texts, texts_of, uint, uints};
+use super::expr::{at_or_above, in_texts, of_blocks, texts, texts_of, uint};
+use super::handoff::handoffs;
 use super::{CONCURRENT_TABLES, DeltaSink};
 use crate::sink::store_error::{InvalidStoredValue, StoreError};
-use crate::sink::table::{CONTRACT_COLUMNS, LEDGER_COLUMNS, REORG_COLUMNS, Table, TableId};
+use crate::sink::table::{CONTRACT_COLUMNS, REORG_COLUMNS, Table, TableId};
 use crate::sink::{StoredContract, hex, millis};
-use crate::window::LEDGER_WINDOW;
-use crate::wire::envelope::BlockMeta;
+use crate::wire::envelope::{BlockMeta, Handoff};
 
 impl DeltaSink {
     /// The contracts discovered on this chain that the lake holds, every one canonical:
@@ -65,56 +63,10 @@ impl DeltaSink {
         Ok(contracts)
     }
 
-    /// The newest [`LEDGER_WINDOW`] accepted blocks, oldest first.
-    ///
-    /// Read from the ledger's newest two partitions alone, which hold at least the window
-    /// (a partition is never narrower), so a restart does not scan every file the
-    /// ledger ever wrote.
-    pub(super) async fn read_ledger(&self) -> Result<Vec<BlockMeta>, StoreError> {
-        let lake = self.lake(Table::AcceptedBlock);
-        let newest = lake.newest_partition()?;
-        let [height, hash, parent_hash, timestamp] = LEDGER_COLUMNS;
-        let batches = lake
-            .read(|frame| {
-                let frame = match newest {
-                    Some(newest) => frame.filter(ident(PARTITION).gt_eq(lit(newest - 1)))?,
-                    None => frame,
-                };
-                let seconds = cast(
-                    cast(ident(timestamp), ArrowType::Int64) / lit(1_000_000_i64),
-                    ArrowType::UInt64,
-                );
-                frame
-                    .sort(vec![ident(height).sort(false, false)])?
-                    .limit(0, Some(LEDGER_WINDOW))?
-                    .select(vec![
-                        cast(ident(height), ArrowType::UInt64),
-                        cast(ident(hash), ArrowType::Utf8),
-                        cast(ident(parent_hash), ArrowType::Utf8),
-                        seconds,
-                    ])
-            })
-            .await?;
-        let mut ledger = Vec::new();
-        for batch in &batches {
-            let heights = uints(batch, 0, "accepted_blocks.height")?;
-            let hashes = texts(batch, 1, "accepted_blocks.hash")?;
-            let parents = texts(batch, 2, "accepted_blocks.parent_hash")?;
-            let times = uints(batch, 3, "accepted_blocks.timestamp")?;
-            for row in 0..batch.num_rows() {
-                ledger.push(BlockMeta {
-                    height: heights.value(row),
-                    hash: InvalidStoredValue::parse("accepted_blocks.hash", hashes.value(row))?,
-                    parent_hash: InvalidStoredValue::parse(
-                        "accepted_blocks.parent_hash",
-                        parents.value(row),
-                    )?,
-                    timestamp: times.value(row),
-                });
-            }
-        }
-        ledger.sort_by_key(|block| block.height);
-        Ok(ledger)
+    /// The contracts backfills handed the running indexer that the lake holds, each with
+    /// the first block decoded with it.
+    pub(super) async fn handoffs(&self) -> Result<Vec<Handoff>, StoreError> {
+        handoffs(self.lake(Table::Handoff)).await
     }
 
     /// Deletes the rows of blocks `ledger` does not name, at or above its oldest height:

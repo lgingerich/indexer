@@ -315,8 +315,12 @@ most, that `decode` and `ingest` do not depend on each other, CI checks with a g
   Metric's are `metric_v1_swaps`, each pool `Swap` with its packed words unpacked into
   exact signed amounts, fees, and the pool's bin after the swap; `metric_v1_bin_fills`,
   each bin a swap filled with its balance changes and fees; `metric_v1_liquidity`, each
-  bin of a liquidity add or remove; and `metric_v1_pool_bins`, each bin of a pool's
-  ladder as created, with its edges. Every derived row also carries its transaction's
+  bin of a liquidity add or remove; `metric_v1_pool_bins`, each bin of a pool's
+  ladder as created, with its edges; `metric_v1_oracle_prices`, each price an oracle
+  stored, read from the Pyth Lazer update or Chainlink Data Streams report in its
+  transaction's input, as `FeedUpdated` carries only the feed; and
+  `metric_v1_compressed_oracle_prices`, each price the compressed oracle stored, read
+  from the slot words pushed to it. Every derived row also carries its transaction's
   sender and recipient, so listing a derived table fetches transactions. A derived
   row carries its log's block hash, so it commits with its block and a reorg deletes it
   with the rest. A derivation runs when the catalog declares its event's exact
@@ -386,12 +390,18 @@ runtime cleanups
 
 ### Stored-log replay
 
-Re-decoding logs already in the store is not implemented. That path would read
-retained raw logs, run them through the same decoder, and replace or deduplicate the
-decoded rows. The store upserts on `(chain, dedupe_key)`, which makes a replay of the
-same interpretation replace the stored row. A changed event definition stays a separate
-row, because its `event_id` is part of the key. A replay would also have to walk the
-contract set in block order, since a contract decodes only from its creation onward.
+`indexer backfill` replays the lake's logs for new manifests (see
+[Backfilling new protocols from the lake](#backfilling-new-protocols-from-the-lake)):
+their listed contracts, the contracts their factories created below the running
+indexer's restart, which it hands the running indexer, and their derived tables, each
+row's sender and recipient read from the lake's `transactions`. One case is not built:
+
+- **Contracts created before the lake's first block.** They are not in it to discover.
+  The plan: read only the factories' creation events for those blocks from a node
+  (`eth_getLogs` filtered by factory and event) or HyperSync, and hand over what they
+  name, optionally just the pools `only` lists.
+
+It fills the lake and, when asked, `PostgreSQL`; not `DuckDB`.
 
 ### Streaming aggregation
 
@@ -538,9 +548,20 @@ Each table names what owns its fields, not where a field was first needed:
   alone. Naming a backend is naming its table, so a key only that backend understands
   has nowhere else to sit. Every sink lists the `tables` it writes — exact names
   (`logs`), `*` globs over names (`uniswap_v3_*`), or `contract_events` for every
-  contract's decoded event table, including protocols added later. There is no
-  default: what lands where is read off the file. `accepted_blocks`, `reorgs`, and
-  `contracts` are written to every store and are not listed. Commit batching is part
+  contract's decoded event table, including protocols added later. An entry written
+  `{ matched = "uniswap_v3_*" }` selects its tables the same way but keeps them to the
+  rows of the pools matched to Metric pools' pairs (see
+  [Pools matched to Metric's pairs](#pools-matched-to-metrics-pairs)), so a database can
+  hold the pools compared with Metric's of a protocol the lake holds whole. Only contract
+  event tables can be matched: theirs are the rows a matched pool's history is filled
+  into, so raw `logs`, `decoded_logs`, or a derived table would hold a pool's rows only
+  from when it was matched. An entry starting with `!`
+  takes the tables it matches back out of what the others select, wherever it stands in
+  the list, as `.gitignore`'s negation does: `["metric_v1_*",
+  "!metric_v1_oracle_provider_feed_updated"]` is every Metric table but that one. There is no
+  default: what lands where is read off the file. `accepted_blocks`, `reorgs`,
+  `contracts`, `sessions`, `handoffs`, and `matched_pools` are written to every store and
+  are not listed. Commit batching is part
   of this, because it is a property of the store: `DuckDB` folds a backlog into larger
   transactions, where the lake commits on a timer.
 - `[decode]` — the protocol manifests.
@@ -554,7 +575,7 @@ the field:
 | `ingest.http_url` | JSON-RPC endpoint for blocks, receipts, and logs. A [secret](#secrets). Named with `ws_url`, unless `[ingest.hypersync]` replaces both |
 | `ingest.ws_url` | WebSocket endpoint for `newHeads`. A [secret](#secrets). Named with `http_url` |
 | at least one `[sink.<backend>]` table | Which backends write. `duckdb`, `postgres`, and `delta` persist; `stdout` prints, opens no store, and runs alone |
-| `sink.<backend>.tables` | The tables that sink writes: names, `*` globs, or `contract_events`. An entry matching no table is a startup error |
+| `sink.<backend>.tables` | The tables that sink writes: names, `*` globs, `contract_events`, or `{ matched = "<name or glob>" }` for only the rows of the pools matched to Metric's pairs, less those a `!` entry names. An entry matching no table is a startup error |
 
 **Defaulted** — correct for a standard deployment; override for a non-standard one:
 
@@ -627,6 +648,90 @@ A few fields differ from what the RPC source stores for the same block:
 | block `size` | BSC | one of two sizes the node reports | the other: BSC's answer depends on how the block was asked for |
 
 So where a backfill hands over to an RPC run, those columns can change at the boundary.
+
+### Backfilling new protocols from the lake
+
+A manifest added later decodes in the running indexer from its restart onward. Its
+history before that is decoded from the logs the lake already holds, by a separate run of
+the same binary, on any machine that reaches the lake, without fetching anything from a
+node or HyperSync. Once it is done, the lake (and the database, when asked) hold every
+record they would have had the manifest been there from the start.
+
+```bash
+indexer backfill indexer.ethereum.backfill.toml
+```
+
+Each chain has a backfill settings file beside its own, `indexer.<chain>.backfill.toml`
+(every key is documented in `src/backfill/mod.rs`): the chain, the lake as its
+`[sink.delta]` names it, and, commented out until a run needs them, `protocols`, the
+manifests to backfill (required), `from` and `to`, the blocks to cover, `out`, another
+lake such as a local directory to write to instead, leaving the chain's only read, and
+`[postgres]`, the running indexer's database to fill too, as its `[sink.postgres]` names
+it.
+
+**What it writes.** It reads `logs` a few hundred megabytes of files at a time, opening
+only the files that hold a range's blocks, keeps only the manifests' addresses, decodes
+them with the same decoder, and appends to `decoded_logs` and the event tables only the
+rows they do not hold yet, by key, in commits of at most 10,000 blocks and 50,000 logs.
+It writes into the running indexer's own tables without stopping it: in Delta, a commit
+that only appends never conflicts with the running store's commits, and the backfill
+writes nothing the running store ever deletes. The small files this leaves in old
+partitions are compacted by the running store's maintenance within the hour. In
+`PostgreSQL` it upserts the same rows into the tables `[postgres] tables` routes there.
+A rerun, or a range the running indexer decoded too, writes each record once, so a
+stopped run is simply run again, or continued by setting `from` to the `resume_from` of
+its last range's log line.
+
+**The bound.** It writes no block above the lake's tip less four ledger windows (16,388
+blocks: about 2.3 days on Ethereum, minutes on a faster chain). The running store deletes
+only above some height: a reorg's fork and a stopped commit's leftovers are inside its
+4,096-block window, and the rewind a restart makes to a slower store is refused deeper
+than four windows. So nothing it deletes can reach a backfilled row. `to` may lower the
+bound, never raise it.
+
+**Handing over without a gap.** Every store writes a `sessions` row with the first block
+it writes after a restart: that block, and every event definition its run decodes. The
+backfill checks each store it writes, the lake's and the database's, against its newest
+session, and refuses unless the running indexer:
+
+- decodes every protocol being backfilled,
+- with the same event definitions, since a decoded record's key names its definition,
+- from a block at or below the bound, so the backfill covers everything below its
+  restart, and the running indexer everything above.
+
+So the order is: deploy the manifest to the running indexer, wait until the lake's tip is
+four windows past its restart, and run the backfill. The refusal says which of these is
+missing, and how long is left to wait.
+
+**Discovered contracts.** A manifest whose contracts come from a factory (`created_by`)
+decodes, in the running indexer, only the contracts created from its restart on. The
+backfill finds the ones created below it: it reads the factories' logs from the lake,
+then those of any child that is a factory in turn, until a pass finds no new one. It
+hands them to the running indexer through `_backfill_contracts`, a queue beside the
+chain's tables, and waits until the running indexer records each in its `handoffs`
+table: the contract, and the first block it decoded it in, written in the commit that
+holds that block. The backfill then fills each below that block. `only = ["0x…"]`
+narrows the contracts handed over and backfilled to those listed.
+
+The running indexer looks for a backfill once a minute, one listing of the lease's log,
+and reads the queue only while one holds the lake, every ten seconds, and once when it
+lets go; at startup it reads the queue once for what it missed while stopped. A handed
+contract joins at a block boundary, gets its `contracts` row so restarts keep decoding
+it, and its record moves to the next block if a reorg orphans the one it was in.
+
+A record is near the tip, above the bound, so a first run fills a handed-over contract
+only through the bound. It logs `rerun_through`: run again from `to + 1` once the bound
+reaches that block, and the two meet with no block between them. A rerun hands over
+nothing it handed before.
+
+**One at a time.** A backfill holds a lease on the lake it writes, a small Delta table
+`_backfill_lock` beside the chain's tables, renewed every minute and released when it
+ends. A second backfill is refused, naming the first. A lease not renewed for ten
+minutes, left by a run that stopped, may be taken over, and the stopped run, should it
+come back, stops at its next write.
+
+History starts where the lake does, at the chain's `start_block`; see
+[Stored-log replay](#stored-log-replay) for contracts created before it.
 
 ### Secrets
 
@@ -820,6 +925,59 @@ two events by one name. Tables are created at startup and never altered. See
 [event table and schema limitations](#event-table-and-schema-limitations) for what that
 leaves unhandled.
 
+### Pools matched to Metric's pairs
+
+With `[decode.pairs]`, every Uniswap V3 and V4 pool on a token pair a Metric pool trades
+is *matched*, so a store routing `{ matched = "uniswap_v3_*" }` and
+`{ matched = "uniswap_v4_*" }` holds the pools compared with Metric's, while the lake
+holds every pool (`src/decode/pairs.rs`):
+
+```toml
+[decode.pairs]
+lookback_days = 30
+hypersync_url = "https://1.hypersync.xyz"
+hypersync_token = { env = "INDEXER_ENVIO_HYPERSYNC_TOKEN" }
+```
+
+- **A pair** is two tokens, lower address first, the native coin counted as the chain's
+  wrapped one, since Metric's pools hold WETH where Uniswap V4's often hold ETH. Every
+  Metric `PoolCreated` names one.
+- **Finding the pools.** One created once its pair is known is matched from its creation
+  in the stream: V3's by the address its factory's `PoolCreated` names, V4's by the id its
+  `PoolManager`'s `Initialize` names. One created earlier, even before the lake's first
+  block, is found by searching the chain's history over HyperSync, since both events
+  name their two tokens as topics; a node's `eth_getLogs`, a few hundred heights a
+  request on most plans, cannot search it. At startup every Metric pool is searched the
+  same way, so no pair waits for a new Metric pool. The searches run on a task of their
+  own, which ingest never waits on, and batch every new pair into one search per
+  protocol. A page the endpoint refuses, as it does past the token's rate, is asked again
+  through the source's backoff, then every five minutes for as long as it takes, keeping
+  the pages already read; only an error asking again cannot fix, such as a refused
+  token, gives a search up, logged.
+- **Recording them.** A pool a search finds joins after a block's marker, as a handed-over
+  contract does, and the next block records it in `matched_pools`, with the `contracts`
+  row of a V3 pool the run did not decode yet: its rows are kept from that block, and a
+  restart restores it from that record. A reorg that orphans the block deletes the record
+  and the next block writes it again. `matched_pools` holds each pool's tokens, fee,
+  hooks, and creation block, what a reader joining the event tables needs; a matched V3
+  pool's own `PoolCreated` row is kept too, when the stream saw it. After a restart, no
+  record is written with a block a store already held, which that store drops as ingest
+  hands it back: it waits for the first block none holds.
+- **Their history.** A pool that existed before it was matched has its earlier rows
+  filled from the lake, back to `lookback_days` before the first Metric pool on its pair:
+  once the lake's bound passes the block it joined at (see the backfill's
+  [bound](#backfilling-new-protocols-from-the-lake)), which it waits for reading only the
+  lake's ledger, the run takes the backfill lease and decodes the pool's logs from the
+  lake, on a runtime of its own beside ingest's. A V3 pool's are read from the lake's
+  first block and appended to the lake's decoded tables too, which the run never decoded
+  before; V4's `PoolManager` is read from shortly before the lookback starts, only the
+  matched pools' logs. Both are upserted into the matched tables, in the backfill's
+  bounded commits. A second record, `filled`, says it is done; a run stopped before
+  then, which lets go of the lease at its next commit, fills it again after a restart.
+
+Only Metric's factory names pairs, and only Uniswap V3 and V4 are matched to them; both
+are in code beside the derivations, not in a manifest.
+
 ### What decode does not do
 
 **It does not project a record into a dataset.** Decoding produces *facts* — an
@@ -921,7 +1079,7 @@ They live under the `DuckDB` table because they are DuckDB's, and no other backe
 know what to do with them. Anything unrecognized is an error from DuckDB naming the
 setting, so a typo is caught at startup rather than silently ignored. Every envelope
 lands in its dataset's own typed table — `blocks`, `transactions`, `logs`,
-`decoded_logs`, `contracts`, `reorgs`, `accepted_blocks` — with real columns rather than a JSON blob, so a
+`decoded_logs`, `contracts`, `reorgs`, `accepted_blocks`, `sessions`, `handoffs` — with real columns rather than a JSON blob, so a
 consumer filters and joins on values. As in Allium's raw tables, chain integers are
 numbers (`BIGNUM` beyond 64 bits), times are `TIMESTAMP`s, and hashes and addresses are
 `0x` hex. The schema is generated from the table definitions in `src/sink/table/`, so a

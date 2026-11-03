@@ -39,7 +39,10 @@
 
 mod assemble;
 mod bincode;
+mod search;
 mod wire;
+
+pub use search::LogSearch;
 
 use std::fmt;
 use std::num::{NonZeroU64, NonZeroUsize};
@@ -381,7 +384,7 @@ impl HyperSyncSource {
 /// closed mid-body — is sent again. A request that could not be sent as built, a status
 /// such as a refused token, and an answer that does not decode are not: asking again
 /// gets the same answer. Every query is a read, so a retry cannot apply anything twice.
-fn judge<T>(result: &Result<T, SourceError>) -> Attempt {
+pub(super) fn judge<T>(result: &Result<T, SourceError>) -> Attempt {
     match result {
         Ok(_) => Attempt::Served,
         Err(

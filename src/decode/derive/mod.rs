@@ -2,8 +2,10 @@
 //!
 //! A [`Derivation`] reads one or more events of one protocol's contract and writes one
 //! table: rows per decoded record, one for most and one per array entry for some, computed
-//! from that record alone. Nothing is carried from one record to the next, so a derived
-//! row belongs to its log's block like the decoded row it came from. A `reorg` deletes it
+//! from that record alone, and, for a derivation that needs it, its transaction's input:
+//! an oracle that emits only which feed it updated carries the price in its calldata.
+//! Nothing is carried from one record to the next, so a derived row belongs to its log's
+//! block like the decoded row it came from. A `reorg` deletes it
 //! by that block, a restart has nothing to restore, and any store, the lake included, can
 //! hold it.
 //!
@@ -18,8 +20,8 @@
 //! full signature, so an ABI that retyped an argument leaves the table undeclared and a
 //! store listing it fails at startup. It reads each argument by position and name, so one
 //! that moved under an unchanged signature is caught at its first record. A record a
-//! derivation cannot read derives nothing and is logged; the decoded record still
-//! commits.
+//! derivation cannot read, or whose transaction's input does not hold what it reads,
+//! derives nothing and is logged; the decoded record still commits.
 //!
 //! A derivation writes each value beside its column's name, so two columns of one type
 //! cannot trade values unseen: the pair moves together, or the names give it away. A row
@@ -54,7 +56,7 @@
 pub(super) mod metric;
 mod value;
 
-use alloy_primitives::{Address, TxHash};
+use alloy_primitives::{Address, Bytes, TxHash};
 use tracing::warn;
 
 use super::abi::EventKey;
@@ -71,6 +73,8 @@ pub(super) const DERIVATIONS: &[Derivation] = &[
     metric::BIN_FILLS,
     metric::LIQUIDITY,
     metric::POOL_BINS,
+    metric::ORACLE_PRICES,
+    metric::COMPRESSED_ORACLE_PRICES,
 ];
 
 /// One table computed from decoded events of one contract: rows per record, from that
@@ -92,9 +96,10 @@ pub(super) struct Derivation {
     /// The indexes the app's reads need, each its columns in order, beside the ones every
     /// table has by block.
     pub(super) indexes: &'static [&'static [&'static str]],
-    /// One record's rows, given the index in `signatures` of the event it decoded as. A
-    /// record may derive none.
-    pub(super) derive: fn(&Decoded, usize) -> Result<Vec<Row>, DeriveError>,
+    /// One record's rows, given the index in `signatures` of the event it decoded as and
+    /// its transaction's input, `None` when the transaction was not fetched. A record may
+    /// derive none.
+    pub(super) derive: fn(&Decoded, usize, Option<&[u8]>) -> Result<Vec<Row>, DeriveError>,
 }
 
 /// One derived row: each of its table's columns, by name, with its value.
@@ -107,15 +112,16 @@ impl Derivation {
     /// # Errors
     ///
     /// Returns [`DeriveError::Argument`] when an argument is missing, misnamed, of another
-    /// type, or out of the range the contract keeps it in, and [`DeriveError::Columns`]
-    /// when a row does not name the table's columns in order.
+    /// type, or out of the range the contract keeps it in, [`DeriveError::Input`] when the
+    /// transaction's input does not hold what the derivation reads, and
+    /// [`DeriveError::Columns`] when a row does not name the table's columns in order.
     fn rows(
         &self,
         decoded: &Decoded,
         signature: usize,
-        sent: Option<Sent>,
+        sent: Option<&Sent>,
     ) -> Result<Vec<Derived>, DeriveError> {
-        (self.derive)(decoded, signature)?
+        (self.derive)(decoded, signature, sent.map(|sent| sent.input.as_ref()))?
             .into_iter()
             .zip(0..)
             .map(|(values, row)| {
@@ -154,7 +160,7 @@ impl Derivation {
 /// Why a decoded record derived no row: the derivation could not read it, or computed a
 /// row that does not match its own table.
 #[derive(Debug, thiserror::Error)]
-pub(super) enum DeriveError {
+pub enum DeriveError {
     /// The record has no argument `name` at `position` of the type the derivation reads.
     #[error("argument {position} is not {expected} named {name}")]
     Argument {
@@ -164,6 +170,13 @@ pub(super) enum DeriveError {
         name: &'static str,
         /// The type the derivation reads there.
         expected: &'static str,
+    },
+    /// The record's transaction input does not hold what the derivation reads there, or
+    /// the transaction was not fetched.
+    #[error("the transaction's input {reason}")]
+    Input {
+        /// What the input lacks.
+        reason: &'static str,
     },
     /// A row does not name its table's columns in order: one short, one over, or two
     /// swapped. A bug in the derivation, which stops the run rather than storing a row
@@ -178,19 +191,21 @@ pub(super) enum DeriveError {
 }
 
 /// The transaction a log came from, as ingest forwarded it just before its logs: whose
-/// sender and recipient every derived row carries.
-#[derive(Debug, Clone, Copy)]
-pub(super) struct Sent {
+/// sender and recipient every derived row carries, and whose input a derivation may read.
+#[derive(Debug, Clone)]
+pub(crate) struct Sent {
     /// The transaction.
-    pub(super) hash: TxHash,
+    pub(crate) hash: TxHash,
     /// The account that sent it.
-    pub(super) from: Address,
+    pub(crate) from: Address,
     /// Its recipient, `None` for a contract creation, as Allium's `to_address` is.
     ///
     /// A derived row's `transaction_to_address` is also `None` when the transaction was
     /// not fetched, which an `Option<Sent>` of `None` stands for; its
     /// `transaction_from_address`, set for every fetched transaction, tells the two apart.
-    pub(super) to: Option<Address>,
+    pub(crate) to: Option<Address>,
+    /// Its calldata.
+    pub(crate) input: Bytes,
 }
 
 /// The derivations a catalog declares, each bound at load to the catalog entry and the
@@ -212,6 +227,12 @@ struct Bound {
 }
 
 impl Derivations {
+    /// Whether no derivation is bound.
+    #[cfg(feature = "delta")]
+    pub(super) fn is_empty(&self) -> bool {
+        self.bound.is_empty()
+    }
+
     /// Runs `derivation` on every record of `entry` decoded as one of `events`, each the
     /// index in its `signatures` of the event's signature and the event's key.
     pub(super) fn bind(
@@ -233,7 +254,8 @@ impl Derivations {
     /// derivation bound to that event, each carrying `sent`'s sender and recipient, or
     /// neither when the transaction was not fetched.
     ///
-    /// A record a derivation cannot read is logged and derives nothing from it.
+    /// A record a derivation cannot read, or whose transaction's input does not hold what
+    /// it reads, is logged and derives nothing from it.
     ///
     /// # Errors
     ///
@@ -244,7 +266,7 @@ impl Derivations {
         chain: &ChainId,
         (entry, event): (EntryId, EventKey),
         decoded: &Decoded,
-        sent: Option<Sent>,
+        sent: Option<&Sent>,
     ) -> Result<Vec<Derived>, DeriveError> {
         let mut derived = Vec::new();
         for Bound {
@@ -259,7 +281,7 @@ impl Derivations {
             match derivation.rows(decoded, *signature, sent) {
                 Ok(rows) => derived.extend(rows),
                 Err(error @ DeriveError::Columns { .. }) => return Err(error),
-                Err(error @ DeriveError::Argument { .. }) => {
+                Err(error @ (DeriveError::Argument { .. } | DeriveError::Input { .. })) => {
                     metrics::derive_failed(derivation.table);
                     warn!(%chain, table = derivation.table, address = %decoded.address,
                         block = decoded.block_number, block_hash = %decoded.block_hash,
@@ -356,15 +378,23 @@ mod tests {
     /// stored short, shifted, or with values under each other's columns.
     #[test]
     fn a_row_not_naming_its_columns_in_order_is_an_error() {
-        fn short(decoded: &Decoded, signature: usize) -> Result<Vec<Row>, DeriveError> {
-            let mut rows = (SWAPS.derive)(decoded, signature)?;
+        fn short(
+            decoded: &Decoded,
+            signature: usize,
+            input: Option<&[u8]>,
+        ) -> Result<Vec<Row>, DeriveError> {
+            let mut rows = (SWAPS.derive)(decoded, signature, input)?;
             for row in &mut rows {
                 row.pop();
             }
             Ok(rows)
         }
-        fn swapped(decoded: &Decoded, signature: usize) -> Result<Vec<Row>, DeriveError> {
-            let mut rows = (SWAPS.derive)(decoded, signature)?;
+        fn swapped(
+            decoded: &Decoded,
+            signature: usize,
+            input: Option<&[u8]>,
+        ) -> Result<Vec<Row>, DeriveError> {
+            let mut rows = (SWAPS.derive)(decoded, signature, input)?;
             for row in &mut rows {
                 row.swap(2, 3);
             }

@@ -147,31 +147,39 @@ async fn a_rewind_takes_the_blocks_above_it_and_they_can_be_written_again() {
 
 /// The lake reports what it buffers, so the drain can commit by size: it grows by each
 /// block's rows, a reorg takes back exactly the rows of the buffered blocks it drops
-/// and adds its own, and it is empty after a commit.
+/// and adds its own, and it is empty after a commit. The first block also buffers the
+/// run's session, so blocks are measured from the second.
 #[tokio::test]
 async fn the_lake_reports_what_it_buffers() {
     let dir = Dir::new();
     let mut sink = open(&dir).await;
     assert_eq!(sink.buffered_bytes(), 0);
     buffer(&mut sink, block(1, 0)).await;
-    let one = sink.buffered_bytes();
-    assert!(one > 0);
+    let first = sink.buffered_bytes();
+    assert!(first > 0);
     buffer(&mut sink, block(2, 0)).await;
+    let one = sink.buffered_bytes() - first;
+    assert!(one > 0);
+    buffer(&mut sink, block(3, 0)).await;
     assert_eq!(
         sink.buffered_bytes(),
-        2 * one,
-        "a second block of the same shape"
+        first + 2 * one,
+        "a third block of the same shape"
     );
-    buffer(&mut sink, vec![reorg(2..=2, 1)]).await;
+    buffer(&mut sink, vec![reorg(3..=3, 1)]).await;
     let after_reorg = sink.buffered_bytes();
     sink.flush().await.expect("commits");
     assert_eq!(sink.buffered_bytes(), 0);
 
     // The reorg's own row, measured alone.
-    buffer(&mut sink, vec![reorg(2..=2, 1)]).await;
+    buffer(&mut sink, vec![reorg(3..=3, 1)]).await;
     let marker = sink.buffered_bytes();
     assert!(marker > 0);
-    assert_eq!(after_reorg, one + marker, "block 2's rows are dropped");
+    assert_eq!(
+        after_reorg,
+        first + one + marker,
+        "block 3's rows are dropped"
+    );
 }
 
 /// A reorg that orphans committed blocks and buffered ones at once deletes the first and
@@ -412,4 +420,35 @@ fn ledger_version(sink: &DeltaSink) -> u64 {
         .table
         .version()
         .expect("a created table")
+}
+
+/// A run writes its session with the first block it commits. A reorg that orphans that
+/// block deletes the row with the block's others, and the block replacing it writes the
+/// session again; a later run, reopened, writes its own.
+#[tokio::test]
+async fn a_session_goes_with_its_block_and_each_run_writes_one() {
+    let dir = Dir::new();
+    let mut sink = open(&dir).await;
+    publish(&mut sink, block(1, 0)).await;
+    publish(&mut sink, block(2, 0)).await;
+    assert_eq!(
+        stored(&sink, Table::Session, "block_hash").await,
+        BTreeSet::from([hex(hash(1, 0))])
+    );
+    publish(&mut sink, vec![reorg(1..=2, 1)]).await;
+    publish(&mut sink, block(1, 1)).await;
+    assert_eq!(
+        stored(&sink, Table::Session, "block_hash").await,
+        BTreeSet::from([hex(hash(1, 1))]),
+        "the orphaned block's session is gone, its replacement's written"
+    );
+    drop(sink);
+
+    let mut sink = open(&dir).await;
+    publish(&mut sink, block(2, 1)).await;
+    assert_eq!(
+        stored(&sink, Table::Session, "block_number").await.len(),
+        2,
+        "the reopened run writes its own session"
+    );
 }

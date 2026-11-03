@@ -57,6 +57,8 @@
 // recursion budget.
 #![recursion_limit = "256"]
 
+#[cfg(feature = "delta")]
+pub mod backfill;
 pub mod config;
 pub mod decode;
 pub mod ingest;

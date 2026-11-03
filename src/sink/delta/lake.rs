@@ -4,10 +4,12 @@
 use std::sync::{Arc, Mutex, PoisonError};
 
 use deltalake::arrow::array::RecordBatch;
+use deltalake::arrow::datatypes::DataType as ArrowType;
 use deltalake::arrow::datatypes::Schema as ArrowSchema;
 use deltalake::datafusion::dataframe::DataFrame;
 use deltalake::datafusion::error::DataFusionError;
-use deltalake::datafusion::prelude::{Expr, SessionContext};
+use deltalake::datafusion::prelude::{Expr, SessionContext, cast, ident, lit};
+use deltalake::kernel::LogicalFileView;
 use deltalake::kernel::transaction::CommitProperties;
 use deltalake::parquet::file::properties::WriterProperties;
 use deltalake::protocol::SaveMode;
@@ -16,8 +18,11 @@ use tokio::sync::Semaphore;
 use tracing::warn;
 
 use super::arrow::{self, PARTITION};
+use super::expr::{seconds, texts, uints};
 use crate::sink::store_error::{EngineError, InvalidStoredValue, Operation, StoreError};
-use crate::sink::table::{Row, TableDef};
+use crate::sink::table::{LEDGER_COLUMNS, Row, TableDef};
+use crate::window::LEDGER_WINDOW;
+use crate::wire::envelope::BlockMeta;
 
 /// How many versions of a table pass between the checkpoints the store starts: delta-rs's
 /// own default interval.
@@ -224,17 +229,77 @@ impl Lake {
     /// The newest partition any of the table's files is in, from its file list rather
     /// than its rows. `None` for a table with no files.
     pub(super) fn newest_partition(&self) -> Result<Option<i64>, StoreError> {
+        let mut newest = None;
+        self.each_file(|partition, _| {
+            newest = newest.max(Some(partition));
+            Ok(())
+        })?;
+        Ok(newest)
+    }
+
+    /// Hands each of the table's files, as its file list names them, to `each`, with the
+    /// partition it is in.
+    pub(super) fn each_file(
+        &self,
+        mut each: impl FnMut(i64, &LogicalFileView) -> Result<(), StoreError>,
+    ) -> Result<(), StoreError> {
         let read = || StoreError::engine(Operation::Read, Some(self.name()));
         let snapshot = self.table.snapshot().map_err(read())?;
         let files = snapshot.snapshot().try_log_data().map_err(read())?;
-        let mut newest = None;
         for file in files.iter() {
             let values = file.partition_values_map();
             let value = values.get(PARTITION).cloned().flatten().unwrap_or_default();
-            let partition: i64 = InvalidStoredValue::parse("accepted_blocks.block_range", &value)?;
-            newest = newest.max(Some(partition));
+            each(InvalidStoredValue::parse("block_range", &value)?, &file)?;
         }
-        Ok(newest)
+        Ok(())
+    }
+
+    /// The newest [`LEDGER_WINDOW`] accepted blocks of this table, the ledger, oldest
+    /// first.
+    ///
+    /// Read from the ledger's newest two partitions alone, which hold at least the window
+    /// (a partition is never narrower), so a restart does not scan every file the
+    /// ledger ever wrote.
+    pub(super) async fn read_ledger(&self) -> Result<Vec<BlockMeta>, StoreError> {
+        let newest = self.newest_partition()?;
+        let [height, hash, parent_hash, timestamp] = LEDGER_COLUMNS;
+        let batches = self
+            .read(|frame| {
+                let frame = match newest {
+                    Some(newest) => frame.filter(ident(PARTITION).gt_eq(lit(newest - 1)))?,
+                    None => frame,
+                };
+                frame
+                    .sort(vec![ident(height).sort(false, false)])?
+                    .limit(0, Some(LEDGER_WINDOW))?
+                    .select(vec![
+                        cast(ident(height), ArrowType::UInt64),
+                        cast(ident(hash), ArrowType::Utf8),
+                        cast(ident(parent_hash), ArrowType::Utf8),
+                        seconds(timestamp),
+                    ])
+            })
+            .await?;
+        let mut ledger = Vec::new();
+        for batch in &batches {
+            let heights = uints(batch, 0, "accepted_blocks.height")?;
+            let hashes = texts(batch, 1, "accepted_blocks.hash")?;
+            let parents = texts(batch, 2, "accepted_blocks.parent_hash")?;
+            let times = uints(batch, 3, "accepted_blocks.timestamp")?;
+            for row in 0..batch.num_rows() {
+                ledger.push(BlockMeta {
+                    height: heights.value(row),
+                    hash: InvalidStoredValue::parse("accepted_blocks.hash", hashes.value(row))?,
+                    parent_hash: InvalidStoredValue::parse(
+                        "accepted_blocks.parent_hash",
+                        parents.value(row),
+                    )?,
+                    timestamp: times.value(row),
+                });
+            }
+        }
+        ledger.sort_by_key(|block| block.height);
+        Ok(ledger)
     }
 }
 

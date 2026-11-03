@@ -1,7 +1,7 @@
 //! `PostgreSQL` 18 storage: the shared [`SqlStore`] over a `tokio-postgres` client.
 //!
-//! Tables live in a schema named for the chain, so chains sharing a database keep their
-//! tables apart. A flush stages each table with binary `COPY`, which sends every value in
+//! Tables live in a schema named for the chain unless `schema` names another, so chains
+//! sharing a database keep their tables apart. A flush stages each table with binary `COPY`, which sends every value in
 //! `PostgreSQL`'s native field format so the server parses no text, then merges it on
 //! `(chain, dedupe_key)`, the primary key — the replica identity logical replication needs
 //! to publish a delete. Unsigned 64-bit integers are `NUMERIC(20,0)`, since `PostgreSQL`
@@ -40,6 +40,10 @@ pub struct PostgresSettings {
     /// `PostgreSQL` URL or keyword connection string. Required; a [`Secret`], since it
     /// carries the password, so a deployment names it as `{ env = "NAME" }`.
     pub connection_string: Secret,
+    /// The database schema the tables live in, and the one the single-writer lock is
+    /// taken on. Defaults to the chain's name.
+    #[serde(default)]
+    pub schema: Option<String>,
     /// Maximum records folded from queued blocks into one commit; blocks are never split.
     #[serde(default = "default_batch_records")]
     pub batch_records: usize,
@@ -50,6 +54,13 @@ pub struct PostgresSettings {
 }
 
 impl PostgresSettings {
+    /// The database schema the tables of `chain` live in: [`schema`](Self::schema), or
+    /// the chain's name.
+    #[must_use]
+    pub fn schema_for<'a>(&'a self, chain: &'a str) -> &'a str {
+        self.schema.as_deref().unwrap_or(chain)
+    }
+
     /// When the store commits: up to [`batch_records`](Self::batch_records) records, as
     /// soon as they are gathered or once the oldest block has waited
     /// [`commit_wait_ms`](Self::commit_wait_ms).
@@ -108,12 +119,13 @@ pub struct Postgres {
     reconnect: Box<Reconnect>,
 }
 
-/// What connecting again needs: the parsed connection settings, and the chain whose
-/// database schema the store writes and whose writer lock it holds.
+/// What connecting again needs: the parsed connection settings, the database schema the
+/// store writes, and whether it holds that schema's writer lock.
 #[derive(Debug)]
 struct Reconnect {
     config: tokio_postgres::Config,
-    chain: String,
+    namespace: String,
+    writer: Writer,
 }
 
 impl Drop for Postgres {
@@ -122,9 +134,21 @@ impl Drop for Postgres {
     }
 }
 
+/// Whether a store is its database schema's writer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Writer {
+    /// The running indexer's store, the one writer: it takes the schema's single-writer
+    /// lock, which a second indexer would contend for.
+    Sole,
+    /// A backfill beside the running store: it only upserts decoded rows below a bound
+    /// the running store never deletes at, and no ledger, so it takes no lock.
+    Beside,
+}
+
 impl PostgresSink {
     /// Connects using platform TLS, takes the single-writer lock on the database schema
-    /// named for `chain`, and creates its tables before ingest starts.
+    /// the settings name for `chain` (see [`PostgresSettings::schema_for`]) when `writer`
+    /// is [`Writer::Sole`], and creates its tables there before anything is written.
     ///
     /// # Errors
     ///
@@ -134,6 +158,7 @@ impl PostgresSink {
         settings: &PostgresSettings,
         schema: Arc<Schema>,
         chain: &str,
+        writer: Writer,
     ) -> Result<Self, StoreError> {
         let mut config: tokio_postgres::Config = settings
             .connection_string
@@ -146,24 +171,27 @@ impl PostgresSink {
             .keepalives_idle(Duration::from_secs(30))
             .keepalives_interval(Duration::from_secs(10))
             .keepalives_retries(3);
-        let (client, task) = connect_as_writer(&config, chain).await?;
+        let namespace = settings.schema_for(chain);
+        let (client, task) = connect_as_writer(&config, namespace, writer).await?;
         let engine = Postgres {
             client,
             connection_task: task,
             reconnect: Box::new(Reconnect {
                 config,
-                chain: chain.to_owned(),
+                namespace: namespace.to_owned(),
+                writer,
             }),
         };
-        let store = SqlStore::new(engine, schema, chain).await?;
+        let store = SqlStore::new(engine, schema, chain, namespace).await?;
         tracing::info!("PostgreSQL storage opened");
         Ok(store)
     }
 }
 
-/// Connects with `config` and takes the writer lock on the database schema named for
-/// `chain`, returning the client and the task driving its connection. The lock is the
-/// session's, so every new session takes it here, before it can write.
+/// Connects with `config` and, as [`Writer::Sole`], takes the writer lock on the
+/// database schema `namespace`, returning the client and the task driving its
+/// connection. The lock is the session's, so every new session takes it here, before it
+/// can write.
 ///
 /// The connection uses platform TLS and [`SESSION_SETTINGS`].
 ///
@@ -173,7 +201,8 @@ impl PostgresSink {
 /// [`StoreError::Locked`] when another session holds the lock.
 async fn connect_as_writer(
     config: &tokio_postgres::Config,
-    chain: &str,
+    namespace: &str,
+    writer: Writer,
 ) -> Result<(Client, tokio::task::JoinHandle<()>), StoreError> {
     let connector = MakeTlsConnector::new(
         native_tls::TlsConnector::new().map_err(StoreError::engine(Operation::Open, None))?,
@@ -202,11 +231,14 @@ async fn connect_as_writer(
         task.abort();
         return Err(opening(error));
     }
+    if writer == Writer::Beside {
+        return Ok((client, task));
+    }
     // One writer per database schema, held for the life of this connection.
     let locked: Result<bool, _> = client
         .query_one(
             "SELECT pg_try_advisory_lock(hashtext('indexer'), hashtext($1))",
-            &[&chain],
+            &[&namespace],
         )
         .await
         .and_then(|row| row.try_get(0));
@@ -215,7 +247,7 @@ async fn connect_as_writer(
         Ok(false) => {
             task.abort();
             Err(StoreError::Locked {
-                schema: chain.to_owned(),
+                schema: namespace.to_owned(),
             })
         }
         Err(error) => {
@@ -226,13 +258,17 @@ async fn connect_as_writer(
 }
 
 impl Postgres {
-    /// Connects again with `reconnect`, takes the writer lock again, and makes the chain's
-    /// database schema the session's default, as opening the store did. The tables are
-    /// already there.
+    /// Connects again with `reconnect`, takes the writer lock again if it held it, and
+    /// makes the store's database schema the session's default, as opening the store did.
+    /// The tables are already there.
     async fn reconnect(&mut self) -> Result<(), StoreError> {
-        let Reconnect { config, chain } = &*self.reconnect;
-        let (client, task) = connect_as_writer(config, chain).await?;
-        if let Err(error) = client.batch_execute(&Self::use_schema(chain)).await {
+        let Reconnect {
+            config,
+            namespace,
+            writer,
+        } = &*self.reconnect;
+        let (client, task) = connect_as_writer(config, namespace, *writer).await?;
+        if let Err(error) = client.batch_execute(&Self::use_schema(namespace)).await {
             task.abort();
             return Err(opening(error));
         }
@@ -624,6 +660,11 @@ impl<'a> FromSql<'a> for Value {
             Type::INT8 => Self::Int(i64::from_sql(ty, raw)?),
             Type::TEXT | Type::VARCHAR => Self::Text(String::from_sql(ty, raw)?),
             Type::BOOL => Self::Bool(bool::from_sql(ty, raw)?),
+            // A version byte, 1, then the document's text.
+            Type::JSONB => match raw.split_first() {
+                Some((1, text)) => Self::Document(std::str::from_utf8(text)?.to_owned()),
+                _ => return Err("an unknown JSONB encoding".into()),
+            },
             Type::TIMESTAMP => {
                 let seconds =
                     i64::from_sql(&Type::INT8, raw)?.div_euclid(1_000_000) + POSTGRES_EPOCH_SECONDS;
@@ -640,7 +681,13 @@ impl<'a> FromSql<'a> for Value {
     fn accepts(ty: &Type) -> bool {
         matches!(
             *ty,
-            Type::NUMERIC | Type::INT8 | Type::TEXT | Type::VARCHAR | Type::BOOL | Type::TIMESTAMP
+            Type::NUMERIC
+                | Type::INT8
+                | Type::TEXT
+                | Type::VARCHAR
+                | Type::BOOL
+                | Type::JSONB
+                | Type::TIMESTAMP
         )
     }
 }

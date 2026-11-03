@@ -67,7 +67,13 @@ impl AnyStore {
             }
             #[cfg(feature = "postgres")]
             StoreSettings::Postgres(postgres) => Self::Postgres(Box::new(
-                PostgresSink::open(&postgres, schema, chain).await?,
+                PostgresSink::open(
+                    &postgres,
+                    schema,
+                    chain,
+                    crate::sink::postgres::Writer::Sole,
+                )
+                .await?,
             )),
             #[cfg(feature = "delta")]
             StoreSettings::Delta(delta) => {

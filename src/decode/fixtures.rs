@@ -23,8 +23,12 @@ pub(super) fn shipped(chain: &str) -> Catalog {
 /// A protocols directory in a temporary location holding one protocol of `files`, one of
 /// which is its `protocol.toml`, loaded on Base.
 pub(super) fn protocol(files: &[(&str, &str)]) -> Result<Catalog, CatalogError> {
+    // Tests run in parallel, and two may load the same files: each call gets its own
+    // directory, so one's clean-up never removes another's.
+    static CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let call = CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let root = std::env::temp_dir().join(format!(
-        "indexer-protocol-{}-{:x}",
+        "indexer-protocol-{}-{call}-{:x}",
         std::process::id(),
         alloy_primitives::keccak256(format!("{files:?}"))
     ));
@@ -137,7 +141,9 @@ pub(super) mod metric {
     use alloy_primitives::{Address, B256, I256, U256, keccak256};
 
     use crate::decode::Decoder;
-    use crate::decode::derive::metric::{BIN_FILLS, LIQUIDITY, POOL_BINS, SWAPS};
+    use crate::decode::derive::metric::{
+        BIN_FILLS, COMPRESSED_ORACLE_PRICES, LIQUIDITY, ORACLE_PRICES, POOL_BINS, SWAPS,
+    };
     use crate::sink::StoredContract;
     use crate::wire::datasets::evm::{Decoded, Log};
 
@@ -327,6 +333,64 @@ pub(super) mod metric {
                 ]),
             )
         })
+    }
+
+    /// `PythOracle`'s `FeedUpdated` for `feed`, decoded against the shipped catalog.
+    pub(in crate::decode) fn feed_updated(feed: B256) -> Decoded {
+        let oracle: Address = "0x30a88bf894D1b806125a23ebf23D715496fD7102"
+            .parse()
+            .expect("the oracle");
+        decode(&Log {
+            address: oracle,
+            topic1: Some(feed),
+            ..pool_log(
+                keccak256(ORACLE_PRICES.signatures[0]),
+                &DynSolValue::Tuple(Vec::new()),
+            )
+        })
+    }
+
+    /// The input of a Robinhood Chain transaction that sent `PythOracle` an update of 11
+    /// feeds, among them ETH/USD, feed 2: `0x50dcf507…3999`, in block 104527365.
+    pub(in crate::decode) fn pyth_lazer_update() -> Vec<u8> {
+        alloy_primitives::hex::decode(
+            include_str!("../../examples/fixtures/pyth_lazer_update.hex").trim(),
+        )
+        .expect("hex")
+    }
+
+    /// The input of a Robinhood Chain transaction that sent `ChainlinkOracle` one tagged
+    /// v3 report, `updateReport`: `0x0e23679c…7a01`, in block 95263804.
+    pub(in crate::decode) fn chainlink_update() -> Vec<u8> {
+        alloy_primitives::hex::decode(
+            include_str!("../../examples/fixtures/chainlink_data_streams_update.hex").trim(),
+        )
+        .expect("hex")
+    }
+
+    /// The compressed oracle's `FeedUpdated` for `feed`, decoded against the shipped
+    /// catalog.
+    pub(in crate::decode) fn compressed_updated(feed: B256) -> Decoded {
+        let oracle: Address = "0xE844701934D9C6085B292e428F41b911cC0b3872"
+            .parse()
+            .expect("the oracle");
+        decode(&Log {
+            address: oracle,
+            topic1: Some(feed),
+            ..pool_log(
+                keccak256(COMPRESSED_ORACLE_PRICES.signatures[0]),
+                &DynSolValue::Tuple(Vec::new()),
+            )
+        })
+    }
+
+    /// The input of a BNB Smart Chain transaction that pushed six slots to the compressed
+    /// oracle, 23 feeds: `0xadddf663…71c3`, in block 131336361.
+    pub(in crate::decode) fn compressed_push() -> Vec<u8> {
+        alloy_primitives::hex::decode(
+            include_str!("../../examples/fixtures/compressed_oracle_push.hex").trim(),
+        )
+        .expect("hex")
     }
 
     fn decode(log: &Log) -> Decoded {

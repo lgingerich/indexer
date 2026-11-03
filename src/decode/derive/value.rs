@@ -65,6 +65,19 @@ pub(super) fn uint(
     }
 }
 
+/// Argument `position` of `decoded`, a `bytes{size}` named `name`.
+pub(super) fn fixed_bytes<'a>(
+    decoded: &'a Decoded,
+    position: usize,
+    name: &'static str,
+    size: u16,
+) -> Result<&'a [u8], DeriveError> {
+    match argument(decoded, position, name) {
+        Some(TypedValue::FixedBytes { value, size: found }) if *found == size => Ok(value),
+        _ => Err(element(position, name, "fixed bytes of its declared size")),
+    }
+}
+
 /// Argument `position` of `decoded`, a dynamic array named `name`.
 pub(super) fn array<'a>(
     decoded: &'a Decoded,

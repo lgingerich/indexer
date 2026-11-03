@@ -9,7 +9,7 @@
 use alloy_dyn_abi::DynSolValue;
 use alloy_primitives::{Address, B256, keccak256};
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::config::Settings;
@@ -19,7 +19,7 @@ use crate::ingest::source::{BlockSource, FetchedBlock, HeadStream, SourceError};
 use crate::sink::channel::Batching;
 use crate::sink::duckdb::DuckDb;
 use crate::sink::resume::Opened;
-use crate::sink::route::StoreBackend;
+use crate::sink::route::{Selection, StoreBackend};
 use crate::sink::stop::Stop;
 use crate::sink::store_runtime::StoreRuntime;
 use crate::sink::table::Schema;
@@ -160,7 +160,7 @@ fn schema() -> Arc<Schema> {
 
 /// A `base` store of [`schema`]'s tables over `connection`.
 async fn duckdb_store(connection: duckdb::Connection) -> DuckDbSink {
-    DuckDbSink::new(DuckDb { connection }, schema(), "base")
+    DuckDbSink::new(DuckDb { connection }, schema(), "base", "base")
         .await
         .expect("open the store")
 }
@@ -171,7 +171,10 @@ fn every_table<S>(backend: StoreBackend, store: S, batching: Batching) -> Opened
         backend,
         store,
         batching,
-        tables: schema().tables().iter().map(|def| def.id).collect(),
+        tables: Selection {
+            tables: schema().tables().iter().map(|def| def.id).collect(),
+            matched: HashSet::new(),
+        },
         runtime: StoreRuntime::current(),
     }
 }

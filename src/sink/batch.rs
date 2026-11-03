@@ -62,6 +62,10 @@ pub(super) struct Batch {
     /// The blocks the store committed above where ingest resumed, each settled as its
     /// height arrives (see the module docs). Kept across commits.
     held: Held,
+    /// The block the `sessions` row was buffered with, once it has been: the first block
+    /// the store writes after opening, or the one replacing it after a reorg (see
+    /// [`Session`](crate::sink::table::Session)). Kept across commits.
+    session: Option<B256>,
     /// Every table the run writes, which renders each decoded record's typed row.
     schema: Arc<Schema>,
 }
@@ -139,6 +143,7 @@ impl Batch {
             orphaned: None,
             bytes: 0,
             held: Held::Unnamed,
+            session: None,
             schema,
         }
     }
@@ -209,6 +214,14 @@ impl Batch {
                 }),
             ))?,
         }
+        // The first block the store writes starts its session (see the module docs); one
+        // it already holds is not written, so does not.
+        if self.session.is_none() {
+            let session = self.schema.session(block);
+            let row = self.schema.session_row(&envelope.chain, &session)?;
+            self.keep(row);
+            self.session = Some(block.hash);
+        }
         self.buffer(envelope)?;
         self.rows.append(&mut self.block);
         Ok(())
@@ -239,6 +252,14 @@ impl Batch {
             self.rows.retain(kept);
             self.block.retain(kept);
             self.bytes = self.rows().map(row_size).sum();
+            // The session's row goes with its block, so the block replacing it writes a
+            // new one.
+            if self
+                .session
+                .is_some_and(|block| reorg.orphaned_hashes.contains(&block))
+            {
+                self.session = None;
+            }
             let orphaned = self.orphaned.get_or_insert(Orphaned {
                 floor: reorg.height,
                 hashes: BTreeSet::new(),
@@ -377,7 +398,7 @@ mod tests {
     use std::sync::Arc;
 
     use super::{Batch, Held};
-    use crate::sink::table::{Schema, Table, TableError, TableId};
+    use crate::sink::table::{Schema, Table, TableError, TableId, Value};
     use crate::sink::{SinkError, StoreError};
     use crate::wire::datasets::evm::{Block, Contract, Log, Transaction};
     use crate::wire::envelope::{BlockMeta, ChainId, Envelope, Event, Reorg};
@@ -428,7 +449,12 @@ mod tests {
         block(&mut batch, meta(6, 0xa1));
         assert_eq!(
             tables(&batch),
-            [Table::Block.into(), Table::AcceptedBlock.into()]
+            [
+                Table::Block.into(),
+                Table::Session.into(),
+                Table::AcceptedBlock.into()
+            ],
+            "the first block written starts the session"
         );
     }
 
@@ -450,6 +476,7 @@ mod tests {
             [
                 Table::Block.into(),
                 Table::Reorg.into(),
+                Table::Session.into(),
                 Table::AcceptedBlock.into()
             ]
         );
@@ -481,6 +508,74 @@ mod tests {
                 Err(SinkError::Table(TableError::UnknownEvent { .. }))
             ));
         }
+    }
+
+    /// A run writes one session, with its first block, listing every event it decodes;
+    /// later blocks, before or after a commit, write none.
+    #[test]
+    fn a_run_writes_its_session_with_its_first_block() {
+        let mut batch = on_base(crate::sink::fixtures::schema());
+        block(&mut batch, meta(5, 0xa0));
+        let session = batch
+            .rows
+            .iter()
+            .find(|row| row.table().id == Table::Session.into())
+            .expect("a session row");
+        assert_eq!(session.block_number(), Some(5));
+        assert!(
+            matches!(
+                session.value("events"),
+                Some(Value::Document(events)) if events.contains("uniswap_v4")
+            ),
+            "it lists the catalog's events"
+        );
+        block(&mut batch, meta(6, 0xa1));
+        batch.clear();
+        block(&mut batch, meta(7, 0xa2));
+        assert_eq!(
+            tables(&batch),
+            [Table::Block.into(), Table::AcceptedBlock.into()]
+        );
+    }
+
+    /// A reorg that orphans the session's block takes its row with it, so the block
+    /// replacing it writes the session again; one that orphans a later block does not.
+    #[test]
+    fn a_reorg_of_the_sessions_block_writes_it_again() {
+        let chain = ChainId::new("base");
+        let reorg = |height: u64, orphaned: u8, new: u8| {
+            Envelope::new(
+                chain.clone(),
+                Event::Reorg(Reorg {
+                    height,
+                    new_head_hash: B256::repeat_byte(new),
+                    orphaned_hashes: vec![B256::repeat_byte(orphaned)],
+                }),
+            )
+        };
+        let mut batch = on_base(crate::sink::fixtures::schema());
+        block(&mut batch, meta(5, 0xa0));
+        block(&mut batch, meta(6, 0xa1));
+        batch.clear();
+        batch.push(&reorg(6, 0xa1, 0xb1)).expect("buffered");
+        block(&mut batch, meta(6, 0xb1));
+        assert!(
+            !tables(&batch).contains(&Table::Session.into()),
+            "the session's block still stands"
+        );
+        batch.clear();
+        batch.push(&reorg(5, 0xa0, 0xb0)).expect("buffered");
+        block(&mut batch, meta(5, 0xb0));
+        let sessions: Vec<_> = batch
+            .rows
+            .iter()
+            .filter(|row| row.table().id == Table::Session.into())
+            .collect();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(
+            sessions[0].block_hash(),
+            Some(format!("{:#x}", B256::repeat_byte(0xb0)).as_str())
+        );
     }
 
     /// What is still to reconcile outlives a commit: the drain commits on its own

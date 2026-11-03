@@ -48,7 +48,7 @@ pub(in crate::decode) const SWAPS: Derivation = Derivation {
 };
 
 /// A `Swap`'s row.
-fn swap(decoded: &Decoded, _: usize) -> Result<Vec<Row>, DeriveError> {
+fn swap(decoded: &Decoded, _: usize, _: Option<&[u8]>) -> Result<Vec<Row>, DeriveError> {
     let sender = address(decoded, 0, "sender")?;
     let recipient = address(decoded, 1, "recipient")?;
     let details = uint(decoded, 2, "details", 256)?;
@@ -152,7 +152,8 @@ mod tests {
             ),
         ];
         for (details, amounts, fees, expected) in cases {
-            let [values] = &unnamed((SWAPS.derive)(&swap(details, amounts, fees), 0))[..] else {
+            let [values] = &unnamed((SWAPS.derive)(&swap(details, amounts, fees), 0, None))[..]
+            else {
                 panic!("one row");
             };
             assert_eq!(values.len(), SWAPS.columns.len());

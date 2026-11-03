@@ -31,9 +31,24 @@ finality_depth = 128
 
 # The app's PostgreSQL (PlanetScale): only what the app serves, a subset of the lake below,
 # in the database schema named for the chain. Requires the `postgres` feature. The connection
-# string is a secret, since it carries the password.
+# string is a secret, since it carries the password. Every protocol's tables but
+# Uniswap's whole; of Uniswap's, only the pools on the pairs Metric's pools trade (see
+# [decode.pairs] below), so the database holds the pools compared with Metric's and the
+# lake every pool.
 [sink.postgres]
-tables = ["contract_events", "metric_v1_swaps", "metric_v1_bin_fills", "metric_v1_liquidity", "metric_v1_pool_bins"]
+tables = [
+    "metric_v1_*",
+    # Each oracle update's raw record, about 1.2M a day on Robinhood Chain; the prices it
+    # carries are in `metric_v1_oracle_prices`, which `metric_v1_*` keeps.
+    "!metric_v1_oracle_provider_feed_updated",
+    # The compressed oracle's, likewise: millions a day on BNB Smart Chain, its prices in
+    # `metric_v1_compressed_oracle_prices`.
+    "!metric_v1_compressed_oracle_feed_updated",
+    "chainlink_data_streams_*",
+    "pyth_lazer_*",
+    { matched = "uniswap_v3_*" },
+    { matched = "uniswap_v4_*" },
+]
 connection_string = { env = "INDEXER_POSTGRES_URL" }
 batch_records = 10000
 # Let a tip block wait up to a second for the next ones to share its commit.
@@ -72,6 +87,16 @@ pool_idle_timeout = "5m"
 # Every protocol manifest under `protocols/`; each lists its addresses per chain.
 [decode]
 protocols = "protocols"
+
+# Match every Uniswap V3 and V4 pool on a pair a Metric pool trades, so the database's
+# `{ matched = … }` tables hold them. Pools created before the pair was known are found
+# in the chain's history over HyperSync, which a node's 500-block `eth_getLogs` cannot
+# search, and their rows from 30 days before the pair's first Metric pool on are filled
+# from the lake once its bound passes them.
+[decode.pairs]
+lookback_days = 30
+hypersync_url = "https://56.hypersync.xyz"
+hypersync_token = { env = "INDEXER_ENVIO_HYPERSYNC_TOKEN" }
 
 # The Prometheus endpoint (`src/metrics.rs`). Each chain's container has its own address,
 # so every chain listens on the same port; the host's collector scrapes each container.

@@ -54,12 +54,11 @@ use futures_util::future::{BoxFuture, try_join_all};
 use tracing::{info, warn};
 
 use crate::sink::channel::Batching;
-use crate::sink::route::StoreBackend;
+use crate::sink::route::{Selection, StoreBackend};
 use crate::sink::store_runtime::StoreRuntime;
-use crate::sink::table::TableId;
 use crate::sink::{Restored, Store, StoreError, StoredContract, millis};
 use crate::window::{LEDGER_WINDOW, Ledger};
-use crate::wire::envelope::BlockMeta;
+use crate::wire::envelope::{BlockMeta, Handoff, Matched};
 
 /// A store, opened, with what the run routes to it and the runtime its work runs on.
 #[derive(Debug)]
@@ -70,8 +69,8 @@ pub(crate) struct Opened<S> {
     pub(crate) store: S,
     /// When its drain commits.
     pub(crate) batching: Batching,
-    /// The tables routed to it.
-    pub(crate) tables: HashSet<TableId>,
+    /// The tables routed to it, and those it keeps to the matched pools' rows.
+    pub(crate) tables: Selection,
     /// Where the store's async calls run: its startup reads and rewind here, and its
     /// drain once ingest starts.
     pub(crate) runtime: StoreRuntime,
@@ -162,6 +161,16 @@ fn describe_tips(tips: &[(StoreBackend, u64)]) -> String {
 pub(crate) struct Resumed {
     /// Every contract any store discovered, each from a block ingest will not hand back.
     pub(crate) contracts: Vec<StoredContract>,
+    /// Every contract a backfill handed over that any store recorded, each from a block
+    /// ingest will not hand back.
+    pub(crate) handoffs: Vec<Handoff>,
+    /// Every record of a pool matched to a Metric pool's pair that any store holds, each
+    /// from a block ingest will not hand back.
+    pub(crate) matched: Vec<Matched>,
+    /// The blocks stores hold above the common block, which ingest hands them again: a
+    /// store that holds one drops its rows as it arrives, so a record published with it
+    /// would not land there.
+    pub(crate) held: HashSet<B256>,
     /// The common block's ledger, and whether a store holds blocks below it.
     pub(crate) ledger: Ledger,
 }
@@ -194,10 +203,18 @@ pub(crate) async fn resume<S: Store>(
     })?;
     let Some((common, slowest)) = common else {
         // Every ledger is empty: a fresh run, with nothing to agree on.
-        let resumed = Resumed {
-            contracts: restored.into_iter().flat_map(|r| r.contracts).collect(),
+        let mut resumed = Resumed {
+            contracts: Vec::new(),
+            handoffs: Vec::new(),
+            matched: Vec::new(),
+            held: HashSet::new(),
             ledger: Ledger::default(),
         };
+        for r in restored {
+            resumed.contracts.extend(r.contracts);
+            resumed.handoffs.extend(r.handoffs);
+            resumed.matched.extend(r.matched);
+        }
         return Ok((stores, resumed));
     };
     let blocks: Vec<BlockMeta> = restored[slowest]
@@ -215,12 +232,25 @@ pub(crate) async fn resume<S: Store>(
     let history_below = history_below(&restored, &blocks);
     // A contract from a block above the common block is discovered again as ingest
     // hands that block back, and only if the block is still canonical.
+    let handoffs = restored
+        .iter_mut()
+        .flat_map(|r| std::mem::take(&mut r.handoffs))
+        .filter(|handoff| !held.contains(&handoff.block_hash))
+        .collect();
+    let matched = restored
+        .iter_mut()
+        .flat_map(|r| std::mem::take(&mut r.matched))
+        .filter(|matched| !held.contains(&matched.block_hash))
+        .collect();
     let resumed = Resumed {
         contracts: restored
             .into_iter()
             .flat_map(|r| r.contracts)
             .filter(|contract| !held.contains(&contract.block_hash))
             .collect(),
+        handoffs,
+        matched,
+        held,
         ledger: Ledger::new(blocks, history_below),
     };
     Ok((settled, resumed))
@@ -334,7 +364,7 @@ async fn restore<S: Store>(opened: Opened<S>) -> Result<(Opened<S>, Restored), R
 /// chain and about two days on Ethereum. The storage drain commits at most half a window
 /// at a time (see `channel::MAX_BLOCKS`), so a stop leaves stores at most that far apart;
 /// this allows for more, and refuses a store further ahead.
-const MAX_RESUME_LAG: u64 = 4 * LEDGER_WINDOW as u64;
+pub(crate) const MAX_RESUME_LAG: u64 = 4 * LEDGER_WINDOW as u64;
 
 /// Non-empty ledgers that share no block.
 #[derive(Debug)]
@@ -389,13 +419,12 @@ fn common_block(ledgers: &[&[BlockMeta]]) -> Result<Option<(BlockMeta, usize)>, 
 // means the fixture or setup is wrong.
 #[expect(clippy::expect_used)]
 mod tests {
-    use std::collections::HashSet;
     use std::sync::{Arc, Mutex};
 
     use alloy_primitives::B256;
 
     use crate::sink::channel::Batching;
-    use crate::sink::route::StoreBackend;
+    use crate::sink::route::{Selection, StoreBackend};
     use crate::sink::store_runtime::StoreRuntime;
     use crate::sink::{EnvelopeSink, Restored, SinkError, Store, StoreError};
     use crate::wire::envelope::{BlockMeta, Envelope};
@@ -429,6 +458,8 @@ mod tests {
             self.note("restore");
             Ok(Restored {
                 contracts: Vec::new(),
+                handoffs: Vec::new(),
+                matched: Vec::new(),
                 ledger: self.ledger.clone(),
             })
         }
@@ -457,7 +488,7 @@ mod tests {
                 threads: Arc::clone(&threads),
             },
             batching: Batching::eager(1),
-            tables: HashSet::new(),
+            tables: Selection::default(),
             runtime: StoreRuntime::dedicated(backend).expect("a runtime"),
         };
         // The lake is ahead with a full window that starts above the database's tip, so
@@ -487,11 +518,15 @@ mod tests {
             [StoreBackend::Postgres, StoreBackend::Delta],
             "every store comes back, in order"
         );
+        // The two stores read back at once, so in either order; the rewind and the read
+        // after it follow.
+        let mut calls = threads.lock().expect("not poisoned").clone();
+        calls[..2].sort_unstable();
         assert_eq!(
-            *threads.lock().expect("not poisoned"),
+            calls,
             [
-                "restore on store-postgres",
                 "restore on store-delta",
+                "restore on store-postgres",
                 "rewind on store-delta",
                 "restore on store-delta",
             ]
@@ -648,7 +683,7 @@ mod tests {
                     threads: Arc::default(),
                 },
                 batching: Batching::eager(1),
-                tables: HashSet::new(),
+                tables: Selection::default(),
                 runtime: StoreRuntime::dedicated(backend).expect("a runtime"),
             };
             let stores = vec![

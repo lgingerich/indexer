@@ -83,7 +83,7 @@ impl Pg {
             OPENED.fetch_add(1, Ordering::Relaxed),
             std::process::id()
         );
-        let sink = PostgresSink::open(&Self::settings(), schema, &name)
+        let sink = PostgresSink::open(&Self::settings(), schema, &name, Writer::Sole)
             .await
             .expect("open");
         let (admin, connection) = tokio_postgres::connect(&Self::url(), tokio_postgres::NoTls)
@@ -349,7 +349,7 @@ fn settings_require_a_connection_reject_typos_and_redact_credentials() {
 async fn a_second_writer_of_a_schema_is_refused() {
     let (_first, harness) = Pg::open(datasets()).await;
     assert!(matches!(
-        PostgresSink::open(&Pg::settings(), datasets(), &harness.schema).await,
+        PostgresSink::open(&Pg::settings(), datasets(), &harness.schema, Writer::Sole).await,
         Err(StoreError::Locked { .. })
     ));
     harness.remove().await;
@@ -567,7 +567,7 @@ async fn a_flush_after_the_server_ends_the_session_connects_again() {
     );
     assert!(
         matches!(
-            PostgresSink::open(&Pg::settings(), datasets(), &harness.schema).await,
+            PostgresSink::open(&Pg::settings(), datasets(), &harness.schema, Writer::Sole).await,
             Err(StoreError::Locked { .. })
         ),
         "the new session holds the writer lock"

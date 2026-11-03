@@ -34,11 +34,12 @@ use crate::sink::store_error::{
     self, ColumnDrift, EngineError, InvalidStoredValue, Operation, StoreError,
 };
 use crate::sink::table::{
-    CONTRACT_COLUMNS, LEDGER_COLUMNS, Row, Schema, Table, TableDef, TableError, TableId, Value,
+    CONTRACT_COLUMNS, HANDOFF_COLUMNS, LEDGER_COLUMNS, MATCHED_COLUMNS, Row, Schema, Session,
+    Table, TableDef, TableError, TableId, Value,
 };
 use crate::sink::{EnvelopeSink, Restored, SinkError, Store, StoredContract};
 use crate::window::LEDGER_WINDOW;
-use crate::wire::envelope::{BlockMeta, ChainId, Envelope};
+use crate::wire::envelope::{BlockMeta, ChainId, Envelope, Handoff, Matched};
 
 /// What runs a [`SqlStore`]'s statements.
 pub trait Engine: Send {
@@ -122,9 +123,12 @@ impl Prepared {
 #[derive(Debug)]
 struct Reads {
     contracts: String,
+    handoffs: String,
+    matched: String,
     ledger: String,
     /// Run by every flush that accepts a block.
     prune_ledger: String,
+    session: String,
 }
 
 impl Reads {
@@ -137,11 +141,24 @@ impl Reads {
             contracts: sql::select(contracts, &CONTRACT_COLUMNS)
                 .ordered_by("dedupe_key")
                 .render()?,
+            handoffs: sql::select(schema.dataset(Table::Handoff), &HANDOFF_COLUMNS)
+                .ordered_by("dedupe_key")
+                .render()?,
+            matched: sql::select(schema.dataset(Table::Matched), &MATCHED_COLUMNS)
+                .ordered_by("dedupe_key")
+                .render()?,
             ledger: sql::select(ledger, &LEDGER_COLUMNS)
                 .newest_first("height")
                 .limit()
                 .render()?,
             prune_ledger: sql::delete_below(ledger, "height")?,
+            session: sql::select(
+                schema.dataset(Table::Session),
+                &["block_number", "block_hash", "block_timestamp", "events"],
+            )
+            .newest_first("block_number")
+            .limit()
+            .render()?,
         })
     }
 }
@@ -160,13 +177,13 @@ pub struct SqlStore<E> {
 }
 
 impl<E: Engine> SqlStore<E> {
-    /// Creates every table in `schema`, with its indexes, in the database schema named
-    /// for `chain`, which becomes the session's default.
+    /// Creates every table in `schema`, with its indexes, in the database schema
+    /// `namespace`, which becomes the session's default, for a store of `chain`.
     ///
-    /// Each chain's tables live in its own schema — `base.logs` — so chains sharing a
-    /// database keep their tables apart, and a [`restore`](Store::restore) reads back
-    /// `chain`'s rows. Existing tables are reused, not migrated, and checked against
-    /// their definitions.
+    /// Each chain's tables live in a schema of their own, named for the chain unless the
+    /// settings name another — `base.logs` — so chains sharing a database keep their
+    /// tables apart, and a [`restore`](Store::restore) reads back `chain`'s rows.
+    /// Existing tables are reused, not migrated, and checked against their definitions.
     ///
     /// # Errors
     ///
@@ -177,12 +194,16 @@ impl<E: Engine> SqlStore<E> {
         mut engine: E,
         schema: Arc<Schema>,
         chain: &str,
+        namespace: &str,
     ) -> Result<Self, StoreError> {
-        for statement in [sql::create_schema(chain), E::Dialect::use_schema(chain)] {
+        for statement in [
+            sql::create_schema(namespace),
+            E::Dialect::use_schema(namespace),
+        ] {
             engine
                 .execute(&statement, &[])
                 .await
-                .map_err(StoreError::engine(Operation::Create, Some(chain)))?;
+                .map_err(StoreError::engine(Operation::Create, Some(namespace)))?;
         }
         begin(&mut engine).await?;
         // Every table and index in one batch, so a remote database pays one round trip for
@@ -201,7 +222,7 @@ impl<E: Engine> SqlStore<E> {
         let created = engine
             .execute(&create, &[])
             .await
-            .map_err(StoreError::engine(Operation::Create, Some(chain)));
+            .map_err(StoreError::engine(Operation::Create, Some(namespace)));
         end(&mut engine, created).await?;
         let stored = describe(&mut engine).await?;
         for def in schema.tables() {
@@ -298,6 +319,73 @@ impl<E: Engine> SqlStore<E> {
             .collect()
     }
 
+    /// The contracts backfills handed the running indexer that the store holds, each with
+    /// the first block decoded with it. One recorded in a block a `reorg` orphaned was
+    /// deleted with that block.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::Engine`] when the query fails and [`StoreError::Restore`]
+    /// when a stored value does not parse.
+    pub(crate) async fn handoffs(&mut self) -> Result<Vec<Handoff>, StoreError> {
+        let chain = self.chain_param();
+        let rows = self
+            .engine
+            .query(&self.reads.handoffs, &[chain])
+            .await
+            .map_err(StoreError::engine(Operation::Read, Some("handoffs")))?;
+        rows.iter()
+            .map(|row| {
+                Ok(Handoff {
+                    protocol: text("handoffs.protocol", column(row, 0))?.to_owned(),
+                    name: text("handoffs.name", column(row, 1))?.to_owned(),
+                    address: parse("handoffs.address", column(row, 2))?,
+                    block_number: uint("handoffs.block_number", column(row, 3))?,
+                    block_hash: parse("handoffs.block_hash", column(row, 4))?,
+                    block_timestamp: timestamp("handoffs.block_timestamp", column(row, 5))?,
+                })
+            })
+            .collect()
+    }
+
+    /// Every pool the store records as matched to a Metric pool's pair, each from a
+    /// canonical block: a record of an orphaned block was deleted with that block.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::Engine`] when the query fails and [`StoreError::Restore`]
+    /// when a stored value does not parse.
+    pub(crate) async fn matched(&mut self) -> Result<Vec<Matched>, StoreError> {
+        let chain = self.chain_param();
+        let rows = self
+            .engine
+            .query(&self.reads.matched, &[chain])
+            .await
+            .map_err(StoreError::engine(Operation::Read, Some("matched_pools")))?;
+        rows.iter()
+            .map(|row| {
+                Ok(Matched {
+                    protocol: text("matched_pools.protocol", column(row, 0))?.to_owned(),
+                    contract: parse("matched_pools.contract", column(row, 1))?,
+                    pool_id: optional("matched_pools.pool_id", column(row, 2))?,
+                    token0: parse("matched_pools.token0", column(row, 3))?,
+                    token1: parse("matched_pools.token1", column(row, 4))?,
+                    fee: uint("matched_pools.fee", column(row, 5))?,
+                    hooks: optional("matched_pools.hooks", column(row, 6))?,
+                    created_block: uint("matched_pools.created_block", column(row, 7))?,
+                    from_timestamp: timestamp("matched_pools.from_timestamp", column(row, 8))?,
+                    filled: match column(row, 9) {
+                        Value::Bool(filled) => *filled,
+                        other => return Err(invalid("matched_pools.filled", other).into()),
+                    },
+                    block_number: uint("matched_pools.block_number", column(row, 10))?,
+                    block_hash: parse("matched_pools.block_hash", column(row, 11))?,
+                    block_timestamp: timestamp("matched_pools.block_timestamp", column(row, 12))?,
+                })
+            })
+            .collect()
+    }
+
     /// The newest `limit` accepted blocks on the store's chain, oldest first. An orphaned
     /// block's row was deleted by its `reorg`, so these are canonical.
     ///
@@ -332,6 +420,35 @@ impl<E: Engine> SqlStore<E> {
             .collect::<Result<Vec<_>, StoreError>>()?;
         ledger.reverse();
         Ok(ledger)
+    }
+
+    /// The newest session this store holds: from which block, and with which
+    /// event definitions, the running indexer's current run writes it. `None` before a
+    /// run that records sessions has written a block.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::Engine`] when the query fails and [`StoreError::Restore`]
+    /// when a stored value does not parse.
+    pub(crate) async fn session(&mut self) -> Result<Option<Session>, StoreError> {
+        let rows = self
+            .engine
+            .query(&self.reads.session, &[self.chain_param(), Value::Int(1)])
+            .await
+            .map_err(StoreError::engine(Operation::Read, Some("sessions")))?;
+        let Some(row) = rows.first() else {
+            return Ok(None);
+        };
+        let events = match column(row, 3) {
+            Value::Document(events) | Value::Text(events) => Session::events_from(events)?,
+            other => return Err(invalid("sessions.events", other).into()),
+        };
+        Ok(Some(Session {
+            block_number: uint("sessions.block_number", column(row, 0))?,
+            block_hash: parse("sessions.block_hash", column(row, 1))?,
+            block_timestamp: timestamp("sessions.block_timestamp", column(row, 2))?,
+            events,
+        }))
     }
 
     /// How many rows are buffered for the next flush.
@@ -452,6 +569,8 @@ impl<E: Engine + 'static> Store for SqlStore<E> {
     async fn restore(&mut self) -> Result<Restored, StoreError> {
         Ok(Restored {
             contracts: self.contracts().await?,
+            handoffs: self.handoffs().await?,
+            matched: self.matched().await?,
             ledger: self.ledger(LEDGER_WINDOW).await?,
         })
     }
@@ -596,6 +715,17 @@ fn uint(column: &'static str, value: &Value) -> Result<u64, InvalidStoredValue> 
             magnitude,
         } => u64::try_from(*magnitude).map_err(|_| invalid(column, value)),
         other => Err(invalid(column, other)),
+    }
+}
+
+/// A nullable value kept as text, parsed as what it holds, or `None` for none.
+fn optional<T: std::str::FromStr>(
+    column: &'static str,
+    value: &Value,
+) -> Result<Option<T>, InvalidStoredValue> {
+    match value {
+        Value::Null => Ok(None),
+        value => parse(column, value).map(Some),
     }
 }
 

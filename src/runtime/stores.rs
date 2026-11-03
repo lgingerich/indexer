@@ -5,9 +5,9 @@
 use std::sync::Arc;
 
 use futures_util::future::try_join_all;
-use tracing::{Instrument as _, info, info_span};
+use tracing::{Instrument as _, info, info_span, warn};
 
-use crate::decode::{Catalog, Decoder, DecodingSink};
+use crate::decode::{Catalog, Decoder, DecodingSink, Matching, MatchingLinks, SharedKept};
 use crate::ingest::pipeline::{Machine, PipelineError};
 use crate::ingest::source::BlockSource;
 use crate::sink::any_store::AnyStore;
@@ -20,6 +20,12 @@ use crate::window::Ledger;
 use crate::wire::envelope::ChainId;
 
 use super::{Pipeline, RuntimeError, StoreRoute};
+
+/// How many batches of handed-over contracts wait for the decode stage, which takes them
+/// at each block's marker. The watch sends a batch a read, and waits when this many are
+/// queued.
+#[cfg(feature = "delta")]
+const HANDED_QUEUE: usize = 16;
 
 impl<B: BlockSource + 'static> Pipeline<B> {
     /// Opens every store `routes` names, each with the tables routed to it and on a
@@ -37,7 +43,7 @@ impl<B: BlockSource + 'static> Pipeline<B> {
         let opens = routes.into_iter().map(|StoreRoute { settings, tables }| {
             let backend = settings.backend();
             let batching = settings.batching();
-            let schema = Arc::new(self.schema.select(&tables));
+            let schema = Arc::new(self.schema.select(&tables.tables));
             let chain = chain.clone();
             async move {
                 let runtime = StoreRuntime::dedicated(backend).map_err(|source| {
@@ -80,7 +86,9 @@ impl<B: BlockSource + 'static> Pipeline<B> {
             stop_block,
             catalog,
             schema,
-            ..
+            #[cfg(feature = "delta")]
+            watch,
+            pairs,
         } = self;
         let chain = source.chain().clone();
         // A stop while resuming drops it part-way; see "Shutdown" in the module docs.
@@ -89,6 +97,17 @@ impl<B: BlockSource + 'static> Pipeline<B> {
             () = stop.wait() => return Ok(()),
             resumed = sink::resume::resume(stores) => resumed?,
         };
+        let matching = pairs.as_ref().and_then(|pairs| {
+            let matching = Matching::new(&catalog, &chain, pairs.lookback);
+            if matching.is_none() {
+                warn!(%chain, "[decode.pairs] is set, but the manifests have no Metric factory \
+                    and protocol to match on this chain; nothing is matched");
+            }
+            matching
+        });
+        let kept = matching
+            .as_ref()
+            .map_or_else(SharedKept::default, Matching::kept);
         let decoder = restore(catalog, &chain, resumed.contracts);
         let ledger = ledger(&chain, resumed.ledger);
 
@@ -114,18 +133,49 @@ impl<B: BlockSource + 'static> Pipeline<B> {
             sinks.push((sender, tables));
         }
 
-        let ingest = Machine::new(
-            source,
-            DecodingSink::new(decoder, Router::new(schema, sinks)),
-            ledger,
-        )
-        .run(start_block, stop_block);
+        let decoding = DecodingSink::new(decoder, Router::new(Arc::clone(&schema), kept, sinks))
+            .holding(resumed.held);
+        // The matching's fetches and fills, each on a task of its own, ended with ingest.
+        let (decoding, matching) = match (matching, pairs) {
+            (Some(matching), Some(pairs)) => {
+                let (tasks, links) = matching_tasks(pairs, &chain)?;
+                (
+                    decoding.with_matching(matching, resumed.matched, links),
+                    Some(tasks),
+                )
+            }
+            _ => (decoding, None),
+        };
+        // The watch on the lake's backfills, on a task of its own so ingest never waits
+        // on it, and ended with ingest.
+        #[cfg(feature = "delta")]
+        let (decoding, watching) = match watch {
+            Some(watch) => {
+                let (handed, handing) = tokio::sync::mpsc::channel(HANDED_QUEUE);
+                let watching = tokio::spawn(watch.run(schema, chain.clone(), handed));
+                (
+                    decoding.with_handoffs(resumed.handoffs, handing),
+                    Some(watching),
+                )
+            }
+            None => (decoding, None),
+        };
+        #[cfg(not(feature = "delta"))]
+        let _ = (schema, resumed.handoffs);
+        let ingest = Machine::new(source, decoding, ledger).run(start_block, stop_block);
         // A stop drops ingest, a crash to it; the stores hear the stop in their drains.
         let ingest = tokio::select! {
             biased;
             () = stop.wait() => Ok(()),
             ingest = ingest => ingest,
         };
+        #[cfg(feature = "delta")]
+        if let Some(watching) = watching {
+            watching.abort();
+        }
+        if let Some(matching) = matching {
+            matching.end().await;
+        }
 
         // Ingest's halves of the channels are gone by now, so each store drains what is
         // queued, or on a stop finishes its commit under way, and ends. The join order is
@@ -136,6 +186,92 @@ impl<B: BlockSource + 'static> Pipeline<B> {
         }
         finish(stopped, ingest)
     }
+}
+
+/// How long the end of a run waits for a fill under way to stop at its next commit and
+/// let go of the lake's lease, before cutting it off; one cut off leaves the lease to go
+/// stale.
+#[cfg(feature = "delta")]
+const FILL_STOP: std::time::Duration = std::time::Duration::from_mins(1);
+
+/// The matching's tasks: the searches, and the fills, on a runtime of their own.
+struct MatchingTasks {
+    lookup: tokio::task::JoinHandle<()>,
+    #[cfg(feature = "delta")]
+    fill: Option<(
+        tokio::task::JoinHandle<()>,
+        StoreRuntime,
+        tokio::sync::watch::Sender<bool>,
+    )>,
+}
+
+impl MatchingTasks {
+    /// Ends the tasks: the searches at once, a fill once it stops at its next commit and
+    /// lets go of the lake's lease, or after [`FILL_STOP`].
+    async fn end(self) {
+        self.lookup.abort();
+        #[cfg(feature = "delta")]
+        if let Some((fill, _runtime, halt)) = self.fill {
+            let _ = halt.send(true);
+            let abort = fill.abort_handle();
+            if tokio::time::timeout(FILL_STOP, fill).await.is_err() {
+                abort.abort();
+            }
+        }
+    }
+}
+
+/// Starts the tasks that fetch matched pools' creation logs and fill their history, as
+/// `pairs` provides for, and returns them with the decode stage's links to them. A run
+/// without a lake starts no fill, and what is sent to fill is dropped. A fill reads the
+/// lake and decodes on a runtime of its own, so ingest's never waits behind it.
+fn matching_tasks(
+    pairs: super::pairs::Pairs,
+    chain: &ChainId,
+) -> Result<(MatchingTasks, MatchingLinks), RuntimeError> {
+    use tokio::sync::mpsc;
+    let (queries, asked) = mpsc::channel(super::pairs::QUEUE);
+    let (answer, found) = mpsc::channel(super::pairs::QUEUE);
+    let (fills, to_fill) = mpsc::channel(super::pairs::QUEUE);
+    let (done, filled) = mpsc::channel(super::pairs::QUEUE);
+    let lookup = tokio::spawn(super::pairs::lookup(
+        pairs.search,
+        chain.clone(),
+        asked,
+        answer,
+    ));
+    #[cfg(feature = "delta")]
+    let fill = if let Some(fill) = pairs.fill {
+        let runtime = StoreRuntime::dedicated(StoreBackend::Delta).map_err(|source| {
+            RuntimeError::StoreRuntime {
+                store: StoreBackend::Delta,
+                source,
+            }
+        })?;
+        let (halt, halted) = Stop::new();
+        let task = runtime.spawn(fill.run(to_fill, done, halted));
+        Some((task, runtime, halt))
+    } else {
+        warn!(%chain, "no lake; matched pools' history is not filled");
+        None
+    };
+    #[cfg(not(feature = "delta"))]
+    {
+        warn!(%chain, "no lake; matched pools' history is not filled");
+        drop((to_fill, done));
+    }
+    let tasks = MatchingTasks {
+        lookup,
+        #[cfg(feature = "delta")]
+        fill,
+    };
+    let links = MatchingLinks {
+        queries,
+        found,
+        fills,
+        filled,
+    };
+    Ok((tasks, links))
 }
 
 /// The decoder over `catalog` with the contracts a previous run discovered, as the

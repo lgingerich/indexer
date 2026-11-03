@@ -91,6 +91,9 @@ tables = ["blocks", "transactions", "logs"]
 # [sink.postgres]
 # tables = ["contract_events"]
 # connection_string = { env = "INDEXER_POSTGRES_URL" }
+# The database schema the tables live in, and the one the single-writer lock is taken
+# on. Defaults to the chain's name.
+# schema = "ethereum"
 # The most records one commit may cover while storage is behind; at the tip a block
 # commits alone. Larger commits amortize each commit's fixed cost during a backfill.
 # batch_records = 20000
@@ -130,6 +133,16 @@ tables = ["blocks", "transactions", "logs"]
 # which is a legitimate way to run.
 # [decode]
 # protocols = "protocols"
+
+# Match the Uniswap V3 and V4 pools on the pairs Metric's pools trade, so a store's
+# `{ matched = "uniswap_v3_*" }` tables keep only those (README: Pools matched to Metric's
+# pairs). Their creation logs are searched for over HyperSync; their rows before they
+# were matched are filled from the lake, from this long before the pair's first Metric
+# pool.
+# [decode.pairs]
+# lookback_days = 30
+# hypersync_url = "https://1.hypersync.xyz"
+# hypersync_token = { env = "INDEXER_ENVIO_HYPERSYNC_TOKEN" }
 
 # A Prometheus endpoint: heads, per-store commit height, lag and timing, decode and RPC
 # failures. Every series is labelled with the chain; see `src/metrics.rs` for the list.
