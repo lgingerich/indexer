@@ -5,13 +5,15 @@
 use std::collections::{BTreeSet, HashMap};
 use std::ops::{Range, RangeInclusive};
 
-use alloy_primitives::B256;
-use tracing::warn;
+use alloy_primitives::{Address, B256};
+use futures_util::stream::{self, StreamExt as _};
+use tracing::{info, warn};
 
-use super::{BackfillError, BackfillSettings, COMMIT_BLOCKS, COMMIT_LOGS};
+use super::handover::Coverage;
+use super::{BackfillError, BackfillSettings, Backfilled, COMMIT_BLOCKS, COMMIT_LOGS, READ_AHEAD};
 use crate::decode::{Decoder, Record, Sent};
-use crate::sink::delta::LogReader;
-use crate::sink::table::{Row, Schema, SessionEvent};
+use crate::sink::delta::{DecodedTables, LogReader, RunLock};
+use crate::sink::table::{Row, Schema};
 use crate::wire::datasets::evm::Log;
 use crate::wire::envelope::{ChainId, Event};
 
@@ -25,8 +27,8 @@ pub(super) struct Database {
 
 impl Database {
     /// Opens the store the settings name, if any, with the tables of `schema` its `tables`
-    /// route (see [`routed`]), and checks its session as the lake's is. A backfill writing
-    /// another lake (`out`) is a trial, and fills no database.
+    /// route (see [`routed`]). A backfill writing another lake (`out`) is a trial, and
+    /// fills no database.
     #[cfg_attr(
         not(feature = "postgres"),
         expect(
@@ -38,9 +40,6 @@ impl Database {
         settings: &BackfillSettings,
         schema: &Schema,
         chain: &ChainId,
-        wanted: &[SessionEvent],
-        protocols: &[String],
-        to: u64,
     ) -> Result<Self, BackfillError> {
         #[cfg(feature = "postgres")]
         if let Some(postgres) = settings
@@ -49,22 +48,43 @@ impl Database {
             .filter(|_| settings.run.out.is_none())
         {
             let tables = routed(&postgres.tables, &settings.decoded, chain, schema)?;
-            let mut store = crate::sink::PostgresSink::open(
+            let store = crate::sink::PostgresSink::open(
                 postgres,
                 std::sync::Arc::new(schema.select(&tables)),
                 chain.as_str(),
                 crate::sink::postgres::Writer::Beside,
             )
             .await?;
-            let session = store.session().await?;
-            super::covers("database", session.as_ref(), wanted, protocols, to)?;
             return Ok(Self { store: Some(store) });
         }
-        let _ = (settings, schema, chain, wanted, protocols, to);
+        let _ = (settings, schema, chain);
         Ok(Self {
             #[cfg(feature = "postgres")]
             store: None,
         })
+    }
+
+    /// From which block the running indexer's current run decodes in the store, as its
+    /// newest session says, checked as `coverage` asks (see [`Coverage::decodes`]);
+    /// `None` when there is no store.
+    #[cfg_attr(
+        not(feature = "postgres"),
+        expect(
+            clippy::unused_async,
+            reason = "the same signature as the `postgres` build's, which reads"
+        )
+    )]
+    pub(super) async fn restart(
+        &mut self,
+        coverage: &Coverage<'_>,
+    ) -> Result<Option<u64>, BackfillError> {
+        #[cfg(feature = "postgres")]
+        if let Some(store) = &mut self.store {
+            let session = store.session().await?;
+            return coverage.decodes("database", session.as_ref()).map(Some);
+        }
+        let _ = coverage;
+        Ok(None)
     }
 
     /// Upserts `events`, decoded and derived records, into the tables the store routes, in
@@ -97,6 +117,84 @@ impl Database {
         }
         #[cfg(not(feature = "postgres"))]
         let _ = (chain, events);
+        Ok(())
+    }
+}
+
+/// What a backfill writes with once it knows what to write: the decoder, the lake's
+/// tables and the database it fills beside the running indexer, under its lease.
+pub(super) struct Writer<'a> {
+    pub(super) chain: &'a ChainId,
+    pub(super) schema: &'a Schema,
+    pub(super) protocols: &'a [String],
+    pub(super) lock: &'a RunLock,
+    pub(super) decoder: Decoder,
+    pub(super) tables: DecodedTables,
+    pub(super) database: Database,
+    /// Whether the manifests derive rows, whose senders are read from `transactions`.
+    pub(super) derives: bool,
+    /// The Parquet streams each read takes.
+    pub(super) streams: usize,
+}
+
+impl Writer<'_> {
+    /// Decodes the logs `addresses` emitted in `blocks`, as `reader` holds them, and
+    /// appends their rows, counting what it did in `done`. Reads [`READ_AHEAD`] ranges at
+    /// once, so the next is read while one is decoded and written.
+    ///
+    /// # Errors
+    ///
+    /// Stops on a store that cannot be read or written, a lease taken over, and a
+    /// decoder or derivation that breaks an invariant.
+    pub(super) async fn write(
+        &mut self,
+        reader: &LogReader,
+        addresses: &[Address],
+        blocks: RangeInclusive<u64>,
+        done: &mut Backfilled,
+    ) -> Result<(), BackfillError> {
+        let (chain, protocols) = (self.chain, self.protocols);
+        let (from, to) = blocks.into_inner();
+        let reads = reader.reads(from, to);
+        done.from = reads.first().map_or(to, |read| *read.start());
+        done.to = to;
+        info!(%chain, ?protocols, contracts = addresses.len(), from = done.from, to,
+            reads = reads.len(), "backfilling from the lake's logs");
+        let mut logs = stream::iter(reads.clone())
+            .map(|blocks| tokio::spawn(reader.read(blocks, addresses, self.streams)))
+            .buffered(READ_AHEAD);
+        for read in reads {
+            let Some(logs) = logs.next().await else {
+                break;
+            };
+            let logs = logs.unwrap_or_else(|join| std::panic::resume_unwind(join.into_panic()))?;
+            let (mut records, mut appended) = (0, 0);
+            for (blocks, positions) in parts(&logs, &read) {
+                let found = decode_all(&mut self.decoder, chain, &logs[positions])?;
+                records += found.len();
+                let events = derive(
+                    &self.decoder,
+                    reader,
+                    chain,
+                    found,
+                    self.derives,
+                    self.streams,
+                )
+                .await?;
+                self.lock.check()?;
+                let rows = rows(chain, self.schema, &events)?;
+                appended += self.tables.fill(blocks, protocols, rows).await?;
+                self.database.fill(chain, events).await?;
+                done.commits += 1;
+            }
+            done.reads += 1;
+            done.logs += logs.len();
+            done.decoded += records;
+            done.appended += appended;
+            info!(%chain, from = read.start(), to = read.end(), logs = logs.len(),
+                decoded = records, appended, resume_from = read.end().saturating_add(1),
+                "range backfilled");
+        }
         Ok(())
     }
 }

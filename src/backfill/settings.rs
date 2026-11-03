@@ -167,20 +167,18 @@ pub enum BackfillError {
         /// The protocol.
         protocol: String,
     },
-    /// The running indexer's current run started above the bound, so the blocks between
-    /// would be left undecoded.
+    /// The running indexer's current run started above the `to` the settings give, so
+    /// the blocks between would be left undecoded.
     #[error(
-        "the running indexer's {store} decodes from block {from}, above the bound {bound}: \
-         wait until the lake's tip passes {}",
+        "the running indexer decodes from block {from}, above to = {to}: raise `to` to it, or \
+         leave `to` out and the backfill waits until the lake's tip passes {}",
         from + MAX_RESUME_LAG
     )]
-    SessionAboveBound {
-        /// The store.
-        store: &'static str,
+    SessionAboveTo {
         /// The first block of its current run.
         from: u64,
-        /// The bound.
-        bound: u64,
+        /// The `to` given.
+        to: u64,
     },
     /// Another backfill holds the lake, or took it over.
     #[error("{0}")]
@@ -242,7 +240,7 @@ impl BackfillError {
             | Self::NoSession { .. }
             | Self::NotDecoding { .. }
             | Self::EventsDiffer { .. }
-            | Self::SessionAboveBound { .. }
+            | Self::SessionAboveTo { .. }
             | Self::Lock(LockError::Held { .. }) => true,
             #[cfg(feature = "postgres")]
             Self::Route { .. } => true,
@@ -282,8 +280,9 @@ pub struct Backfilled {
     pub discovered: usize,
     /// Contracts handed over, by this run or an earlier one, and backfilled.
     pub handed: usize,
-    /// When some handed-over contract is decoded by the running indexer only above `to`,
-    /// the highest block below that: a rerun from `to + 1` once the bound reaches it
-    /// leaves no block between the two.
+    /// When the settings give `to` and some handed-over contract is decoded by the
+    /// running indexer only above it, the highest block below that: a rerun from
+    /// `to + 1` once the bound reaches it leaves no block between the two. Without `to`
+    /// the backfill waits for the bound to reach that block, and this is `None`.
     pub rerun_through: Option<u64>,
 }

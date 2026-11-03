@@ -40,8 +40,12 @@
 //! running indexer every block from it, with the same keys. So:
 //!
 //! 1. Deploy the manifests to the running indexer.
-//! 2. Wait until the lake's tip is four ledger windows past its restart.
-//! 3. Run the backfill. A refusal names what is missing.
+//! 2. Run the backfill. A refusal names what is missing.
+//!
+//! Without `to`, a backfill started before the lake's tip is four ledger windows past the
+//! restart hands over what it discovers at once, then waits until it is, and past every
+//! handed-over contract's record, and fills through the bound then. A `to` below the
+//! restart is refused.
 //!
 //! The backfill reads `logs` a few hundred megabytes of files at a time (see
 //! [`LogReader`]), so each file is read once, and writes in commits of at most
@@ -64,9 +68,10 @@
 //! from its block on, and the backfill below it; `only` narrows the contracts handed
 //! over and backfilled to some.
 //!
-//! The records are near the tip, above the bound, so a first run fills each handed-over
-//! contract only through the bound, and says from where to run again once the tip has
-//! passed them by the lag; a rerun hands over nothing it handed before.
+//! The records are near the tip, above the bound, so a backfill without `to` waits until
+//! the bound passes them too, and fills each handed-over contract up to its record in the
+//! one run. One with `to` below a record fills through `to` and says from where to run
+//! again once the bound has passed it; a rerun hands over nothing it handed before.
 //!
 //! # Contracts created before the lake's first block
 //!
@@ -81,7 +86,6 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use alloy_primitives::Address;
-use futures_util::stream::{self, StreamExt as _};
 use tracing::{info, warn};
 
 use crate::decode::{Catalog, Decoder};
@@ -93,9 +97,9 @@ mod handover;
 mod settings;
 mod write;
 
-use self::handover::{adopt, covers, discover, handover, select};
+use self::handover::{Coverage, adopt, discover, handover, select};
 pub use self::settings::{BackfillError, BackfillSettings, Backfilled};
-use self::write::{Database, cores, decode_all, derive, parts, rows};
+use self::write::{Database, Writer, cores};
 
 /// How the subcommand is called.
 pub const USAGE: &str = "indexer backfill <indexer.<chain>.toml>";
@@ -115,6 +119,14 @@ const HANDOFF_POLL: std::time::Duration = if cfg!(test) {
     std::time::Duration::from_millis(100)
 } else {
     std::time::Duration::from_secs(10)
+};
+
+/// How often a backfill without `to` reads the lake's tip again while it waits for the
+/// bound to pass the running indexer's restart and records (see [`settle`]).
+const BOUND_POLL: std::time::Duration = if cfg!(test) {
+    std::time::Duration::from_millis(100)
+} else {
+    std::time::Duration::from_mins(1)
 };
 
 /// The most heights one commit covers, aligned to multiples of it.
@@ -139,22 +151,26 @@ pub async fn run(path: &Path) -> Result<Backfilled, BackfillError> {
 }
 
 /// Decodes the logs of `settings`' manifests' contracts in its lake from `from` (the
-/// lake's first block when absent) through `to` (the bound when absent, see
-/// [`LogReader::bound`]), and appends each decoded row its table does not hold yet: in
-/// the lake, or in `out` when given, and in the `PostgreSQL` store when one is named.
+/// lake's first block when absent) through `to`, and appends each decoded row its table
+/// does not hold yet: in the lake, or in `out` when given, and in the `PostgreSQL` store
+/// when one is named.
 ///
 /// Holds the lake's backfill lease throughout, so no other backfill writes beside it.
 /// Before writing to the running indexer's stores, checks each one's newest session:
 /// its current run decodes the protocols, with these manifests' event definitions, from
 /// a block at or below `to`, so the backfill and the running indexer leave no block
-/// between them. Decodes on the calling worker thread, as Tokio's multi-threaded runtime
-/// allows.
+/// between them. Without `to`, hands over the contracts it discovers first, then waits
+/// until the bound (see [`LogReader::bound`]) reaches that block and each handed-over
+/// contract's record, and fills through the bound then. Decodes on the calling worker
+/// thread, as Tokio's multi-threaded runtime allows.
 ///
 /// # Errors
 ///
-/// Refuses manifests that do not load or list no contract on the chain; an empty ledger; a `to` above the bound; a store whose session
-/// does not cover the protocols (see the module docs); and a lake another backfill
-/// holds. Stops on a store that cannot be read or written, or a lease taken over.
+/// Refuses manifests that do not load or list no contract on the chain; an empty ledger;
+/// a `to` above the bound, or below the running indexer's restart; a store whose session
+/// does not decode the protocols as these manifests do (see the module docs), also when
+/// a restart while it waits changes that; and a lake another backfill holds. Stops on a
+/// store that cannot be read or written, or a lease taken over.
 pub async fn backfill(settings: &BackfillSettings) -> Result<Backfilled, BackfillError> {
     let chain = ChainId::new(&settings.chain);
     let catalog = Catalog::load(&settings.run.protocols, &chain)?;
@@ -210,45 +226,64 @@ async fn fill(
     let derives = catalog.derives();
     let discovers = catalog.discovers();
     let mut decoder = Decoder::new(catalog, []);
-    let lake = &settings.lake;
-    let reader =
-        LogReader::open(&lake.uri, &lake.storage, &schema, chain.as_str(), derives).await?;
+    let (lake, run) = (&settings.lake, &settings.run);
+    let open = || LogReader::open(&lake.uri, &lake.storage, &schema, chain.as_str(), derives);
+    let mut reader = open().await?;
     let bound = reader.bound().ok_or(BackfillError::EmptyLedger)?;
-    let to = match settings.run.to {
-        Some(to) if to > bound => return Err(BackfillError::ToAboveBound { to, bound }),
-        Some(to) => to,
-        None => bound,
-    };
-    let wanted = schema.decoded_events();
-    match &settings.run.out {
-        // The running indexer writes the chain's own lake, not this one, so its session
-        // says nothing about what this one holds.
-        Some(out) => info!(out, "writing to another lake; the chain's is only read"),
-        None => covers("lake", reader.session(), &wanted, protocols, to)?,
+    if let Some(to) = run.to
+        && to > bound
+    {
+        return Err(BackfillError::ToAboveBound { to, bound });
     }
-    let target = settings.run.out.as_deref().unwrap_or(&lake.uri);
-    let mut tables =
+    let wanted = schema.decoded_events();
+    let coverage = Coverage {
+        wanted: &wanted,
+        protocols,
+    };
+    let mut database = Database::open(settings, &schema, chain).await?;
+    // Where the running indexer's current run decodes from. With `out` there is none: the
+    // running indexer writes the chain's own lake, not this one.
+    let restart = match &run.out {
+        Some(out) => {
+            info!(out, "writing to another lake; the chain's is only read");
+            None
+        }
+        None => Some(coverage.restart(&reader, &mut database).await?),
+    };
+    // The last block, when it is known before handing over: `to`, or with `out`, where
+    // nothing is handed over or waited for, the bound.
+    let fixed = run.to.or_else(|| run.out.as_ref().map(|_| bound));
+    if let (Some(from), Some(to)) = (restart, fixed)
+        && from > to
+    {
+        return Err(BackfillError::SessionAboveTo { from, to });
+    }
+    let target = run.out.as_deref().unwrap_or(&lake.uri);
+    let tables =
         DecodedTables::open(target, storage, &schema, chain.as_str(), reader.width()).await?;
-    let mut database = Database::open(settings, &schema, chain, &wanted, protocols, to).await?;
 
-    let from = settings.run.from.unwrap_or(0);
+    let from = run.from.unwrap_or(0);
     // Each read owns a copy of the reader, so the next is read while one is decoded and
     // written. They share the cores: each Parquet stream holds a row group of up to a
     // million rows while it reads, so a stream per core per read would hold gigabytes.
     let streams = cores().div_ceil(READ_AHEAD);
     let mut done = Backfilled::default();
     let mut addresses = addresses.to_vec();
+    // The highest block the fill must reach to leave none between it and the running
+    // indexer: its restart, and below each handed-over contract's record.
+    let mut needed = restart.unwrap_or(0);
     if discovers {
-        // The running indexer discovers what is created from its restart on; with `out`,
-        // there is no running indexer to hand anything to.
-        let run = &settings.run;
-        let restart = run.out.is_none().then(|| reader.session()).flatten();
-        let below = restart.map_or(to, |session| session.block_number.saturating_sub(1));
-        let blocks = from..=below.min(to);
+        // The running indexer discovers what is created from its restart on. Handing over
+        // needs only that it decodes these manifests, not the bound, so a backfill run
+        // right after a deploy hands over at once, and the contracts are decoded live
+        // from then on.
+        let session = run.out.is_none().then(|| reader.session()).flatten();
+        let below = session.map_or(bound, |session| session.block_number.saturating_sub(1));
+        let blocks = from..=fixed.map_or(below, |to| below.min(to));
         let hypersync = run.hypersync.as_ref();
         let found = discover(&mut decoder, &reader, hypersync, blocks, streams).await?;
         done.discovered = found.len();
-        let handed = match &settings.run.out {
+        let handed = match fixed.filter(|_| run.out.is_some()) {
             None => {
                 handover(
                     settings,
@@ -262,51 +297,79 @@ async fn fill(
                 .await?
             }
             // Nothing decodes them above `to`, so there is nothing to wait for.
-            Some(_) => select(settings.run.only.as_deref(), found)?
+            Some(to) => select(run.only.as_deref(), found)?
                 .into_iter()
                 .map(|contract| (contract, to.saturating_add(1)))
                 .collect(),
         };
         done.handed = handed.len();
-        let restart = restart.map(|session| session.block_number);
-        done.rerun_through = adopt(&mut decoder, &mut addresses, &handed, restart, to);
+        let restart = session.map(|session| session.block_number);
+        let through = adopt(&mut decoder, &mut addresses, &handed, restart);
+        needed = needed.max(through.unwrap_or(0));
     }
-    let addresses = &addresses[..];
-
-    let reads = reader.reads(from, to);
-    done.from = reads.first().map_or(to, |read| *read.start());
-    done.to = to;
-    info!(%chain, ?protocols, contracts = addresses.len(), from = done.from, to,
-        reads = reads.len(), "backfilling from the lake's logs");
-    let mut logs = stream::iter(reads.clone())
-        .map(|blocks| tokio::spawn(reader.read(blocks, addresses, streams)))
-        .buffered(READ_AHEAD);
-    for read in reads {
-        let Some(logs) = logs.next().await else {
-            break;
-        };
-        let logs = logs.unwrap_or_else(|join| std::panic::resume_unwind(join.into_panic()))?;
-        let (mut records, mut appended) = (0, 0);
-        for (blocks, positions) in parts(&logs, &read) {
-            let found = decode_all(&mut decoder, chain, &logs[positions])?;
-            records += found.len();
-            let events = derive(&decoder, &reader, chain, found, derives, streams).await?;
-            lock.check()?;
-            appended += tables
-                .fill(blocks, protocols, rows(chain, &schema, &events)?)
-                .await?;
-            database.fill(chain, events).await?;
-            done.commits += 1;
-        }
-        done.reads += 1;
-        done.logs += logs.len();
-        done.decoded += records;
-        done.appended += appended;
-        info!(%chain, from = read.start(), to = read.end(), logs = logs.len(), decoded = records,
-            appended, resume_from = read.end().saturating_add(1), "range backfilled");
-    }
+    let to = if let Some(to) = fixed {
+        done.rerun_through = Some(needed).filter(|&through| through > to);
+        to
+    } else {
+        let settled = settle(chain, &coverage, open, reader, &mut database, needed, lock);
+        let to;
+        (reader, to) = settled.await?;
+        to
+    };
+    let mut writer = Writer {
+        chain,
+        schema: &schema,
+        protocols,
+        lock,
+        decoder,
+        tables,
+        database,
+        derives,
+        streams,
+    };
+    writer
+        .write(&reader, &addresses, from..=to, &mut done)
+        .await?;
     report(chain, &done);
     Ok(done)
+}
+
+/// Waits, holding the lease `lock`, until the lake's bound reaches `needed` and where the
+/// running indexer's current run decodes from, as `coverage` reads it from the lake and
+/// `database`, reading the lake again with `open` every [`BOUND_POLL`]. Returns the lake
+/// as last read, and its bound, the block to fill through. A restart of the running
+/// indexer while it waits moves where it decodes from on, which it then waits for.
+///
+/// # Errors
+///
+/// As [`Coverage::restart`], when the running indexer no longer decodes the protocols
+/// as the backfill does; [`BackfillError::Lock`] for a lease taken over; and
+/// [`BackfillError::Store`] for a lake that cannot be read.
+async fn settle<F>(
+    chain: &ChainId,
+    coverage: &Coverage<'_>,
+    open: impl Fn() -> F,
+    mut reader: LogReader,
+    database: &mut Database,
+    needed: u64,
+    lock: &RunLock,
+) -> Result<(LogReader, u64), BackfillError>
+where
+    F: Future<Output = Result<LogReader, crate::sink::StoreError>>,
+{
+    loop {
+        let bound = reader.bound().ok_or(BackfillError::EmptyLedger)?;
+        let needed = needed.max(coverage.restart(&reader, database).await?);
+        if bound >= needed {
+            return Ok((reader, bound));
+        }
+        info!(%chain, bound, needed, blocks = needed - bound,
+            "waiting for the lake's tip to pass the running indexer's restart and records by \
+             four ledger windows");
+        lock.check()?;
+        tokio::time::sleep(BOUND_POLL).await;
+        reader = open().await?;
+    }
 }
 
 /// Logs what a backfill did, and from where to run it again if it is not done.

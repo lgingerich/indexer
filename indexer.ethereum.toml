@@ -90,15 +90,15 @@ protocols = "protocols"
 
 # `indexer backfill indexer.ethereum.toml` decodes manifests added after their blocks were
 # indexed, from the logs `[sink.delta]` holds, into that lake and the `[sink.postgres]`
-# tables. The running indexer ignores this section. Before running,
-# deploy the manifests to the running indexer and wait until the lake's tip is four
-# ledger windows (16,388 blocks) past its restart; the backfill checks this and says what
-# is missing. See `src/backfill/mod.rs` and the README's "Backfilling new protocols from
-# the lake".
+# tables. The running indexer ignores this section. Before running, deploy the manifests
+# to the running indexer. Run right after the deploy: discovered contracts are handed over
+# at once, then the backfill waits until the lake's tip is four ledger windows (16,388
+# blocks) past the restart and the handed-over contracts' records, and fills. See
+# `src/backfill/mod.rs` and the README's "Backfilling new protocols from the lake".
 # [backfill]
 # protocols = "protocols/<protocol>"   # the manifests to backfill; required
 # from = <height>                      # the lake's first when absent; a stopped run's `resume_from`
-# to = <height>                        # the lake's tip less four ledger windows when absent
+# to = <height>                        # the bound once it passes the restart when absent; given, no waiting
 # only = ["0x…"]                       # discovered contracts to hand over; every one when absent
 # out = "/tmp/indexer-backfill"        # a trial: writes here instead, reads the chain's lake, fills no database
 # [backfill.hypersync]                 # finds what factories created before the lake's first block

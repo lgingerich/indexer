@@ -7,6 +7,7 @@ use std::ops::RangeInclusive;
 use alloy_primitives::{Address, B256};
 use tracing::{info, warn};
 
+use super::write::Database;
 use super::{BackfillError, BackfillSettings, HANDOFF_POLL, HANDOFF_WAIT};
 use crate::config::HyperSyncEndpoint;
 use crate::decode::Decoder;
@@ -125,14 +126,13 @@ fn admit(
 /// Adds `handed`, each with the first block its record names, to `decoder`, for one an
 /// earlier run handed over that this run's discovery did not find, and to the
 /// `addresses` the fill reads. Returns the highest block below where the running
-/// indexer decodes any of them from, its record or `restart` if later, when it is above
-/// `to`.
+/// indexer decodes any of them from, its record or `restart` if later: the fill must
+/// reach it to leave no block between the two.
 pub(super) fn adopt(
     decoder: &mut Decoder,
     addresses: &mut Vec<Address>,
     handed: &[(Contract, u64)],
     restart: Option<u64>,
-    to: u64,
 ) -> Option<u64> {
     let mut decoded_from = None;
     for (contract, first) in handed {
@@ -143,9 +143,7 @@ pub(super) fn adopt(
     }
     addresses.sort_unstable();
     addresses.dedup();
-    decoded_from
-        .map(|first| first.saturating_sub(1))
-        .filter(|&through| through > to)
+    decoded_from.map(|first| first.saturating_sub(1))
 }
 
 /// `contracts`, narrowed to those `only` names when it names any.
@@ -245,47 +243,72 @@ pub(super) async fn handover(
     }
 }
 
-/// Refuses a backfill through `to` unless `store`'s newest `session` decodes each of
-/// `protocols` with the event definitions of `wanted`, the backfill's, since a block at
-/// or below `to`. Then the running indexer decodes every block above `to`, and the
-/// backfill every one at or below it, with the same keys.
-pub(super) fn covers(
-    store: &'static str,
-    session: Option<&Session>,
-    wanted: &[SessionEvent],
-    protocols: &[String],
-    to: u64,
-) -> Result<(), BackfillError> {
-    let session = session.ok_or(BackfillError::NoSession { store })?;
-    for protocol in protocols {
-        let events = |events: &[SessionEvent]| -> BTreeSet<(String, B256)> {
-            events
-                .iter()
-                .filter(|event| &event.protocol == protocol)
-                .map(|event| (event.contract.clone(), event.event_id))
-                .collect()
-        };
-        let running = events(&session.events);
-        if running.is_empty() {
-            return Err(BackfillError::NotDecoding {
-                store,
-                protocol: protocol.clone(),
-                from: session.block_number,
-            });
-        }
-        if running != events(wanted) {
-            return Err(BackfillError::EventsDiffer {
-                store,
-                protocol: protocol.clone(),
-            });
-        }
+/// What the running indexer's stores must decode for a backfill to write beside them:
+/// each of `protocols`, with the event definitions of `wanted`, the backfill's.
+pub(super) struct Coverage<'a> {
+    pub(super) wanted: &'a [SessionEvent],
+    pub(super) protocols: &'a [String],
+}
+
+impl Coverage<'_> {
+    /// From which block the running indexer's current run decodes, the later of where
+    /// its lake's session, in `reader`, and its database's, in `database`, start.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::decodes`], for either store, and [`BackfillError::Store`] or
+    /// [`BackfillError::Database`] when the database's session cannot be read.
+    pub(super) async fn restart(
+        &self,
+        reader: &LogReader,
+        database: &mut Database,
+    ) -> Result<u64, BackfillError> {
+        let lake = self.decodes("lake", reader.session())?;
+        Ok(database
+            .restart(self)
+            .await?
+            .map_or(lake, |db| lake.max(db)))
     }
-    if session.block_number > to {
-        return Err(BackfillError::SessionAboveBound {
-            store,
-            from: session.block_number,
-            bound: to,
-        });
+
+    /// Where `store`'s newest `session` decodes from, refusing unless it decodes each of
+    /// the protocols with the backfill's event definitions. Then the backfill and the
+    /// running indexer write the same keys, and once the backfill reaches that block,
+    /// leave no block between them.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BackfillError::NoSession`] for no session,
+    /// [`BackfillError::NotDecoding`] for a protocol it does not decode, and
+    /// [`BackfillError::EventsDiffer`] for one it decodes with other definitions.
+    pub(super) fn decodes(
+        &self,
+        store: &'static str,
+        session: Option<&Session>,
+    ) -> Result<u64, BackfillError> {
+        let session = session.ok_or(BackfillError::NoSession { store })?;
+        for protocol in self.protocols {
+            let events = |events: &[SessionEvent]| -> BTreeSet<(String, B256)> {
+                events
+                    .iter()
+                    .filter(|event| &event.protocol == protocol)
+                    .map(|event| (event.contract.clone(), event.event_id))
+                    .collect()
+            };
+            let running = events(&session.events);
+            if running.is_empty() {
+                return Err(BackfillError::NotDecoding {
+                    store,
+                    protocol: protocol.clone(),
+                    from: session.block_number,
+                });
+            }
+            if running != events(self.wanted) {
+                return Err(BackfillError::EventsDiffer {
+                    store,
+                    protocol: protocol.clone(),
+                });
+            }
+        }
+        Ok(session.block_number)
     }
-    Ok(())
 }

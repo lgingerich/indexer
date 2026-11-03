@@ -15,7 +15,9 @@ use deltalake::arrow::datatypes::Int64Type;
 use deltalake::arrow::util::display::{ArrayFormatter, FormatOptions};
 use deltalake::datafusion::prelude::SessionContext;
 
-use super::{BackfillError, BackfillSettings, COMMIT_BLOCKS, COMMIT_LOGS, backfill, covers, parts};
+use super::handover::Coverage;
+use super::write::{decode_all, parts, rows as rows_of};
+use super::{BackfillError, BackfillSettings, COMMIT_BLOCKS, COMMIT_LOGS, backfill};
 use crate::config::BackfillRun;
 use crate::decode::{Catalog, Decoder, DecodingSink};
 use crate::sink::SinkError;
@@ -426,7 +428,7 @@ async fn appends_commit_beside_the_running_stores_appends_and_deletes() {
             ]
         })
         .collect();
-    let records: Vec<Event> = super::decode_all(&mut decoder, &chain, &logs)
+    let records: Vec<Event> = decode_all(&mut decoder, &chain, &logs)
         .expect("decodes")
         .into_iter()
         .map(|record| Event::Decoded(Box::new(record.decoded)))
@@ -435,7 +437,7 @@ async fn appends_commit_beside_the_running_stores_appends_and_deletes() {
         .fill(
             FIRST..=FIRST + 9,
             &["uniswap_v4".to_owned()],
-            super::rows(&chain, &schema, &records).expect("rows"),
+            rows_of(&chain, &schema, &records).expect("rows"),
         )
         .await
         .expect("appended despite the reorg's delete");
@@ -510,12 +512,15 @@ async fn a_lake_the_running_indexer_does_not_cover_is_refused() {
         "{refused:?}"
     );
 
+    // Without `to` a backfill would wait for the bound to pass the restart; with one
+    // below it, it is refused.
     let too_recent = Dir::new();
     deployed(&too_recent, FIRST + 5, FIRST + 10).await;
-    let refused = backfill(&too_recent.backfill(&uniswap_v4())).await;
+    let mut below = too_recent.backfill(&uniswap_v4());
+    below.run.to = Some(0);
+    let refused = backfill(&below).await;
     assert!(
-        matches!(&refused, Err(BackfillError::SessionAboveBound { from, .. })
-            if *from == FIRST + 5),
+        matches!(refused, Err(BackfillError::SessionAboveTo { from, to: 0 }) if from == FIRST + 5),
         "{refused:?}"
     );
 
@@ -546,6 +551,10 @@ fn a_session_with_other_event_definitions_is_refused() {
     let catalog = Catalog::load(uniswap_v4(), &ChainId::new(CHAIN)).expect("loads");
     let wanted = catalog.schema().decoded_events();
     let protocols = ["uniswap_v4".to_owned()];
+    let coverage = Coverage {
+        wanted: &wanted,
+        protocols: &protocols,
+    };
     let session = |events: Vec<SessionEvent>| Session {
         block_number: 5,
         block_hash: B256::ZERO,
@@ -553,25 +562,20 @@ fn a_session_with_other_event_definitions_is_refused() {
         events,
     };
     assert!(
-        covers(
-            "lake",
-            Some(&session(wanted.clone())),
-            &wanted,
-            &protocols,
-            5
-        )
-        .is_ok()
+        coverage
+            .decodes("lake", Some(&session(wanted.clone())))
+            .is_ok()
     );
     let mut other = wanted.clone();
     other[0].event_id = B256::repeat_byte(0xee);
     assert!(matches!(
-        covers("lake", Some(&session(other)), &wanted, &protocols, 5),
+        coverage.decodes("lake", Some(&session(other))),
         Err(BackfillError::EventsDiffer { .. })
     ));
     let mut fewer = wanted.clone();
     fewer.pop();
     assert!(matches!(
-        covers("lake", Some(&session(fewer)), &wanted, &protocols, 5),
+        coverage.decodes("lake", Some(&session(fewer))),
         Err(BackfillError::EventsDiffer { .. })
     ));
     let mut more = wanted.clone();
@@ -581,7 +585,7 @@ fn a_session_with_other_event_definitions_is_refused() {
     });
     assert!(
         matches!(
-            covers("lake", Some(&session(more)), &wanted, &protocols, 5),
+            coverage.decodes("lake", Some(&session(more))),
             Err(BackfillError::EventsDiffer { .. })
         ),
         "an event the running indexer decodes and the backfill would not"
@@ -592,14 +596,9 @@ fn a_session_with_other_event_definitions_is_refused() {
         ..wanted[0].clone()
     });
     assert!(
-        covers(
-            "lake",
-            Some(&session(other_protocol)),
-            &wanted,
-            &protocols,
-            5
-        )
-        .is_ok(),
+        coverage
+            .decodes("lake", Some(&session(other_protocol)))
+            .is_ok(),
         "other protocols the running indexer decodes are its own business"
     );
 }
@@ -1185,8 +1184,13 @@ impl LiveV3 {
     }
 }
 
-/// A backfill run beside `live`, which watches the queue and indexes a block at a time
-/// until the backfill ends, as the running indexer would.
+/// How many blocks the running indexer beside a backfill commits at a time: few enough
+/// that a handed-over contract is recorded soon after it is queued, enough that a
+/// backfill waiting for the bound sees it pass in a few dozen commits.
+const STEP: u64 = 1_000;
+
+/// A backfill run beside `live`, which watches the queue and indexes [`STEP`] blocks at a
+/// time until the backfill ends, as the running indexer would.
 async fn beside(live: &mut LiveV3, dir: &Dir, settings: BackfillSettings) -> super::Backfilled {
     let schema = Catalog::load(protocols("uniswap/v3"), &ChainId::new(CHAIN))
         .expect("loads")
@@ -1196,20 +1200,14 @@ async fn beside(live: &mut LiveV3, dir: &Dir, settings: BackfillSettings) -> sup
     while !backfilling.is_finished() {
         live.watch(dir, &schema).await;
         let next = live.next;
-        live.index(next).await;
+        live.index(next + STEP - 1).await;
     }
     backfilling.await.expect("joined").expect("backfilled")
 }
 
-/// A pool created below the restart is discovered from the lake and handed to the
-/// running indexer, which records the block it decodes it from. The first run fills it
-/// through the bound and says to run again; once the tip is past the record, a rerun
-/// from there completes it, handing over nothing new. The pool's swaps then read as if
-/// the manifest had been there from the first block. `only` naming a contract the
-/// factories did not create is refused.
-#[tokio::test(flavor = "multi_thread")]
-async fn a_discovered_contract_is_handed_over_and_backfilled_without_a_gap() {
-    let dir = Dir::new();
+/// The lake the running indexer wrote from [`FIRST`] without the Uniswap V3 manifest,
+/// then from [`RESTART`] through `last` with it, which goes on beside the backfill.
+async fn deployed_v3(dir: &Dir, last: u64) -> LiveV3 {
     let chain = ChainId::new(CHAIN);
     let mut lake = DeltaSink::open(
         &dir.store(),
@@ -1229,8 +1227,47 @@ async fn a_discovered_contract_is_handed_over_and_backfilled_without_a_gap() {
     lake.flush().await.expect("committed");
     lake.finish().await.expect("ledger written");
     drop(lake);
-    let mut live = LiveV3::start(&dir, RESTART).await;
-    live.index(LAST).await;
+    let mut live = LiveV3::start(dir, RESTART).await;
+    live.index(last).await;
+    live
+}
+
+/// Where the running indexer recorded each contract handed to it.
+async fn records(dir: &Dir) -> Vec<(Address, u64)> {
+    let schema = Schema::new().expect("schema");
+    crate::sink::delta::recorded(&dir.uri(), &BTreeMap::new(), &schema, CHAIN)
+        .await
+        .expect("read")
+        .iter()
+        .map(|handoff| (handoff.address, handoff.block_number))
+        .collect()
+}
+
+/// The early pool's swaps in `dir`, and as a run with the manifest from the first block
+/// through `live`'s last would have decoded them.
+async fn early_swaps(dir: &Dir, live: &LiveV3) -> (Vec<String>, Vec<String>) {
+    let control = Dir::new();
+    let mut whole = LiveV3::start(&control, FIRST).await;
+    whole.index(live.next - 1).await;
+    let early = format!("address = '{EARLY_POOL:#x}'");
+    let expected = rows(&control, "uniswap_v3_pool_swap", &early).await;
+    assert_eq!(
+        expected.len(),
+        usize::try_from(live.next - 1 - (FIRST + 10) + 1).expect("fits")
+    );
+    (rows(dir, "uniswap_v3_pool_swap", &early).await, expected)
+}
+
+/// A backfill started right after the deploy, its restart still above the bound, hands
+/// a pool created below the restart to the running indexer at once, so the pool is
+/// decoded live from soon after the restart, not four ledger windows later. It then waits
+/// until the bound passes the record and fills everything below it in the one run: the
+/// pool's swaps read as if the manifest had been there from the first block. `only`
+/// naming a contract the factories did not create is refused.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_discovered_contract_is_handed_over_and_backfilled_without_a_gap() {
+    let dir = Dir::new();
+    let mut live = deployed_v3(&dir, RESTART + 10).await;
 
     let mut unknown = dir.backfill(&protocols("uniswap/v3"));
     unknown.run.only = Some(vec![Address::repeat_byte(0xee)]);
@@ -1240,25 +1277,40 @@ async fn a_discovered_contract_is_handed_over_and_backfilled_without_a_gap() {
         "{refused:?}"
     );
 
-    let first = beside(&mut live, &dir, dir.backfill(&protocols("uniswap/v3"))).await;
-    assert_eq!((first.discovered, first.handed), (1, 1), "{first:?}");
-    let through = first.rerun_through.expect("the record is above the bound");
-    let recorded = crate::sink::delta::recorded(
-        &dir.uri(),
-        &BTreeMap::new(),
-        &Schema::new().expect("schema"),
-        CHAIN,
-    )
-    .await
-    .expect("read");
+    let done = beside(&mut live, &dir, dir.backfill(&protocols("uniswap/v3"))).await;
     assert_eq!(
-        recorded
-            .iter()
-            .map(|handoff| (handoff.address, handoff.block_number))
-            .collect::<Vec<_>>(),
-        [(EARLY_POOL, through + 1)],
-        "only the pool below the restart is handed over"
+        (done.discovered, done.handed, done.rerun_through),
+        (1, 1, None),
+        "{done:?}"
     );
+    let recorded = records(&dir).await;
+    let [(pool, at)] = recorded[..] else {
+        panic!("only the pool below the restart is handed over: {recorded:?}");
+    };
+    assert_eq!(pool, EARLY_POOL);
+    assert!(
+        at < RESTART + MAX_RESUME_LAG,
+        "handed over before the bound passed the restart: {at}"
+    );
+    assert!(done.to >= at - 1, "filled up to the record: {done:?}");
+    let (swaps, expected) = early_swaps(&dir, &live).await;
+    assert_eq!(swaps, expected);
+}
+
+/// With `to` given, a backfill does not wait: it fills a handed-over pool through `to`
+/// and says to run again from there. Once the tip is past the record, a rerun from there
+/// completes it, handing over nothing new.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_backfill_through_a_given_to_says_to_run_again() {
+    let dir = Dir::new();
+    let mut live = deployed_v3(&dir, LAST).await;
+
+    let mut bounded = dir.backfill(&protocols("uniswap/v3"));
+    bounded.run.to = Some(BOUND);
+    let first = beside(&mut live, &dir, bounded).await;
+    assert_eq!((first.discovered, first.handed, first.to), (1, 1, BOUND));
+    let through = first.rerun_through.expect("the record is above `to`");
+    assert_eq!(records(&dir).await, [(EARLY_POOL, through + 1)]);
 
     live.index(through + MAX_RESUME_LAG + 1).await;
     let mut rerun = dir.backfill(&protocols("uniswap/v3"));
@@ -1270,17 +1322,8 @@ async fn a_discovered_contract_is_handed_over_and_backfilled_without_a_gap() {
         "{second:?}"
     );
     assert!(second.to >= through);
-
-    let control = Dir::new();
-    let mut whole = LiveV3::start(&control, FIRST).await;
-    whole.index(live.next - 1).await;
-    let early = format!("address = '{EARLY_POOL:#x}'");
-    let swaps = rows(&control, "uniswap_v3_pool_swap", &early).await;
-    assert_eq!(
-        swaps.len(),
-        usize::try_from(live.next - 1 - (FIRST + 10) + 1).expect("fits")
-    );
-    assert_eq!(rows(&dir, "uniswap_v3_pool_swap", &early).await, swaps);
+    let (swaps, expected) = early_swaps(&dir, &live).await;
+    assert_eq!(swaps, expected);
 }
 
 /// A pool the factory created before the lake's first block, which only `HyperSync`
@@ -1385,7 +1428,7 @@ async fn a_backfill_into_another_lake_opens_no_database() {
         .expect("loads")
         .schema()
         .clone();
-    super::write::Database::open(&settings, &schema, &ChainId::new(CHAIN), &[], &[], 0)
+    super::write::Database::open(&settings, &schema, &ChainId::new(CHAIN))
         .await
         .expect("no database opened");
 }

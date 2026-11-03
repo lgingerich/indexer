@@ -691,13 +691,14 @@ backfill checks each store it writes, the lake's and the database's, against its
 session, and refuses unless the running indexer:
 
 - decodes every protocol being backfilled,
-- with the same event definitions, since a decoded record's key names its definition,
-- from a block at or below the bound, so the backfill covers everything below its
-  restart, and the running indexer everything above.
+- with the same event definitions, since a decoded record's key names its definition.
 
-So the order is: deploy the manifest to the running indexer, wait until the lake's tip is
-four windows past its restart, and run the backfill. The refusal says which of these is
-missing, and how long is left to wait.
+It writes only once the bound is at or above the restart, so the backfill covers
+everything below the restart, and the running indexer everything from it. So the order
+is: deploy the manifest to the running indexer, then run the backfill, right away if you
+like. A backfill started before the lake's tip is four windows past the restart hands
+over what it discovers at once (below), then waits, logging how many blocks are left,
+and fills once the bound has passed it. A `to` below the restart is refused.
 
 **Discovered contracts.** A manifest whose contracts come from a factory (`created_by`)
 decodes, in the running indexer, only the contracts created from its restart on. The
@@ -715,10 +716,11 @@ lets go; at startup it reads the queue once for what it missed while stopped. A 
 contract joins at a block boundary, gets its `contracts` row so restarts keep decoding
 it, and its record moves to the next block if a reorg orphans the one it was in.
 
-A record is near the tip, above the bound, so a first run fills a handed-over contract
-only through the bound. It logs `rerun_through`: run again from `to + 1` once the bound
-reaches that block, and the two meet with no block between them. A rerun hands over
-nothing it handed before.
+A record is near the tip, above the bound, so the backfill also waits for the bound to
+pass every record before it fills, and fills each handed-over contract up to its record
+in the one run. Given a `to` below a record, it fills through `to` and logs
+`rerun_through`: run again from `to + 1` once the bound reaches that block, and the two
+meet with no block between them. A rerun hands over nothing it handed before.
 
 **One at a time.** A backfill holds a lease on the lake it writes, a small Delta table
 `_backfill_lock` beside the chain's tables, renewed every minute and released when it
