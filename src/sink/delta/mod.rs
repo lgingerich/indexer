@@ -74,11 +74,12 @@ mod handoff;
 mod lake;
 mod lock;
 mod maintenance;
-mod matched;
 mod open;
 mod repair;
 mod replay;
 mod settings;
+#[cfg(test)]
+pub(crate) mod testing;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -106,7 +107,7 @@ pub use self::handoff::{HandoffQueue, HandoffWatch, recorded};
 use self::lake::Lake;
 pub use self::lock::{LockError, RunLock};
 use self::maintenance::Maintenance;
-pub use self::replay::{DecodedTables, LedgerEnds, LogReader, ledger_ends};
+pub use self::replay::{DecodedTables, LogReader};
 pub use self::settings::DeltaSettings;
 
 /// How many tables an open, a repair, or a delete across the lake works on at once:
@@ -672,16 +673,14 @@ impl Store for DeltaSink {
         // A wait of its own, so a failed or hung append fails the store as a failed
         // commit does.
         self.guarded(Self::settle_ledger).await?;
-        let (contracts, handoffs, matched, ledger) = tokio::try_join!(
+        let (contracts, handoffs, ledger) = tokio::try_join!(
             self.contracts(),
             self.handoffs(),
-            matched::matched(self.lake(Table::Matched)),
             self.lake(Table::AcceptedBlock).read_ledger()
         )?;
         Ok(Restored {
             contracts,
             handoffs,
-            matched,
             ledger,
         })
     }

@@ -7,7 +7,6 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
 
 use alloy_dyn_abi::DynSolValue;
 use alloy_primitives::{Address, B256, U256, address, keccak256};
@@ -16,12 +15,11 @@ use deltalake::arrow::datatypes::Int64Type;
 use deltalake::arrow::util::display::{ArrayFormatter, FormatOptions};
 use deltalake::datafusion::prelude::SessionContext;
 
-use super::{
-    BackfillError, BackfillSettings, COMMIT_BLOCKS, COMMIT_LOGS, LakeSettings, backfill, covers,
-    parts,
-};
+use super::{BackfillError, BackfillSettings, COMMIT_BLOCKS, COMMIT_LOGS, backfill, covers, parts};
+use crate::config::BackfillRun;
 use crate::decode::{Catalog, Decoder, DecodingSink};
 use crate::sink::SinkError;
+use crate::sink::delta::testing::Dir;
 use crate::sink::delta::{DecodedTables, DeltaSettings, DeltaSink, LockError, RunLock};
 use crate::sink::resume::MAX_RESUME_LAG;
 use crate::sink::table::{Schema, Session, SessionEvent};
@@ -47,23 +45,7 @@ const LAST: u64 = RESTART + MAX_RESUME_LAG + 1_000;
 /// The bound a backfill of the full lake stops at.
 const BOUND: u64 = LAST - MAX_RESUME_LAG;
 
-/// A fresh directory, removed when the guard drops.
-struct Dir(PathBuf);
-
 impl Dir {
-    fn new() -> Self {
-        static NEXT: AtomicU32 = AtomicU32::new(0);
-        Self(std::env::temp_dir().join(format!(
-            "indexer-backfill-{}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        )))
-    }
-
-    fn uri(&self) -> String {
-        self.0.display().to_string()
-    }
-
     /// This directory as the lake the running indexer's store opens.
     fn store(&self) -> DeltaSettings {
         DeltaSettings {
@@ -82,24 +64,19 @@ impl Dir {
     fn backfill(&self, protocols: &Path) -> BackfillSettings {
         BackfillSettings {
             chain: CHAIN.to_owned(),
-            protocols: protocols.to_path_buf(),
-            from: None,
-            to: None,
-            only: None,
-            out: None,
-            lake: LakeSettings {
-                uri: self.uri(),
-                storage: BTreeMap::new(),
+            run: BackfillRun {
+                protocols: protocols.to_path_buf(),
+                from: None,
+                to: None,
+                only: None,
+                out: None,
+                hypersync: None,
             },
+            decoded: protocols.to_path_buf(),
+            lake: self.store(),
             #[cfg(feature = "postgres")]
             postgres: None,
         }
-    }
-}
-
-impl Drop for Dir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
     }
 }
 
@@ -483,10 +460,8 @@ async fn a_backfill_into_another_lake_leaves_the_chains_alone() {
         .await
         .index(FIRST..=FIRST + MAX_RESUME_LAG + 500)
         .await;
-    let settings = BackfillSettings {
-        out: Some(out.uri()),
-        ..dir.backfill(&uniswap_v4())
-    };
+    let mut settings = dir.backfill(&uniswap_v4());
+    settings.run.out = Some(out.uri());
     let done = backfill(&settings).await.expect("backfilled");
     let expected = 2 * 501;
     assert_eq!(
@@ -511,11 +486,9 @@ async fn a_backfill_into_another_lake_leaves_the_chains_alone() {
     );
 
     let resumed = Dir::new();
-    let settings = BackfillSettings {
-        out: Some(resumed.uri()),
-        from: Some(FIRST + 300),
-        ..dir.backfill(&uniswap_v4())
-    };
+    let mut settings = dir.backfill(&uniswap_v4());
+    settings.run.out = Some(resumed.uri());
+    settings.run.from = Some(FIRST + 300);
     let done = backfill(&settings).await.expect("backfilled from a block");
     assert_eq!(done.from, FIRST + 300);
     assert_eq!(done.decoded, 2 * 201);
@@ -546,10 +519,8 @@ async fn a_lake_the_running_indexer_does_not_cover_is_refused() {
         "{refused:?}"
     );
 
-    let settings = BackfillSettings {
-        to: Some(FIRST + 10),
-        ..too_recent.backfill(&uniswap_v4())
-    };
+    let mut settings = too_recent.backfill(&uniswap_v4());
+    settings.run.to = Some(FIRST + 10);
     let refused = backfill(&settings).await;
     assert!(
         matches!(
@@ -737,73 +708,54 @@ fn commits_cover_the_logs_in_bounded_whole_blocks() {
     );
 }
 
-/// A settings file names the chain, the manifests (relative to the file), the optional
-/// bounds and output, and the lake; a typo or a missing required key is an error naming
-/// it.
-/// Nothing in the environment.
-fn unset(_: &str) -> Result<String, std::env::VarError> {
-    Err(std::env::VarError::NotPresent)
+/// A stand-in for every secret a settings file names.
+#[expect(clippy::unnecessary_wraps, reason = "a `secret::Env`")]
+fn stand_in(_: &str) -> Result<String, std::env::VarError> {
+    Ok("stand-in".to_owned())
 }
 
+/// A running indexer's settings file with `backfill` appended, written in `dir`.
+fn settings_file(dir: &Dir, backfill: &str) -> PathBuf {
+    let text = format!(
+        "[ingest]\nchain = \"{CHAIN}\"\nhttp_url = \"http://node\"\nws_url = \"ws://node\"\n\
+         [sink.delta]\ntables = [\"*\"]\nuri = \"s3://lake\"\n\
+         [decode]\nprotocols = \"protocols\"\n{backfill}"
+    );
+    std::fs::create_dir_all(&dir.0).expect("created");
+    let path = dir.0.join("indexer.base.toml");
+    std::fs::write(&path, text).expect("written");
+    path
+}
+
+/// A backfill runs on the running indexer's own settings file: the manifests its
+/// `[backfill]` names and those the running indexer decodes, both found beside the file,
+/// and its chain and lake. A file without `[backfill]`, or with an unknown key in it,
+/// is refused.
 #[test]
-fn settings_parse() {
-    let text = r#"
-chain = "ethereum"
-protocols = "protocols/uniswap/v4"
-from = 5
-to = 9
-out = "/tmp/lake"
-
-[lake]
-uri = "s3://blockchain-data"
-
-[lake.storage]
-region = "auto"
-"#;
-    let settings = BackfillSettings::parse(text, Path::new("/app"), unset).expect("parses");
-    assert_eq!(settings.chain, "ethereum");
-    assert_eq!(settings.protocols, Path::new("/app/protocols/uniswap/v4"));
-    assert_eq!((settings.from, settings.to), (Some(5), Some(9)));
-    assert_eq!(settings.out.as_deref(), Some("/tmp/lake"));
-    assert_eq!(settings.lake.uri, "s3://blockchain-data");
+fn a_backfill_reads_the_running_indexers_settings() {
+    let dir = Dir::new();
+    let path = settings_file(&dir, "[backfill]\nprotocols = \"protocols/uniswap/v4\"\n");
+    let settings = BackfillSettings::from_file(&path, stand_in).expect("parses");
+    assert_eq!(settings.run.protocols, dir.0.join("protocols/uniswap/v4"));
+    assert_eq!(settings.decoded, dir.0.join("protocols"));
     assert_eq!(
-        settings
-            .lake
-            .storage
-            .get("region")
-            .map(crate::secret::Secret::expose),
-        Some("auto")
+        (settings.chain.as_str(), settings.lake.uri.as_str()),
+        (CHAIN, "s3://lake")
     );
 
-    #[cfg(feature = "postgres")]
-    {
-        let with_database = "chain = \"bsc\"\nprotocols = \"p\"\n[lake]\nuri = \"/lake\"\n\
-             [postgres]\ntables = [\"contract_events\"]\nconnection_string = \"host=db\"\n";
-        let settings =
-            BackfillSettings::parse(with_database, Path::new(""), unset).expect("parses");
-        assert!(settings.postgres.is_some());
-    }
-
-    let minimal = "chain = \"bsc\"\nprotocols = \"p\"\n[lake]\nuri = \"/lake\"\n";
-    let settings = BackfillSettings::parse(minimal, Path::new(""), unset).expect("parses");
-    assert_eq!(
-        (settings.from, settings.to, settings.out),
-        (None, None, None)
-    );
-
-    for (wrong, names) in [
-        ("chain = \"bsc\"\n[lake]\nuri = \"/lake\"\n", "protocols"),
-        ("chain = \"bsc\"\nprotocols = \"p\"\n", "lake"),
-        (
-            "chain = \"bsc\"\nprotocols = \"p\"\ntoo = 9\n[lake]\nuri = \"/lake\"\n",
-            "too",
+    assert!(matches!(
+        BackfillSettings::from_file(&settings_file(&dir, ""), stand_in),
+        Err(BackfillError::Missing {
+            section: "[backfill]"
+        })
+    ));
+    assert!(matches!(
+        BackfillSettings::from_file(
+            &settings_file(&dir, "[backfill]\nprotocols = \"p\"\ntoo = 9\n"),
+            stand_in
         ),
-    ] {
-        let Err(error) = BackfillSettings::parse(wrong, Path::new(""), unset) else {
-            panic!("{wrong:?} must not parse");
-        };
-        assert!(error.to_string().contains(names), "{error}");
-    }
+        Err(BackfillError::Settings(_))
+    ));
 }
 
 /// The running indexer's database is filled beside it as its lake is: the backfill checks
@@ -909,7 +861,7 @@ async fn index_both(
         .expect("the lake opens");
     let mut database = crate::sink::PostgresSink::open(
         postgres,
-        Arc::new(schema.select(&routed.tables)),
+        Arc::new(schema.select(&routed)),
         chain.as_str(),
         crate::sink::postgres::Writer::Sole,
     )
@@ -1102,11 +1054,9 @@ const EARLY_POOL: Address = Address::repeat_byte(0xc1);
 /// A pool created after the restart, which the running indexer discovers itself.
 const LATE_POOL: Address = Address::repeat_byte(0xc2);
 
-/// Block `height`'s envelopes: the factory's `PoolCreated` for [`EARLY_POOL`] ten blocks
-/// past [`FIRST`] and for [`LATE_POOL`] ten past [`RESTART`], a swap of each pool in
-/// every block from its creation on, then the block's marker.
-fn v3_block(height: u64) -> Vec<Event> {
-    let created = |pool: Address, log_index: u64| Log {
+/// The factory's `PoolCreated` for `pool` in block `height`.
+fn pool_created(height: u64, pool: Address, log_index: u64) -> Log {
+    Log {
         log_index,
         transaction_hash: hash(height, 1),
         address: V3_FACTORY,
@@ -1126,35 +1076,43 @@ fn v3_block(height: u64) -> Vec<Event> {
         block_hash: hash(height, 0),
         block_timestamp: 1_700_000_000 + height,
         ..Log::default()
+    }
+}
+
+/// A swap of `pool` in block `height`.
+fn pool_swap(height: u64, pool: Address, log_index: u64) -> Log {
+    let envelope: Envelope = serde_json::from_str(
+        include_str!("../../examples/fixtures/uniswap_v3_swaps.ndjson")
+            .lines()
+            .next()
+            .expect("fixture"),
+    )
+    .expect("envelope");
+    let Event::Log(log) = envelope.event else {
+        panic!("a log");
     };
-    let swap = |pool: Address, log_index: u64| {
-        let envelope: Envelope = serde_json::from_str(
-            include_str!("../../examples/fixtures/uniswap_v3_swaps.ndjson")
-                .lines()
-                .next()
-                .expect("fixture"),
-        )
-        .expect("envelope");
-        let Event::Log(log) = envelope.event else {
-            panic!("a log");
-        };
-        Log {
-            log_index,
-            transaction_hash: hash(height, 2),
-            address: pool,
-            block_number: height,
-            block_hash: hash(height, 0),
-            block_timestamp: 1_700_000_000 + height,
-            ..*log
-        }
-    };
+    Log {
+        log_index,
+        transaction_hash: hash(height, 2),
+        address: pool,
+        block_number: height,
+        block_hash: hash(height, 0),
+        block_timestamp: 1_700_000_000 + height,
+        ..*log
+    }
+}
+
+/// Block `height`'s envelopes: the factory's `PoolCreated` for [`EARLY_POOL`] ten blocks
+/// past [`FIRST`] and for [`LATE_POOL`] ten past [`RESTART`], a swap of each pool in
+/// every block from its creation on, then the block's marker.
+fn v3_block(height: u64) -> Vec<Event> {
     let mut logs = Vec::new();
     for (pool, created_at, index) in [(EARLY_POOL, FIRST + 10, 0), (LATE_POOL, RESTART + 10, 2)] {
         if height == created_at {
-            logs.push(created(pool, index));
+            logs.push(pool_created(height, pool, index));
         }
         if height >= created_at {
-            logs.push(swap(pool, index + 1));
+            logs.push(pool_swap(height, pool, index + 1));
         }
     }
     logs.into_iter()
@@ -1274,10 +1232,8 @@ async fn a_discovered_contract_is_handed_over_and_backfilled_without_a_gap() {
     let mut live = LiveV3::start(&dir, RESTART).await;
     live.index(LAST).await;
 
-    let unknown = BackfillSettings {
-        only: Some(vec![Address::repeat_byte(0xee)]),
-        ..dir.backfill(&protocols("uniswap/v3"))
-    };
+    let mut unknown = dir.backfill(&protocols("uniswap/v3"));
+    unknown.run.only = Some(vec![Address::repeat_byte(0xee)]);
     let refused = backfill(&unknown).await;
     assert!(
         matches!(refused, Err(BackfillError::NotDiscovered { .. })),
@@ -1305,10 +1261,8 @@ async fn a_discovered_contract_is_handed_over_and_backfilled_without_a_gap() {
     );
 
     live.index(through + MAX_RESUME_LAG + 1).await;
-    let rerun = BackfillSettings {
-        from: Some(first.to + 1),
-        ..dir.backfill(&protocols("uniswap/v3"))
-    };
+    let mut rerun = dir.backfill(&protocols("uniswap/v3"));
+    rerun.run.from = Some(first.to + 1);
     let second = beside(&mut live, &dir, rerun).await;
     assert_eq!(
         (second.discovered, second.handed, second.rerun_through),
@@ -1329,11 +1283,16 @@ async fn a_discovered_contract_is_handed_over_and_backfilled_without_a_gap() {
     assert_eq!(rows(&dir, "uniswap_v3_pool_swap", &early).await, swaps);
 }
 
-/// A matched pool's history is filled from the lake's logs once the bound reaches the
-/// block before the run kept it from: its swaps land in the lake's decoded tables, from
-/// the lake's first block through that one and no further. A fill above the bound waits.
+/// A pool the factory created before the lake's first block, which only `HyperSync`
+/// knows of.
+const ANCIENT_POOL: Address = Address::repeat_byte(0xc0);
+
+/// A pool the factory created before the lake's first block is found over `HyperSync`,
+/// which is asked for only the factory's logs and only below that block. It is handed
+/// over and backfilled with the pool created in the lake, so its swaps the lake holds
+/// are decoded.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_matched_pool_is_filled_from_the_lake_through_its_block() {
+async fn a_pool_created_before_the_lake_is_found_over_hypersync() {
     let dir = Dir::new();
     let chain = ChainId::new(CHAIN);
     let mut lake = DeltaSink::open(
@@ -1344,8 +1303,12 @@ async fn a_matched_pool_is_filled_from_the_lake_through_its_block() {
     .await
     .expect("the lake opens");
     lake.restore().await.expect("restored");
-    for height in FIRST..=LAST {
-        for event in v3_block(height) {
+    for height in FIRST..RESTART {
+        let mut events = v3_block(height);
+        let marker = events.pop().expect("the marker");
+        events.push(Event::Log(Box::new(pool_swap(height, ANCIENT_POOL, 9))));
+        events.push(marker);
+        for event in events {
             lake.publish(Envelope::new(chain.clone(), event))
                 .await
                 .expect("accepted");
@@ -1354,100 +1317,104 @@ async fn a_matched_pool_is_filled_from_the_lake_through_its_block() {
     lake.flush().await.expect("committed");
     lake.finish().await.expect("ledger written");
     drop(lake);
+    let mut live = LiveV3::start(&dir, RESTART).await;
+    live.index(LAST).await;
 
-    let lookback = super::Lookback {
-        chain: chain.clone(),
-        catalog: Catalog::load(protocols("uniswap/v3"), &chain).expect("loads"),
-        lake: dir.store(),
-        #[cfg(feature = "postgres")]
-        postgres: None,
-    };
-    let never = crate::sink::stop::Stop::never();
-    let pool = |through: u64| crate::decode::Fill {
-        pools: vec![crate::wire::envelope::Matched {
-            protocol: "uniswap_v3".to_owned(),
-            contract: EARLY_POOL,
-            pool_id: None,
-            token0: Address::repeat_byte(1),
-            token1: Address::repeat_byte(2),
-            fee: 3000,
-            hooks: None,
-            created_block: FIRST + 10,
-            from_timestamp: 0,
-            filled: false,
-            block_number: through + 1,
-            block_hash: B256::ZERO,
-            block_timestamp: 0,
-        }],
-        through,
-    };
-    assert!(
-        !lookback
-            .fill(&pool(BOUND + 1), &never)
-            .await
-            .expect("waits"),
-        "above the bound it waits"
+    let created = pool_created(FIRST - 500, ANCIENT_POOL, 0);
+    let topic = |topic: Option<B256>| format!("{:#x}", topic.expect("a topic"));
+    let page = format!(
+        r#"{{"data":[{{"blocks":[{{"number":{height},"hash":"{block}","timestamp":{timestamp}}}],
+        "logs":[{{"block_hash":"{block}","block_number":{height},"transaction_index":0,
+        "log_index":0,"transaction_hash":"{transaction}","address":"{address:#x}",
+        "data":"{data}","topic0":"{topic0}","topic1":"{topic1}","topic2":"{topic2}",
+        "topic3":"{topic3}"}}]}}],"next_block":{FIRST},"archive_height":{LAST}}}"#,
+        height = created.block_number,
+        block = created.block_hash,
+        timestamp = created.block_timestamp,
+        transaction = created.transaction_hash,
+        address = created.address,
+        data = created.data,
+        topic0 = topic(created.topic0),
+        topic1 = topic(created.topic1),
+        topic2 = topic(created.topic2),
+        topic3 = topic(created.topic3),
     );
-    let through = BOUND - 100;
-    assert!(lookback.fill(&pool(through), &never).await.expect("filled"));
-    let filter = format!("address = '{EARLY_POOL:#x}'");
-    let (swaps, keys) = count(&dir, "uniswap_v3_pool_swap", &filter).await;
-    let expected = i64::try_from(through - (FIRST + 10) + 1).expect("fits");
-    assert_eq!((swaps, keys), (expected, expected));
-    let (others, _) = count(
-        &dir,
-        "uniswap_v3_pool_swap",
-        &format!("address = '{LATE_POOL:#x}'"),
-    )
-    .await;
-    assert_eq!(others, 0, "only the matched pool");
-    assert!(
-        lookback
-            .fill(&pool(through), &never)
-            .await
-            .expect("filled again")
+    let (url, served) =
+        crate::ingest::source::hypersync::testing::endpoint(vec![(200, page)]).await;
+    let mut settings = dir.backfill(&protocols("uniswap/v3"));
+    settings.run.hypersync =
+        Some(toml::from_str(&format!("url = '{url}'\ntoken = 'token'")).expect("an endpoint"));
+    let done = beside(&mut live, &dir, settings).await;
+    assert_eq!((done.discovered, done.handed), (2, 2), "{done:?}");
+
+    let asked = served.await.expect("served");
+    assert_eq!(asked.len(), 1);
+    let asked: serde_json::Value = serde_json::from_str(&asked[0]).expect("a query");
+    assert_eq!(
+        asked["to_block"], FIRST,
+        "only below the lake's first block"
     );
     assert_eq!(
-        count(&dir, "uniswap_v3_pool_swap", &filter).await,
-        (expected, expected),
-        "a fill made again writes each row once"
+        asked["logs"][0]["address"],
+        serde_json::json!([format!("{V3_FACTORY:#x}")]),
+        "only the factory's logs"
+    );
+
+    let ancient = format!("address = '{ANCIENT_POOL:#x}'");
+    assert_eq!(
+        rows(&dir, "uniswap_v3_pool_swap", &ancient).await.len(),
+        usize::try_from(RESTART - FIRST).expect("fits"),
+        "every swap of it the lake holds"
     );
 }
 
-/// The shipped Ethereum backfill parses, its manifests load on its chain, and its
-/// database's tables resolve against them, so a typo fails here rather than at the start
-/// of a run.
+/// A backfill into another lake is a trial: it opens no database, not even one it
+/// names, so nothing it writes reaches what the running indexer serves.
+#[cfg(feature = "postgres")]
+#[tokio::test]
+async fn a_backfill_into_another_lake_opens_no_database() {
+    let dir = Dir::new();
+    let mut settings = dir.backfill(&uniswap_v4());
+    settings.run.out = Some(Dir::new().uri());
+    // A database nothing listens for, which a connection attempt fails on.
+    settings.postgres = Some(
+        toml::from_str("tables = [\"*\"]\nconnection_string = \"host=127.0.0.1 port=1\"")
+            .expect("settings"),
+    );
+    let schema = Catalog::load(uniswap_v4(), &ChainId::new(CHAIN))
+        .expect("loads")
+        .schema()
+        .clone();
+    super::write::Database::open(&settings, &schema, &ChainId::new(CHAIN), &[], &[], 0)
+        .await
+        .expect("no database opened");
+}
+
+/// A backfill of a subtree of the running indexer's manifests fills the tables of the
+/// subtree its shipped `[sink.postgres] tables` route, though most entries name other
+/// protocols' tables: Robinhood's, backfilling Uniswap, fills every Uniswap event table.
+#[cfg(feature = "postgres")]
 #[test]
-fn the_ethereum_backfill_settings_resolve() {
+fn a_subtree_backfill_fills_the_tables_the_database_routes_of_it() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let settings =
-        BackfillSettings::from_file(&root.join("indexer.ethereum.backfill.toml"), |_| {
-            Ok("stand-in".to_owned())
-        })
+    let running = crate::config::Settings::from_file(root.join("indexer.robinhood.toml"), stand_in)
         .expect("parses");
-    assert_eq!(settings.chain, "ethereum");
-    let catalog = Catalog::load(&settings.protocols, &ChainId::new(&settings.chain))
-        .expect("the manifests load");
-    #[cfg(feature = "postgres")]
-    {
-        let postgres = settings.postgres.expect("a database");
-        let routed = postgres
-            .tables
-            .resolve(catalog.schema())
-            .expect("its tables resolve");
-        let names: Vec<&str> = catalog
-            .schema()
-            .tables()
-            .iter()
-            .filter(|def| routed.tables.contains(&def.id) && !routed.matched.contains(&def.id))
-            .map(|def| def.name.as_str())
-            .collect();
-        assert!(names.contains(&"metric_v1_oracle_prices"));
-        assert!(!names.contains(&"metric_v1_oracle_provider_feed_updated"));
-        assert!(
-            !names.iter().any(|name| name.starts_with("uniswap_")),
-            "matched tables are the running indexer's to fill"
-        );
-    }
-    let _ = catalog;
+    let chain = ChainId::new(&running.ingest.chain);
+    let uniswap = Catalog::load(root.join("protocols/uniswap"), &chain).expect("loads");
+    let routed = super::write::routed(
+        &running.sink.postgres.as_ref().expect("a database").tables,
+        &running.protocols_path().expect("manifests"),
+        &chain,
+        uniswap.schema(),
+    )
+    .expect("routed");
+    let events: std::collections::HashSet<_> = uniswap
+        .schema()
+        .tables()
+        .iter()
+        .filter(|def| matches!(def.id, crate::sink::table::TableId::Event(_)))
+        .map(|def| def.id)
+        .collect();
+    assert!(!events.is_empty());
+    assert_eq!(routed, events);
 }

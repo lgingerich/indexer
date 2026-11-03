@@ -1,15 +1,11 @@
 //! Which tables each store writes, and the `Router` that hands each store its share.
 //!
 //! Every `[sink.<backend>]` lists its [`Tables`]: exact table names, globs over them, or
-//! [`CONTRACT_EVENTS`] for every contract's decoded event tables. An entry written as
-//! `{ matched = "<glob>" }` selects tables too, but takes only the rows of the pools
-//! matched to Metric pools' pairs (see `crate::decode::pairs`), so a store can hold the
-//! pools compared with Metric's of a protocol the lake holds whole, and an entry starting
+//! [`CONTRACT_EVENTS`] for every contract's decoded event tables, and an entry starting
 //! with `!` takes its tables back out. The list is resolved against the run's [`Schema`]
 //! at startup, so a name that matches nothing is an error rather than an empty table. The
-//! bookkeeping tables, `accepted_blocks`, `reorgs`, `contracts`, `sessions`, `handoffs`,
-//! and `matched_pools`, are not listed: every store writes them (see
-//! [`Table::is_bookkeeping`]).
+//! bookkeeping tables, `accepted_blocks`, `reorgs`, `contracts`, `sessions`, and
+//! `handoffs`, are not listed: every store writes them (see [`Table::is_bookkeeping`]).
 //!
 //! What the stores write is also what ingest fetches: [`datasets`] is the union, so a
 //! dataset no store keeps is never fetched.
@@ -27,7 +23,6 @@ use futures_util::future::try_join_all;
 use serde::Deserialize;
 use serde::de::{self, Deserializer};
 
-use crate::decode::SharedKept;
 use crate::sink::table::{Schema, Table, TableId};
 use crate::sink::{EnvelopeSink, SinkError};
 use crate::wire::datasets::Datasets;
@@ -123,12 +118,6 @@ impl fmt::Display for StoreBackend {
 /// run of characters (`uniswap_v3_*`), or [`CONTRACT_EVENTS`]. Required and non-empty:
 /// a store says what it holds rather than defaulting to everything.
 ///
-/// An entry may also be `{ matched = "<name or glob>" }`: the tables it matches take only
-/// the rows of the pools matched to Metric pools' pairs (see `crate::decode::pairs`).
-/// Only contract event tables can be matched: theirs are the rows a matched pool's
-/// history is filled into (see `crate::backfill`), so raw `logs`, `decoded_logs`, and a
-/// derived table would hold a pool's rows only from when it was matched.
-///
 /// An entry starting with `!` takes the tables it matches back out of what the others
 /// select, wherever it stands in the list, as `.gitignore`'s negation does: the store
 /// writes every table some other entry selects and no `!` entry names.
@@ -137,25 +126,17 @@ impl fmt::Display for StoreBackend {
 /// tables = [
 ///     "metric_v1_*",
 ///     "!metric_v1_oracle_provider_feed_updated",   # its derived table is enough
-///     { matched = "uniswap_v3_pool_*" },
 /// ]
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Tables(Vec<Entry>);
 
 /// One entry of a [`Tables`] list.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(untagged, deny_unknown_fields)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum Entry {
-    /// A name, a glob, or [`CONTRACT_EVENTS`]: every row of the tables it matches.
+    /// A name, a glob, or [`CONTRACT_EVENTS`]: the tables it matches.
     All(String),
-    /// A name or a glob whose tables take only the matched pools' rows.
-    Matched {
-        /// The name or glob.
-        matched: String,
-    },
     /// A name or a glob, written after a `!`, whose tables are taken out of the others'.
-    #[serde(skip)]
     Excluded(String),
 }
 
@@ -163,23 +144,18 @@ impl Entry {
     /// The name, glob, or [`CONTRACT_EVENTS`] as written.
     fn pattern(&self) -> &str {
         match self {
-            Self::All(pattern) | Self::Matched { matched: pattern } | Self::Excluded(pattern) => {
-                pattern
-            }
+            Self::All(pattern) | Self::Excluded(pattern) => pattern,
         }
     }
 }
 
 impl<'de> Deserialize<'de> for Tables {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let entries: Vec<Entry> = Vec::<Entry>::deserialize(deserializer)?
+        let entries: Vec<Entry> = Vec::<String>::deserialize(deserializer)?
             .into_iter()
-            .map(|entry| match entry {
-                Entry::All(pattern) => match pattern.strip_prefix('!') {
-                    Some(excluded) => Entry::Excluded(excluded.to_owned()),
-                    None => Entry::All(pattern),
-                },
-                entry => entry,
+            .map(|pattern| match pattern.strip_prefix('!') {
+                Some(excluded) => Entry::Excluded(excluded.to_owned()),
+                None => Entry::All(pattern),
             })
             .collect();
         if entries.is_empty() {
@@ -207,29 +183,16 @@ impl<'de> Deserialize<'de> for Tables {
     }
 }
 
-/// What one sink takes, resolved from its [`Tables`].
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct Selection {
-    /// Every table it writes.
-    pub tables: HashSet<TableId>,
-    /// The tables of `tables` it takes only the matched pools' rows of: those only a `matched`
-    /// entry selects. A table an entry selects whole is taken whole.
-    pub matched: HashSet<TableId>,
-}
-
 impl Tables {
-    /// The tables `schema` holds that the entries name and no `!` entry takes out, and
-    /// those of them only `matched` entries name.
+    /// The tables `schema` holds that the entries name and no `!` entry takes out.
     ///
     /// # Errors
     ///
     /// Returns [`RouteError::Bookkeeping`] for an entry naming a table every store writes
     /// already, [`RouteError::Reserved`] when a table is itself named
     /// [`CONTRACT_EVENTS`], [`RouteError::NoMatch`] for an entry that matches no table,
-    /// which is how a typo, or `contract_events` with no protocols loaded, is caught,
-    /// and [`RouteError::NotAnEventTable`] for a `matched` entry matching a table that
-    /// is not a contract event table.
-    pub fn resolve(&self, schema: &Schema) -> Result<Selection, RouteError> {
+    /// which is how a typo, or `contract_events` with no protocols loaded, is caught.
+    pub fn resolve(&self, schema: &Schema) -> Result<HashSet<TableId>, RouteError> {
         if schema
             .tables()
             .iter()
@@ -238,7 +201,6 @@ impl Tables {
             return Err(RouteError::Reserved);
         }
         let mut whole = HashSet::new();
-        let mut matched = HashSet::new();
         let mut excluded = HashSet::new();
         for entry in &self.0 {
             let pattern = entry.pattern();
@@ -262,33 +224,19 @@ impl Tables {
                 match entry {
                     Entry::All(_) => whole.insert(def.id),
                     Entry::Excluded(_) => excluded.insert(def.id),
-                    Entry::Matched { .. } if matches!(def.id, TableId::Event(_)) => {
-                        matched.insert(def.id)
-                    }
-                    Entry::Matched { .. } => {
-                        return Err(RouteError::NotAnEventTable {
-                            entry: pattern.to_owned(),
-                            table: def.name.clone(),
-                        });
-                    }
                 };
             }
             if !hits {
                 return Err(RouteError::NoMatch {
                     entry: match entry {
                         Entry::Excluded(_) => format!("!{pattern}"),
-                        Entry::All(_) | Entry::Matched { .. } => pattern.to_owned(),
+                        Entry::All(_) => pattern.to_owned(),
                     },
                 });
             }
         }
-        matched.retain(|id| !whole.contains(id) && !excluded.contains(id));
         whole.retain(|id| !excluded.contains(id));
-        whole.extend(&matched);
-        Ok(Selection {
-            tables: whole,
-            matched,
-        })
+        Ok(whole)
     }
 }
 
@@ -306,15 +254,6 @@ pub enum RouteError {
     Bookkeeping {
         /// The table.
         table: Table,
-    },
-    /// A `matched` entry matches a table that is not a contract event table, the only
-    /// tables a matched pool's history is filled into.
-    #[error("{entry:?} is matched, but {table} is not a contract event table")]
-    NotAnEventTable {
-        /// The entry as written.
-        entry: String,
-        /// The table it matched.
-        table: String,
     },
     /// A generated table took the name of the [`CONTRACT_EVENTS`] entry.
     #[error("a table is named {CONTRACT_EVENTS:?}, which is reserved")]
@@ -347,16 +286,13 @@ fn glob(pattern: &str, name: &str) -> bool {
 /// decoded or derived from them. A derived table also needs transactions, whose sender
 /// and recipient its rows carry, whether or not a store writes them.
 #[must_use]
-pub fn datasets<'a>(selections: impl IntoIterator<Item = &'a Selection>) -> Datasets {
+pub fn datasets<'a>(selections: impl IntoIterator<Item = &'a HashSet<TableId>>) -> Datasets {
     let mut datasets = Datasets {
         blocks: false,
         transactions: false,
         logs: false,
     };
-    for id in selections
-        .into_iter()
-        .flat_map(|selection| &selection.tables)
-    {
+    for id in selections.into_iter().flatten() {
         match id {
             TableId::Dataset(Table::Block) => datasets.blocks = true,
             TableId::Dataset(Table::Transaction) => datasets.transactions = true,
@@ -372,8 +308,7 @@ pub fn datasets<'a>(selections: impl IntoIterator<Item = &'a Selection>) -> Data
                 | Table::Reorg
                 | Table::AcceptedBlock
                 | Table::Session
-                | Table::Handoff
-                | Table::Matched,
+                | Table::Handoff,
             ) => {}
         }
     }
@@ -389,10 +324,6 @@ pub fn datasets<'a>(selections: impl IntoIterator<Item = &'a Selection>) -> Data
 /// to the last sink that takes it and cloned only for the others, so one store costs no
 /// copy.
 ///
-/// A log, decoded record, or derived row that is not a matched pool's goes to no sink
-/// that keeps any of its tables to the matched pools' rows, so a decoded record is
-/// left out of `decoded_logs` there too.
-///
 /// Every sink sees every block boundary: [`flush`](EnvelopeSink::flush) reaches each,
 /// including one that took nothing from the block, since its accepted-block marker went
 /// everywhere.
@@ -400,26 +331,14 @@ pub fn datasets<'a>(selections: impl IntoIterator<Item = &'a Selection>) -> Data
 pub(crate) struct Router<K> {
     /// The run's schema, which names each decoded record's event table.
     schema: Arc<Schema>,
-    /// The matched pools, whose rows the matched tables keep, as the decode stage
-    /// changes them.
-    kept: SharedKept,
-    /// Each sink and what it takes.
-    sinks: Vec<(K, Selection)>,
+    /// Each sink and the tables it writes.
+    sinks: Vec<(K, HashSet<TableId>)>,
 }
 
 impl<K> Router<K> {
-    /// Routes to `sinks`, each writing its selection of `schema`, the matched tables only
-    /// the rows of the pools `kept` holds.
-    pub(crate) const fn new(
-        schema: Arc<Schema>,
-        kept: SharedKept,
-        sinks: Vec<(K, Selection)>,
-    ) -> Self {
-        Self {
-            schema,
-            kept,
-            sinks,
-        }
+    /// Routes to `sinks`, each writing its tables of `schema`.
+    pub(crate) const fn new(schema: Arc<Schema>, sinks: Vec<(K, HashSet<TableId>)>) -> Self {
+        Self { schema, sinks }
     }
 }
 
@@ -427,32 +346,16 @@ impl<K: EnvelopeSink> EnvelopeSink for Router<K> {
     async fn publish(&mut self, envelope: Envelope) -> Result<(), SinkError> {
         let (table, typed) = self.schema.tables_for(&envelope.event)?;
         let everywhere = matches!(table, TableId::Dataset(table) if table.is_bookkeeping());
-        let tables = || std::iter::once(table).chain(typed);
-        // Read only when some sink keeps a table of the envelope to the matched pools.
-        let mut kept = None;
-        let mut keeps = || {
-            *kept.get_or_insert_with(|| {
-                self.kept
-                    .read()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .keeps(&envelope.event)
-            })
+        let takes = |written: &HashSet<TableId>| {
+            everywhere
+                || written.contains(&table)
+                || typed.is_some_and(|typed| written.contains(&typed))
         };
-        // One bit per sink: a run has at most one sink of each backend.
-        let mut takes = 0_u32;
-        for (position, (_, selection)) in self.sinks.iter().enumerate() {
-            let routed = everywhere
-                || tables().any(|id| selection.tables.contains(&id))
-                    && (!tables().any(|id| selection.matched.contains(&id)) || keeps());
-            if routed {
-                takes |= 1 << position;
-            }
-        }
-        let Some(last) = takes.checked_ilog2().map(|last| last as usize) else {
+        let Some(last) = self.sinks.iter().rposition(|(_, written)| takes(written)) else {
             return Ok(());
         };
-        for (position, (sink, _)) in self.sinks[..last].iter_mut().enumerate() {
-            if takes & (1 << position) != 0 {
+        for (sink, written) in &mut self.sinks[..last] {
+            if takes(written) {
                 sink.publish(envelope.clone()).await?;
             }
         }
@@ -490,9 +393,7 @@ mod tests {
     use crate::wire::datasets::Datasets;
     use crate::wire::envelope::{BlockMeta, ChainId, Envelope, Event};
 
-    use super::{Entry, RouteError, Router, Selection, Tables, datasets, glob};
-    use crate::decode::{Kept, SharedKept};
-    use crate::wire::datasets::evm::Decoded;
+    use super::{Entry, RouteError, Router, Tables, datasets, glob};
 
     fn tables(entries: &[&str]) -> Tables {
         Tables(
@@ -538,8 +439,7 @@ mod tests {
         let (schema, _) = fixtures::derived();
         let events = tables(&["contract_events"])
             .resolve(&schema)
-            .expect("resolves")
-            .tables;
+            .expect("resolves");
         let every_event: HashSet<TableId> = schema
             .tables()
             .iter()
@@ -554,20 +454,15 @@ mod tests {
 
         let raw = tables(&["blocks", "*logs"])
             .resolve(&schema)
-            .expect("resolves")
-            .tables;
+            .expect("resolves");
         assert_eq!(names(&schema, &raw), ["blocks", "decoded_logs", "logs"]);
 
         let swaps = tables(&["uniswap_v3_pool_swap"])
             .resolve(&schema)
-            .expect("resolves")
-            .tables;
+            .expect("resolves");
         assert_eq!(names(&schema, &swaps), ["uniswap_v3_pool_swap"]);
 
-        let derived = tables(&["test_*"])
-            .resolve(&schema)
-            .expect("resolves")
-            .tables;
+        let derived = tables(&["test_*"]).resolve(&schema).expect("resolves");
         assert_eq!(names(&schema, &derived), ["test_rows"]);
         assert!(
             !events.iter().any(|id| derived.contains(id)),
@@ -580,7 +475,7 @@ mod tests {
     #[test]
     fn a_glob_never_selects_a_bookkeeping_table() {
         let schema = fixtures::schema();
-        let every = tables(&["*"]).resolve(&schema).expect("resolves").tables;
+        let every = tables(&["*"]).resolve(&schema).expect("resolves");
         let listable: HashSet<TableId> = schema
             .tables()
             .iter()
@@ -686,7 +581,6 @@ mod tests {
         let resolve = |entries: &[&str]| tables(entries).resolve(&schema).expect("resolves");
         let mut router = Router::new(
             Arc::clone(&schema),
-            SharedKept::default(),
             vec![
                 (Seen::default(), resolve(&["blocks", "logs"])),
                 (Seen::default(), resolve(&["contract_events"])),
@@ -754,83 +648,8 @@ mod tests {
         }
     }
 
-    /// A `matched` entry selects its tables like any other, keeps them to the matched
-    /// pools' rows unless an entry selects them whole, and cannot name a table of rows no
-    /// contract emits.
-    #[test]
-    fn matched_entries_keep_their_tables_to_the_matched_pools() {
-        /// A sink's settings, as a settings file writes its `tables`.
-        #[derive(serde::Deserialize)]
-        struct Sink {
-            tables: Tables,
-        }
-
-        let schema = fixtures::schema();
-        let parse = |json: &str| serde_json::from_str::<Tables>(json).expect(json);
-        let matched = parse(r#"["logs", {"matched": "uniswap_v3_pool_*"}]"#)
-            .resolve(&schema)
-            .expect("resolves");
-        let pool = names(&schema, &matched.matched);
-        assert!(
-            pool.contains(&"uniswap_v3_pool_swap".to_owned())
-                && pool.iter().all(|name| name.starts_with("uniswap_v3_pool_")),
-            "{pool:?}"
-        );
-        assert!(matched.matched.is_subset(&matched.tables));
-        assert_eq!(
-            matched.tables.len(),
-            matched.matched.len() + 1,
-            "and logs whole"
-        );
-
-        let whole = parse(r#"[{"matched": "uniswap_v3_pool_*"}, "uniswap_v3_pool_swap"]"#)
-            .resolve(&schema)
-            .expect("resolves");
-        assert!(
-            !names(&schema, &whole.matched).contains(&"uniswap_v3_pool_swap".to_owned()),
-            "a table an entry selects whole is taken whole"
-        );
-
-        assert!(matches!(
-            parse(r#"[{"matched": "blocks"}]"#).resolve(&schema),
-            Err(RouteError::NotAnEventTable { table, .. }) if table == "blocks"
-        ));
-        for table in ["logs", "decoded_logs", "test_rows"] {
-            let (schema, _) = fixtures::derived();
-            let json = format!(r#"[{{"matched": "{table}"}}]"#);
-            assert!(
-                matches!(
-                    parse(&json).resolve(&schema),
-                    Err(RouteError::NotAnEventTable { .. })
-                ),
-                "{table} has no matched history to fill"
-            );
-        }
-        assert!(matches!(
-            parse(r#"[{"matched": "uniswap_v9_*"}]"#).resolve(&schema),
-            Err(RouteError::NoMatch { .. })
-        ));
-        assert!(
-            serde_json::from_str::<Tables>(r#"[{"matched": "logs", "only": "x"}]"#).is_err(),
-            "an unknown key is refused"
-        );
-
-        let sink: Sink =
-            toml::from_str(r#"tables = ["metric_v1_*", { matched = "uniswap_v3_pool_*" }]"#)
-                .expect("a settings file's form parses");
-        assert_eq!(
-            sink.tables,
-            Tables(vec![
-                Entry::All("metric_v1_*".to_owned()),
-                Entry::Matched {
-                    matched: "uniswap_v3_pool_*".to_owned()
-                },
-            ])
-        );
-    }
-
-    /// A `!` entry takes its tables out of what the others select, wherever it stands,
-    /// matched ones too; one matching nothing is refused as any entry is, and a list of
+    /// A `!` entry takes its tables out of what the others select, wherever it stands;
+    /// one matching nothing is refused as any entry is, and a list of
     /// nothing but `!` entries does not parse.
     #[test]
     fn a_negated_entry_takes_its_tables_out() {
@@ -839,24 +658,13 @@ mod tests {
         let selected = parse(r#"["!uniswap_v3_pool_swap", "uniswap_v3_pool_*", "test_*"]"#)
             .resolve(&schema)
             .expect("resolves");
-        let names = names(&schema, &selected.tables);
+        let names = names(&schema, &selected);
         assert!(names.contains(&"uniswap_v3_pool_mint".to_owned()));
         assert!(names.contains(&"test_rows".to_owned()));
         assert!(
             !names.contains(&"uniswap_v3_pool_swap".to_owned()),
             "taken out, though it came first"
         );
-
-        let matched = parse(r#"[{"matched": "uniswap_v3_pool_*"}, "!*_swap"]"#)
-            .resolve(&schema)
-            .expect("resolves");
-        assert!(
-            !super::tests::names(&schema, &matched.tables)
-                .iter()
-                .any(|name| name.ends_with("_swap")),
-            "a matched table is taken out too"
-        );
-        assert!(matched.matched.is_subset(&matched.tables));
 
         assert!(matches!(
             parse(r#"["logs", "!uniswap_v9_*"]"#).resolve(&schema),
@@ -870,88 +678,6 @@ mod tests {
         assert!(serde_json::from_str::<Tables>(r#"["logs", "!"]"#).is_err());
     }
 
-    /// A sink keeping a table to the matched pools' rows takes a matched pool's decoded
-    /// record and no other contract's; a sink taking the same tables whole takes both,
-    /// and the bookkeeping reaches each. A pool matched later is kept from then on.
-    #[tokio::test]
-    async fn a_matched_sink_takes_only_the_matched_pools_rows() {
-        let schema = fixtures::schema();
-        let matched =
-            serde_json::from_str::<Tables>(r#"["logs", {"matched": "uniswap_v3_pool_*"}]"#)
-                .expect("parses")
-                .resolve(&schema)
-                .expect("resolves");
-        let whole = tables(&["logs", "contract_events"])
-            .resolve(&schema)
-            .expect("resolves");
-        let pool = fixtures::decoded_swap();
-        let mut other = pool.clone();
-        other.address = alloy_primitives::Address::repeat_byte(0x0e);
-        other.log_index += 1;
-        let kept = SharedKept::new(std::sync::RwLock::new(Kept::of(&[pool.address], &[])));
-        let mut router = Router::new(
-            Arc::clone(&schema),
-            Arc::clone(&kept),
-            vec![(Seen::default(), matched), (Seen::default(), whole)],
-        );
-        let log = |address, log_index| {
-            Event::Log(Box::new(crate::wire::datasets::evm::Log {
-                log_index,
-                address,
-                ..Default::default()
-            }))
-        };
-        let events = [
-            log(pool.address, 0),
-            log(other.address, 1),
-            Event::Decoded(Box::new(pool)),
-            Event::Decoded(Box::new(other.clone())),
-            Event::AcceptedBlock(BlockMeta {
-                height: 1,
-                hash: B256::with_last_byte(1),
-                parent_hash: B256::ZERO,
-                timestamp: 1,
-            }),
-        ];
-        for event in &events {
-            router
-                .publish(envelope(event.clone()))
-                .await
-                .expect("publish");
-        }
-        *kept.write().expect("not poisoned") =
-            Kept::of(&[events_address(&events[0]), other.address], &[]);
-        let later = Event::Decoded(Box::new(Decoded {
-            log_index: other.log_index + 1,
-            ..other
-        }));
-        router
-            .publish(envelope(later.clone()))
-            .await
-            .expect("publish");
-        let key = |at: usize| events[at].dedupe_key();
-        let [matched, whole] = &router.sinks[..] else {
-            panic!("two sinks");
-        };
-        // Logs are taken whole; of the pool tables, only the matched pools' records.
-        assert_eq!(
-            matched.0.keys,
-            [key(0), key(1), key(2), key(4), later.dedupe_key()]
-        );
-        assert_eq!(
-            whole.0.keys,
-            [key(0), key(1), key(2), key(3), key(4), later.dedupe_key()]
-        );
-    }
-
-    /// The contract `event`, a log, came from.
-    fn events_address(event: &Event) -> alloy_primitives::Address {
-        match event {
-            Event::Log(log) => log.address,
-            _ => panic!("a log"),
-        }
-    }
-
     /// A sink stuck in its flush, as a store with a full channel is, does not hold the
     /// block back from the sinks after it.
     #[tokio::test]
@@ -959,13 +685,9 @@ mod tests {
         let gate = Arc::new(tokio::sync::Semaphore::new(0));
         let sink = |opens| {
             let gate = Arc::clone(&gate);
-            (Gate { opens, gate }, Selection::default())
+            (Gate { opens, gate }, HashSet::new())
         };
-        let mut router = Router::new(
-            fixtures::schema(),
-            SharedKept::default(),
-            vec![sink(false), sink(true)],
-        );
+        let mut router = Router::new(fixtures::schema(), vec![sink(false), sink(true)]);
         tokio::time::timeout(std::time::Duration::from_secs(5), router.flush())
             .await
             .expect("the second sink's flush opens the first's gate")

@@ -49,72 +49,16 @@ use crate::wire::datasets::evm::Log;
 /// never split, so a read may take more.
 const READ_BYTES: u64 = 256 * 1024 * 1024;
 
+/// The most addresses a read of `logs` filters by in the scan, as `address IN (…)`.
+/// `DataFusion` plans such a list as nested expressions, one deeper per value, so a long
+/// one overflows the stack: a read of more is not filtered in the scan, and keeps only the
+/// rows of its addresses as the batches stream past.
+pub(crate) const SCAN_ADDRESSES: usize = 256;
+
 /// How many times a backfill's commit is tried before it stops. An append conflicts only
 /// with a concurrent commit that deletes a file it read, such as a reorg's in the running
 /// store's window; the next try reads the table again.
 const WRITE_ATTEMPTS: u32 = 4;
-
-/// The oldest and newest blocks of the ledger of the chain's lake under `<uri>/<chain>/`,
-/// reached with the object store options `storage`, and the bound below which a backfill
-/// may write (see [`LogReader::bound`]); `None` when the ledger is empty. Opens the
-/// ledger alone, without listing the other tables' files, so it is cheap to ask often.
-///
-/// # Errors
-///
-/// Returns [`StoreError::Engine`] when the table does not exist or cannot be read,
-/// [`StoreError::Drift`] when it does not match its definition, and
-/// [`StoreError::Restore`] when a stored value does not parse.
-pub async fn ledger_ends(
-    uri: &str,
-    storage: &BTreeMap<String, Secret>,
-    schema: &Schema,
-    chain: &str,
-) -> Result<Option<LedgerEnds>, StoreError> {
-    let root = uri.trim_end_matches('/');
-    let storage = Storage::new(root, storage)?;
-    let def = schema.dataset(Table::AcceptedBlock);
-    let uri = format!("{root}/{chain}/{}", def.name);
-    let checkpoints = Arc::new(Semaphore::new(CONCURRENT_CHECKPOINTS));
-    let ledger = open_table(&storage, uri, def, Missing::Refuse, checkpoints).await?;
-    let ledger = ledger.read_ledger().await?;
-    Ok(ledger
-        .first()
-        .zip(ledger.last())
-        .map(|(oldest, newest)| LedgerEnds {
-            oldest: *oldest,
-            newest: *newest,
-            bound: newest.height.saturating_sub(MAX_RESUME_LAG),
-        }))
-}
-
-/// What [`ledger_ends`] reads.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct LedgerEnds {
-    /// The ledger's oldest block, a window below its newest.
-    pub oldest: crate::wire::envelope::BlockMeta,
-    /// Its newest block, the lake's tip.
-    pub newest: crate::wire::envelope::BlockMeta,
-    /// The highest block a backfill may write.
-    pub bound: u64,
-}
-
-impl LedgerEnds {
-    /// The height about `seconds` before the tip, from the ledger's pace, rounded down
-    /// so a read from it starts no later.
-    #[must_use]
-    pub fn height_before(&self, seconds: u64) -> u64 {
-        let heights = self.newest.height.saturating_sub(self.oldest.height).max(1);
-        let elapsed = self
-            .newest
-            .timestamp
-            .saturating_sub(self.oldest.timestamp)
-            .max(1);
-        let back = u128::from(seconds) * u128::from(heights) / u128::from(elapsed);
-        self.newest
-            .height
-            .saturating_sub(u64::try_from(back).unwrap_or(u64::MAX))
-    }
-}
 
 /// A chain's lake, read only: which files of `logs` hold which heights, the newest
 /// block the running store committed, and what its current run decodes. Cheap to clone,
@@ -271,6 +215,12 @@ impl LogReader {
         self.width
     }
 
+    /// The lowest block any file of `logs` holds, `None` for a lake with none.
+    #[must_use]
+    pub fn first(&self) -> Option<u64> {
+        self.files.first().map(|file| file.low)
+    }
+
     /// The highest block a backfill may write: the ledger's tip less
     /// four ledger windows. The running store deletes only above some height — a reorg's
     /// fork, a stopped commit's leftovers, both inside its window, and a restart's rewind
@@ -328,6 +278,9 @@ impl LogReader {
             .iter()
             .map(|address| format!("{address:#x}"))
             .collect();
+        // A short list filters the scan too; a long one only the rows as they stream past.
+        let scanned = (addresses.len() <= SCAN_ADDRESSES).then(|| addresses.clone());
+        let kept: HashSet<String> = addresses.into_iter().collect();
         async move {
             let mut logs = Vec::new();
             if paths.is_empty() {
@@ -339,13 +292,15 @@ impl LogReader {
                     .into();
                 columns.extend(texts_of(&TEXT_COLUMNS));
                 columns.extend([ident("removed"), seconds("block_timestamp")]);
-                frame
-                    .filter(within("block_number", &blocks, width))?
-                    .filter(in_texts("address", &addresses))?
-                    .select(columns)
+                let frame = frame.filter(within("block_number", &blocks, width))?;
+                match &scanned {
+                    Some(addresses) => frame.filter(in_texts("address", addresses))?,
+                    None => frame,
+                }
+                .select(columns)
             };
             scan((&table, "logs"), Some(paths), streams, plan, |batch| {
-                logs_of(batch, &mut logs)
+                logs_of(batch, &kept, &mut logs)
             })
             .await?;
             logs.sort_unstable_by_key(|log| (log.block_number, log.log_index));
@@ -688,8 +643,13 @@ const TEXT_COLUMNS: [&str; 8] = [
     "block_hash",
 ];
 
-/// Appends the logs of `batch`, read as [`LogReader::read`] selects them, to `logs`.
-fn logs_of(batch: &RecordBatch, logs: &mut Vec<Log>) -> Result<(), InvalidStoredValue> {
+/// Appends the logs of `batch`, read as [`LogReader::read`] selects them, to `logs`: those
+/// of `kept`'s addresses.
+fn logs_of(
+    batch: &RecordBatch,
+    kept: &HashSet<String>,
+    logs: &mut Vec<Log>,
+) -> Result<(), InvalidStoredValue> {
     const TOPICS: [&str; 4] = ["logs.topic0", "logs.topic1", "logs.topic2", "logs.topic3"];
     let log_index = uints(batch, 0, "logs.log_index")?;
     let transaction_index = uints(batch, 1, "logs.transaction_index")?;
@@ -717,6 +677,9 @@ fn logs_of(batch: &RecordBatch, logs: &mut Vec<Log>) -> Result<(), InvalidStored
         InvalidStoredValue::parse(TOPICS[index], values.value(row)).map(Some)
     };
     for row in 0..batch.num_rows() {
+        if !kept.contains(address.value(row)) {
+            continue;
+        }
         logs.push(Log {
             log_index: log_index.value(row),
             transaction_hash: InvalidStoredValue::parse(

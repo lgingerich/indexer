@@ -9,7 +9,7 @@
 use alloy_dyn_abi::DynSolValue;
 use alloy_primitives::{Address, B256, keccak256};
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::config::Settings;
@@ -19,7 +19,7 @@ use crate::ingest::source::{BlockSource, FetchedBlock, HeadStream, SourceError};
 use crate::sink::channel::Batching;
 use crate::sink::duckdb::DuckDb;
 use crate::sink::resume::Opened;
-use crate::sink::route::{Selection, StoreBackend};
+use crate::sink::route::StoreBackend;
 use crate::sink::stop::Stop;
 use crate::sink::store_runtime::StoreRuntime;
 use crate::sink::table::Schema;
@@ -171,10 +171,7 @@ fn every_table<S>(backend: StoreBackend, store: S, batching: Batching) -> Opened
         backend,
         store,
         batching,
-        tables: Selection {
-            tables: schema().tables().iter().map(|def| def.id).collect(),
-            matched: HashSet::new(),
-        },
+        tables: schema().tables().iter().map(|def| def.id).collect(),
         runtime: StoreRuntime::current(),
     }
 }

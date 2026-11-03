@@ -452,3 +452,56 @@ async fn a_session_goes_with_its_block_and_each_run_writes_one() {
         "the reopened run writes its own session"
     );
 }
+
+/// A handed-over contract recorded in a committed block is restored whole when the
+/// lake opens again.
+#[tokio::test]
+async fn a_handed_over_contract_is_restored_whole() {
+    let dir = Dir::new();
+    let mut sink = open(&dir).await;
+    let handoff = fixtures::handoff(1, hash(1, 0));
+    let mut envelopes = block(1, 0);
+    envelopes.push(Envelope::new(
+        ChainId::new(CHAIN),
+        Event::Handoff(Box::new(handoff.clone())),
+    ));
+    publish(&mut sink, envelopes).await;
+    drop(sink);
+
+    let restored = open(&dir).await.restore().await.expect("the lake restores");
+    assert_eq!(restored.handoffs, [handoff]);
+}
+
+/// A backfill's read for more contracts than a scan filters by, as a chain with hundreds
+/// of thousands of pools asks, returns the same logs as a read for the one among them
+/// that emitted any, rather than overflowing the stack planning the filter.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_read_for_many_contracts_finds_their_logs() {
+    let dir = Dir::new();
+    let mut sink = open(&dir).await;
+    for height in 1..=20 {
+        publish(&mut sink, block(height, 0)).await;
+    }
+    drop(sink);
+    let reader = crate::sink::delta::LogReader::open(
+        &dir.uri(),
+        &std::collections::BTreeMap::new(),
+        &Schema::new().expect("the dataset tables"),
+        CHAIN,
+        false,
+    )
+    .await
+    .expect("the reader opens");
+    let emitter = alloy_primitives::Address::ZERO;
+    let mut many: Vec<alloy_primitives::Address> = (1..=crate::sink::delta::replay::SCAN_ADDRESSES)
+        .map(|n| {
+            let mut bytes = [0xaa; 20];
+            bytes[..8].copy_from_slice(&u64::try_from(n).expect("fits").to_be_bytes());
+            alloy_primitives::Address::from(bytes)
+        })
+        .collect();
+    many.push(emitter);
+    let one = reader.read(1..=20, &[emitter], 2).await.expect("read");
+    assert_eq!(one.len(), 20);
+    assert_eq!(reader.read(1..=20, &many, 2).await.expect("read"), one);
+}

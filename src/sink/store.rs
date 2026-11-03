@@ -34,12 +34,12 @@ use crate::sink::store_error::{
     self, ColumnDrift, EngineError, InvalidStoredValue, Operation, StoreError,
 };
 use crate::sink::table::{
-    CONTRACT_COLUMNS, HANDOFF_COLUMNS, LEDGER_COLUMNS, MATCHED_COLUMNS, Row, Schema, Session,
-    Table, TableDef, TableError, TableId, Value,
+    CONTRACT_COLUMNS, HANDOFF_COLUMNS, LEDGER_COLUMNS, Row, Schema, Session, Table, TableDef,
+    TableError, TableId, Value,
 };
 use crate::sink::{EnvelopeSink, Restored, SinkError, Store, StoredContract};
 use crate::window::LEDGER_WINDOW;
-use crate::wire::envelope::{BlockMeta, ChainId, Envelope, Handoff, Matched};
+use crate::wire::envelope::{BlockMeta, ChainId, Envelope, Handoff};
 
 /// What runs a [`SqlStore`]'s statements.
 pub trait Engine: Send {
@@ -124,7 +124,6 @@ impl Prepared {
 struct Reads {
     contracts: String,
     handoffs: String,
-    matched: String,
     ledger: String,
     /// Run by every flush that accepts a block.
     prune_ledger: String,
@@ -142,9 +141,6 @@ impl Reads {
                 .ordered_by("dedupe_key")
                 .render()?,
             handoffs: sql::select(schema.dataset(Table::Handoff), &HANDOFF_COLUMNS)
-                .ordered_by("dedupe_key")
-                .render()?,
-            matched: sql::select(schema.dataset(Table::Matched), &MATCHED_COLUMNS)
                 .ordered_by("dedupe_key")
                 .render()?,
             ledger: sql::select(ledger, &LEDGER_COLUMNS)
@@ -348,44 +344,6 @@ impl<E: Engine> SqlStore<E> {
             .collect()
     }
 
-    /// Every pool the store records as matched to a Metric pool's pair, each from a
-    /// canonical block: a record of an orphaned block was deleted with that block.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`StoreError::Engine`] when the query fails and [`StoreError::Restore`]
-    /// when a stored value does not parse.
-    pub(crate) async fn matched(&mut self) -> Result<Vec<Matched>, StoreError> {
-        let chain = self.chain_param();
-        let rows = self
-            .engine
-            .query(&self.reads.matched, &[chain])
-            .await
-            .map_err(StoreError::engine(Operation::Read, Some("matched_pools")))?;
-        rows.iter()
-            .map(|row| {
-                Ok(Matched {
-                    protocol: text("matched_pools.protocol", column(row, 0))?.to_owned(),
-                    contract: parse("matched_pools.contract", column(row, 1))?,
-                    pool_id: optional("matched_pools.pool_id", column(row, 2))?,
-                    token0: parse("matched_pools.token0", column(row, 3))?,
-                    token1: parse("matched_pools.token1", column(row, 4))?,
-                    fee: uint("matched_pools.fee", column(row, 5))?,
-                    hooks: optional("matched_pools.hooks", column(row, 6))?,
-                    created_block: uint("matched_pools.created_block", column(row, 7))?,
-                    from_timestamp: timestamp("matched_pools.from_timestamp", column(row, 8))?,
-                    filled: match column(row, 9) {
-                        Value::Bool(filled) => *filled,
-                        other => return Err(invalid("matched_pools.filled", other).into()),
-                    },
-                    block_number: uint("matched_pools.block_number", column(row, 10))?,
-                    block_hash: parse("matched_pools.block_hash", column(row, 11))?,
-                    block_timestamp: timestamp("matched_pools.block_timestamp", column(row, 12))?,
-                })
-            })
-            .collect()
-    }
-
     /// The newest `limit` accepted blocks on the store's chain, oldest first. An orphaned
     /// block's row was deleted by its `reorg`, so these are canonical.
     ///
@@ -570,7 +528,6 @@ impl<E: Engine + 'static> Store for SqlStore<E> {
         Ok(Restored {
             contracts: self.contracts().await?,
             handoffs: self.handoffs().await?,
-            matched: self.matched().await?,
             ledger: self.ledger(LEDGER_WINDOW).await?,
         })
     }
@@ -715,17 +672,6 @@ fn uint(column: &'static str, value: &Value) -> Result<u64, InvalidStoredValue> 
             magnitude,
         } => u64::try_from(*magnitude).map_err(|_| invalid(column, value)),
         other => Err(invalid(column, other)),
-    }
-}
-
-/// A nullable value kept as text, parsed as what it holds, or `None` for none.
-fn optional<T: std::str::FromStr>(
-    column: &'static str,
-    value: &Value,
-) -> Result<Option<T>, InvalidStoredValue> {
-    match value {
-        Value::Null => Ok(None),
-        value => parse(column, value).map(Some),
     }
 }
 

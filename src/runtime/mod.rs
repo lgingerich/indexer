@@ -88,6 +88,7 @@
 //! but a `SIGTERM` from anything else, such as an operator's `docker stop`, also leaves
 //! the chain down until something starts it again.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use thiserror::Error;
@@ -100,14 +101,12 @@ use crate::ingest::source::evm::{http_client, ws_connect};
 use crate::ingest::source::{
     AnySource, BlockSource, EvmSource, HyperSyncRanges, HyperSyncSource, SourceError,
 };
-use crate::sink::route::{self, Backend, RouteError, Router, Selection, StoreBackend};
+use crate::sink::route::{self, Backend, RouteError, Router, StoreBackend};
 use crate::sink::stop::Stop;
-use crate::sink::table::Schema;
+use crate::sink::table::{Schema, TableId};
 use crate::sink::{SinkError, StdoutJsonSink};
 use crate::wire::envelope::ChainId;
 
-#[cfg(feature = "store")]
-mod pairs;
 #[cfg(feature = "store")]
 mod stores;
 
@@ -251,9 +250,6 @@ pub(crate) struct Pipeline<B = AnySource> {
     /// `crate::sink::delta::HandoffWatch`).
     #[cfg(feature = "delta")]
     watch: Option<crate::sink::delta::HandoffWatch>,
-    /// The pools to match to Metric's pairs, when `[decode.pairs]` asks for them.
-    #[cfg(feature = "store")]
-    pairs: Option<pairs::Pairs>,
 }
 
 /// Where [`Pipeline::run`] sends the stream, resolved from the settings once: the tables
@@ -266,7 +262,7 @@ pub(crate) struct Pipeline<B = AnySource> {
 #[derive(Debug)]
 pub(crate) enum Routes {
     /// `[sink.stdout]`, and the tables it prints.
-    Print(Selection),
+    Print(HashSet<TableId>),
     /// Every store named, in a fixed order. Never empty.
     #[cfg(feature = "store")]
     Store(Vec<StoreRoute>),
@@ -277,7 +273,7 @@ pub(crate) enum Routes {
 #[derive(Debug)]
 pub(crate) struct StoreRoute {
     settings: crate::config::StoreSettings,
-    tables: Selection,
+    tables: HashSet<TableId>,
 }
 
 impl Pipeline {
@@ -348,8 +344,8 @@ impl Pipeline {
             }
         };
         #[cfg_attr(
-            not(feature = "store"),
-            expect(unused_mut, reason = "only a run that stores matches pools")
+            not(feature = "delta"),
+            expect(unused_mut, reason = "only a run with a lake watches its backfills")
         )]
         let mut pipeline = Self::new(
             source,
@@ -357,10 +353,6 @@ impl Pipeline {
             settings.ingest.stop_block,
             catalog,
         );
-        #[cfg(feature = "store")]
-        {
-            pipeline.pairs = pairs::Pairs::from_settings(settings, &routes, &pipeline.catalog)?;
-        }
         // The first lake's backfills hand the run contracts.
         #[cfg(feature = "delta")]
         if let Routes::Store(stores) = &routes {
@@ -375,7 +367,7 @@ impl Pipeline {
 
 impl Routes {
     /// The tables each sink writes, whose union ingest fetches.
-    fn tables(&self) -> Vec<&Selection> {
+    fn tables(&self) -> Vec<&HashSet<TableId>> {
         match self {
             Self::Print(tables) => vec![tables],
             #[cfg(feature = "store")]
@@ -403,8 +395,6 @@ impl<B: BlockSource + 'static> Pipeline<B> {
             catalog,
             #[cfg(feature = "delta")]
             watch: None,
-            #[cfg(feature = "store")]
-            pairs: None,
         }
     }
 
@@ -443,7 +433,7 @@ impl<B: BlockSource + 'static> Pipeline<B> {
 
     /// Prints `tables`, as `[sink.stdout]` names them. No store, so nothing to restore: a
     /// run starts fresh from the manifests' seeds.
-    async fn print(self, tables: Selection) -> Result<(), RuntimeError> {
+    async fn print(self, tables: HashSet<TableId>) -> Result<(), RuntimeError> {
         let Self {
             source,
             start_block,
@@ -452,12 +442,8 @@ impl<B: BlockSource + 'static> Pipeline<B> {
             schema,
             ..
         } = self;
-        // Printing keeps no store to record a match in, so it matches nothing.
         let sinks = vec![(StdoutJsonSink::new(), tables)];
-        let sink = DecodingSink::new(
-            Decoder::new(catalog, []),
-            Router::new(schema, crate::decode::SharedKept::default(), sinks),
-        );
+        let sink = DecodingSink::new(Decoder::new(catalog, []), Router::new(schema, sinks));
         Machine::new(source, sink, Vec::new())
             .run(start_block, stop_block)
             .await?;

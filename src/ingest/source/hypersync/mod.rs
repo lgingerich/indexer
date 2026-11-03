@@ -43,6 +43,8 @@ mod search;
 mod wire;
 
 pub use search::LogSearch;
+#[cfg(all(test, feature = "delta"))]
+pub(crate) use search::testing;
 
 use std::fmt;
 use std::num::{NonZeroU64, NonZeroUsize};
@@ -338,32 +340,7 @@ impl HyperSyncSource {
         &self,
         request: &impl Fn(&reqwest::Client) -> reqwest::RequestBuilder,
     ) -> Result<T, SourceError> {
-        let response = request(&self.client)
-            .bearer_auth(&self.token)
-            .send()
-            .await?;
-        let status = response.status();
-        // The delay-seconds form only, as alloy reads it for the RPC source; a date is
-        // rare, and the backoff covers it.
-        let retry_after = response
-            .headers()
-            .get(reqwest::header::RETRY_AFTER)
-            .and_then(|value| value.to_str().ok())
-            .and_then(|value| value.trim().parse().ok())
-            .map(Duration::from_secs);
-        let body = response.bytes().await?;
-        if !status.is_success() {
-            return Err(SourceError::Status {
-                context: CONTEXT,
-                status: status.as_u16(),
-                detail: String::from_utf8_lossy(&body).chars().take(500).collect(),
-                retry_after,
-            });
-        }
-        serde_json::from_slice(&body).map_err(|source| SourceError::Json {
-            context: CONTEXT,
-            source,
-        })
+        answer(request(&self.client), &self.token).await
     }
 
     /// The header at `height`, read alone.
@@ -375,6 +352,37 @@ impl HyperSyncSource {
             .map(|block| block.meta)
             .ok_or_else(|| malformed(CONTEXT, format!("no block at {height}")))
     }
+}
+
+/// Sends `request` once, authorized by `token`, and decodes the answer: a status other
+/// than success is a [`SourceError::Status`] carrying the endpoint's `Retry-After`.
+pub(super) async fn answer<T: DeserializeOwned>(
+    request: reqwest::RequestBuilder,
+    token: &str,
+) -> Result<T, SourceError> {
+    let response = request.bearer_auth(token).send().await?;
+    let status = response.status();
+    // The delay-seconds form only, as alloy reads it for the RPC source; a date is
+    // rare, and the backoff covers it.
+    let retry_after = response
+        .headers()
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse().ok())
+        .map(Duration::from_secs);
+    let body = response.bytes().await?;
+    if !status.is_success() {
+        return Err(SourceError::Status {
+            context: CONTEXT,
+            status: status.as_u16(),
+            detail: String::from_utf8_lossy(&body).chars().take(500).collect(),
+            retry_after,
+        });
+    }
+    serde_json::from_slice(&body).map_err(|source| SourceError::Json {
+        context: CONTEXT,
+        source,
+    })
 }
 
 /// What `result` came to: whether it is worth sending again, and how it moves the pace.

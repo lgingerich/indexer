@@ -5,52 +5,54 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ops::RangeInclusive;
 
 use alloy_primitives::{Address, B256};
-use tracing::info;
+use tracing::{info, warn};
 
 use super::{BackfillError, BackfillSettings, HANDOFF_POLL, HANDOFF_WAIT};
+use crate::config::HyperSyncEndpoint;
 use crate::decode::Decoder;
+use crate::ingest::source::LogSearch;
 use crate::sink::delta::{HandoffQueue, LogReader, RunLock};
 use crate::sink::table::{Schema, Session, SessionEvent};
-use crate::wire::datasets::evm::Contract;
+use crate::wire::datasets::evm::{Contract, Log};
 use crate::wire::envelope::ChainId;
 
-/// Finds the contracts the decoder's factories created in `blocks` of the lake: reads
-/// their logs, adding each child they create, then the logs of any child that creates
-/// others in turn, until a pass finds no new factory. Returns them in creation order.
+/// Finds the contracts the decoder's factories created in `blocks`: first those created
+/// below the lake's first block, from their logs over `HyperSync` when `hypersync` names it
+/// (from the chain's first block, whatever `blocks` starts at, since the lake has no
+/// record of which it searched before),
+/// then those in the lake. Each reads the factories' logs, adding each child they create,
+/// then the logs of any child that creates others in turn, until a pass finds no new
+/// factory. Returns them in creation order.
 pub(super) async fn discover(
     decoder: &mut Decoder,
     reader: &LogReader,
+    hypersync: Option<&HyperSyncEndpoint>,
     blocks: RangeInclusive<u64>,
     streams: usize,
 ) -> Result<Vec<Contract>, BackfillError> {
-    let mut read = HashSet::new();
     let mut found = Vec::new();
+    let first = reader.first().unwrap_or_default();
+    if *blocks.start() < first && !blocks.is_empty() {
+        let through = first.saturating_sub(1).min(*blocks.end());
+        if let Some(hypersync) = hypersync {
+            before_lake(decoder, hypersync, through, &mut found).await?;
+        } else {
+            warn!(
+                first,
+                "no [backfill.hypersync]: contracts the factories created \
+                below the lake's first block are not found"
+            );
+        }
+    }
+    let mut read = HashSet::new();
     loop {
-        let parents: Vec<Address> = decoder
-            .parents()
-            .into_iter()
-            .filter(|&parent| read.insert(parent))
-            .collect();
+        let parents = unread(decoder, &mut read);
         if parents.is_empty() || blocks.is_empty() {
             break;
         }
         for range in reader.reads(*blocks.start(), *blocks.end()) {
             let logs = reader.read(range, &parents, streams).await?;
-            tokio::task::block_in_place(|| {
-                for log in &logs {
-                    let Some((record, claims)) = decoder.decode(log) else {
-                        continue;
-                    };
-                    if let Err(error) = record
-                        && error.is_invariant()
-                    {
-                        return Err(BackfillError::from(error));
-                    }
-                    found.extend(claims.contracts().cloned());
-                    decoder.admit(claims);
-                }
-                Ok(())
-            })?;
+            tokio::task::block_in_place(|| admit(decoder, &logs, &mut found))?;
         }
         info!(
             factories = parents.len(),
@@ -62,6 +64,62 @@ pub(super) async fn discover(
     }
     found.sort_by_key(|contract| (contract.block_number, contract.log_index));
     Ok(found)
+}
+
+/// Adds to `decoder` and `found` the contracts its factories created through block
+/// `through`, below the lake, from their logs over `hypersync`.
+async fn before_lake(
+    decoder: &mut Decoder,
+    hypersync: &HyperSyncEndpoint,
+    through: u64,
+    found: &mut Vec<Contract>,
+) -> Result<(), BackfillError> {
+    let search = LogSearch::new(&hypersync.url, hypersync.token.expose())?;
+    let mut searched = HashSet::new();
+    loop {
+        let parents = unread(decoder, &mut searched);
+        if parents.is_empty() {
+            return Ok(());
+        }
+        let logs = search.logs(&parents, through).await?;
+        tokio::task::block_in_place(|| admit(decoder, &logs, found))?;
+        info!(
+            factories = parents.len(),
+            found = found.len(),
+            through,
+            "discovered contracts below the lake's first block"
+        );
+    }
+}
+
+/// The decoder's factories not in `read` yet, now added to it.
+fn unread(decoder: &Decoder, read: &mut HashSet<Address>) -> Vec<Address> {
+    decoder
+        .parents()
+        .into_iter()
+        .filter(|&parent| read.insert(parent))
+        .collect()
+}
+
+/// Decodes `logs`, adding each contract they create to `decoder` and `found`.
+fn admit(
+    decoder: &mut Decoder,
+    logs: &[Log],
+    found: &mut Vec<Contract>,
+) -> Result<(), BackfillError> {
+    for log in logs {
+        let Some((record, claims)) = decoder.decode(log) else {
+            continue;
+        };
+        if let Err(error) = record
+            && error.is_invariant()
+        {
+            return Err(BackfillError::from(error));
+        }
+        found.extend(claims.contracts().cloned());
+        decoder.admit(claims);
+    }
+    Ok(())
 }
 
 /// Adds `handed`, each with the first block its record names, to `decoder`, for one an
@@ -141,7 +199,10 @@ pub(super) async fn handover(
     for contract in found {
         candidates.entry(contract.address).or_insert(contract);
     }
-    let handed = select(settings.only.as_deref(), candidates.into_values().collect())?;
+    let handed = select(
+        settings.run.only.as_deref(),
+        candidates.into_values().collect(),
+    )?;
     lock.check()?;
     let queued = queue.append(schema, chain, &handed).await?;
     info!(%chain, handed = handed.len(), queued, "contracts handed to the running indexer");

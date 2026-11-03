@@ -38,7 +38,7 @@ use crate::sink::{
 };
 use crate::window::LEDGER_WINDOW;
 use crate::wire::datasets::evm::{Block, Contract, Log, Transaction};
-use crate::wire::envelope::{BlockMeta, ChainId, Envelope, Event, Handoff, Matched, Reorg};
+use crate::wire::envelope::{BlockMeta, ChainId, Envelope, Event, Handoff, Reorg};
 
 /// How an engine's tests open a store and look inside it.
 pub(crate) trait Harness: Sized {
@@ -86,6 +86,7 @@ macro_rules! contract_tests {
             the_ledger_reads_back_the_newest_canonical_window,
             a_flush_prunes_the_ledger_below_the_window,
             stored_contracts_read_back_and_orphaned_ones_are_deleted,
+            a_handed_over_contract_reads_back_whole,
             a_decoded_record_lands_in_its_typed_event_table,
             a_store_writes_only_the_tables_routed_to_it,
         );
@@ -159,21 +160,6 @@ pub(crate) fn every_kind(chain: &ChainId) -> Vec<Envelope> {
             protocol: "uniswap_v3".to_owned(),
             name: "UniswapV3Pool".to_owned(),
             address: Address::from([0x77; 20]),
-            block_number: 100,
-            block_hash: hash(0x01),
-            block_timestamp: 1_700_000_000,
-        })),
-        Event::Matched(Box::new(Matched {
-            protocol: "uniswap_v4".to_owned(),
-            contract: Address::from([0x78; 20]),
-            pool_id: Some(hash(0x79)),
-            token0: Address::ZERO,
-            token1: Address::from([0x7a; 20]),
-            fee: 500,
-            hooks: None,
-            created_block: 90,
-            from_timestamp: 1_699_000_000,
-            filled: false,
             block_number: 100,
             block_hash: hash(0x01),
             block_timestamp: 1_700_000_000,

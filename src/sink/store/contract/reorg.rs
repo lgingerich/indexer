@@ -384,3 +384,21 @@ pub(crate) async fn stored_contracts_read_back_and_orphaned_ones_are_deleted<H: 
     assert_eq!(row_count(&mut harness, "contracts").await, 0);
     harness.remove().await;
 }
+
+/// A handed-over contract reads back as it was written, every field, so a restart
+/// restores it whole.
+pub(crate) async fn a_handed_over_contract_reads_back_whole<H: Harness>() {
+    let (mut sink, harness) = H::open(datasets()).await;
+    let chain = harness.chain();
+    let handoff = crate::sink::fixtures::handoff(100, hash(0x01));
+    commit(
+        &mut sink,
+        [Envelope::new(
+            chain,
+            Event::Handoff(Box::new(handoff.clone())),
+        )],
+    )
+    .await;
+    assert_eq!(sink.handoffs().await.expect("read back"), [handoff]);
+    harness.remove().await;
+}

@@ -45,9 +45,7 @@ use crate::wire::datasets::evm::Decoded;
 use crate::wire::envelope::{BlockMeta, ChainId, Event};
 
 pub use cell::{Cell, Timestamp, Value};
-pub use datasets::{
-    CONTRACT_COLUMNS, HANDOFF_COLUMNS, LEDGER_COLUMNS, MATCHED_COLUMNS, REORG_COLUMNS,
-};
+pub use datasets::{CONTRACT_COLUMNS, HANDOFF_COLUMNS, LEDGER_COLUMNS, REORG_COLUMNS};
 pub use events::snake_case;
 pub use session::{Session, SessionEvent};
 
@@ -136,14 +134,11 @@ pub enum Table {
     /// The contracts a backfill handed the running indexer, each with the first block it
     /// decoded them in: see [`Handoff`](crate::wire::envelope::Handoff).
     Handoff,
-    /// The pools matched to Metric pools' pairs, which the stores keeping only matched
-    /// pools take: see [`Matched`](crate::wire::envelope::Matched).
-    Matched,
 }
 
 impl Table {
     /// Every dataset table, in the order a store creates them.
-    pub const ALL: [Self; 10] = [
+    pub const ALL: [Self; 9] = [
         Self::Block,
         Self::Transaction,
         Self::Log,
@@ -153,7 +148,6 @@ impl Table {
         Self::AcceptedBlock,
         Self::Session,
         Self::Handoff,
-        Self::Matched,
     ];
 
     /// The table's name. Plural, as Allium names its tables.
@@ -169,23 +163,17 @@ impl Table {
             Self::AcceptedBlock => "accepted_blocks",
             Self::Session => "sessions",
             Self::Handoff => "handoffs",
-            Self::Matched => "matched_pools",
         }
     }
 
     /// Whether every store writes this table, whatever it is routed: the ledger a
     /// restart resumes from, the retractions it applied, the contracts decode restores,
-    /// what each run decoded, the contracts backfills handed it, and the pools it matched.
+    /// what each run decoded, and the contracts backfills handed it.
     #[must_use]
     pub const fn is_bookkeeping(self) -> bool {
         matches!(
             self,
-            Self::Contract
-                | Self::Reorg
-                | Self::AcceptedBlock
-                | Self::Session
-                | Self::Handoff
-                | Self::Matched
+            Self::Contract | Self::Reorg | Self::AcceptedBlock | Self::Session | Self::Handoff
         )
     }
 }
@@ -694,7 +682,6 @@ impl Schema {
             }
             Event::Contract(_) => (Table::Contract.into(), None),
             Event::Handoff(_) => (Table::Handoff.into(), None),
-            Event::Matched(_) => (Table::Matched.into(), None),
             Event::Reorg(_) => (Table::Reorg.into(), None),
             Event::AcceptedBlock(_) => (Table::AcceptedBlock.into(), None),
         })

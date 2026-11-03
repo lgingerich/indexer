@@ -54,11 +54,12 @@ use futures_util::future::{BoxFuture, try_join_all};
 use tracing::{info, warn};
 
 use crate::sink::channel::Batching;
-use crate::sink::route::{Selection, StoreBackend};
+use crate::sink::route::StoreBackend;
 use crate::sink::store_runtime::StoreRuntime;
+use crate::sink::table::TableId;
 use crate::sink::{Restored, Store, StoreError, StoredContract, millis};
 use crate::window::{LEDGER_WINDOW, Ledger};
-use crate::wire::envelope::{BlockMeta, Handoff, Matched};
+use crate::wire::envelope::{BlockMeta, Handoff};
 
 /// A store, opened, with what the run routes to it and the runtime its work runs on.
 #[derive(Debug)]
@@ -69,8 +70,8 @@ pub(crate) struct Opened<S> {
     pub(crate) store: S,
     /// When its drain commits.
     pub(crate) batching: Batching,
-    /// The tables routed to it, and those it keeps to the matched pools' rows.
-    pub(crate) tables: Selection,
+    /// The tables routed to it.
+    pub(crate) tables: HashSet<TableId>,
     /// Where the store's async calls run: its startup reads and rewind here, and its
     /// drain once ingest starts.
     pub(crate) runtime: StoreRuntime,
@@ -164,9 +165,6 @@ pub(crate) struct Resumed {
     /// Every contract a backfill handed over that any store recorded, each from a block
     /// ingest will not hand back.
     pub(crate) handoffs: Vec<Handoff>,
-    /// Every record of a pool matched to a Metric pool's pair that any store holds, each
-    /// from a block ingest will not hand back.
-    pub(crate) matched: Vec<Matched>,
     /// The blocks stores hold above the common block, which ingest hands them again: a
     /// store that holds one drops its rows as it arrives, so a record published with it
     /// would not land there.
@@ -232,7 +230,6 @@ fn gathered(restored: Vec<Restored>, held: HashSet<B256>, ledger: Ledger) -> Res
     let mut resumed = Resumed {
         contracts: Vec::new(),
         handoffs: Vec::new(),
-        matched: Vec::new(),
         held: HashSet::new(),
         ledger,
     };
@@ -240,16 +237,12 @@ fn gathered(restored: Vec<Restored>, held: HashSet<B256>, ledger: Ledger) -> Res
     for r in restored {
         let contracts = r.contracts.into_iter();
         let handoffs = r.handoffs.into_iter();
-        let matched = r.matched.into_iter();
         resumed
             .contracts
             .extend(contracts.filter(|contract| canonical(&contract.block_hash)));
         resumed
             .handoffs
             .extend(handoffs.filter(|handoff| canonical(&handoff.block_hash)));
-        resumed
-            .matched
-            .extend(matched.filter(|matched| canonical(&matched.block_hash)));
     }
     resumed.held = held;
     resumed
@@ -423,7 +416,7 @@ mod tests {
     use alloy_primitives::B256;
 
     use crate::sink::channel::Batching;
-    use crate::sink::route::{Selection, StoreBackend};
+    use crate::sink::route::StoreBackend;
     use crate::sink::store_runtime::StoreRuntime;
     use crate::sink::{EnvelopeSink, Restored, SinkError, Store, StoreError};
     use crate::wire::envelope::{BlockMeta, Envelope};
@@ -458,7 +451,6 @@ mod tests {
             Ok(Restored {
                 contracts: Vec::new(),
                 handoffs: Vec::new(),
-                matched: Vec::new(),
                 ledger: self.ledger.clone(),
             })
         }
@@ -487,7 +479,7 @@ mod tests {
                 threads: Arc::clone(&threads),
             },
             batching: Batching::eager(1),
-            tables: Selection::default(),
+            tables: std::collections::HashSet::new(),
             runtime: StoreRuntime::dedicated(backend).expect("a runtime"),
         };
         // The lake is ahead with a full window that starts above the database's tip, so
@@ -682,7 +674,7 @@ mod tests {
                     threads: Arc::default(),
                 },
                 batching: Batching::eager(1),
-                tables: Selection::default(),
+                tables: std::collections::HashSet::new(),
                 runtime: StoreRuntime::dedicated(backend).expect("a runtime"),
             };
             let stores = vec![

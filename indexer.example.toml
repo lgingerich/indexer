@@ -134,16 +134,6 @@ tables = ["blocks", "transactions", "logs"]
 # [decode]
 # protocols = "protocols"
 
-# Match the Uniswap V3 and V4 pools on the pairs Metric's pools trade, so a store's
-# `{ matched = "uniswap_v3_*" }` tables keep only those (README: Pools matched to Metric's
-# pairs). Their creation logs are searched for over HyperSync; their rows before they
-# were matched are filled from the lake, from this long before the pair's first Metric
-# pool.
-# [decode.pairs]
-# lookback_days = 30
-# hypersync_url = "https://1.hypersync.xyz"
-# hypersync_token = { env = "INDEXER_ENVIO_HYPERSYNC_TOKEN" }
-
 # A Prometheus endpoint: heads, per-store commit height, lag and timing, decode and RPC
 # failures. Every series is labelled with the chain; see `src/metrics.rs` for the list.
 # Absent, nothing listens and nothing is recorded.

@@ -9,12 +9,12 @@
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
 
 use alloy_primitives::{B256, U256};
 use deltalake::DeltaTable;
 
 use super::expr::{in_texts, texts, texts_of};
+use super::testing::Dir;
 use super::{DeltaSettings, DeltaSink};
 use crate::sink::table::{Schema, Table, TableId};
 use crate::sink::{EnvelopeSink, SinkError, Store as _, StoreError};
@@ -23,20 +23,7 @@ use crate::wire::envelope::{BlockMeta, ChainId, Envelope, Event, Reorg};
 
 const CHAIN: &str = "base";
 
-/// A fresh directory for one test's lake, removed when the test's guard drops.
-struct Dir(PathBuf);
-
 impl Dir {
-    fn new() -> Self {
-        static NEXT: AtomicU32 = AtomicU32::new(0);
-        let path = std::env::temp_dir().join(format!(
-            "indexer-delta-{}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        ));
-        Self(path)
-    }
-
     /// Settings for a lake in this directory. The sink commits on every flush; how
     /// often that is, the drain decides. A test runs maintenance itself.
     fn settings(&self) -> DeltaSettings {
@@ -63,12 +50,6 @@ impl Dir {
     /// Where the lake keeps `table` of the test chain.
     fn table(&self, table: &str) -> String {
         format!("{}/{CHAIN}/{table}", self.0.display())
-    }
-}
-
-impl Drop for Dir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
     }
 }
 

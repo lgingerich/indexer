@@ -98,6 +98,9 @@ pub struct Settings {
     /// [`crate::metrics`].
     #[serde(default)]
     pub metrics: Option<MetricsSettings>,
+    /// What `indexer backfill` backfills from the lake. The running indexer ignores it.
+    #[serde(default)]
+    pub backfill: Option<BackfillRun>,
     /// The directory the settings file lives in, which a relative path in it resolves
     /// against. Filled by [`Settings::from_file`]; empty for text given to
     /// [`Settings::parse`], which leaves a relative path as written. Not a file key, so a `dir` in the file is
@@ -472,25 +475,6 @@ impl StoreSettings {
         }
     }
 
-    /// The database's settings, when this is `[sink.postgres]`.
-    #[cfg(feature = "postgres")]
-    #[cfg_attr(
-        not(any(feature = "duckdb", feature = "delta")),
-        expect(
-            clippy::unnecessary_wraps,
-            reason = "a build with other stores has settings that are not the database's"
-        )
-    )]
-    pub(crate) const fn postgres(&self) -> Option<&crate::sink::postgres::PostgresSettings> {
-        match self {
-            #[cfg(feature = "duckdb")]
-            Self::DuckDb(_) => None,
-            Self::Postgres(postgres) => Some(postgres),
-            #[cfg(feature = "delta")]
-            Self::Delta(_) => None,
-        }
-    }
-
     /// The lake's settings, when this is `[sink.delta]`.
     #[cfg(feature = "delta")]
     #[cfg_attr(
@@ -538,50 +522,62 @@ pub struct DecodeSettings {
     /// The protocols directory, relative to the settings file's directory. Absent means
     /// an empty catalog.
     pub protocols: Option<PathBuf>,
-    /// `[decode.pairs]`: match other protocols' pools to the pairs Metric's pools trade,
-    /// so a store routing tables as `{ matched = "…" }` keeps only those pools' rows.
-    /// Absent, nothing is matched and such a store keeps none.
-    pub pairs: Option<PairsSettings>,
 }
 
-/// `[decode.pairs]`: see `crate::decode::pairs`.
+/// `[backfill]`: what `indexer backfill <this file>` decodes from the logs the lake of
+/// `[sink.delta]` holds, writing to that lake and to the `[sink.postgres]` database (see
+/// `crate::backfill`).
 ///
 /// ```toml
-/// [decode.pairs]
-/// lookback_days = 30
-/// ```
+/// [backfill]
+/// protocols = "protocols/uniswap/v4"   # the manifests to backfill
+/// # from = 25984373                    # the lake's first block when absent
+/// # to = 26200000                      # the bound when absent
+/// # only = ["0x…"]                     # discovered contracts to hand over; every one when absent
+/// # out = "/tmp/indexer-backfill"      # a trial: written instead, fills no database
 ///
-/// The pools created before a pair was known are found in the chain's whole history over
-/// `HyperSync`, which a node's `eth_getLogs`, a few hundred heights a request on most
-/// plans, cannot search. Their earlier rows are filled from the lake, which a run without
-/// `[sink.delta]` does not have.
-#[derive(Debug, Clone, Deserialize)]
+/// # [backfill.hypersync]               # finds what factories created before the lake's first block
+/// # url = "https://4663.hypersync.xyz"
+/// # token = { env = "INDEXER_ENVIO_HYPERSYNC_TOKEN" }
+/// ```
+#[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct PairsSettings {
-    /// How many days before the first Metric pool on a pair a matched pool's rows are kept
-    /// from, so its figures over a window that long exist from the day the Metric pool
-    /// opens. 30 by default.
-    #[serde(default = "default_lookback_days")]
-    pub lookback_days: u64,
-    /// The chain's `HyperSync` endpoint, such as `https://1.hypersync.xyz`, searched for
-    /// pools' creation logs. Required.
+pub struct BackfillRun {
+    /// The manifests to backfill, a subtree of `[decode] protocols`, relative to the
+    /// settings file.
+    pub protocols: PathBuf,
+    /// The first block to backfill; the lake's first when absent.
+    #[serde(default)]
+    pub from: Option<u64>,
+    /// The last block to backfill; the bound no delete of the running store reaches when
+    /// absent, and never above it.
+    #[serde(default)]
+    pub to: Option<u64>,
+    /// The discovered contracts to hand over and backfill, when only some are wanted.
+    /// Every one when absent.
+    #[serde(default)]
+    pub only: Option<Vec<alloy_primitives::Address>>,
+    /// Another lake to write to, such as a local directory, instead of the chain's own,
+    /// which is then only read: a trial, which fills no database. Reached with no storage
+    /// options.
+    #[serde(default)]
+    pub out: Option<String>,
+    /// `[backfill.hypersync]`: the chain's `HyperSync` endpoint, searched for the logs
+    /// the factories emitted before the lake's first block, so the contracts they
+    /// created then are found too. Absent, only those created in the lake are.
+    #[serde(default)]
+    pub hypersync: Option<HyperSyncEndpoint>,
+}
+
+/// A chain's `HyperSync` endpoint and the token it is read with.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HyperSyncEndpoint {
+    /// The endpoint, such as `https://4663.hypersync.xyz`. Required.
     #[serde(deserialize_with = "non_empty")]
-    pub hypersync_url: String,
+    pub url: String,
     /// The Envio API token. Required; a [`Secret`].
-    pub hypersync_token: Secret,
-}
-
-impl PairsSettings {
-    /// The lookback in seconds.
-    #[must_use]
-    pub const fn lookback(&self) -> u64 {
-        self.lookback_days.saturating_mul(86_400)
-    }
-}
-
-/// A month, a fee APR's usual longest window.
-const fn default_lookback_days() -> u64 {
-    30
+    pub token: Secret,
 }
 
 /// Why a settings file could not be turned into [`Settings`].
@@ -703,6 +699,9 @@ impl Settings {
         // directory rather than the process's working directory. A bare filename's
         // parent is empty, and joining onto an empty path is the path as written.
         settings.dir = path.parent().unwrap_or_else(|| Path::new("")).to_path_buf();
+        if let Some(backfill) = &mut settings.backfill {
+            backfill.protocols = settings.dir.join(&backfill.protocols);
+        }
         #[cfg(feature = "duckdb")]
         if let Some(duckdb) = &mut settings.sink.duckdb
             && duckdb.path != Path::new(":memory:")

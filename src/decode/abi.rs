@@ -159,17 +159,6 @@ impl Abi {
             .collect()
     }
 
-    /// The topic `param` of `event` is, `topic0` being the selector, or `None` when the
-    /// event has no indexed argument by that name.
-    pub(crate) fn topic_of(&self, event: EventKey, param: &str) -> Option<usize> {
-        let event = self.events.get(&event)?;
-        let at = event
-            .indexed
-            .iter()
-            .position(|argument| argument.name == param)?;
-        Some(1 + at)
-    }
-
     /// Where `event`'s `address` input called `param` sits in a log.
     pub(crate) fn address_input(&self, event: EventKey, param: &str) -> Option<AddressSlot> {
         let event = self.events.get(&event)?;

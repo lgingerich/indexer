@@ -313,10 +313,15 @@ impl HandoffWatch {
         let mut sent: HashSet<Address> = HashSet::new();
         // At startup, for what was queued while the run was stopped.
         let mut read = true;
+        let mut failed = false;
         let mut held = false;
         loop {
             if read {
-                match self.read(&storage, &schema, &chain, &mut queue).await {
+                let contracts = self
+                    .read(&storage, &schema, &chain, &mut queue, failed)
+                    .await;
+                failed = contracts.is_err();
+                match contracts {
                     Ok(contracts) => {
                         let new: Vec<Contract> = contracts
                             .into_iter()
@@ -345,23 +350,25 @@ impl HandoffWatch {
                     held
                 }
             };
-            // Once more after a release, for what was queued since the last read.
-            read = holds || held;
+            // Once more after a release, for what was queued since the last read, and
+            // until a failed read succeeds.
+            read = holds || held || failed;
             held = holds;
         }
     }
 
     /// The queue's contracts, opening it once it exists, and reading it only when it
-    /// changed since the last read.
+    /// changed since the last read or, `again`, that read failed.
     async fn read(
         &self,
         storage: &Storage,
         schema: &Schema,
         chain: &ChainId,
         queue: &mut Option<HandoffQueue>,
+        again: bool,
     ) -> Result<Vec<Contract>, StoreError> {
         if let Some(queue) = queue {
-            if !queue.refresh().await? {
+            if !queue.refresh().await? && !again {
                 return Ok(Vec::new());
             }
             return queue.read().await;
@@ -381,45 +388,20 @@ impl HandoffWatch {
 #[expect(clippy::expect_used)]
 mod tests {
     use std::collections::BTreeMap;
-    use std::path::PathBuf;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicU32, Ordering};
     use std::time::Duration;
 
     use alloy_primitives::{Address, B256};
     use tokio::sync::mpsc;
 
     use super::{HandoffQueue, HandoffWatch, LeaseWatch, Storage};
+    use crate::sink::delta::testing::Dir;
     use crate::sink::delta::{DeltaSettings, RunLock};
     use crate::sink::table::Schema;
     use crate::wire::datasets::evm::Contract;
     use crate::wire::envelope::ChainId;
 
     const CHAIN: &str = "base";
-
-    /// A fresh directory for one test's lake, removed when the guard drops.
-    struct Dir(PathBuf);
-
-    impl Dir {
-        fn new() -> Self {
-            static NEXT: AtomicU32 = AtomicU32::new(0);
-            Self(std::env::temp_dir().join(format!(
-                "indexer-handoff-{}-{}",
-                std::process::id(),
-                NEXT.fetch_add(1, Ordering::Relaxed)
-            )))
-        }
-
-        fn uri(&self) -> String {
-            self.0.display().to_string()
-        }
-    }
-
-    impl Drop for Dir {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
 
     fn pool(byte: u8) -> Contract {
         Contract {
@@ -489,6 +471,66 @@ mod tests {
             .await
             .expect("in time")
             .expect("a batch")
+    }
+
+    /// A read of the queue that fails is made again at the next poll, though the queue
+    /// has not changed since: what it held is not missed.
+    #[tokio::test]
+    async fn the_watch_reads_again_after_a_failed_read() {
+        /// Moves each data file under `from` to the same path under `to`.
+        fn move_files(from: &std::path::Path, to: &std::path::Path) {
+            for entry in std::fs::read_dir(from).expect("listed") {
+                let path = entry.expect("an entry").path();
+                let moved = to.join(path.file_name().expect("a name"));
+                if path.is_dir() {
+                    std::fs::create_dir_all(&moved).expect("created");
+                    move_files(&path, &moved);
+                } else if path.extension().is_some_and(|ext| ext == "parquet") {
+                    std::fs::rename(&path, &moved).expect("moved");
+                }
+            }
+        }
+
+        let dir = Dir::new();
+        let schema = Schema::new().expect("the dataset tables");
+        let chain = ChainId::new(CHAIN);
+        let mut queue = HandoffQueue::open(&dir.uri(), &BTreeMap::new(), &schema, CHAIN, 100_000)
+            .await
+            .expect("opens");
+        let settings: DeltaSettings =
+            toml::from_str(&format!("tables = ['*']\nuri = '{}'", dir.uri())).expect("settings");
+        let watch = HandoffWatch::new(&settings);
+        let storage = Storage::new(&dir.uri(), &BTreeMap::new()).expect("storage");
+        let mut watched = None;
+        assert!(
+            watch
+                .read(&storage, &schema, &chain, &mut watched, false)
+                .await
+                .expect("read")
+                .is_empty()
+        );
+
+        queue
+            .append(&schema, &chain, &[pool(1)])
+            .await
+            .expect("appended");
+        let files = dir.0.join(CHAIN).join(super::TABLE);
+        let aside = Dir::new();
+        std::fs::create_dir_all(&aside.0).expect("created");
+        move_files(&files, &aside.0);
+        let failed = watch
+            .read(&storage, &schema, &chain, &mut watched, false)
+            .await;
+        move_files(&aside.0, &files);
+        assert!(failed.is_err(), "the queue's files are gone");
+        assert_eq!(
+            watch
+                .read(&storage, &schema, &chain, &mut watched, true)
+                .await
+                .expect("read"),
+            [pool(1)],
+            "read again, unchanged since"
+        );
     }
 
     /// The watch hands over what was queued before the run started, then what a backfill

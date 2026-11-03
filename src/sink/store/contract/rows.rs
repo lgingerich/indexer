@@ -287,7 +287,6 @@ pub(crate) async fn a_store_writes_only_the_tables_routed_to_it<H: Harness>() {
             "reorgs",
             "sessions",
             "handoffs",
-            "matched_pools",
         ]
         .map(str::to_owned),
     );
@@ -324,7 +323,6 @@ pub(crate) async fn a_store_writes_only_the_tables_routed_to_it<H: Harness>() {
         "contracts",
         "sessions",
         "handoffs",
-        "matched_pools",
     ] {
         assert_eq!(row_count(&mut harness, table).await, 0, "{table} is empty");
     }

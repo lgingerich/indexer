@@ -1,120 +1,70 @@
 //! A backfill's settings file, what stops one, and what it did.
 
-use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use alloy_primitives::Address;
-use serde::Deserialize;
 
 use super::USAGE;
+use crate::config::BackfillRun;
 use crate::decode::{CatalogError, DecodeError, DeriveError};
-use crate::secret::Secret;
 use crate::sink::StoreError;
+use crate::sink::delta::DeltaSettings;
 use crate::sink::delta::LockError;
 use crate::sink::resume::MAX_RESUME_LAG;
 use crate::sink::table::TableError;
 use crate::wire::envelope::ChainId;
 
-/// A backfill's settings file, `indexer.<chain>.backfill.toml`. TOML; every table refuses
-/// an unknown key, and a secret is named as in the indexer's settings, `{ env = "NAME" }`.
-///
-/// ```toml
-/// chain = "ethereum"
-/// protocols = "protocols/uniswap/v4"   # the manifests to backfill
-/// # from = 25984373                    # the lake's first block when absent
-/// # to = 26200000                      # the bound when absent (see [`LogReader::bound`](crate::sink::delta::LogReader::bound))
-/// # only = ["0x…"]                     # discovered contracts to hand over; every one when absent
-/// # out = "/tmp/indexer-backfill"      # write here instead; the lake is only read
-///
-/// # [postgres]                         # also fill the running indexer's database
-/// # tables = ["contract_events"]       # as its [sink.postgres] routes them
-/// # connection_string = { env = "INDEXER_POSTGRES_URL" }
-///
-/// [lake]
-/// uri = "s3://blockchain-data"
-///
-/// [lake.storage]                       # passed to the object store, as [sink.delta.storage]
-/// endpoint = { env = "S3_ENDPOINT" }
-/// region = "auto"
-/// access_key_id = { env = "S3_ACCESS_KEY_ID" }
-/// secret_access_key = { env = "S3_SECRET_ACCESS_KEY" }
-/// ```
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
+/// What a backfill runs with: the `[backfill]` section of the running indexer's settings
+/// file, `indexer.<chain>.toml`, with the chain its `[ingest]` follows, the manifests its
+/// `[decode]` loads, the lake its `[sink.delta]` writes, and the database its
+/// `[sink.postgres]` writes.
+#[derive(Debug)]
 pub struct BackfillSettings {
     /// The chain, as the running indexer names it in `[ingest] chain`.
-    #[serde(deserialize_with = "crate::config::non_empty")]
     pub chain: String,
-    /// The manifests to backfill, relative to the settings file.
-    pub protocols: PathBuf,
-    /// The first block to backfill; the lake's first when absent.
-    #[serde(default)]
-    pub from: Option<u64>,
-    /// The last block to backfill; the bound no delete of the running store reaches when
-    /// absent (see [`LogReader::bound`](crate::sink::delta::LogReader::bound)), and never above it.
-    #[serde(default)]
-    pub to: Option<u64>,
-    /// The discovered contracts to hand over and backfill, when only some are wanted, each
-    /// one the manifests' factories created in the lake. Every one when absent. The
-    /// manifests' listed contracts are backfilled either way.
-    #[serde(default)]
-    pub only: Option<Vec<Address>>,
-    /// Another lake to write to, such as a local directory, instead of the chain's own,
-    /// which is then only read: to try a backfill out without touching what the running
-    /// indexer serves. Reached with no storage options.
-    #[serde(default)]
-    pub out: Option<String>,
-    /// The lake the running indexer writes, as its `[sink.delta]` names it.
-    pub lake: LakeSettings,
-    /// The running indexer's `PostgreSQL` store, as its `[sink.postgres]` names it, to
-    /// fill too: the decoded tables it routes there get the same rows, upserted. Absent,
-    /// only the lake is filled.
+    /// What to backfill: `[backfill]`.
+    pub run: BackfillRun,
+    /// Every manifest the running indexer decodes, which its `[sink.postgres] tables`
+    /// name; the backfill's are a subtree of them.
+    pub decoded: PathBuf,
+    /// The lake the running indexer writes.
+    pub lake: DeltaSettings,
+    /// The running indexer's `PostgreSQL` store, to fill too: the decoded tables it
+    /// routes there get the same rows, upserted. Absent, only the lake is filled.
     #[cfg(feature = "postgres")]
-    #[serde(default)]
     pub postgres: Option<crate::sink::PostgresSettings>,
 }
 
-/// Where the lake is: `[lake]`.
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct LakeSettings {
-    /// The lake's root, as `[sink.delta] uri`: each chain's tables are under
-    /// `<uri>/<chain>/`.
-    #[serde(deserialize_with = "crate::config::non_empty")]
-    pub uri: String,
-    /// The object store's options, as `[sink.delta.storage]`.
-    #[serde(default)]
-    pub storage: BTreeMap<String, Secret>,
-}
-
 impl BackfillSettings {
-    /// Reads the settings file at `path`, each secret it names from `env`, as the
-    /// indexer's settings read theirs (see [`crate::secret::process_env`]).
+    /// Reads the running indexer's settings file at `path`, each secret it names from
+    /// `env` (see [`crate::secret::process_env`]), for its `[backfill]`.
     ///
     /// # Errors
     ///
-    /// Returns [`BackfillError::Read`] when the file cannot be read and
-    /// [`BackfillError::Parse`] when it is not valid settings, or names a secret whose
-    /// variable is unset.
+    /// Returns [`BackfillError::Settings`] when the file cannot be read or is not valid
+    /// settings, and [`BackfillError::Missing`] when it has no `[backfill]` or no
+    /// `[sink.delta]`.
     pub fn from_file(path: &Path, env: crate::secret::Env) -> Result<Self, BackfillError> {
-        let text = std::fs::read_to_string(path).map_err(|source| BackfillError::Read {
-            path: path.display().to_string(),
-            source,
-        })?;
-        Self::parse(&text, path.parent().unwrap_or_else(|| Path::new("")), env)
+        Self::of(crate::config::Settings::from_file(path, env)?)
     }
 
-    /// Parses settings text, resolving a relative `protocols` against `dir`, as the
-    /// indexer's settings resolve theirs, and each secret it names from `env`.
-    pub(super) fn parse(
-        text: &str,
-        dir: &Path,
-        env: crate::secret::Env,
-    ) -> Result<Self, BackfillError> {
-        let mut settings: Self = crate::secret::reading(env, || toml::from_str(text))
-            .map_err(|source| BackfillError::Parse { source })?;
-        settings.protocols = dir.join(&settings.protocols);
-        Ok(settings)
+    /// The backfill `settings` name.
+    pub(super) fn of(settings: crate::config::Settings) -> Result<Self, BackfillError> {
+        let decoded = settings.protocols_path();
+        let run = settings.backfill.ok_or(BackfillError::Missing {
+            section: "[backfill]",
+        })?;
+        let lake = settings.sink.delta.ok_or(BackfillError::Missing {
+            section: "[sink.delta]",
+        })?;
+        Ok(Self {
+            chain: settings.ingest.chain,
+            decoded: decoded.unwrap_or_else(|| run.protocols.clone()),
+            run,
+            lake,
+            #[cfg(feature = "postgres")]
+            postgres: settings.sink.postgres,
+        })
     }
 }
 
@@ -127,19 +77,14 @@ pub enum BackfillError {
         /// What is wrong with it.
         problem: String,
     },
-    /// The settings file could not be read.
-    #[error("read settings at {path}: {source}")]
-    Read {
-        /// The path that failed.
-        path: String,
-        /// The underlying I/O error.
-        source: std::io::Error,
-    },
-    /// The settings file is not valid backfill settings.
-    #[error("invalid settings: {source}")]
-    Parse {
-        /// `toml`'s error, which carries the line and column.
-        source: toml::de::Error,
+    /// The settings file could not be read, or is not valid settings.
+    #[error(transparent)]
+    Settings(#[from] crate::config::SettingsError),
+    /// The settings file has no section a backfill needs.
+    #[error("the settings file has no {section}, which a backfill reads")]
+    Missing {
+        /// The section.
+        section: &'static str,
     },
     /// The manifests could not be loaded.
     #[error("protocol manifests could not be loaded: {0}")]
@@ -240,9 +185,9 @@ pub enum BackfillError {
     /// Another backfill holds the lake, or took it over.
     #[error("{0}")]
     Lock(#[from] LockError),
-    /// `[postgres] tables` names something the manifests do not have.
+    /// `[sink.postgres] tables` names something the manifests do not have.
     #[cfg(feature = "postgres")]
-    #[error("[postgres] tables: {source}")]
+    #[error("[sink.postgres] tables: {source}")]
     Route {
         /// What was wrong with the list.
         source: crate::sink::route::RouteError,
@@ -270,6 +215,9 @@ pub enum BackfillError {
         /// The record's event.
         event: String,
     },
+    /// `HyperSync` could not be searched for the factories' logs before the lake.
+    #[error("searching HyperSync for what the factories created before the lake: {0}")]
+    Search(#[from] crate::ingest::source::SourceError),
     /// The decoder broke an invariant.
     #[error("decode: {0}")]
     Decode(#[from] DecodeError),
@@ -284,8 +232,8 @@ impl BackfillError {
     pub fn is_config(&self) -> bool {
         match self {
             Self::Usage { .. }
-            | Self::Read { .. }
-            | Self::Parse { .. }
+            | Self::Settings(_)
+            | Self::Missing { .. }
             | Self::Catalog(_)
             | Self::NotDiscovered { .. }
             | Self::NoContracts { .. }
@@ -305,6 +253,7 @@ impl BackfillError {
             | Self::Table(_)
             | Self::UnknownEvent { .. }
             | Self::NotHandedOver { .. }
+            | Self::Search(_)
             | Self::Decode(_)
             | Self::Derive(_) => false,
         }

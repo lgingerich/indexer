@@ -22,8 +22,9 @@
 //! environment variables it names — can be checked before a deploy restarts a chain on
 //! it. It exits as a run that failed there would, and 0 when they assemble.
 //!
-//! `indexer backfill indexer.<chain>.backfill.toml` instead decodes manifests added after
-//! their blocks were indexed, from the logs the lake holds (see [`indexer::backfill`]).
+//! `indexer backfill indexer.<chain>.toml` instead decodes the manifests its `[backfill]`
+//! names, added after their blocks were indexed, from the logs the lake holds (see
+//! [`indexer::backfill`]).
 
 use std::process::ExitCode;
 

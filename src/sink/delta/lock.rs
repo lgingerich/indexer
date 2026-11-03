@@ -44,6 +44,10 @@ const HEARTBEAT: Duration = Duration::from_mins(1);
 /// How long after its last heartbeat a lease may be taken over.
 const STALE: Duration = Duration::from_mins(10);
 
+/// How long the holder goes on writing while its renewals fail: half of [`STALE`], so it
+/// stops well before another run may take the lease over.
+const RENEWAL_DEADLINE: Duration = Duration::from_secs(STALE.as_secs() / 2);
+
 /// Why a backfill could not take, or lost, the lease.
 #[derive(Debug, thiserror::Error)]
 pub enum LockError {
@@ -140,11 +144,7 @@ impl RunLock {
             // Another run claimed it first: name it.
             Err(error) => {
                 let mut table = table;
-                table
-                    .update_state()
-                    .await
-                    .map_err(StoreError::engine(Operation::Open, Some(TABLE)))?;
-                return match latest(&table).await? {
+                return match newest(&mut table).await? {
                     Some(lease) if lease.run != run => Err(held(lease, unix_now())),
                     _ => Err(error.into()),
                 };
@@ -152,7 +152,18 @@ impl RunLock {
         };
         let lost = Arc::new(AtomicBool::new(false));
         let (stop, stopped) = oneshot::channel();
-        let renewing = tokio::spawn(renew(table, claim, Arc::clone(&lost), stopped));
+        let renewing = tokio::spawn({
+            let lost = Arc::clone(&lost);
+            async move {
+                let renewed = renew(table, claim, stopped).await;
+                // However renewing ended, a lease no longer renewed may be taken over:
+                // the run stops before its next write.
+                if renewed.is_err() {
+                    lost.store(true, Ordering::Release);
+                }
+                renewed
+            }
+        });
         Ok(Self {
             lost,
             stop: Some(stop),
@@ -255,15 +266,16 @@ impl Drop for RunLock {
 
 /// Renews `lease` every [`HEARTBEAT`] until `stopped`, then releases it. A renewal that
 /// fails is checked against the table: if another run's change is newest, the lease is
-/// lost; otherwise the next renewal tries again.
+/// lost; otherwise the next renewal tries again, until [`RENEWAL_DEADLINE`] has passed
+/// since the last that succeeded, when the lease counts as lost too.
 async fn renew(
     mut table: DeltaTable,
     mut lease: Lease,
-    lost: Arc<AtomicBool>,
     mut stopped: oneshot::Receiver<()>,
 ) -> Result<(), LockError> {
     let mut ticks = tokio::time::interval(HEARTBEAT);
     ticks.tick().await;
+    let mut renewed = tokio::time::Instant::now();
     loop {
         let release = tokio::select! {
             _ = &mut stopped => true,
@@ -275,23 +287,22 @@ async fn renew(
             released: release,
             ..lease.clone()
         };
-        match commit(table.clone(), &change).await {
+        match bounded(commit(table.clone(), &change)).await {
             Ok(committed) => {
                 table = committed;
                 lease = change;
+                renewed = tokio::time::Instant::now();
             }
             Err(error) => {
-                table
-                    .update_state()
-                    .await
-                    .map_err(StoreError::engine(Operation::Open, Some(TABLE)))?;
-                match latest(&table).await? {
-                    Some(newest) if newest.run != lease.run => {
-                        lost.store(true, Ordering::Release);
-                        return Err(LockError::Lost);
-                    }
-                    Some(newest) => lease = newest,
-                    None => {}
+                match bounded(newest(&mut table)).await {
+                    Ok(Some(newest)) if newest.run != lease.run => return Err(LockError::Lost),
+                    Ok(Some(newest)) => lease = newest,
+                    Ok(None) => {}
+                    Err(read) => warn!(%read, "backfill lease could not be read back"),
+                }
+                if renewed.elapsed() >= RENEWAL_DEADLINE {
+                    warn!(%error, "backfill lease not renewed for too long; stopping");
+                    return Err(LockError::Lost);
                 }
                 warn!(%error, "backfill lease renewal failed; trying again");
                 if release {
@@ -304,6 +315,23 @@ async fn renew(
             return Ok(());
         }
     }
+}
+
+/// `call`, given up on as stalled after a [`HEARTBEAT`]: a renewal waits on no request
+/// longer, so a hung one is retried, and counts toward the deadline, as a failed one is.
+async fn bounded<T, E: From<StoreError>>(call: impl Future<Output = Result<T, E>>) -> Result<T, E> {
+    tokio::time::timeout(HEARTBEAT, call)
+        .await
+        .unwrap_or_else(|_| Err(StoreError::Stalled { after: HEARTBEAT }.into()))
+}
+
+/// The newest change to the lease, `table` brought up to date first.
+async fn newest(table: &mut DeltaTable) -> Result<Option<Lease>, LockError> {
+    table
+        .update_state()
+        .await
+        .map_err(StoreError::engine(Operation::Open, Some(TABLE)))?;
+    Ok(latest(table).await?)
 }
 
 /// The lease's table at `uri`, created when there is none. Two runs creating it at once
@@ -434,30 +462,13 @@ fn unix_now() -> i64 {
 #[expect(clippy::expect_used)]
 mod tests {
     use std::collections::BTreeMap;
-    use std::path::PathBuf;
-    use std::sync::atomic::{AtomicU32, Ordering};
 
     use super::{Lease, LockError, RunLock, STALE, Storage, TABLE, commit, latest, open, unix_now};
+    use crate::sink::delta::testing::Dir;
 
     const CHAIN: &str = "base";
 
-    /// A fresh directory for one test's lake, removed when the guard drops.
-    struct Dir(PathBuf);
-
     impl Dir {
-        fn new() -> Self {
-            static NEXT: AtomicU32 = AtomicU32::new(0);
-            Self(std::env::temp_dir().join(format!(
-                "indexer-lock-{}-{}",
-                std::process::id(),
-                NEXT.fetch_add(1, Ordering::Relaxed)
-            )))
-        }
-
-        fn uri(&self) -> String {
-            self.0.display().to_string()
-        }
-
         async fn acquire(&self, run: &str) -> Result<RunLock, LockError> {
             RunLock::acquire(&self.uri(), &BTreeMap::new(), CHAIN, run, "uniswap_v4").await
         }
@@ -477,12 +488,6 @@ mod tests {
                 .await
                 .expect("the lease's table");
             latest(&table).await.expect("read").expect("a lease")
-        }
-    }
-
-    impl Drop for Dir {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
         }
     }
 
@@ -528,6 +533,36 @@ mod tests {
                 "a losing claim is refused naming the winner: {refused:?}"
             );
         }
+    }
+
+    /// A holder whose renewals keep failing, the lease's table neither written nor read,
+    /// stops writing before another run may take the lease over.
+    #[tokio::test(start_paused = true)]
+    async fn a_holder_whose_renewals_keep_failing_counts_the_lease_lost() {
+        let dir = Dir::new();
+        let holder = dir.acquire("holder").await.expect("the lease is free");
+        // The log is a file where its directory was, which no commit or read gets past.
+        let log = dir.0.join(CHAIN).join(TABLE).join("_delta_log");
+        let aside = log.with_extension("aside");
+        std::fs::rename(&log, &aside).expect("moved aside");
+        std::fs::write(&log, "").expect("a file in its place");
+        tokio::time::sleep(super::HEARTBEAT).await;
+        tokio::task::yield_now().await;
+        holder.check().expect("one failed renewal is tried again");
+        tokio::time::sleep(super::RENEWAL_DEADLINE).await;
+        for _ in 0..5_000 {
+            if holder.check().is_err() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+            tokio::task::yield_now().await;
+        }
+        std::fs::remove_file(&log).expect("removed");
+        std::fs::rename(&aside, &log).expect("put back");
+        assert!(
+            matches!(holder.check(), Err(LockError::Lost)),
+            "renewals failing past the deadline lose the lease"
+        );
     }
 
     /// A holder whose lease another run took over learns it at its next heartbeat, and

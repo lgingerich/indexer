@@ -157,68 +157,6 @@ impl Handoff {
     }
 }
 
-/// A pool another protocol runs on a token pair a Metric pool trades, which the stores
-/// keeping only matched pools take the rows of (see `decode::pairs`): the pool Metric's
-/// is compared with.
-///
-/// A control signal published with the block it names, before that block's marker, as a
-/// [`Handoff`] is, so a reorg that orphans the block deletes it with the block's rows and
-/// the decode stage publishes it again with the next. It is published twice for a pool
-/// that existed before it was matched: once, not `filled`, from the block the run keeps
-/// its rows; and once `filled`, when the rows before that, back to `from_timestamp`, are
-/// written.
-///
-/// Natural key is `(contract, pool_id, filled, block_hash)`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Matched {
-    /// The pool's protocol, from its manifest, for example `uniswap_v4`.
-    pub protocol: String,
-    /// The contract whose logs are the pool's: the pool itself, or the contract holding
-    /// it, such as Uniswap V4's `PoolManager`.
-    pub contract: Address,
-    /// The pool within `contract`, for a contract holding many: Uniswap V4's pool id.
-    pub pool_id: Option<B256>,
-    /// The pair's first token, as the pool names it: the native coin is the zero address.
-    pub token0: Address,
-    /// The pair's second token.
-    pub token1: Address,
-    /// The pool's fee, in hundredths of a basis point, as its creation names it.
-    #[serde(with = "alloy_serde::quantity")]
-    pub fee: u64,
-    /// The pool's hook contract, for a protocol that has them; `None` for none.
-    pub hooks: Option<Address>,
-    /// The block the pool was created in.
-    #[serde(with = "alloy_serde::quantity")]
-    pub created_block: u64,
-    /// The earliest time its rows are kept from: the lookback before the first Metric pool
-    /// on its pair, or its creation if later.
-    #[serde(with = "alloy_serde::quantity")]
-    pub from_timestamp: u64,
-    /// Whether its rows from `from_timestamp` up to the block it was first matched in are
-    /// written: true from the start for a pool created after it was matched.
-    pub filled: bool,
-    /// The block this record is published with.
-    #[serde(with = "alloy_serde::quantity")]
-    pub block_number: u64,
-    /// That block's hash.
-    pub block_hash: B256,
-    /// That block's timestamp.
-    #[serde(with = "alloy_serde::quantity")]
-    pub block_timestamp: u64,
-}
-
-impl Matched {
-    /// `block_hash:contract:pool_id:matched`, or `:filled`.
-    #[must_use]
-    pub fn dedupe_key(&self) -> String {
-        let pool = self
-            .pool_id
-            .map_or_else(String::new, |id| format!("{id:#x}"));
-        let state = if self.filled { "filled" } else { "matched" };
-        format!("{}:{:#x}:{pool}:{state}", self.block_hash, self.contract)
-    }
-}
-
 /// A block's identity, parent hash, and timestamp: what a `newHeads` notification
 /// carries, what a fetched block is anchored to, and, as [`Event::AcceptedBlock`], the
 /// marker that ends every block's batch.
@@ -264,8 +202,6 @@ pub enum Event {
     /// A contract a backfill handed over, decoded from its block on. Only the decode stage
     /// produces this.
     Handoff(Box<Handoff>),
-    /// A pool matched to a Metric pool's pair. Only the decode stage produces this.
-    Matched(Box<Matched>),
     /// A discontinuity in the published chain.
     Reorg(Reorg),
     /// A block the pipeline accepted, published last in its batch.
@@ -284,7 +220,6 @@ impl Event {
             Self::Contract(_) => "contract",
             Self::Derived(_) => "derived",
             Self::Handoff(_) => "handoff",
-            Self::Matched(_) => "matched",
             Self::Reorg(_) => "reorg",
             Self::AcceptedBlock(_) => "accepted_block",
         }
@@ -312,7 +247,6 @@ impl Event {
             Self::Contract(contract) => contract.dedupe_key(),
             Self::Derived(derived) => derived.dedupe_key(),
             Self::Handoff(handoff) => handoff.dedupe_key(),
-            Self::Matched(matched) => matched.dedupe_key(),
             Self::Reorg(reorg) => format!("{}:reorg", reorg.new_head_hash),
             Self::AcceptedBlock(accepted) => format!("{}:accepted_block", accepted.hash),
         }

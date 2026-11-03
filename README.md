@@ -394,12 +394,11 @@ runtime cleanups
 [Backfilling new protocols from the lake](#backfilling-new-protocols-from-the-lake)):
 their listed contracts, the contracts their factories created below the running
 indexer's restart, which it hands the running indexer, and their derived tables, each
-row's sender and recipient read from the lake's `transactions`. One case is not built:
-
-- **Contracts created before the lake's first block.** They are not in it to discover.
-  The plan: read only the factories' creation events for those blocks from a node
-  (`eth_getLogs` filtered by factory and event) or HyperSync, and hand over what they
-  name, optionally just the pools `only` lists.
+row's sender and recipient read from the lake's `transactions`. Contracts created
+before the lake's first block are not in it to discover: with `[backfill.hypersync]`,
+the backfill asks HyperSync for the factories' logs below that block, and hands over
+and backfills what they created with the rest, their logs from the lake's first block
+on being in the lake.
 
 It fills the lake and, when asked, `PostgreSQL`; not `DuckDB`.
 
@@ -548,19 +547,12 @@ Each table names what owns its fields, not where a field was first needed:
   alone. Naming a backend is naming its table, so a key only that backend understands
   has nowhere else to sit. Every sink lists the `tables` it writes — exact names
   (`logs`), `*` globs over names (`uniswap_v3_*`), or `contract_events` for every
-  contract's decoded event table, including protocols added later. An entry written
-  `{ matched = "uniswap_v3_*" }` selects its tables the same way but keeps them to the
-  rows of the pools matched to Metric pools' pairs (see
-  [Pools matched to Metric's pairs](#pools-matched-to-metrics-pairs)), so a database can
-  hold the pools compared with Metric's of a protocol the lake holds whole. Only contract
-  event tables can be matched: theirs are the rows a matched pool's history is filled
-  into, so raw `logs`, `decoded_logs`, or a derived table would hold a pool's rows only
-  from when it was matched. An entry starting with `!`
-  takes the tables it matches back out of what the others select, wherever it stands in
+  contract's decoded event table, including protocols added later. An entry starting
+  with `!` takes the tables it matches back out of what the others select, wherever it stands in
   the list, as `.gitignore`'s negation does: `["metric_v1_*",
   "!metric_v1_oracle_provider_feed_updated"]` is every Metric table but that one. There is no
   default: what lands where is read off the file. `accepted_blocks`, `reorgs`,
-  `contracts`, `sessions`, `handoffs`, and `matched_pools` are written to every store and
+  `contracts`, `sessions`, and `handoffs` are written to every store and
   are not listed. Commit batching is part
   of this, because it is a property of the store: `DuckDB` folds a backlog into larger
   transactions, where the lake commits on a timer.
@@ -575,7 +567,7 @@ the field:
 | `ingest.http_url` | JSON-RPC endpoint for blocks, receipts, and logs. A [secret](#secrets). Named with `ws_url`, unless `[ingest.hypersync]` replaces both |
 | `ingest.ws_url` | WebSocket endpoint for `newHeads`. A [secret](#secrets). Named with `http_url` |
 | at least one `[sink.<backend>]` table | Which backends write. `duckdb`, `postgres`, and `delta` persist; `stdout` prints, opens no store, and runs alone |
-| `sink.<backend>.tables` | The tables that sink writes: names, `*` globs, `contract_events`, or `{ matched = "<name or glob>" }` for only the rows of the pools matched to Metric's pairs, less those a `!` entry names. An entry matching no table is a startup error |
+| `sink.<backend>.tables` | The tables that sink writes: names, `*` globs, or `contract_events`, less those a `!` entry names. An entry matching no table is a startup error |
 
 **Defaulted** — correct for a standard deployment; override for a non-standard one:
 
@@ -653,21 +645,25 @@ So where a backfill hands over to an RPC run, those columns can change at the bo
 
 A manifest added later decodes in the running indexer from its restart onward. Its
 history before that is decoded from the logs the lake already holds, by a separate run of
-the same binary, on any machine that reaches the lake, without fetching anything from a
-node or HyperSync. Once it is done, the lake (and the database, when asked) hold every
+the same binary, on any machine that reaches the lake. Nothing is fetched from a node;
+only the factories' logs from before the lake's first block are fetched from HyperSync,
+to find the contracts they created then. Once it is done, the lake (and the database, when asked) hold every
 record they would have had the manifest been there from the start.
 
 ```bash
-indexer backfill indexer.ethereum.backfill.toml
+indexer backfill indexer.ethereum.toml
 ```
 
-Each chain has a backfill settings file beside its own, `indexer.<chain>.backfill.toml`
-(every key is documented in `src/backfill/mod.rs`): the chain, the lake as its
-`[sink.delta]` names it, and, commented out until a run needs them, `protocols`, the
-manifests to backfill (required), `from` and `to`, the blocks to cover, `out`, another
-lake such as a local directory to write to instead, leaving the chain's only read, and
-`[postgres]`, the running indexer's database to fill too, as its `[sink.postgres]` names
-it.
+It reads the running indexer's own settings file: the chain is its `[ingest]`, the lake
+its `[sink.delta]`, and the database to fill too its `[sink.postgres]`, of whose `tables`
+it fills those of the manifests it backfills. The file's `[backfill]` section, commented
+out until a run needs it, names `protocols`, the manifests to backfill (required), `from`
+and `to`, the blocks to cover, `only`, the discovered contracts to hand over, `out`,
+another lake such as a local directory to write to instead, a trial that leaves the
+chain's lake only read and fills no database, and `[backfill.hypersync]`, the chain's
+HyperSync endpoint and token, to find what the factories created before the lake's first
+block. The running indexer ignores the section. A backfill reads every secret the file
+names, as the running indexer does.
 
 **What it writes.** It reads `logs` a few hundred megabytes of files at a time, opening
 only the files that hold a range's blocks, keeps only the manifests' addresses, decodes
@@ -677,7 +673,7 @@ It writes into the running indexer's own tables without stopping it: in Delta, a
 that only appends never conflicts with the running store's commits, and the backfill
 writes nothing the running store ever deletes. The small files this leaves in old
 partitions are compacted by the running store's maintenance within the hour. In
-`PostgreSQL` it upserts the same rows into the tables `[postgres] tables` routes there.
+`PostgreSQL` it upserts the same rows into the tables `[sink.postgres] tables` routes there.
 A rerun, or a range the running indexer decoded too, writes each record once, so a
 stopped run is simply run again, or continued by setting `from` to the `resume_from` of
 its last range's log line.
@@ -924,59 +920,6 @@ a name produced twice: two contracts given the same `table`, or one contract dec
 two events by one name. Tables are created at startup and never altered. See
 [event table and schema limitations](#event-table-and-schema-limitations) for what that
 leaves unhandled.
-
-### Pools matched to Metric's pairs
-
-With `[decode.pairs]`, every Uniswap V3 and V4 pool on a token pair a Metric pool trades
-is *matched*, so a store routing `{ matched = "uniswap_v3_*" }` and
-`{ matched = "uniswap_v4_*" }` holds the pools compared with Metric's, while the lake
-holds every pool (`src/decode/pairs.rs`):
-
-```toml
-[decode.pairs]
-lookback_days = 30
-hypersync_url = "https://1.hypersync.xyz"
-hypersync_token = { env = "INDEXER_ENVIO_HYPERSYNC_TOKEN" }
-```
-
-- **A pair** is two tokens, lower address first, the native coin counted as the chain's
-  wrapped one, since Metric's pools hold WETH where Uniswap V4's often hold ETH. Every
-  Metric `PoolCreated` names one.
-- **Finding the pools.** One created once its pair is known is matched from its creation
-  in the stream: V3's by the address its factory's `PoolCreated` names, V4's by the id its
-  `PoolManager`'s `Initialize` names. One created earlier, even before the lake's first
-  block, is found by searching the chain's history over HyperSync, since both events
-  name their two tokens as topics; a node's `eth_getLogs`, a few hundred heights a
-  request on most plans, cannot search it. At startup every Metric pool is searched the
-  same way, so no pair waits for a new Metric pool. The searches run on a task of their
-  own, which ingest never waits on, and batch every new pair into one search per
-  protocol. A page the endpoint refuses, as it does past the token's rate, is asked again
-  through the source's backoff, then every five minutes for as long as it takes, keeping
-  the pages already read; only an error asking again cannot fix, such as a refused
-  token, gives a search up, logged.
-- **Recording them.** A pool a search finds joins after a block's marker, as a handed-over
-  contract does, and the next block records it in `matched_pools`, with the `contracts`
-  row of a V3 pool the run did not decode yet: its rows are kept from that block, and a
-  restart restores it from that record. A reorg that orphans the block deletes the record
-  and the next block writes it again. `matched_pools` holds each pool's tokens, fee,
-  hooks, and creation block, what a reader joining the event tables needs; a matched V3
-  pool's own `PoolCreated` row is kept too, when the stream saw it. After a restart, no
-  record is written with a block a store already held, which that store drops as ingest
-  hands it back: it waits for the first block none holds.
-- **Their history.** A pool that existed before it was matched has its earlier rows
-  filled from the lake, back to `lookback_days` before the first Metric pool on its pair:
-  once the lake's bound passes the block it joined at (see the backfill's
-  [bound](#backfilling-new-protocols-from-the-lake)), which it waits for reading only the
-  lake's ledger, the run takes the backfill lease and decodes the pool's logs from the
-  lake, on a runtime of its own beside ingest's. A V3 pool's are read from the lake's
-  first block and appended to the lake's decoded tables too, which the run never decoded
-  before; V4's `PoolManager` is read from shortly before the lookback starts, only the
-  matched pools' logs. Both are upserted into the matched tables, in the backfill's
-  bounded commits. A second record, `filled`, says it is done; a run stopped before
-  then, which lets go of the lease at its next commit, fills it again after a restart.
-
-Only Metric's factory names pairs, and only Uniswap V3 and V4 are matched to them; both
-are in code beside the derivations, not in a manifest.
 
 ### What decode does not do
 

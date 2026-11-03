@@ -1,4 +1,4 @@
-//! What a backfill and a matched pools' fill write with: decoding a commit's logs as the
+//! What a backfill writes with: decoding a commit's logs as the
 //! running indexer does, deriving their rows, the commits they are written in, and the
 //! running indexer's database, filled beside it.
 
@@ -24,8 +24,9 @@ pub(super) struct Database {
 }
 
 impl Database {
-    /// Opens the store the settings name, if any, with the tables its `tables` route of
-    /// `schema`, and checks its session as the lake's is.
+    /// Opens the store the settings name, if any, with the tables of `schema` its `tables`
+    /// route (see [`routed`]), and checks its session as the lake's is. A backfill writing
+    /// another lake (`out`) is a trial, and fills no database.
     #[cfg_attr(
         not(feature = "postgres"),
         expect(
@@ -42,57 +43,28 @@ impl Database {
         to: u64,
     ) -> Result<Self, BackfillError> {
         #[cfg(feature = "postgres")]
+        if let Some(postgres) = settings
+            .postgres
+            .as_ref()
+            .filter(|_| settings.run.out.is_none())
         {
-            let Some(postgres) = &settings.postgres else {
-                return Ok(Self::none());
-            };
-            let routed = postgres
-                .tables
-                .resolve(schema)
-                .map_err(|source| BackfillError::Route { source })?;
-            // A table kept to the pools matched to Metric's pairs is the running indexer's
-            // to fill, which knows the pools (see `crate::decode::pairs`).
-            let whole: std::collections::HashSet<_> =
-                routed.tables.difference(&routed.matched).copied().collect();
-            let mut database = Self::beside(postgres, schema, &whole, chain).await?;
-            if let Some(store) = &mut database.store {
-                let session = store.session().await?;
-                super::covers("database", session.as_ref(), wanted, protocols, to)?;
-            }
-            Ok(database)
+            let tables = routed(&postgres.tables, &settings.decoded, chain, schema)?;
+            let mut store = crate::sink::PostgresSink::open(
+                postgres,
+                std::sync::Arc::new(schema.select(&tables)),
+                chain.as_str(),
+                crate::sink::postgres::Writer::Beside,
+            )
+            .await?;
+            let session = store.session().await?;
+            super::covers("database", session.as_ref(), wanted, protocols, to)?;
+            return Ok(Self { store: Some(store) });
         }
-        #[cfg(not(feature = "postgres"))]
-        {
-            let _ = (settings, schema, chain, wanted, protocols, to);
-            Ok(Self::none())
-        }
-    }
-
-    /// No database: what is filled into it is dropped.
-    pub(super) const fn none() -> Self {
-        Self {
+        let _ = (settings, schema, chain, wanted, protocols, to);
+        Ok(Self {
             #[cfg(feature = "postgres")]
             store: None,
-        }
-    }
-
-    /// The running indexer's database that `postgres` names, opened beside it with
-    /// `tables` of `schema`: it takes no lock, and writes no ledger.
-    #[cfg(feature = "postgres")]
-    pub(super) async fn beside(
-        postgres: &crate::sink::PostgresSettings,
-        schema: &Schema,
-        tables: &std::collections::HashSet<crate::sink::table::TableId>,
-        chain: &ChainId,
-    ) -> Result<Self, BackfillError> {
-        let store = crate::sink::PostgresSink::open(
-            postgres,
-            std::sync::Arc::new(schema.select(tables)),
-            chain.as_str(),
-            crate::sink::postgres::Writer::Beside,
-        )
-        .await?;
-        Ok(Self { store: Some(store) })
+        })
     }
 
     /// Upserts `events`, decoded and derived records, into the tables the store routes, in
@@ -127,6 +99,37 @@ impl Database {
         let _ = (chain, events);
         Ok(())
     }
+}
+
+/// The tables of `schema`, a backfill's, that `tables` routes to the running indexer's
+/// database. `tables` names the tables of every manifest the running indexer decodes,
+/// `decoded`, so it is resolved against those, where a typo is caught as at its startup,
+/// and its tables taken from `schema` by name: an entry naming another protocol's is
+/// none of the backfill's.
+#[cfg(feature = "postgres")]
+pub(super) fn routed(
+    tables: &crate::sink::route::Tables,
+    decoded: &std::path::Path,
+    chain: &ChainId,
+    schema: &Schema,
+) -> Result<std::collections::HashSet<crate::sink::table::TableId>, BackfillError> {
+    let all = crate::decode::Catalog::load(decoded, chain)?;
+    let all = all.schema();
+    let routed = tables
+        .resolve(all)
+        .map_err(|source| BackfillError::Route { source })?;
+    let names: std::collections::HashSet<&str> = all
+        .tables()
+        .iter()
+        .filter(|def| routed.contains(&def.id))
+        .map(|def| def.name.as_str())
+        .collect();
+    Ok(schema
+        .tables()
+        .iter()
+        .filter(|def| names.contains(def.name.as_str()))
+        .map(|def| def.id)
+        .collect())
 }
 
 /// How many threads the machine runs at once.

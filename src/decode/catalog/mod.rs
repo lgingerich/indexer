@@ -130,7 +130,7 @@ pub(crate) type EntryId = usize;
 
 /// One `[[contract]]`, loaded: its protocol, name, merged ABI, and the contracts its
 /// instances create.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub(crate) struct Entry {
     /// The protocol tag decoded records carry.
     pub(crate) protocol: String,
@@ -154,7 +154,7 @@ pub(crate) struct Rule {
 
 /// The loaded catalog for one chain: every contract entry, and the seed addresses on that
 /// chain.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct Catalog {
     pub(crate) entries: Vec<Entry>,
     pub(crate) seeds: Vec<(Address, EntryId)>,
@@ -704,29 +704,6 @@ addresses = { base = ["0x33128a8fC17869897dcE68Ed026d694621f6FDfD"], ethereum = 
                 ("uniswap_v3.UniswapV3Factory", "bnb")
             ),
             other => panic!("expected an unknown chain, got {other:?}"),
-        }
-    }
-
-    /// Uniswap V4's one `PoolManager` is listed on each chain the indexer runs it on.
-    #[test]
-    fn uniswap_v4_lists_its_pool_manager_per_chain() {
-        for (chain, pool_manager) in [
-            ("ethereum", "0x000000000004444c5dc75cB358380D2e3dE08A90"),
-            ("robinhood", "0x8366a39cc670b4001a1121b8f6a443a643e40951"),
-        ] {
-            let catalog = Catalog::load(
-                protocols().join("uniswap/v4"),
-                &crate::wire::envelope::ChainId::new(chain),
-            )
-            .expect("loads");
-            let seeds: Vec<_> = catalog.seeds.iter().map(|&(address, _)| address).collect();
-            assert_eq!(
-                seeds,
-                [pool_manager
-                    .parse::<alloy_primitives::Address>()
-                    .expect("an address")],
-                "{chain}"
-            );
         }
     }
 

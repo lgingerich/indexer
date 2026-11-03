@@ -8,12 +8,11 @@ use tracing::{info, warn};
 
 use super::derive::Sent;
 use super::handoff::Handoffs;
-use super::pairs::{Fill, Matching, Query};
 use super::{Claims, Decoder, Record};
 use crate::metrics;
 use crate::sink::{EnvelopeSink, SinkError};
 use crate::wire::datasets::evm::{Contract, Log};
-use crate::wire::envelope::{BlockMeta, ChainId, Envelope, Event, Handoff};
+use crate::wire::envelope::{ChainId, Envelope, Event, Handoff};
 
 /// Forwards every raw record and adds decoded logs, their derived rows, and discovered
 /// contracts.
@@ -40,14 +39,6 @@ use crate::wire::envelope::{BlockMeta, ChainId, Envelope, Event, Handoff};
 /// published before the block's marker with the contract's `contracts` row: the backfill
 /// decodes its logs below that block, the run from it. A reorg that orphans the block
 /// deletes the record with it, so the next block records it again.
-///
-/// # Pools matched to Metric's pairs
-///
-/// With a matching (see `crate::decode::pairs`), every record it
-/// decodes is also shown to the matching, which keeps the pools on Metric's pairs. Their
-/// records, and the creation logs fetched from a node, follow the handed-over contracts'
-/// course: taken after a block's marker, recorded with the next block (see
-/// `crate::decode::pairs`).
 pub struct DecodingSink<K> {
     decoder: Decoder,
     /// The last transaction forwarded in the current block, `None` before its first. A
@@ -56,8 +47,6 @@ pub struct DecodingSink<K> {
     transaction: Option<Sent>,
     /// The contracts backfills hand over, when the run's watch reads them from the lake.
     handoffs: Option<Handoffs>,
-    /// The pools matched to Metric's pairs, and the tasks that fetch and fill them.
-    matching: Option<Linked>,
     /// The blocks some store holds already, which a restart's ingest hands back (see
     /// [`holding`](Self::holding)): no record is published with one, since a store that
     /// holds it drops the block's rows as it arrives.
@@ -87,77 +76,23 @@ impl<K: EnvelopeSink> DecodingSink<K> {
             decoder,
             transaction: None,
             handoffs: None,
-            matching: None,
             held: HashSet::new(),
             decoded: 0,
             inner,
         }
     }
 
-    /// Publishes no handoff or match record with a block of `held`, the blocks the stores
-    /// hold above where ingest resumed: such a record waits for the first block no store
-    /// holds, as the stores' session row does, so every store writes it. The contract or
-    /// pool it records is decoded from when it joined all the same; a store holding a
-    /// block drops that block's rows, and the record's later block puts them below it,
-    /// for the backfill or the fill to write.
+    /// Publishes no handoff record with a block of `held`, the blocks the stores hold
+    /// above where ingest resumed: such a record waits for the first block no store
+    /// holds, as the stores' session row does, so every store writes it. The contract it
+    /// records is decoded from when it joined all the same; a store holding a block drops
+    /// that block's rows, and the record's later block puts them below it, for the
+    /// backfill to write.
     #[must_use]
     #[cfg(feature = "store")]
     pub(crate) fn holding(mut self, held: HashSet<B256>) -> Self {
         self.held = held;
         self
-    }
-
-    /// Matches the pools on Metric's pairs with `matching`, which the stores' records,
-    /// `restored`, take back, through `links` to the tasks that fetch creation logs and
-    /// fill pools' history.
-    #[must_use]
-    #[cfg(feature = "store")]
-    pub(crate) fn with_matching(
-        mut self,
-        mut matching: Matching,
-        restored: Vec<crate::wire::envelope::Matched>,
-        links: MatchingLinks,
-    ) -> Self {
-        let fills = matching.restore(restored);
-        self.matching = Some(Linked {
-            matching,
-            links,
-            queries: Vec::new(),
-            fills,
-        });
-        self
-    }
-
-    /// Takes what the fetches and fills answered since the last marker, `block`: each
-    /// creation log a fetch found, decoded here as the stream's are, and each fill done.
-    /// Then sends on what is waiting to be fetched or filled, as far as the tasks take it.
-    fn take_answers(&mut self, chain: &ChainId, block: &BlockMeta) {
-        let Some(linked) = &mut self.matching else {
-            return;
-        };
-        if let Some(query) = linked.matching.start(block.height) {
-            linked.queries.push(query);
-        }
-        while let Ok(logs) = linked.links.found.try_recv() {
-            for log in logs {
-                let Some((Ok(Record { decoded, event }), claims)) = self.decoder.decode(&log)
-                else {
-                    warn!(%chain, address = %log.address, block = log.block_number,
-                        "a fetched creation log does not decode; skipped");
-                    continue;
-                };
-                let contract = claims.contracts().next().cloned();
-                if linked.matching.fetched(&decoded, event, contract) {
-                    self.decoder.admit(claims);
-                }
-            }
-        }
-        while let Ok(fill) = linked.links.filled.try_recv() {
-            linked.matching.filled(&fill);
-        }
-        let queries = linked.matching.queries(block.height);
-        linked.queries.extend(queries);
-        linked.send();
     }
 
     /// Takes the contracts backfills hand over from `handed`, and `restored`, the records
@@ -197,9 +132,6 @@ impl<K: EnvelopeSink> DecodingSink<K> {
                     .decoder
                     .derive(chain, event, &decoded, sent)
                     .map_err(|error| SinkError::Decode(Box::new(error)))?;
-                if let Some(linked) = &mut self.matching {
-                    linked.matching.decoded(&decoded, event);
-                }
                 events.push(Event::Decoded(Box::new(decoded)));
                 events.extend(derived.into_iter().map(|row| Event::Derived(Box::new(row))));
             }
@@ -258,15 +190,11 @@ impl<K: EnvelopeSink> EnvelopeSink for DecodingSink<K> {
             .as_ref()
             .filter(|block| !self.held.remove(&block.hash))
         {
-            let handed = self
+            let records: Vec<Event> = self
                 .handoffs
                 .iter()
-                .flat_map(|handoffs| handoffs.events(block));
-            let matched = self
-                .matching
-                .iter()
-                .flat_map(|linked| linked.matching.events(block));
-            let records: Vec<Event> = handed.chain(matched).collect();
+                .flat_map(|handoffs| handoffs.events(block))
+                .collect();
             for event in records {
                 self.inner
                     .publish(Envelope::new(chain.clone(), event))
@@ -274,11 +202,6 @@ impl<K: EnvelopeSink> EnvelopeSink for DecodingSink<K> {
             }
             if let Some(handoffs) = &mut self.handoffs {
                 handoffs.recorded(block);
-            }
-            if let Some(linked) = &mut self.matching
-                && let Some(fill) = linked.matching.recorded(block)
-            {
-                linked.fills.push(fill);
             }
         }
         self.inner.publish(envelope).await?;
@@ -301,15 +224,11 @@ impl<K: EnvelopeSink> EnvelopeSink for DecodingSink<K> {
             if let Some(handoffs) = &mut self.handoffs {
                 handoffs.rejoin(&orphaned);
             }
-            if let Some(linked) = &mut self.matching {
-                linked.matching.rejoin(&orphaned);
-            }
         }
-        if let Some(block) = &marker {
-            if let Some(handoffs) = &mut self.handoffs {
-                handoffs.adopt(&mut self.decoder);
-            }
-            self.take_answers(&chain, block);
+        if marker.is_some()
+            && let Some(handoffs) = &mut self.handoffs
+        {
+            handoffs.adopt(&mut self.decoder);
         }
         Ok(())
     }
@@ -330,56 +249,6 @@ impl<K: EnvelopeSink> EnvelopeSink for DecodingSink<K> {
     }
 }
 
-/// The decode stage's ends of the channels to the tasks that fetch pools' creation logs
-/// from a node and fill their history from the lake.
-#[derive(Debug)]
-pub(crate) struct MatchingLinks {
-    /// The fetches to make.
-    pub(crate) queries: mpsc::Sender<Vec<Query>>,
-    /// The logs they found.
-    pub(crate) found: mpsc::Receiver<Vec<Log>>,
-    /// The fills to make.
-    pub(crate) fills: mpsc::Sender<Fill>,
-    /// The fills done.
-    pub(crate) filled: mpsc::Receiver<Fill>,
-}
-
-/// A [`Matching`] with its links, and what waits to be sent on them: a task behind on
-/// its work never holds the ingest task back, which sends again at the next marker.
-#[derive(Debug)]
-struct Linked {
-    matching: Matching,
-    links: MatchingLinks,
-    queries: Vec<Query>,
-    fills: Vec<Fill>,
-}
-
-impl Linked {
-    /// Sends what waits, as far as each channel takes it.
-    fn send(&mut self) {
-        if !self.queries.is_empty() {
-            match self
-                .links
-                .queries
-                .try_send(std::mem::take(&mut self.queries))
-            {
-                Ok(()) | Err(mpsc::error::TrySendError::Closed(_)) => {}
-                Err(mpsc::error::TrySendError::Full(queries)) => self.queries = queries,
-            }
-        }
-        while let Some(fill) = self.fills.pop() {
-            match self.links.fills.try_send(fill) {
-                Ok(()) => {}
-                Err(mpsc::error::TrySendError::Closed(_)) => self.fills.clear(),
-                Err(mpsc::error::TrySendError::Full(fill)) => {
-                    self.fills.push(fill);
-                    break;
-                }
-            }
-        }
-    }
-}
-
 #[cfg(test)]
 #[expect(clippy::expect_used)]
 mod tests {
@@ -388,7 +257,7 @@ mod tests {
     use super::*;
     use crate::decode::fixtures::uniswap_v3::{pool_created, swap};
     use crate::decode::fixtures::{metric, shipped};
-    use crate::wire::envelope::Reorg;
+    use crate::wire::envelope::{BlockMeta, Reorg};
 
     #[derive(Default)]
     struct Collect {
@@ -517,6 +386,61 @@ mod tests {
         );
     }
 
+    /// Many contracts handed over at once are recorded at most [`PER_BLOCK`] a block, in
+    /// the order handed, each once, however many blocks a store already holds keep them
+    /// waiting.
+    #[cfg(feature = "store")]
+    #[tokio::test]
+    async fn handed_over_contracts_are_recorded_at_most_a_blocks_share_at_a_time() {
+        use crate::decode::handoff::PER_BLOCK;
+
+        let pools: Vec<Address> = (0..=2 * PER_BLOCK)
+            .map(|n| {
+                let mut bytes = [0xd0; 20];
+                bytes[..8].copy_from_slice(&u64::try_from(n).expect("fits").to_be_bytes());
+                Address::from(bytes)
+            })
+            .collect();
+        let (sink, sender) = handing(Vec::new());
+        let held = |height: u64| B256::with_last_byte(u8::try_from(height).expect("small"));
+        let mut sink = sink.holding(HashSet::from([held(2), held(3)]));
+        sender
+            .send(pools.iter().copied().map(handed).collect())
+            .await
+            .expect("sent");
+        for height in 1..=6 {
+            sink.publish(marker(height)).await.expect("marker");
+        }
+        let recorded: Vec<(Address, u64)> = sink
+            .inner
+            .records
+            .iter()
+            .filter_map(|envelope| match &envelope.event {
+                Event::Handoff(handoff) => Some((handoff.address, handoff.block_number)),
+                _ => None,
+            })
+            .collect();
+        let per_block = |height: u64| {
+            recorded
+                .iter()
+                .filter(|(_, block)| *block == height)
+                .count()
+        };
+        assert_eq!(
+            [per_block(4), per_block(5), per_block(6)],
+            [PER_BLOCK, PER_BLOCK, 1],
+            "none with the held blocks, then a block's share each"
+        );
+        assert_eq!(
+            recorded
+                .iter()
+                .map(|(address, _)| *address)
+                .collect::<Vec<_>>(),
+            pools,
+            "each once, in the order handed"
+        );
+    }
+
     /// A record waits past the blocks a store holds already, which drops their rows as
     /// they arrive, and is published with the first block none holds; the contract
     /// decodes from when it joined all the same.
@@ -616,104 +540,6 @@ mod tests {
             panic!("handoff");
         };
         assert_eq!(handoff.block_number, 3);
-    }
-
-    /// A Metric pool in the stream on a new pair asks for the pools already on it; one a
-    /// fetch finds joins after the next marker, so the block after records it, its
-    /// `contracts` row then its match, decodes its logs from there, and asks for its
-    /// history before that block to be filled; the fill's answer records it filled.
-    #[cfg(feature = "store")]
-    #[tokio::test]
-    async fn a_pool_found_on_a_metric_pair_joins_and_is_filled() {
-        use crate::decode::pairs::tests::{USDC, WETH, ethereum, metric, v3_created};
-        use tokio::sync::mpsc;
-
-        let (matching, _) = ethereum();
-        let (queries, mut asked) = mpsc::channel(4);
-        let (answer, found) = mpsc::channel(4);
-        let (fills, mut to_fill) = mpsc::channel(4);
-        let (done, filled) = mpsc::channel(4);
-        let links = MatchingLinks {
-            queries,
-            found,
-            fills,
-            filled,
-        };
-        let chain = || ChainId::new("ethereum");
-        let mut sink = DecodingSink::new(Decoder::new(shipped("ethereum"), []), Collect::default())
-            .with_matching(matching, Vec::new(), links);
-        let publish = |event| Envelope::new(chain(), event);
-        let marker = |height: u64| {
-            publish(Event::AcceptedBlock(BlockMeta {
-                height,
-                hash: B256::with_last_byte(u8::try_from(height).expect("small")),
-                parent_hash: B256::ZERO,
-                timestamp: 1_800_000_000 + height,
-            }))
-        };
-        sink.publish(publish(Event::Log(Box::new(metric(
-            USDC,
-            WETH,
-            1,
-            1_700_000_000,
-        )))))
-        .await
-        .expect("metric");
-        sink.publish(marker(1)).await.expect("marker");
-        let startup = asked.try_recv().expect("the startup fetch and the pair's");
-        assert!(startup.len() >= 4, "{startup:?}");
-
-        let pool = Address::repeat_byte(0x31);
-        answer
-            .send(vec![v3_created(USDC, WETH, pool, 0)])
-            .await
-            .expect("answered");
-        sink.publish(marker(2)).await.expect("marker");
-        sink.publish(log(swap(pool))).await.expect("swap");
-        sink.publish(marker(3)).await.expect("marker");
-        let fill = to_fill.try_recv().expect("a fill");
-        assert_eq!(fill.through, 2);
-        assert_eq!(fill.pools[0].contract, pool);
-        done.send(fill).await.expect("filled");
-        sink.publish(marker(4)).await.expect("marker");
-        sink.publish(marker(5)).await.expect("marker");
-
-        // The Metric pool's own rows, derived and discovered, are the stream's as ever.
-        let kinds: Vec<_> = sink
-            .inner
-            .records
-            .iter()
-            .map(|envelope| envelope.event.kind())
-            .filter(|&kind| kind != "derived")
-            .collect();
-        assert_eq!(
-            kinds,
-            [
-                "log",
-                "decoded",
-                "contract",
-                "accepted_block",
-                "accepted_block",
-                "log",
-                "decoded",
-                "contract",
-                "matched",
-                "accepted_block",
-                "accepted_block",
-                "matched",
-                "accepted_block",
-            ]
-        );
-        let filled: Vec<bool> = sink
-            .inner
-            .records
-            .iter()
-            .filter_map(|envelope| match &envelope.event {
-                Event::Matched(matched) => Some(matched.filled),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(filled, [false, true]);
     }
 
     /// A log no contract decodes and a control marker are each forwarded once, with

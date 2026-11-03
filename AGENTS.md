@@ -92,9 +92,12 @@ production. The VM size, container memory caps, alerts and dashboards live in
 
 Rules:
 
-- Never point a local run, test or benchmark at production Postgres or the
-  `s3://blockchain-data` lake. A second writer duplicates rows. Use `dev` and a
-  local Postgres, or a `_dev`/`_benchmark` prefix in R2 the user has agreed to.
+- Reading the production `s3://blockchain-data` lake from a local run is fine:
+  queries, row counts, Delta log and file statistics, anything that writes
+  nothing.
+- Never point a local run, test or benchmark that writes at production Postgres
+  or the lake. A second writer duplicates rows. Use `dev` and a local Postgres,
+  or a `_dev`/`_benchmark` prefix in R2 the user has agreed to.
 - Before changing memory buffers, batch sizes, concurrency or the VM size,
   measure the change locally under a container memory cap
   (`docker run --memory=<cap>`) and report the numbers. Change one setting per

@@ -114,11 +114,9 @@ impl DeltaSink {
             .collect();
         // After the repair, which deletes a stopped commit's handoffs with its other rows.
         let handoffs = sink.handoffs().await?;
-        let matched = super::matched::matched(sink.lake(Table::Matched)).await?;
         sink.phase = Phase::Opened(Restored {
             contracts,
             handoffs,
-            matched,
             ledger,
         });
         sink.publish_tip();

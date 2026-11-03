@@ -1,14 +1,18 @@
 //! `indexer backfill`: decodes protocols added after their blocks were indexed, from the
 //! logs the lake already holds, so adding a manifest does not mean indexing the chain
-//! again. Nothing is fetched from a node or `HyperSync`.
+//! again. Nothing is fetched from a node; only the factories' logs from before the lake's
+//! first block are fetched from `HyperSync`, when `[backfill.hypersync]` names it (see
+//! "Contracts created before the lake's first block").
 //!
 //! ```bash
-//! indexer backfill indexer.ethereum.backfill.toml
+//! indexer backfill indexer.ethereum.toml
 //! ```
 //!
-//! A backfill has a settings file of its own, `indexer.<chain>.backfill.toml` (see
-//! [`BackfillSettings`]): the chain, the lake, and the manifests to backfill, a subtree
-//! of the running indexer's, so the tables they declare are the ones it writes.
+//! A backfill reads the running indexer's own settings file (see [`BackfillSettings`]):
+//! its `[backfill]` names the manifests to backfill, a subtree of the running
+//! indexer's, so the tables they declare are the ones it writes, and the chain, the lake,
+//! and the database are the running indexer's `[ingest]`, `[sink.delta]`, and
+//! `[sink.postgres]`.
 //!
 //! # Writing beside the running indexer
 //!
@@ -64,11 +68,14 @@
 //! contract only through the bound, and says from where to run again once the tip has
 //! passed them by the lag; a rerun hands over nothing it handed before.
 //!
-//! # Not handled
+//! # Contracts created before the lake's first block
 //!
-//! Contracts created before the lake's first block are not in it to discover: they
-//! need seeds, or their factories' logs fetched from a node (see the README's
-//! "Stored-log replay").
+//! Those are not in the lake to discover. With `[backfill.hypersync]`, the backfill
+//! first asks `HyperSync` for the factories' logs below the lake's first block, a few
+//! requests over the chain's whole history, and adds what they created to what it
+//! hands over and backfills. Their logs from the lake's first block on are in the lake,
+//! so they are decoded from there like any other. Without it, they are not found, and a
+//! warning says so.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -83,17 +90,15 @@ use crate::sink::delta::{DecodedTables, LogReader, RunLock};
 use crate::wire::envelope::ChainId;
 
 mod handover;
-mod lookback;
 mod settings;
 mod write;
 
 use self::handover::{adopt, covers, discover, handover, select};
-pub(crate) use self::lookback::Lookback;
-pub use self::settings::{BackfillError, BackfillSettings, Backfilled, LakeSettings};
+pub use self::settings::{BackfillError, BackfillSettings, Backfilled};
 use self::write::{Database, cores, decode_all, derive, parts, rows};
 
 /// How the subcommand is called.
-pub const USAGE: &str = "indexer backfill <indexer.<chain>.backfill.toml>";
+pub const USAGE: &str = "indexer backfill <indexer.<chain>.toml>";
 
 /// How many reads run at once: the next while one is decoded and written. More were no
 /// faster, since a read already spreads over every core, and each holds its logs until
@@ -123,8 +128,8 @@ pub const COMMIT_LOGS: usize = 50_000;
 ///
 /// # Errors
 ///
-/// As [`backfill`], and [`BackfillError::Read`] and [`BackfillError::Parse`] for the
-/// settings.
+/// As [`backfill`], and [`BackfillError::Settings`] and [`BackfillError::Missing`] for
+/// the settings.
 pub async fn run(path: &Path) -> Result<Backfilled, BackfillError> {
     backfill(&BackfillSettings::from_file(
         path,
@@ -152,7 +157,7 @@ pub async fn run(path: &Path) -> Result<Backfilled, BackfillError> {
 /// holds. Stops on a store that cannot be read or written, or a lease taken over.
 pub async fn backfill(settings: &BackfillSettings) -> Result<Backfilled, BackfillError> {
     let chain = ChainId::new(&settings.chain);
-    let catalog = Catalog::load(&settings.protocols, &chain)?;
+    let catalog = Catalog::load(&settings.run.protocols, &chain)?;
     let addresses: Vec<Address> = catalog.seeds.iter().map(|&(address, _)| address).collect();
     if addresses.is_empty() {
         return Err(BackfillError::NoContracts { chain });
@@ -166,8 +171,8 @@ pub async fn backfill(settings: &BackfillSettings) -> Result<Backfilled, Backfil
         .collect();
 
     let lake = &settings.lake;
-    let target = settings.out.as_deref().unwrap_or(&lake.uri);
-    let storage = match settings.out {
+    let target = settings.run.out.as_deref().unwrap_or(&lake.uri);
+    let storage = match settings.run.out {
         Some(_) => BTreeMap::new(),
         None => lake.storage.clone(),
     };
@@ -209,24 +214,24 @@ async fn fill(
     let reader =
         LogReader::open(&lake.uri, &lake.storage, &schema, chain.as_str(), derives).await?;
     let bound = reader.bound().ok_or(BackfillError::EmptyLedger)?;
-    let to = match settings.to {
+    let to = match settings.run.to {
         Some(to) if to > bound => return Err(BackfillError::ToAboveBound { to, bound }),
         Some(to) => to,
         None => bound,
     };
     let wanted = schema.decoded_events();
-    match &settings.out {
+    match &settings.run.out {
         // The running indexer writes the chain's own lake, not this one, so its session
         // says nothing about what this one holds.
         Some(out) => info!(out, "writing to another lake; the chain's is only read"),
         None => covers("lake", reader.session(), &wanted, protocols, to)?,
     }
-    let target = settings.out.as_deref().unwrap_or(&lake.uri);
+    let target = settings.run.out.as_deref().unwrap_or(&lake.uri);
     let mut tables =
         DecodedTables::open(target, storage, &schema, chain.as_str(), reader.width()).await?;
     let mut database = Database::open(settings, &schema, chain, &wanted, protocols, to).await?;
 
-    let from = settings.from.unwrap_or(0);
+    let from = settings.run.from.unwrap_or(0);
     // Each read owns a copy of the reader, so the next is read while one is decoded and
     // written. They share the cores: each Parquet stream holds a row group of up to a
     // million rows while it reads, so a stream per core per read would hold gigabytes.
@@ -236,11 +241,14 @@ async fn fill(
     if discovers {
         // The running indexer discovers what is created from its restart on; with `out`,
         // there is no running indexer to hand anything to.
-        let restart = settings.out.is_none().then(|| reader.session()).flatten();
+        let run = &settings.run;
+        let restart = run.out.is_none().then(|| reader.session()).flatten();
         let below = restart.map_or(to, |session| session.block_number.saturating_sub(1));
-        let found = discover(&mut decoder, &reader, from..=below.min(to), streams).await?;
+        let blocks = from..=below.min(to);
+        let hypersync = run.hypersync.as_ref();
+        let found = discover(&mut decoder, &reader, hypersync, blocks, streams).await?;
         done.discovered = found.len();
-        let handed = match &settings.out {
+        let handed = match &settings.run.out {
             None => {
                 handover(
                     settings,
@@ -254,7 +262,7 @@ async fn fill(
                 .await?
             }
             // Nothing decodes them above `to`, so there is nothing to wait for.
-            Some(_) => select(settings.only.as_deref(), found)?
+            Some(_) => select(settings.run.only.as_deref(), found)?
                 .into_iter()
                 .map(|contract| (contract, to.saturating_add(1)))
                 .collect(),

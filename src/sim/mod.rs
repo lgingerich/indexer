@@ -57,7 +57,7 @@ use crate::runtime::{Pipeline, RuntimeError};
 use crate::sink::channel::Batching;
 use crate::sink::duckdb::DuckDb;
 use crate::sink::resume::{Opened, ResumeError};
-use crate::sink::route::{Selection, StoreBackend};
+use crate::sink::route::StoreBackend;
 use crate::sink::stop::Stop;
 use crate::sink::store_runtime::StoreRuntime;
 use crate::sink::table::{Schema, Table, TableId};
@@ -209,8 +209,7 @@ impl StorePlan {
                     | Table::Reorg
                     | Table::AcceptedBlock
                     | Table::Session
-                    | Table::Handoff
-                    | Table::Matched,
+                    | Table::Handoff,
                 ) => true,
             })
             .collect()
@@ -444,10 +443,7 @@ async fn open(
             held: BTreeMap::new(),
         },
         batching: store.batching,
-        tables: Selection {
-            tables,
-            matched: HashSet::new(),
-        },
+        tables,
         // The simulation runs on one thread to stay deterministic.
         runtime: StoreRuntime::current(),
     })

@@ -1,7 +1,7 @@
-//! A search of a chain's whole history for the logs some contracts emitted with some
-//! topics, over `HyperSync`: what finds a pool's creation log among hundreds of millions
-//! of blocks in a few requests, where a node's `eth_getLogs` may take a few hundred
-//! heights a request.
+//! A search of a chain's history for the logs some contracts emitted, over `HyperSync`:
+//! what finds the contracts a factory created among hundreds of millions of blocks in a
+//! few hundred requests, where a node's `eth_getLogs` may take a few hundred heights a
+//! request.
 
 use alloy_primitives::{Address, B256};
 use serde::{Deserialize, Serialize};
@@ -11,7 +11,7 @@ use crate::wire::datasets::evm::Log;
 use crate::wire::envelope::BlockMeta;
 
 use super::wire::{Quantity, RawLog};
-use super::{CONTEXT, REQUEST_TIMEOUT, judge};
+use super::{CONTEXT, REQUEST_TIMEOUT, answer, judge};
 use crate::ingest::source::retry::{Attempt, Backoff, os_seed};
 
 /// The log columns a search returns: every column of a `logs` row.
@@ -41,7 +41,6 @@ const PAGE_PAUSE: std::time::Duration = if cfg!(test) {
 };
 
 /// A chain's `HyperSync` endpoint, searched for logs.
-#[derive(Clone)]
 pub struct LogSearch {
     client: reqwest::Client,
     query_url: reqwest::Url,
@@ -70,12 +69,10 @@ struct Query<'a> {
     field_selection: Fields,
 }
 
-/// The logs a search matches: emitted by any of `address`, with each topic any of its
-/// list, an empty list matching any.
+/// The logs a search matches: emitted by any of `address`.
 #[derive(Debug, Serialize)]
 struct Selection<'a> {
     address: &'a [Address],
-    topics: Vec<Vec<B256>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -134,20 +131,15 @@ impl LogSearch {
         })
     }
 
-    /// Every log `addresses` emitted with each topic one of its list in `topics`, an empty
-    /// list matching any, from the first block through `through`, in block and log order, each with its block's
-    /// timestamp.
+    /// Every log `addresses` emitted from the first block through `through`, in block and
+    /// log order, each with its block's timestamp. An endpoint not yet at `through` is
+    /// asked again every few minutes until it is, keeping what it answered: a search
+    /// never returns with the blocks above the endpoint's height missing.
     ///
     /// # Errors
     ///
     /// Returns the first request's error, or a row that is not what was selected.
-    pub async fn logs(
-        &self,
-        addresses: &[Address],
-        topics: &[Vec<B256>; 4],
-        through: u64,
-    ) -> Result<Vec<Log>, SourceError> {
-        let topics: Vec<Vec<B256>> = topics.to_vec();
+    pub async fn logs(&self, addresses: &[Address], through: u64) -> Result<Vec<Log>, SourceError> {
         let to_block = through.saturating_add(1);
         let mut logs = Vec::new();
         let mut from_block = 0;
@@ -156,10 +148,7 @@ impl LogSearch {
             let query = Query {
                 from_block,
                 to_block,
-                logs: [Selection {
-                    address: addresses,
-                    topics: topics.clone(),
-                }],
+                logs: [Selection { address: addresses }],
                 field_selection: Fields {
                     block: BLOCK_FIELDS,
                     log: LOG_FIELDS,
@@ -179,13 +168,20 @@ impl LogSearch {
             for batch in response.data {
                 logs.extend(rows(batch)?);
             }
-            // An endpoint a few blocks behind `through` answers up to its own height; the
-            // stream has the blocks above it.
-            if response
+            // An endpoint below `through` answers up to its own height: what it answered
+            // is kept, and the rest asked for once it has caught up.
+            if let Some(height) = response
                 .archive_height
-                .is_some_and(|height| response.next_block > height)
+                .filter(|&height| height < through && response.next_block > height)
             {
-                break;
+                tracing::warn!(
+                    height,
+                    through,
+                    "HyperSync is behind the search; asking again later"
+                );
+                from_block = from_block.max(height.saturating_add(1));
+                tokio::time::sleep(PAGE_PAUSE).await;
+                continue;
             }
             if response.next_block <= from_block {
                 return Err(malformed(CONTEXT, "a search answered without moving on"));
@@ -219,34 +215,11 @@ impl LogSearch {
     }
 
     async fn request(&self, query: &Query<'_>) -> Result<Response, SourceError> {
-        let response = self
-            .client
-            .post(self.query_url.clone())
-            .bearer_auth(&self.token)
-            .json(query)
-            .send()
-            .await?;
-        let status = response.status();
-        // The delay-seconds form only, as the source reads it.
-        let retry_after = response
-            .headers()
-            .get(reqwest::header::RETRY_AFTER)
-            .and_then(|value| value.to_str().ok())
-            .and_then(|value| value.trim().parse().ok())
-            .map(std::time::Duration::from_secs);
-        let body = response.bytes().await?;
-        if !status.is_success() {
-            return Err(SourceError::Status {
-                context: CONTEXT,
-                status: status.as_u16(),
-                detail: String::from_utf8_lossy(&body).chars().take(500).collect(),
-                retry_after,
-            });
-        }
-        serde_json::from_slice(&body).map_err(|source| SourceError::Json {
-            context: CONTEXT,
-            source,
-        })
+        answer(
+            self.client.post(self.query_url.clone()).json(query),
+            &self.token,
+        )
+        .await
     }
 }
 
@@ -278,17 +251,15 @@ fn rows(batch: Batch) -> Result<Vec<Log>, SourceError> {
         .collect()
 }
 
+/// A stand-in `HyperSync` endpoint, for tests here and elsewhere.
 #[cfg(test)]
 #[expect(clippy::expect_used)]
-mod tests {
-    use alloy_primitives::{Address, B256};
+pub(crate) mod testing {
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
-
-    use super::LogSearch;
 
     /// An endpoint answering each request with the next of `answers`, a status and a
     /// body, and the requests' bodies it was sent.
-    async fn endpoint(
+    pub(crate) async fn endpoint(
         answers: Vec<(u16, String)>,
     ) -> (String, tokio::task::JoinHandle<Vec<String>>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -331,6 +302,15 @@ mod tests {
         });
         (url, served)
     }
+}
+
+#[cfg(test)]
+#[expect(clippy::expect_used)]
+mod tests {
+    use alloy_primitives::{Address, B256};
+
+    use super::LogSearch;
+    use super::testing::endpoint;
 
     /// One page's answer: a log of `address` in block `height`, and where the next starts.
     fn page(height: u64, next: u64, archive: u64) -> String {
@@ -348,40 +328,37 @@ mod tests {
     }
 
     /// A refused rate is waited out on the same page; the pages are read in turn, each log
-    /// placed in its block; and the search stops at the endpoint's height, short of a
-    /// `through` it does not hold yet.
+    /// placed in its block; and an endpoint short of `through` is asked again once it has
+    /// caught up, for the blocks above the height it answered to, rather than the search
+    /// ending without them.
     #[tokio::test]
-    async fn a_search_waits_out_refusals_and_stops_at_the_endpoints_height() {
+    async fn a_search_waits_out_refusals_and_an_endpoint_behind_it() {
         let (url, served) = endpoint(vec![
             (429, "slow down".to_owned()),
             (200, page(5, 50, 99)),
             (200, page(60, 100, 99)),
+            (200, page(150, 201, 300)),
         ])
         .await;
         let search = LogSearch::new(&url, "token").expect("built");
-        let topics: [Vec<B256>; 4] = [
-            vec![B256::with_last_byte(1)],
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-        ];
         let logs = search
-            .logs(&[Address::repeat_byte(7)], &topics, 200)
+            .logs(&[Address::repeat_byte(7)], 200)
             .await
             .expect("searched");
         assert_eq!(
             logs.iter()
                 .map(|log| (log.block_number, log.block_timestamp))
                 .collect::<Vec<_>>(),
-            [(5, 16), (60, 16)]
+            [(5, 16), (60, 16), (150, 16)]
         );
         let bodies = served.await.expect("served");
         assert_eq!(
             bodies.len(),
-            3,
+            4,
             "the refused page asked again, then the next"
         );
         assert!(bodies[2].contains(r#""from_block":50"#), "{}", bodies[2]);
+        assert!(bodies[3].contains(r#""from_block":100"#), "{}", bodies[3]);
         assert!(
             !format!("{search:?}").contains("token"),
             "the token is never shown"
@@ -393,7 +370,6 @@ mod tests {
     async fn a_refused_token_ends_the_search() {
         let (url, _served) = endpoint(vec![(401, "no".to_owned())]).await;
         let search = LogSearch::new(&url, "token").expect("built");
-        let topics: [Vec<B256>; 4] = Default::default();
-        assert!(search.logs(&[Address::ZERO], &topics, 10).await.is_err());
+        assert!(search.logs(&[Address::ZERO], 10).await.is_err());
     }
 }
