@@ -361,6 +361,14 @@ impl Pipeline {
         {
             pipeline.pairs = pairs::Pairs::from_settings(settings, &routes, &pipeline.catalog)?;
         }
+        // The first lake's backfills hand the run contracts.
+        #[cfg(feature = "delta")]
+        if let Routes::Store(stores) = &routes {
+            pipeline.watch = stores
+                .iter()
+                .find_map(|store| store.settings.delta())
+                .map(crate::sink::delta::HandoffWatch::new);
+        }
         Ok((pipeline, routes))
     }
 }
@@ -416,24 +424,13 @@ impl<B: BlockSource + 'static> Pipeline<B> {
             Routes::Print(tables) => tables,
             #[cfg(feature = "store")]
             Routes::Store(routes) => {
-                #[cfg(feature = "delta")]
-                let mut this = self;
-                #[cfg(not(feature = "delta"))]
-                let this = self;
-                #[cfg(feature = "delta")]
-                {
-                    this.watch = routes
-                        .iter()
-                        .find_map(|route| route.settings.delta())
-                        .map(crate::sink::delta::HandoffWatch::new);
-                }
                 // A stop while opening drops what is open; see "Shutdown" in the module docs.
                 let stores = tokio::select! {
                     biased;
                     () = stop.wait() => return Ok(()),
-                    stores = this.open(routes) => stores?,
+                    stores = self.open(routes) => stores?,
                 };
-                return Box::pin(this.run_with_stores(stores, stop)).await;
+                return Box::pin(self.run_with_stores(stores, stop)).await;
             }
         };
         // A stop drops ingest; stdout has nothing to finish.

@@ -201,6 +201,28 @@ pub(super) enum Missing {
     Refuse,
 }
 
+/// The table of `def` at `uri`, opened to be read, or `None` when none was created there
+/// yet: a table only a later run of the indexer, or a backfill, creates.
+pub(super) async fn open_existing(
+    storage: &Storage,
+    uri: String,
+    def: &Arc<TableDef>,
+) -> Result<Option<Lake>, StoreError> {
+    let exists = storage
+        .table(&uri)
+        .await
+        .map_err(StoreError::engine(Operation::Open, Some(&def.name)))?
+        .version()
+        .is_some();
+    if !exists {
+        return Ok(None);
+    }
+    let checkpoints = Arc::new(Semaphore::new(CONCURRENT_CHECKPOINTS));
+    open_table(storage, uri, def, Missing::Refuse, checkpoints)
+        .await
+        .map(Some)
+}
+
 /// Opens the table of `def` at `uri`, creating it when it does not exist as `missing`
 /// says, and checks an existing one against its definition and width. Starts no
 /// checkpoint: the store starts those for the tables it writes.

@@ -19,13 +19,9 @@ use tracing::warn;
 
 use super::abi::{DecodeError, EventKey, event_key};
 use super::catalog::{Catalog, EntryId};
-#[cfg(feature = "delta")]
 use super::derive::{DeriveError, Sent};
 use crate::sink::StoredContract;
-#[cfg(feature = "delta")]
-use crate::wire::datasets::evm::Derived;
-use crate::wire::datasets::evm::{Contract, Decoded, Log};
-#[cfg(feature = "delta")]
+use crate::wire::datasets::evm::{Contract, Decoded, Derived, Log};
 use crate::wire::envelope::ChainId;
 
 /// What [`Decoder::adopt`] did with a handed-over contract.
@@ -184,11 +180,6 @@ impl Decoder {
         parents
     }
 
-    /// The catalog it decodes with.
-    pub(super) const fn catalog(&self) -> &Catalog {
-        &self.catalog
-    }
-
     /// The rows `decoded` derives, as the running indexer's decode stage derives them:
     /// `event` is the [`Record::event`] it decoded as, and `sent` its transaction, whose
     /// sender and recipient each row carries, `None` when it is not known.
@@ -197,7 +188,6 @@ impl Decoder {
     ///
     /// Returns [`DeriveError::Columns`] when a derivation computes a row that does not
     /// match its table, a bug in it that stops the run.
-    #[cfg(feature = "delta")]
     pub(crate) fn derive(
         &self,
         chain: &ChainId,

@@ -47,6 +47,7 @@ use alloy_primitives::{Address, B256, address};
 use super::abi::EventKey;
 use super::catalog::{Catalog, EntryId};
 use super::decoder::DecodedAs;
+use super::records::{BlockRecord, BlockRecords};
 use crate::wire::datasets::evm::{Contract, Decoded};
 use crate::wire::envelope::{BlockMeta, ChainId, Event, Matched};
 use crate::wire::typed::TypedValue;
@@ -81,10 +82,8 @@ const REFERENCE: Rule = Rule {
     contract: "MetricOmmPoolFactory",
     event: "PoolCreated",
     tokens: ["token0", "token1"],
-    token_topics: [2, 3],
     pool: Pool::Contract("poolAddress"),
     fee: None,
-    child: None,
 };
 
 /// The events that announce a pool to match, each with where its arguments are.
@@ -94,24 +93,19 @@ const CANDIDATES: [Rule; 2] = [
         contract: "UniswapV3Factory",
         event: "PoolCreated",
         tokens: ["token0", "token1"],
-        token_topics: [1, 2],
         pool: Pool::Contract("pool"),
         fee: Some("fee"),
-        child: Some("UniswapV3Pool"),
     },
     Rule {
         protocol: "uniswap_v4",
         contract: "PoolManager",
         event: "Initialize",
         tokens: ["currency0", "currency1"],
-        token_topics: [2, 3],
         pool: Pool::Id {
             id: "id",
-            id_topic: 1,
             hooks: "hooks",
         },
         fee: Some("fee"),
-        child: None,
     },
 ];
 
@@ -121,15 +115,12 @@ struct Rule {
     protocol: &'static str,
     contract: &'static str,
     event: &'static str,
-    /// The arguments naming the pair's two tokens.
+    /// The arguments naming the pair's two tokens, which must be indexed: a search
+    /// filters on their topics.
     tokens: [&'static str; 2],
-    /// The topics those arguments are, which a fetch filters on.
-    token_topics: [usize; 2],
     pool: Pool,
     /// The argument holding the pool's fee, if it has one.
     fee: Option<&'static str>,
-    /// The contract a pool that is a contract of its own decodes as.
-    child: Option<&'static str>,
 }
 
 /// How an event names its pool.
@@ -139,10 +130,9 @@ enum Pool {
     Contract(&'static str),
     /// By a `bytes32` argument, within the contract emitting the event, with the
     /// argument naming its hooks. Every event of the contract that concerns one pool
-    /// names it by that argument, the topic `id_topic` of its log.
+    /// names it by that argument, indexed, at the same topic as in this event.
     Id {
         id: &'static str,
-        id_topic: usize,
         hooks: &'static str,
     },
 }
@@ -158,18 +148,13 @@ pub(crate) struct PoolIds {
 }
 
 impl PoolIds {
-    /// The pools of `protocol`'s contract holding many, if its pools are kept by id.
-    pub(crate) fn of(protocol: &str) -> Option<Self> {
-        CANDIDATES
-            .iter()
-            .find(|rule| rule.protocol == protocol)
-            .and_then(|rule| match rule.pool {
-                Pool::Id { id, id_topic, .. } => Some(Self {
-                    argument: id,
-                    topic: id_topic,
-                }),
-                Pool::Contract(_) => None,
-            })
+    /// How `protocol`'s contract holding many names its pools, as `catalog` declares it,
+    /// if its pools are kept by id.
+    pub(crate) fn of(catalog: &Catalog, protocol: &str) -> Option<Self> {
+        let rule = CANDIDATES
+            .into_iter()
+            .find(|rule| rule.protocol == protocol)?;
+        Bound::new(catalog, rule)?.ids
     }
 
     /// The pool `decoded` names.
@@ -196,23 +181,43 @@ struct Bound {
     entry: EntryId,
     keys: Vec<EventKey>,
     addresses: Vec<Address>,
+    /// The topics the token arguments are, as the event's ABI indexes them.
+    token_topics: [usize; 2],
+    /// How a contract holding many names its pools, for a rule of [`Pool::Id`].
+    ids: Option<PoolIds>,
 }
 
 impl Bound {
+    /// `rule` bound to `catalog`, or `None` when the catalog does not declare its event,
+    /// lists no instance of its contract on the chain, or does not index the arguments a
+    /// search filters on.
     fn new(catalog: &Catalog, rule: Rule) -> Option<Self> {
         let entry = catalog.entry(rule.protocol, rule.contract)?;
-        let keys = catalog.entries[entry].abi.events_named(rule.event);
+        let abi = &catalog.entries[entry].abi;
+        let keys = abi.events_named(rule.event);
+        let key = *keys.first()?;
         let addresses: Vec<Address> = catalog
             .seeds
             .iter()
             .filter(|&&(_, seeded)| seeded == entry)
             .map(|&(address, _)| address)
             .collect();
-        (!keys.is_empty() && !addresses.is_empty()).then_some(Self {
+        let [first, second] = rule.tokens;
+        let token_topics = [abi.topic_of(key, first)?, abi.topic_of(key, second)?];
+        let ids = match rule.pool {
+            Pool::Id { id, .. } => Some(PoolIds {
+                argument: id,
+                topic: abi.topic_of(key, id)?,
+            }),
+            Pool::Contract(_) => None,
+        };
+        (!addresses.is_empty()).then_some(Self {
             rule,
             entry,
             keys,
             addresses,
+            token_topics,
+            ids,
         })
     }
 
@@ -227,7 +232,7 @@ impl Bound {
         let mut topics: [Vec<B256>; 4] = Default::default();
         topics[0] = self.keys.iter().map(|key| key.0).collect();
         if let Some(tokens) = tokens {
-            for (topic, tokens) in self.rule.token_topics.into_iter().zip(tokens) {
+            for (topic, tokens) in self.token_topics.into_iter().zip(tokens) {
                 topics[topic] = tokens.iter().map(Address::into_word).collect();
             }
         }
@@ -300,9 +305,9 @@ impl Kept {
         }
     }
 
-    /// Adds `pool`.
-    fn keep(&mut self, pool: &Matched) {
-        match (pool.pool_id, PoolIds::of(&pool.protocol)) {
+    /// Adds `pool`, which `ids` names when it is a pool of a contract holding many.
+    fn keep(&mut self, pool: &Matched, ids: Option<PoolIds>) {
+        match (pool.pool_id, ids) {
             (Some(id), Some(ids)) => {
                 self.pools
                     .entry(pool.contract)
@@ -334,9 +339,11 @@ impl Kept {
     /// The kept pools of `contracts` holding many and the kept pool contracts, as a test
     /// sets them.
     #[cfg(test)]
-    #[expect(clippy::expect_used)]
     pub(crate) fn of(contracts: &[Address], pools: &[(Address, B256)]) -> Self {
-        let ids = PoolIds::of("uniswap_v4").expect("Uniswap V4 keeps pools by id");
+        let ids = PoolIds {
+            argument: "id",
+            topic: 1,
+        };
         let mut kept = Self {
             contracts: contracts.iter().copied().collect(),
             pools: HashMap::new(),
@@ -354,7 +361,7 @@ impl Kept {
 }
 
 /// The key a pool is matched under: the contract its logs are, and its id within it.
-type PoolKey = (Address, Option<B256>);
+type PoolKey = <Matched as BlockRecord>::Key;
 
 /// Pools' history to fill from the lake: their rows through block `through`, the one
 /// before the run kept them from, into the stores keeping matched pools from each pool's
@@ -369,12 +376,19 @@ pub(crate) struct Fill {
 }
 
 /// The contract a pool of `protocol` that is a contract of its own decodes as, to add it
-/// to a decoder that does not know it: `UniswapV3Pool` for `uniswap_v3`.
-pub(crate) fn pool_contract(protocol: &str) -> Option<&'static str> {
-    CANDIDATES
+/// to a decoder that does not know it: the one `catalog`'s factory discovers from the
+/// creation event, `UniswapV3Pool` for `uniswap_v3`.
+pub(crate) fn pool_contract(catalog: &Catalog, protocol: &str) -> Option<String> {
+    let rule = CANDIDATES
+        .into_iter()
+        .find(|rule| rule.protocol == protocol)?;
+    let bound = Bound::new(catalog, rule)?;
+    let created = bound
+        .keys
         .iter()
-        .find(|rule| rule.protocol == protocol)
-        .and_then(|rule| rule.child)
+        .find_map(|key| catalog.entries[bound.entry].rules.get(key))?;
+    let child = created.first()?.child;
+    Some(catalog.entries[child].name.clone())
 }
 
 /// What a decoded record tells the matching.
@@ -397,12 +411,10 @@ pub(crate) struct Matching {
     lookback: u64,
     /// Every pair, with the creation time of its first Metric pool.
     pairs: HashMap<Pair, u64>,
-    /// Every pool matched, by key, with its latest record.
-    matched: HashMap<PoolKey, Matched>,
-    /// Pools found since the last marker, which the next block records: each with its
-    /// `contracts` row when it is a contract the run did not decode yet. A record not yet
-    /// `filled` has earlier rows to fill.
-    joining: Vec<(Matched, Option<Contract>)>,
+    /// Every pool matched, with its latest record, and those joining at the next block,
+    /// each with its `contracts` row when it is a contract the run did not decode yet. A
+    /// record not yet `filled` has earlier rows to fill.
+    records: BlockRecords<Matched>,
     /// The pairs seen since the last [`Self::queries`], to search for the pools on them.
     asking: BTreeSet<Pair>,
     /// The pools whose earlier rows were sent to fill, so a record written again after a
@@ -445,8 +457,7 @@ impl Matching {
             wrapped,
             lookback,
             pairs: HashMap::new(),
-            matched: HashMap::new(),
-            joining: Vec::new(),
+            records: BlockRecords::default(),
             filling: HashSet::new(),
             asking: BTreeSet::new(),
             started: false,
@@ -477,20 +488,20 @@ impl Matching {
             {
                 unfilled.insert(key, pool.clone());
             }
-            let newer = self.matched.get(&key).is_none_or(|kept| {
+            let newer = self.records.get(&key).is_none_or(|kept| {
                 (kept.filled, kept.block_number) < (pool.filled, pool.block_number)
             });
             if newer {
-                self.matched.insert(key, pool);
+                self.records.restore(pool);
             }
         }
         let mut kept = self
             .kept
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        for (key, pool) in &self.matched {
-            kept.keep(pool);
-            self.filling.insert(*key);
+        for pool in self.records.latest() {
+            kept.keep(pool, ids(&self.candidates, &pool.protocol));
+            self.filling.insert(pool.key());
         }
         let mut fills: HashMap<u64, Vec<Matched>> = HashMap::new();
         for (key, pool) in unfilled {
@@ -662,56 +673,42 @@ impl Matching {
     /// Adds `pool` to the kept pools and the next block's records, unless it is matched
     /// already, returning whether it joined.
     fn join(&mut self, pool: Matched, contract: Option<Contract>) -> bool {
-        let key = (pool.contract, pool.pool_id);
-        if self.matched.contains_key(&key)
-            || self
-                .joining
-                .iter()
-                .any(|(joining, _)| (joining.contract, joining.pool_id) == key)
-        {
+        if self.records.knows(&pool.key()) {
             return false;
         }
         self.kept
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .keep(&pool);
-        self.joining.push((pool, contract));
+            .keep(&pool, ids(&self.candidates, &pool.protocol));
+        self.records.join(pool, contract);
         true
     }
 
     /// Takes `fill` as done: its pools are recorded filled with the next block.
     pub(crate) fn filled(&mut self, fill: &Fill) {
         for pool in &fill.pools {
-            let key = (pool.contract, pool.pool_id);
-            let Some(matched) = self.matched.get(&key) else {
+            let Some(matched) = self
+                .records
+                .get(&pool.key())
+                .filter(|matched| !matched.filled)
+            else {
                 continue;
             };
-            if matched.filled {
-                continue;
-            }
             let filled = Matched {
                 filled: true,
                 ..matched.clone()
             };
-            self.joining.push((filled, None));
+            self.records.join(filled, None);
         }
     }
 
-    /// The records the next block, `block`, holds: each joining pool's `contracts` row
-    /// when it has one, then its record. They stay joining until [`Self::recorded`], once
-    /// published.
-    pub(crate) fn records(&self, block: &BlockMeta) -> Vec<Event> {
-        let mut events = Vec::with_capacity(2 * self.joining.len());
-        for (pool, contract) in &self.joining {
-            if let Some(contract) = contract {
-                events.push(Event::Contract(Box::new(contract.clone())));
-            }
-            events.push(Event::Matched(Box::new(at(pool, block))));
-        }
-        events
+    /// The events the next block, `block`, publishes before its marker (see
+    /// [`BlockRecords::events`]).
+    pub(crate) fn events(&self, block: &BlockMeta) -> Vec<Event> {
+        self.records.events(block)
     }
 
-    /// Takes the joining pools as recorded in `block`, once [`Self::records`] are
+    /// Takes the joining pools as recorded in `block`, once [`Self::events`] are
     /// published, and returns the fills their records call for: the earlier rows of each
     /// pool that existed before it was matched, through the block before this one.
     pub(crate) fn recorded(&mut self, block: &BlockMeta) -> Option<Fill> {
@@ -719,61 +716,41 @@ impl Matching {
             pools: Vec::new(),
             through: block.height.saturating_sub(1),
         };
-        for (pool, _) in std::mem::take(&mut self.joining) {
-            let pool = at(&pool, block);
+        for pool in self.records.recorded(block) {
             tracing::info!(protocol = %pool.protocol, contract = %pool.contract,
                 pool_id = ?pool.pool_id, filled = pool.filled, block = block.height,
                 "pool matched to a Metric pair recorded");
-            let key = (pool.contract, pool.pool_id);
-            if !pool.filled && self.filling.insert(key) {
-                fill.pools.push(pool.clone());
-            }
-            let replaces = self
-                .matched
-                .get(&key)
-                .is_none_or(|kept| !kept.filled || pool.filled);
-            if replaces {
-                self.matched.insert(key, pool);
+            if !pool.filled && self.filling.insert(pool.key()) {
+                fill.pools.push(pool);
             }
         }
         (!fill.pools.is_empty()).then_some(fill)
     }
 
-    /// Forgets the records `orphaned` deleted, so the next block records each again,
+    /// Joins again the records `orphaned` deleted, so the next block records each again,
     /// unless the pool was created in the same block, the stream having matched it from
     /// its creation: then it was never created, and is no longer kept.
     pub(crate) fn rejoin(&mut self, orphaned: &[B256]) {
-        let lost: Vec<PoolKey> = self
-            .matched
-            .iter()
-            .filter(|(_, pool)| orphaned.contains(&pool.block_hash))
-            .map(|(&key, _)| key)
-            .collect();
-        for key in lost {
-            let Some(pool) = self.matched.remove(&key) else {
-                continue;
-            };
+        for pool in self.records.orphaned(orphaned) {
             if pool.filled && pool.created_block == pool.block_number {
                 self.kept
                     .write()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .forget(&pool);
-                self.filling.remove(&key);
+                self.filling.remove(&pool.key());
             } else {
-                self.joining.push((pool, None));
+                self.records.join(pool, None);
             }
         }
     }
 }
 
-/// `pool` as recorded in `block`.
-fn at(pool: &Matched, block: &BlockMeta) -> Matched {
-    Matched {
-        block_number: block.height,
-        block_hash: block.hash,
-        block_timestamp: block.timestamp,
-        ..pool.clone()
-    }
+/// How `protocol`'s pools are named, of `candidates`, when they are kept by id.
+fn ids(candidates: &[Bound], protocol: &str) -> Option<PoolIds> {
+    candidates
+        .iter()
+        .find(|bound| bound.rule.protocol == protocol)
+        .and_then(|bound| bound.ids)
 }
 
 /// The argument of `decoded` named `name`, indexed or not.
@@ -811,444 +788,4 @@ fn pool_id(decoded: &Decoded, name: &str) -> Option<B256> {
 }
 
 #[cfg(test)]
-#[expect(clippy::expect_used)]
-pub(super) mod tests {
-    use alloy_dyn_abi::DynSolValue;
-    use alloy_primitives::{Address, B256, I256, U256, address, keccak256};
-
-    use super::{Kept, Matching};
-    use crate::decode::fixtures::shipped;
-    use crate::decode::{Decoder, Record};
-    use crate::wire::datasets::evm::{Contract, Decoded, Log};
-    use crate::wire::envelope::{BlockMeta, ChainId, Event, Matched};
-
-    pub(in crate::decode) const USDC: Address =
-        address!("0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48");
-    pub(in crate::decode) const WETH: Address =
-        address!("0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2");
-    const V3_FACTORY: Address = address!("0x1F98431c8aD98523631AE4a59f267346ea31F984");
-    const POOL_MANAGER: Address = address!("0x000000000004444c5dc75cB358380D2e3dE08A90");
-    const DAY: u64 = 86_400;
-    /// When the first Metric pool on the pair opened: after the V3 pool was created, and
-    /// within 30 days after the V4 pool was.
-    const METRIC_OPENED: u64 = 1_700_000_020 + 10 * DAY;
-
-    /// The matching over the shipped catalog on Ethereum, keeping 30 days, and a decoder
-    /// over the same catalog.
-    pub(in crate::decode) fn ethereum() -> (Matching, Decoder) {
-        let chain = ChainId::new("ethereum");
-        let matching = Matching::new(&shipped("ethereum"), &chain, 30 * DAY).expect("matches");
-        (matching, Decoder::new(shipped("ethereum"), []))
-    }
-
-    /// `log` stamped as of `block` at `timestamp`.
-    fn at(log: Log, block: u64, timestamp: u64) -> Log {
-        Log {
-            block_number: block,
-            block_hash: B256::with_last_byte(u8::try_from(block % 256).expect("small")),
-            block_timestamp: timestamp,
-            ..log
-        }
-    }
-
-    /// Metric's `PoolCreated` on `token0`/`token1`, at `block` and `timestamp`.
-    pub(in crate::decode) fn metric(
-        token0: Address,
-        token1: Address,
-        block: u64,
-        timestamp: u64,
-    ) -> Log {
-        at(
-            crate::sink::fixtures::metric_pool_created(token0, token1),
-            block,
-            timestamp,
-        )
-    }
-
-    /// Uniswap V3's factory creating `pool` on `token0`/`token1` at fee 500.
-    pub(in crate::decode) fn v3_created(
-        token0: Address,
-        token1: Address,
-        pool: Address,
-        block: u64,
-    ) -> Log {
-        at(
-            Log {
-                address: V3_FACTORY,
-                topic0: Some(keccak256(
-                    "PoolCreated(address,address,uint24,int24,address)",
-                )),
-                topic1: Some(token0.into_word()),
-                topic2: Some(token1.into_word()),
-                topic3: Some(B256::left_padding_from(&500_u16.to_be_bytes())),
-                data: DynSolValue::Tuple(vec![
-                    DynSolValue::Int(I256::try_from(10).expect("fits"), 24),
-                    DynSolValue::Address(pool),
-                ])
-                .abi_encode_params()
-                .into(),
-                log_index: 3,
-                ..Log::default()
-            },
-            block,
-            1_600_000_000 + block,
-        )
-    }
-
-    /// Uniswap V4's `PoolManager` initializing pool `id` on `currency0`/`currency1` at
-    /// fee 3000, with no hooks.
-    pub(in crate::decode) fn v4_initialized(
-        id: B256,
-        currency0: Address,
-        currency1: Address,
-        block: u64,
-    ) -> Log {
-        at(
-            Log {
-                address: POOL_MANAGER,
-                topic0: Some(keccak256(
-                    "Initialize(bytes32,address,address,uint24,int24,address,uint160,int24)",
-                )),
-                topic1: Some(id),
-                topic2: Some(currency0.into_word()),
-                topic3: Some(currency1.into_word()),
-                data: DynSolValue::Tuple(vec![
-                    DynSolValue::Uint(U256::from(3000), 24),
-                    DynSolValue::Int(I256::try_from(60).expect("fits"), 24),
-                    DynSolValue::Address(Address::ZERO),
-                    DynSolValue::Uint(U256::from(1) << 96, 160),
-                    DynSolValue::Int(I256::ZERO, 24),
-                ])
-                .abi_encode_params()
-                .into(),
-                log_index: 5,
-                ..Log::default()
-            },
-            block,
-            1_700_000_000 + block,
-        )
-    }
-
-    /// `log` decoded, with the contract its claims name.
-    pub(in crate::decode) fn decode(
-        decoder: &Decoder,
-        log: &Log,
-    ) -> (Decoded, super::DecodedAs, Option<Contract>) {
-        let (record, claims) = decoder.decode(log).expect("a listed contract's event");
-        let Record { decoded, event } = record.expect("decodes");
-        let contract = claims.contracts().next().cloned();
-        (decoded, event, contract)
-    }
-
-    fn block(height: u64) -> BlockMeta {
-        BlockMeta {
-            height,
-            hash: B256::with_last_byte(u8::try_from(height % 256).expect("small")),
-            parent_hash: B256::ZERO,
-            timestamp: 1_800_000_000 + height,
-        }
-    }
-
-    fn matched(events: &[Event]) -> Vec<&Matched> {
-        events
-            .iter()
-            .filter_map(|event| match event {
-                Event::Matched(matched) => Some(matched.as_ref()),
-                _ => None,
-            })
-            .collect()
-    }
-
-    /// The startup search asks for every Metric pool once; the pairs Metric pools name
-    /// are searched together for every Uniswap V3 pool and every V4 pool on them, the V4
-    /// ones holding the wrapped coin or the native one, and a known pair is not searched
-    /// again.
-    #[test]
-    fn new_pairs_are_searched_for_every_pool_on_them() {
-        let (mut matching, decoder) = ethereum();
-        let start = matching.start(100).expect("the first block asks");
-        assert_eq!(
-            start.addresses,
-            [address!("0x2a53833cc95548cf52c7b159110e22d3a9018f32")]
-        );
-        assert_eq!(start.through, 100);
-        assert!(matching.start(101).is_none(), "and only once");
-
-        let dai = address!("0x6B175474E89094C44Da98b954EedeAC495271d0F");
-        for (token0, token1) in [(USDC, WETH), (dai, USDC)] {
-            let (record, event, _) = decode(&decoder, &metric(token0, token1, 50, 30 * DAY));
-            assert!(!matching.fetched(&record, event, None));
-        }
-        let queries = matching.queries(100);
-        let word = |address: Address| address.into_word();
-        let mut asked: Vec<_> = queries
-            .iter()
-            .map(|query| (query.addresses.clone(), query.topics[1..].to_vec()))
-            .collect();
-        asked.sort();
-        let mut lower = vec![word(USDC), word(dai)];
-        lower.sort();
-        let mut upper = vec![word(USDC), word(WETH)];
-        upper.sort();
-        let mut expected = vec![
-            (
-                vec![V3_FACTORY],
-                vec![lower.clone(), upper.clone(), Vec::new()],
-            ),
-            (vec![POOL_MANAGER], vec![Vec::new(), lower, upper]),
-            (
-                vec![POOL_MANAGER],
-                vec![Vec::new(), vec![word(Address::ZERO)], vec![word(USDC)]],
-            ),
-        ];
-        expected.sort();
-        assert_eq!(asked, expected);
-        assert!(queries.iter().all(|query| query.through == 100));
-        assert!(matching.queries(101).is_empty(), "searched once");
-
-        let (record, event, _) = decode(&decoder, &metric(USDC, WETH, 60, 31 * DAY));
-        assert!(!matching.fetched(&record, event, None));
-        assert!(
-            matching.queries(102).is_empty(),
-            "a known pair is not searched again"
-        );
-    }
-
-    /// Pools a fetch finds on a known pair join at the next block: a V3 pool with its
-    /// `contracts` row, a V4 pool by id, each kept from then on and filled before it, from
-    /// the lookback before the pair's first Metric pool. A pool on another pair is not
-    /// matched, and one created in the stream is kept from its creation, filled already.
-    #[test]
-    fn found_pools_join_at_the_next_block_and_are_filled_before_it() {
-        let (mut matching, mut decoder) = ethereum();
-        let (record, event, _) = decode(&decoder, &metric(USDC, WETH, 50, METRIC_OPENED));
-        let _ = matching.fetched(&record, event, None);
-
-        let pool = Address::repeat_byte(0x31);
-        let id = B256::repeat_byte(0x41);
-        let (record, event, contract) = decode(&decoder, &v3_created(USDC, WETH, pool, 10));
-        assert!(contract.is_some(), "a pool the run does not decode yet");
-        assert!(matching.fetched(&record, event, contract));
-        let (record, event, _) = decode(&decoder, &v4_initialized(id, Address::ZERO, USDC, 20));
-        assert!(matching.fetched(&record, event, None));
-        let other = B256::repeat_byte(0x42);
-        let (record, event, _) = decode(
-            &decoder,
-            &v4_initialized(other, USDC, Address::repeat_byte(0x99), 20),
-        );
-        assert!(!matching.fetched(&record, event, None), "another pair");
-
-        let kept = matching.kept();
-        let swap = |address| {
-            Event::Log(Box::new(Log {
-                address,
-                ..Log::default()
-            }))
-        };
-        assert!(kept.read().expect("readable").keeps(&swap(pool)));
-        assert!(
-            !kept
-                .read()
-                .expect("readable")
-                .keeps(&swap(Address::repeat_byte(0x32)))
-        );
-
-        let records = matching.records(&block(101));
-        assert!(
-            matches!(records[0], Event::Contract(_)),
-            "the pool's row first"
-        );
-        let pools = matched(&records);
-        assert_eq!(pools.len(), 2);
-        let v3 = pools
-            .iter()
-            .find(|pool| pool.pool_id.is_none())
-            .expect("v3");
-        assert_eq!(
-            (v3.contract, v3.token0, v3.token1, v3.fee),
-            (pool, USDC, WETH, 500)
-        );
-        assert_eq!(
-            v3.from_timestamp,
-            METRIC_OPENED - 30 * DAY,
-            "30 days before the pair's first pool"
-        );
-        assert!(!v3.filled);
-        let v4 = pools
-            .iter()
-            .find(|pool| pool.pool_id.is_some())
-            .expect("v4");
-        assert_eq!(
-            (v4.contract, v4.pool_id, v4.token0, v4.fee),
-            (POOL_MANAGER, Some(id), Address::ZERO, 3000)
-        );
-        assert_eq!(v4.block_number, 101);
-        assert_eq!(
-            v4.from_timestamp, 1_700_000_020,
-            "created within the lookback, so kept from its creation"
-        );
-
-        let fill = matching.recorded(&block(101)).expect("a fill");
-        assert_eq!(fill.through, 100);
-        assert_eq!(fill.pools.len(), 2);
-        assert!(matching.records(&block(102)).is_empty(), "recorded once");
-
-        // A pool created in the stream on the pair is kept from its creation.
-        let created = Address::repeat_byte(0x33);
-        let (record, event, contract) = decode(&decoder, &v3_created(WETH, USDC, created, 102));
-        if let Some(contract) = contract {
-            let (_, claims) = decoder
-                .decode(&v3_created(WETH, USDC, created, 102))
-                .expect("decodes");
-            decoder.admit(claims);
-            let _ = contract;
-        }
-        matching.decoded(&record, event);
-        let records = matching.records(&block(102));
-        assert_eq!(matched(&records).len(), 1);
-        assert!(matched(&records)[0].filled, "nothing before its creation");
-        assert!(
-            matching.recorded(&block(102)).is_none(),
-            "and nothing to fill"
-        );
-
-        // Once filled, each is recorded so.
-        matching.filled(&fill);
-        let records = matching.records(&block(103));
-        assert!(matched(&records).iter().all(|pool| pool.filled));
-        assert_eq!(matched(&records).len(), 2);
-        assert!(matching.recorded(&block(103)).is_none());
-    }
-
-    /// A reorg of the block recording a pool records it again with the next, without
-    /// filling it again; a restart takes the records back, keeps their pools, and fills
-    /// what was not filled.
-    #[test]
-    fn records_survive_a_reorg_and_a_restart() {
-        let (mut matching, decoder) = ethereum();
-        let (record, event, _) = decode(&decoder, &metric(USDC, WETH, 50, 40 * DAY));
-        let _ = matching.fetched(&record, event, None);
-        let id = B256::repeat_byte(0x41);
-        let (record, event, _) = decode(&decoder, &v4_initialized(id, USDC, WETH, 20));
-        assert!(matching.fetched(&record, event, None));
-        let records = matching.records(&block(101));
-        assert!(matching.recorded(&block(101)).is_some());
-
-        matching.rejoin(&[block(101).hash]);
-        let again = matching.records(&block(102));
-        assert_eq!(matched(&again).len(), 1);
-        assert!(matching.recorded(&block(102)).is_none(), "filled only once");
-
-        let (mut restarted, _) = ethereum();
-        let stored: Vec<Matched> = matched(&again).into_iter().cloned().collect();
-        let fills = restarted.restore(stored);
-        assert_eq!(fills.len(), 1);
-        assert_eq!(fills[0].through, 101);
-        let manager = Event::Decoded(Box::new(record));
-        assert!(restarted.kept().read().expect("readable").keeps(&manager));
-        let _ = records;
-    }
-
-    /// A V3 pool created in the stream on a known pair is kept from its creation, its
-    /// factory's record creating it too; a reorg orphaning the block that created it
-    /// forgets it rather than recording it again.
-    #[test]
-    fn a_pool_created_in_an_orphaned_block_is_forgotten() {
-        let (mut matching, decoder) = ethereum();
-        let (record, event, _) = decode(&decoder, &metric(USDC, WETH, 50, METRIC_OPENED));
-        let _ = matching.fetched(&record, event, None);
-        let pool = Address::repeat_byte(0x35);
-        let created = v3_created(USDC, WETH, pool, 102);
-        let (record, event, _) = decode(&decoder, &created);
-        matching.decoded(&record, event);
-        let kept = matching.kept();
-        assert!(
-            kept.read()
-                .expect("readable")
-                .keeps(&Event::Decoded(Box::new(record))),
-            "the factory's record creating a kept pool"
-        );
-        assert_eq!(matched(&matching.records(&block(102))).len(), 1);
-        assert!(matching.recorded(&block(102)).is_none());
-        matching.rejoin(&[block(102).hash]);
-        assert!(
-            matching.records(&block(103)).is_empty(),
-            "not recorded again"
-        );
-        let swap = Event::Log(Box::new(Log {
-            address: pool,
-            ..Log::default()
-        }));
-        assert!(
-            !kept.read().expect("readable").keeps(&swap),
-            "and no longer kept"
-        );
-    }
-
-    /// A restart takes each pool's newest record, so a reorg of the block holding its
-    /// `filled` record is seen, and fills only a pool with no `filled` record, up to the
-    /// block of its first.
-    #[test]
-    fn a_restart_takes_the_newest_record_and_fills_only_what_is_unfilled() {
-        let (mut matching, _) = ethereum();
-        let record = |id: u8, height: u64, filled: bool| Matched {
-            protocol: "uniswap_v4".to_owned(),
-            contract: POOL_MANAGER,
-            pool_id: Some(B256::repeat_byte(id)),
-            token0: USDC,
-            token1: WETH,
-            fee: 3000,
-            hooks: None,
-            created_block: 1,
-            from_timestamp: 0,
-            filled,
-            block_number: height,
-            block_hash: block(height).hash,
-            block_timestamp: block(height).timestamp,
-        };
-        let fills = matching.restore(vec![
-            record(1, 10, true),
-            record(1, 5, false),
-            record(2, 7, false),
-        ]);
-        assert_eq!(fills.len(), 1);
-        assert_eq!(fills[0].through, 6);
-        assert_eq!(fills[0].pools[0].pool_id, Some(B256::repeat_byte(2)));
-        matching.rejoin(&[block(10).hash]);
-        let again = matching.records(&block(11));
-        assert_eq!(matched(&again).len(), 1);
-        assert!(matched(&again)[0].filled, "the filled record written again");
-    }
-
-    /// A contract holding many pools keeps the decoded records naming a kept pool's
-    /// `id`, none of its raw logs, and no record naming another pool or a token's `id`.
-    #[test]
-    fn a_pool_manager_keeps_only_its_kept_pools_records() {
-        let (_, decoder) = ethereum();
-        let id = B256::repeat_byte(0x41);
-        let kept = Kept::of(&[], &[(POOL_MANAGER, id)]);
-        let ours = v4_initialized(id, USDC, WETH, 20);
-        let theirs = v4_initialized(B256::repeat_byte(0x42), USDC, WETH, 20);
-        let (record, _, _) = decode(&decoder, &ours);
-        assert!(kept.keeps(&Event::Decoded(Box::new(record))));
-        let (record, _, _) = decode(&decoder, &theirs);
-        assert!(!kept.keeps(&Event::Decoded(Box::new(record))));
-        assert!(!kept.keeps(&Event::Log(Box::new(ours))), "no raw log");
-        let transfer = Log {
-            address: POOL_MANAGER,
-            topic0: Some(keccak256(
-                "Transfer(address,address,address,uint256,uint256)",
-            )),
-            topic1: Some(Address::repeat_byte(5).into_word()),
-            topic2: Some(Address::repeat_byte(6).into_word()),
-            topic3: Some(id),
-            data: vec![0; 64].into(),
-            ..Log::default()
-        };
-        let (record, _, _) = decode(&decoder, &transfer);
-        assert!(
-            !kept.keeps(&Event::Decoded(Box::new(record))),
-            "a token's id is not a pool's"
-        );
-    }
-}
+pub(super) mod tests;

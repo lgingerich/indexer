@@ -1,43 +1,37 @@
 //! The pools the lake records as matched to Metric pools' pairs (see
 //! [`Matched`]), read back when it opens so the decode stage keeps them.
 
-use deltalake::arrow::array::Array as _;
+use deltalake::arrow::array::{Array as _, RecordBatch, StringArray, UInt64Array};
 use deltalake::arrow::datatypes::DataType as ArrowType;
-use deltalake::datafusion::prelude::{cast, ident};
+use deltalake::datafusion::prelude::{Expr, cast, ident};
 
-use super::expr::{seconds, texts, texts_of, uints};
+use super::expr::{seconds, texts, uints};
 use super::lake::Lake;
 use crate::sink::store_error::{InvalidStoredValue, StoreError};
 use crate::sink::table::MATCHED_COLUMNS;
 use crate::wire::envelope::Matched;
 
+/// The columns read as whole seconds; every other is text or an unsigned integer.
+const TIMESTAMPS: [&str; 2] = ["from_timestamp", "block_timestamp"];
+/// The columns read as unsigned integers.
+const NUMBERS: [&str; 3] = ["fee", "created_block", "block_number"];
+
 /// The rows of `lake`, a `matched_pools` table, in key order.
 pub(super) async fn matched(lake: &Lake) -> Result<Vec<Matched>, StoreError> {
-    let [
-        protocol,
-        contract,
-        pool_id,
-        token0,
-        token1,
-        fee,
-        hooks,
-        created_block,
-        from_timestamp,
-        filled,
-        block_number,
-        block_hash,
-        block_timestamp,
-    ] = MATCHED_COLUMNS;
+    let columns: Vec<Expr> = MATCHED_COLUMNS
+        .iter()
+        .map(|&column| {
+            if TIMESTAMPS.contains(&column) {
+                seconds(column)
+            } else if NUMBERS.contains(&column) {
+                cast(ident(column), ArrowType::UInt64).alias(column)
+            } else {
+                cast(ident(column), ArrowType::Utf8).alias(column)
+            }
+        })
+        .collect();
     let batches = lake
         .read(|frame| {
-            let mut columns = texts_of(&[
-                protocol, contract, pool_id, token0, token1, hooks, filled, block_hash,
-            ]);
-            for number in [fee, created_block, block_number] {
-                columns.push(cast(ident(number), ArrowType::UInt64).alias(number));
-            }
-            columns.push(seconds(from_timestamp));
-            columns.push(seconds(block_timestamp));
             frame
                 .sort(vec![ident("dedupe_key").sort(true, false)])?
                 .select(columns)
@@ -45,58 +39,67 @@ pub(super) async fn matched(lake: &Lake) -> Result<Vec<Matched>, StoreError> {
         .await?;
     let mut matched = Vec::new();
     for batch in &batches {
-        let text = |index, column| texts(batch, index, column);
-        let (protocols, contracts, ids) = (
-            text(0, "matched_pools.protocol")?,
-            text(1, "matched_pools.contract")?,
-            text(2, "matched_pools.pool_id")?,
-        );
-        let (firsts, seconds_tokens, hook_texts) = (
-            text(3, "matched_pools.token0")?,
-            text(4, "matched_pools.token1")?,
-            text(5, "matched_pools.hooks")?,
-        );
-        let (filleds, hashes) = (
-            text(6, "matched_pools.filled")?,
-            text(7, "matched_pools.block_hash")?,
-        );
-        let fees = uints(batch, 8, "matched_pools.fee")?;
-        let createds = uints(batch, 9, "matched_pools.created_block")?;
-        let numbers = uints(batch, 10, "matched_pools.block_number")?;
-        let froms = uints(batch, 11, "matched_pools.from_timestamp")?;
-        let timestamps = uints(batch, 12, "matched_pools.block_timestamp")?;
+        let read = Columns(batch);
         for row in 0..batch.num_rows() {
+            let text = |column| read.text(column).map(|texts| texts.value(row));
+            let number = |column| read.number(column).map(|numbers| numbers.value(row));
+            let parse = |column| -> Result<_, InvalidStoredValue> { Ok((column, text(column)?)) };
             matched.push(Matched {
-                protocol: protocols.value(row).to_owned(),
-                contract: InvalidStoredValue::parse(
-                    "matched_pools.contract",
-                    contracts.value(row),
-                )?,
-                pool_id: (!ids.is_null(row))
-                    .then(|| InvalidStoredValue::parse("matched_pools.pool_id", ids.value(row)))
-                    .transpose()?,
-                token0: InvalidStoredValue::parse("matched_pools.token0", firsts.value(row))?,
-                token1: InvalidStoredValue::parse(
-                    "matched_pools.token1",
-                    seconds_tokens.value(row),
-                )?,
-                fee: fees.value(row),
-                hooks: (!hook_texts.is_null(row))
-                    .then(|| {
-                        InvalidStoredValue::parse("matched_pools.hooks", hook_texts.value(row))
-                    })
-                    .transpose()?,
-                created_block: createds.value(row),
-                from_timestamp: froms.value(row),
-                filled: InvalidStoredValue::parse("matched_pools.filled", filleds.value(row))?,
-                block_number: numbers.value(row),
-                block_hash: InvalidStoredValue::parse(
-                    "matched_pools.block_hash",
-                    hashes.value(row),
-                )?,
-                block_timestamp: timestamps.value(row),
+                protocol: text("protocol")?.to_owned(),
+                contract: typed(parse("contract")?)?,
+                pool_id: read.optional("pool_id", row)?,
+                token0: typed(parse("token0")?)?,
+                token1: typed(parse("token1")?)?,
+                fee: number("fee")?,
+                hooks: read.optional("hooks", row)?,
+                created_block: number("created_block")?,
+                from_timestamp: number("from_timestamp")?,
+                filled: typed(parse("filled")?)?,
+                block_number: number("block_number")?,
+                block_hash: typed(parse("block_hash")?)?,
+                block_timestamp: number("block_timestamp")?,
             });
         }
     }
     Ok(matched)
+}
+
+/// A column's text, `(column, text)`, parsed as what it holds.
+fn typed<T: std::str::FromStr>(
+    (column, text): (&'static str, &str),
+) -> Result<T, InvalidStoredValue> {
+    InvalidStoredValue::parse(column, text)
+}
+
+/// A batch read in [`MATCHED_COLUMNS`]' order, its columns found by name.
+struct Columns<'a>(&'a RecordBatch);
+
+impl Columns<'_> {
+    /// Where `column` is in the batch: an error for a name the read did not select.
+    fn position(column: &'static str) -> Result<usize, InvalidStoredValue> {
+        MATCHED_COLUMNS
+            .iter()
+            .position(|named| *named == column)
+            .ok_or_else(|| InvalidStoredValue::new(column, "not read"))
+    }
+
+    fn text(&self, column: &'static str) -> Result<&StringArray, InvalidStoredValue> {
+        texts(self.0, Self::position(column)?, column)
+    }
+
+    fn number(&self, column: &'static str) -> Result<&UInt64Array, InvalidStoredValue> {
+        uints(self.0, Self::position(column)?, column)
+    }
+
+    /// Row `row` of nullable text `column`, parsed, or `None` for none.
+    fn optional<T: std::str::FromStr>(
+        &self,
+        column: &'static str,
+        row: usize,
+    ) -> Result<Option<T>, InvalidStoredValue> {
+        let texts = self.text(column)?;
+        (!texts.is_null(row))
+            .then(|| InvalidStoredValue::parse(column, texts.value(row)))
+            .transpose()
+    }
 }

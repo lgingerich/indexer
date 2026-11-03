@@ -36,7 +36,7 @@ use tracing::warn;
 
 use super::expr::{in_texts, seconds, texts, texts_of, uints, within};
 use super::lake::{CONCURRENT_CHECKPOINTS, Lake};
-use super::open::{Missing, Storage, open_table};
+use super::open::{Missing, Storage, open_existing, open_table};
 use super::{CONCURRENT_TABLES, append_all, record_batches};
 use crate::secret::Secret;
 use crate::sink::resume::MAX_RESUME_LAG;
@@ -176,17 +176,9 @@ impl LogReader {
         let tip = ledger.read_ledger().await?.last().map(|block| block.height);
         let sessions = schema.dataset(Table::Session);
         let uri = format!("{root}/{chain}/{}", sessions.name);
-        let has_sessions = storage
-            .table(&uri)
-            .await
-            .map_err(StoreError::engine(Operation::Open, Some(&sessions.name)))?
-            .version()
-            .is_some();
-        let session = if has_sessions {
-            let lake = open_table(&storage, uri, sessions, Missing::Refuse, checkpoints).await?;
-            latest_session(&lake).await?
-        } else {
-            None
+        let session = match open_existing(&storage, uri, sessions).await? {
+            Some(lake) => latest_session(&lake).await?,
+            None => None,
         };
         Ok(Self {
             files: log_files(&logs)?.into(),

@@ -1,13 +1,13 @@
 //! Live decode stays inline before the bounded storage channel.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
-use alloy_primitives::{Address, B256};
+use alloy_primitives::B256;
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
-use super::decoder::Adopted;
-use super::derive::{Derivations, Sent};
+use super::derive::Sent;
+use super::handoff::Handoffs;
 use super::pairs::{Fill, Matching, Query};
 use super::{Claims, Decoder, Record};
 use crate::metrics;
@@ -50,20 +50,12 @@ use crate::wire::envelope::{BlockMeta, ChainId, Envelope, Event, Handoff};
 /// `crate::decode::pairs`).
 pub struct DecodingSink<K> {
     decoder: Decoder,
-    /// The derivations the catalog bound, run on every record decoded.
-    derivations: Derivations,
     /// The last transaction forwarded in the current block, `None` before its first. A
     /// block's batch ends with its accepted-block marker, and a reorg marker starts
     /// another branch, so either clears it.
     transaction: Option<Sent>,
-    /// The contracts backfills hand over, as the run's watch reads them from the lake.
-    handed: Option<mpsc::Receiver<Vec<Contract>>>,
-    /// Contracts that joined since the last marker, which the next block records: each
-    /// with its `contracts` row when it is new to the set.
-    joining: Vec<(Handoff, Option<Contract>)>,
-    /// Every handed-over contract's record, by address, as the stores held it or this run
-    /// wrote it.
-    handoffs: HashMap<Address, Handoff>,
+    /// The contracts backfills hand over, when the run's watch reads them from the lake.
+    handoffs: Option<Handoffs>,
     /// The pools matched to Metric's pairs, and the tasks that fetch and fill them.
     matching: Option<Linked>,
     /// The blocks some store holds already, which a restart's ingest hands back (see
@@ -92,12 +84,9 @@ impl<K: EnvelopeSink> DecodingSink<K> {
             warn!("no contracts registered; no log will decode");
         }
         Self {
-            derivations: decoder.catalog().derivations.clone(),
             decoder,
             transaction: None,
-            handed: None,
-            joining: Vec::new(),
-            handoffs: HashMap::new(),
+            handoffs: None,
             matching: None,
             held: HashSet::new(),
             decoded: 0,
@@ -179,87 +168,8 @@ impl<K: EnvelopeSink> DecodingSink<K> {
         restored: Vec<Handoff>,
         handed: mpsc::Receiver<Vec<Contract>>,
     ) -> Self {
-        self.handoffs = restored
-            .into_iter()
-            .map(|handoff| (handoff.address, handoff))
-            .collect();
-        self.handed = Some(handed);
+        self.handoffs = Some(Handoffs::new(restored, handed));
         self
-    }
-
-    /// Adds the contracts handed over since the last marker that the set does not hold
-    /// yet a record of, for the next block to record.
-    fn adopt_handed(&mut self) {
-        let Some(handed) = &mut self.handed else {
-            return;
-        };
-        while let Ok(contracts) = handed.try_recv() {
-            for contract in contracts {
-                if self.handoffs.contains_key(&contract.address)
-                    || self
-                        .joining
-                        .iter()
-                        .any(|(joining, _)| joining.address == contract.address)
-                {
-                    continue;
-                }
-                let row = match self.decoder.adopt(&contract) {
-                    Adopted::Added => Some(contract.clone()),
-                    Adopted::Known => None,
-                    Adopted::Refused => continue,
-                };
-                let handoff = Handoff {
-                    protocol: contract.protocol.clone(),
-                    name: contract.name.clone(),
-                    address: contract.address,
-                    block_number: 0,
-                    block_hash: B256::ZERO,
-                    block_timestamp: 0,
-                };
-                self.joining.push((handoff, row));
-            }
-        }
-    }
-
-    /// The records of the contracts that joined since the last marker, as `block`, whose
-    /// marker comes next, holds them: each new contract's `contracts` row, then its
-    /// [`Handoff`]. They stay joining until [`Self::recorded`], once published.
-    fn records(&self, block: &BlockMeta) -> Vec<Event> {
-        let mut events = Vec::with_capacity(2 * self.joining.len());
-        for (handoff, row) in &self.joining {
-            if let Some(contract) = row {
-                events.push(Event::Contract(Box::new(contract.clone())));
-            }
-            events.push(Event::Handoff(Box::new(at(handoff, block))));
-        }
-        events
-    }
-
-    /// Takes the contracts that joined as recorded in `block`, once [`Self::records`] are
-    /// published.
-    fn recorded(&mut self, block: &BlockMeta) {
-        for (handoff, _) in std::mem::take(&mut self.joining) {
-            let handoff = at(&handoff, block);
-            info!(address = %handoff.address, protocol = %handoff.protocol,
-                name = %handoff.name, block = block.height,
-                "handed-over contract decoded from this block on");
-            self.handoffs.insert(handoff.address, handoff);
-        }
-    }
-
-    /// Forgets the records `orphaned` deleted, so the next block records each again.
-    fn rejoin(&mut self, orphaned: &[B256]) {
-        let lost: Vec<Address> = self
-            .handoffs
-            .values()
-            .filter(|handoff| orphaned.contains(&handoff.block_hash))
-            .map(|handoff| handoff.address)
-            .collect();
-        for address in lost {
-            if let Some(handoff) = self.handoffs.remove(&address) {
-                self.joining.push((handoff, None));
-            }
-        }
     }
 
     /// Decodes one log into the records to publish after it, and the claims on the
@@ -284,8 +194,8 @@ impl<K: EnvelopeSink> DecodingSink<K> {
                     .as_ref()
                     .filter(|sent| sent.hash == log.transaction_hash);
                 let derived = self
-                    .derivations
-                    .rows(chain, event, &decoded, sent)
+                    .decoder
+                    .derive(chain, event, &decoded, sent)
                     .map_err(|error| SinkError::Decode(Box::new(error)))?;
                 if let Some(linked) = &mut self.matching {
                     linked.matching.decoded(&decoded, event);
@@ -348,16 +258,23 @@ impl<K: EnvelopeSink> EnvelopeSink for DecodingSink<K> {
             .as_ref()
             .filter(|block| !self.held.remove(&block.hash))
         {
-            let mut records = self.records(block);
-            if let Some(linked) = &self.matching {
-                records.extend(linked.matching.records(block));
-            }
+            let handed = self
+                .handoffs
+                .iter()
+                .flat_map(|handoffs| handoffs.events(block));
+            let matched = self
+                .matching
+                .iter()
+                .flat_map(|linked| linked.matching.events(block));
+            let records: Vec<Event> = handed.chain(matched).collect();
             for event in records {
                 self.inner
                     .publish(Envelope::new(chain.clone(), event))
                     .await?;
             }
-            self.recorded(block);
+            if let Some(handoffs) = &mut self.handoffs {
+                handoffs.recorded(block);
+            }
             if let Some(linked) = &mut self.matching
                 && let Some(fill) = linked.matching.recorded(block)
             {
@@ -381,13 +298,17 @@ impl<K: EnvelopeSink> EnvelopeSink for DecodingSink<K> {
             if retracted > 0 {
                 info!(%chain, retracted, "retracted contracts created in orphaned blocks");
             }
-            self.rejoin(&orphaned);
+            if let Some(handoffs) = &mut self.handoffs {
+                handoffs.rejoin(&orphaned);
+            }
             if let Some(linked) = &mut self.matching {
                 linked.matching.rejoin(&orphaned);
             }
         }
         if let Some(block) = &marker {
-            self.adopt_handed();
+            if let Some(handoffs) = &mut self.handoffs {
+                handoffs.adopt(&mut self.decoder);
+            }
             self.take_answers(&chain, block);
         }
         Ok(())
@@ -456,16 +377,6 @@ impl Linked {
                 }
             }
         }
-    }
-}
-
-/// `handoff` as recorded in `block`.
-fn at(handoff: &Handoff, block: &BlockMeta) -> Handoff {
-    Handoff {
-        block_number: block.height,
-        block_hash: block.hash,
-        block_timestamp: block.timestamp,
-        ..handoff.clone()
     }
 }
 

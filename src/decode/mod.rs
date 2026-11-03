@@ -26,14 +26,14 @@ mod decoder;
 mod derive;
 #[cfg(test)]
 mod fixtures;
+mod handoff;
 mod pairs;
 pub(crate) mod param;
+mod records;
 mod sink;
 
 pub use abi::{AbiError, DecodeError};
 pub use catalog::{Catalog, CatalogError};
-#[cfg(feature = "delta")]
-pub(crate) use decoder::DecodedAs;
 pub use decoder::{Claims, Decoder, Record};
 pub use derive::DeriveError;
 #[cfg(feature = "delta")]

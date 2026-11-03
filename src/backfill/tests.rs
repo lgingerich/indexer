@@ -449,10 +449,10 @@ async fn appends_commit_beside_the_running_stores_appends_and_deletes() {
             ]
         })
         .collect();
-    let records: Vec<Event> = logs
-        .iter()
-        .filter_map(|log| super::decode(&mut decoder, &chain, log).expect("decodes"))
-        .map(|(record, _)| Event::Decoded(Box::new(record)))
+    let records: Vec<Event> = super::decode_all(&mut decoder, &chain, &logs)
+        .expect("decodes")
+        .into_iter()
+        .map(|record| Event::Decoded(Box::new(record.decoded)))
         .collect();
     let appended = tables
         .fill(

@@ -28,7 +28,7 @@ use alloy_primitives::{Address, B256};
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
-use super::{BackfillError, Database, cores, decode, parts, rows};
+use super::{BackfillError, Database, cores, decode_all, parts, rows};
 use crate::decode::{Catalog, Decoder, Fill, PoolIds, pool_contract};
 use crate::sink::delta::{
     DecodedTables, DeltaSettings, LedgerEnds, LockError, LogReader, RunLock, ledger_ends,
@@ -162,7 +162,7 @@ impl Lookback {
     ) -> Result<bool, BackfillError> {
         let chain = &self.chain;
         let mut decoder = Decoder::new(self.catalog.clone(), []);
-        let pools = pools(&mut decoder, fill);
+        let pools = pools(&self.catalog, &mut decoder, fill);
         let lake = &self.lake;
         let reader =
             LogReader::open(&lake.uri, &lake.storage, schema, chain.as_str(), false).await?;
@@ -217,14 +217,10 @@ impl Lookback {
                     .filter(|log| !pools.managers.contains_key(&log.address) || pools.names(log))
                     .collect();
                 for (blocks, positions) in parts(&logs, &read) {
-                    let records = tokio::task::block_in_place(|| {
-                        logs[positions]
-                            .iter()
-                            .map(|log| decode(&mut decoder, chain, log))
-                            .filter_map(Result::transpose)
-                            .map(|found| found.map(|(record, _)| record))
-                            .collect::<Result<Vec<Decoded>, _>>()
-                    })?;
+                    let records: Vec<Decoded> = decode_all(&mut decoder, chain, &logs[positions])?
+                        .into_iter()
+                        .map(|record| record.decoded)
+                        .collect();
                     lock.check()?;
                     if let Some(tables) = &mut tables {
                         let owned = events(
@@ -279,20 +275,10 @@ impl Lookback {
     async fn database(&self, schema: &Schema) -> Result<Database, BackfillError> {
         #[cfg(feature = "postgres")]
         if let Some((settings, selection)) = &self.postgres {
-            let store = crate::sink::PostgresSink::open(
-                settings,
-                std::sync::Arc::new(schema.select(&selection.tables)),
-                self.chain.as_str(),
-                crate::sink::postgres::Writer::Beside,
-            )
-            .await?;
-            return Ok(Database { store: Some(store) });
+            return Database::beside(settings, schema, &selection.tables, &self.chain).await;
         }
         let _ = schema;
-        Ok(Database {
-            #[cfg(feature = "postgres")]
-            store: None,
-        })
+        Ok(Database::none())
     }
 }
 
@@ -305,11 +291,11 @@ struct Written {
 
 /// `fill`'s pools, the pool contracts added to `decoder`, which knows only the catalog's
 /// listed contracts.
-fn pools(decoder: &mut Decoder, fill: &Fill) -> Pools {
+fn pools(catalog: &Catalog, decoder: &mut Decoder, fill: &Fill) -> Pools {
     let mut pools = Pools::default();
     for pool in &fill.pools {
         if let Some(id) = pool.pool_id {
-            let Some(ids) = PoolIds::of(&pool.protocol) else {
+            let Some(ids) = PoolIds::of(catalog, &pool.protocol) else {
                 continue;
             };
             pools
@@ -320,12 +306,12 @@ fn pools(decoder: &mut Decoder, fill: &Fill) -> Pools {
                 .insert(id, pool.from_timestamp);
             continue;
         }
-        let Some(name) = pool_contract(&pool.protocol) else {
+        let Some(name) = pool_contract(catalog, &pool.protocol) else {
             continue;
         };
         decoder.adopt(&Contract {
             protocol: pool.protocol.clone(),
-            name: name.to_owned(),
+            name,
             address: pool.contract,
             factory_address: Address::ZERO,
             transaction_hash: B256::ZERO,

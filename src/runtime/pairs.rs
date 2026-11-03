@@ -94,11 +94,10 @@ pub(crate) async fn lookup(
     while let Some(batch) = queries.recv().await {
         // One at a time: each pages through the chain's whole history, and the endpoint
         // limits how fast one token asks.
-        let mut searched = Vec::with_capacity(batch.len());
+        let mut logs = Vec::new();
         for query in &batch {
-            searched.push(search_retrying(&search, &chain, query).await);
+            logs.extend(searched(&search, &chain, query).await);
         }
-        let logs: Vec<Log> = searched.into_iter().flatten().collect();
         info!(%chain, logs = logs.len(), "creation logs found");
         if !logs.is_empty() && found.send(logs).await.is_err() {
             return;
@@ -109,7 +108,7 @@ pub(crate) async fn lookup(
 /// The logs `query` finds; none, logged, when it failed for good: the search waits out a
 /// refused rate or an endpoint down for as long as it takes (see [`LogSearch::logs`]), so
 /// only an error asking again cannot fix, such as a refused token, ends one.
-async fn search_retrying(search: &LogSearch, chain: &ChainId, query: &Query) -> Vec<Log> {
+async fn searched(search: &LogSearch, chain: &ChainId, query: &Query) -> Vec<Log> {
     match search
         .logs(&query.addresses, &query.topics, query.through)
         .await

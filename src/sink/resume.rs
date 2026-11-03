@@ -203,19 +203,10 @@ pub(crate) async fn resume<S: Store>(
     })?;
     let Some((common, slowest)) = common else {
         // Every ledger is empty: a fresh run, with nothing to agree on.
-        let mut resumed = Resumed {
-            contracts: Vec::new(),
-            handoffs: Vec::new(),
-            matched: Vec::new(),
-            held: HashSet::new(),
-            ledger: Ledger::default(),
-        };
-        for r in restored {
-            resumed.contracts.extend(r.contracts);
-            resumed.handoffs.extend(r.handoffs);
-            resumed.matched.extend(r.matched);
-        }
-        return Ok((stores, resumed));
+        return Ok((
+            stores,
+            gathered(restored, HashSet::new(), Ledger::default()),
+        ));
     };
     let blocks: Vec<BlockMeta> = restored[slowest]
         .ledger
@@ -230,30 +221,38 @@ pub(crate) async fn resume<S: Store>(
         settled.push(settle(opened, restored, common.height, &mut held).await?);
     }
     let history_below = history_below(&restored, &blocks);
-    // A contract from a block above the common block is discovered again as ingest
-    // hands that block back, and only if the block is still canonical.
-    let handoffs = restored
-        .iter_mut()
-        .flat_map(|r| std::mem::take(&mut r.handoffs))
-        .filter(|handoff| !held.contains(&handoff.block_hash))
-        .collect();
-    let matched = restored
-        .iter_mut()
-        .flat_map(|r| std::mem::take(&mut r.matched))
-        .filter(|matched| !held.contains(&matched.block_hash))
-        .collect();
-    let resumed = Resumed {
-        contracts: restored
-            .into_iter()
-            .flat_map(|r| r.contracts)
-            .filter(|contract| !held.contains(&contract.block_hash))
-            .collect(),
-        handoffs,
-        matched,
-        held,
-        ledger: Ledger::new(blocks, history_below),
-    };
+    let resumed = gathered(restored, held, Ledger::new(blocks, history_below));
     Ok((settled, resumed))
+}
+
+/// What every store read back, but what it holds of the `held` blocks, which ingest
+/// hands back: a contract or record from one is discovered or recorded again then, and
+/// only if the block is still canonical. Resumed from `ledger`.
+fn gathered(restored: Vec<Restored>, held: HashSet<B256>, ledger: Ledger) -> Resumed {
+    let mut resumed = Resumed {
+        contracts: Vec::new(),
+        handoffs: Vec::new(),
+        matched: Vec::new(),
+        held: HashSet::new(),
+        ledger,
+    };
+    let canonical = |hash: &B256| !held.contains(hash);
+    for r in restored {
+        let contracts = r.contracts.into_iter();
+        let handoffs = r.handoffs.into_iter();
+        let matched = r.matched.into_iter();
+        resumed
+            .contracts
+            .extend(contracts.filter(|contract| canonical(&contract.block_hash)));
+        resumed
+            .handoffs
+            .extend(handoffs.filter(|handoff| canonical(&handoff.block_hash)));
+        resumed
+            .matched
+            .extend(matched.filter(|matched| canonical(&matched.block_hash)));
+    }
+    resumed.held = held;
+    resumed
 }
 
 /// Whether any store, as settled, may hold a block below the oldest of `blocks`: its

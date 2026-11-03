@@ -27,7 +27,7 @@ use tracing::{info, warn};
 use super::expr::{seconds, texts, texts_of, uints};
 use super::lake::{CONCURRENT_CHECKPOINTS, Lake};
 use super::lock::LeaseWatch;
-use super::open::{Missing, Storage, open_table};
+use super::open::{Missing, Storage, open_existing, open_table};
 use super::settings::DeltaSettings;
 use crate::secret::Secret;
 use crate::sink::store_error::{InvalidStoredValue, Operation, StoreError};
@@ -76,25 +76,23 @@ impl HandoffQueue {
     ) -> Result<Self, StoreError> {
         let root = uri.trim_end_matches('/');
         let storage = Storage::new(root, storage)?;
-        Self::opened(&storage, root, schema, chain, Missing::Create { width }).await
-    }
-
-    async fn opened(
-        storage: &Storage,
-        root: &str,
-        schema: &Schema,
-        chain: &str,
-        missing: Missing,
-    ) -> Result<Self, StoreError> {
         let uri = format!("{root}/{chain}/{TABLE}");
         let checkpoints = Arc::new(Semaphore::new(CONCURRENT_CHECKPOINTS));
+        let missing = Missing::Create { width };
         let def = schema.dataset(Table::Contract);
-        Ok(Self {
-            lake: open_table(storage, uri, def, missing, checkpoints).await?,
+        Ok(Self::of(
+            open_table(&storage, uri, def, missing, checkpoints).await?,
+        ))
+    }
+
+    /// The queue in `lake`.
+    fn of(lake: Lake) -> Self {
+        Self {
+            lake,
             writer: WriterProperties::builder()
                 .set_compression(Compression::ZSTD(ZstdLevel::default()))
                 .build(),
-        })
+        }
     }
 
     /// Appends the `contracts` of `chain` the queue does not hold yet, by key, as one
@@ -233,18 +231,10 @@ pub async fn recorded(
     let storage = Storage::new(root, storage)?;
     let def = schema.dataset(Table::Handoff);
     let uri = format!("{root}/{chain}/{}", def.name);
-    let exists = storage
-        .table(&uri)
-        .await
-        .map_err(StoreError::engine(Operation::Open, Some(&def.name)))?
-        .version()
-        .is_some();
-    if !exists {
-        return Ok(Vec::new());
+    match open_existing(&storage, uri, def).await? {
+        Some(lake) => handoffs(&lake).await,
+        None => Ok(Vec::new()),
     }
-    let checkpoints = Arc::new(Semaphore::new(CONCURRENT_CHECKPOINTS));
-    let lake = open_table(&storage, uri, def, Missing::Refuse, checkpoints).await?;
-    handoffs(&lake).await
 }
 
 /// The rows of `lake`, a `handoffs` table.
@@ -377,18 +367,10 @@ impl HandoffWatch {
             return queue.read().await;
         }
         let uri = format!("{}/{chain}/{TABLE}", self.uri);
-        let exists = storage
-            .table(&uri)
-            .await
-            .map_err(StoreError::engine(Operation::Open, Some(TABLE)))?
-            .version()
-            .is_some();
-        if !exists {
+        let Some(lake) = open_existing(storage, uri, schema.dataset(Table::Contract)).await? else {
             return Ok(Vec::new());
-        }
-        let opened =
-            HandoffQueue::opened(storage, &self.uri, schema, chain.as_str(), Missing::Refuse)
-                .await?;
+        };
+        let opened = HandoffQueue::of(lake);
         let contracts = opened.read().await?;
         *queue = Some(opened);
         Ok(contracts)
