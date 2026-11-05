@@ -1434,12 +1434,12 @@ async fn a_backfill_into_another_lake_opens_no_database() {
 }
 
 /// A backfill of a subtree of the running indexer's manifests fills the tables of the
-/// subtree its shipped `[sink.postgres] tables` route, though most entries name other
-/// protocols' tables: Robinhood's, backfilling Uniswap, fills every Uniswap event table.
+/// subtree its `[sink.postgres] tables` route, though most entries name other protocols'
+/// tables: Robinhood's manifests, backfilling Uniswap, fill every routed Uniswap table.
 #[cfg(feature = "postgres")]
 #[test]
 fn a_subtree_backfill_fills_the_tables_the_database_routes_of_it() {
-    // The tables the settings take back out of `uniswap_v4_*`.
+    // The tables the route takes back out of `uniswap_v4_*`.
     const CLAIM_TOKENS: [&str; 3] = [
         "uniswap_v4_pool_manager_transfer",
         "uniswap_v4_pool_manager_approval",
@@ -1450,8 +1450,14 @@ fn a_subtree_backfill_fills_the_tables_the_database_routes_of_it() {
         .expect("parses");
     let chain = ChainId::new(&running.ingest.chain);
     let uniswap = Catalog::load(root.join("protocols/uniswap"), &chain).expect("loads");
+    let tables = serde_json::from_str(
+        r#"["metric_v1_*", "chainlink_data_streams_*", "uniswap_v3_*", "uniswap_v4_*",
+            "!uniswap_v4_pool_manager_transfer", "!uniswap_v4_pool_manager_approval",
+            "!uniswap_v4_pool_manager_operator_set"]"#,
+    )
+    .expect("parses");
     let routed = super::write::routed(
-        &running.sink.postgres.as_ref().expect("a database").tables,
+        &tables,
         &running.protocols_path().expect("manifests"),
         &chain,
         uniswap.schema(),

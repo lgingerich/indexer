@@ -47,12 +47,14 @@ tables = [
     "!metric_v1_metric_omm_pool_bin_swapped",
     "chainlink_data_streams_*",
     "pyth_lazer_*",
-    "uniswap_v3_*",
-    "uniswap_v4_*",
+    # Uniswap goes to the lake only until its backfill: restore these lines in the deploy
+    # before it, and the backfill fills Postgres from the lake, these blocks included.
+    # "uniswap_v3_*",
+    # "uniswap_v4_*",
     # V4's claim tokens, not its pools: ERC-6909 balances held in the `PoolManager`.
-    "!uniswap_v4_pool_manager_transfer",
-    "!uniswap_v4_pool_manager_approval",
-    "!uniswap_v4_pool_manager_operator_set",
+    # "!uniswap_v4_pool_manager_transfer",
+    # "!uniswap_v4_pool_manager_approval",
+    # "!uniswap_v4_pool_manager_operator_set",
 ]
 connection_string = { env = "INDEXER_POSTGRES_URL" }
 batch_records = 10000
