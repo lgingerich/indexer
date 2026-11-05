@@ -288,6 +288,9 @@ pub struct Backfilled {
     /// Rows appended to the lake: the decoded rows its tables did not hold yet, two a
     /// record, one in `decoded_logs` and one in its event's table.
     pub appended: usize,
+    /// Records decoded from the logs of the events manifests' `before_lake` names, fetched
+    /// from below the lake's first block. Counted in `logs` and `decoded` too.
+    pub before_lake: usize,
     /// Contracts this run's discovery found below the running indexer's restart.
     pub discovered: usize,
     /// Contracts handed over, by this run or an earlier one, and backfilled.

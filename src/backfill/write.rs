@@ -12,7 +12,7 @@ use tracing::{info, warn};
 use super::handover::Coverage;
 use super::{BackfillError, BackfillSettings, Backfilled, COMMIT_BLOCKS, COMMIT_LOGS, READ_AHEAD};
 use crate::decode::{Decoder, Record, Sent};
-use crate::sink::delta::{DecodedTables, LogReader, RunLock};
+use crate::sink::delta::{DecodedTables, LogReader, Placement, RunLock};
 use crate::sink::table::{Row, Schema};
 use crate::wire::datasets::evm::Log;
 use crate::wire::envelope::{ChainId, Event};
@@ -153,7 +153,7 @@ impl Writer<'_> {
         blocks: RangeInclusive<u64>,
         done: &mut Backfilled,
     ) -> Result<(), BackfillError> {
-        let (chain, protocols) = (self.chain, self.protocols);
+        let (chain, protocols, streams) = (self.chain, self.protocols, self.streams);
         let (from, to) = blocks.into_inner();
         let reads = reader.reads(from, to);
         done.from = reads.first().map_or(to, |read| *read.start());
@@ -161,7 +161,7 @@ impl Writer<'_> {
         info!(%chain, ?protocols, contracts = addresses.len(), from = done.from, to,
             reads = reads.len(), "backfilling from the lake's logs");
         let mut logs = stream::iter(reads.clone())
-            .map(|blocks| tokio::spawn(reader.read(blocks, addresses, self.streams)))
+            .map(|blocks| tokio::spawn(reader.read(blocks, addresses, streams)))
             .buffered(READ_AHEAD);
         for read in reads {
             let Some(logs) = logs.next().await else {
@@ -170,21 +170,11 @@ impl Writer<'_> {
             let logs = logs.unwrap_or_else(|join| std::panic::resume_unwind(join.into_panic()))?;
             let (mut records, mut appended) = (0, 0);
             for (blocks, positions) in parts(&logs, &read) {
-                let found = decode_all(&mut self.decoder, chain, &logs[positions])?;
-                records += found.len();
-                let events = derive(
-                    &self.decoder,
-                    reader,
-                    chain,
-                    found,
-                    self.derives,
-                    self.streams,
-                )
-                .await?;
-                self.lock.check()?;
-                let rows = rows(chain, self.schema, &events)?;
-                appended += self.tables.fill(blocks, protocols, rows).await?;
-                self.database.fill(chain, events).await?;
+                let (decoded, added) = self
+                    .commit(reader, blocks, &logs[positions], Placement::ByHeight)
+                    .await?;
+                records += decoded;
+                appended += added;
                 done.commits += 1;
             }
             done.reads += 1;
@@ -196,6 +186,71 @@ impl Writer<'_> {
                 "range backfilled");
         }
         Ok(())
+    }
+
+    /// Decodes and appends `logs`, sorted, which are from below the lake's first block, in
+    /// commits of at most [`COMMIT_LOGS`] logs, counting what it did in `done`. These
+    /// logs are sparse across a long history, so a commit spans as many heights as its
+    /// logs do, where one per [`COMMIT_BLOCKS`] heights would make thousands of commits,
+    /// and they go in one partition rather than a small file in each they fall in (see
+    /// [`Placement::Together`]).
+    ///
+    /// # Errors
+    ///
+    /// As [`write`](Self::write).
+    pub(super) async fn write_before_lake(
+        &mut self,
+        reader: &LogReader,
+        logs: &[Log],
+        done: &mut Backfilled,
+    ) -> Result<(), BackfillError> {
+        for part in logs.chunks(COMMIT_LOGS) {
+            let (Some(first), Some(last)) = (part.first(), part.last()) else {
+                continue;
+            };
+            let blocks = first.block_number..=last.block_number;
+            let (decoded, appended) = self
+                .commit(reader, blocks, part, Placement::Together)
+                .await?;
+            done.commits += 1;
+            done.logs += part.len();
+            done.decoded += decoded;
+            done.appended += appended;
+            done.before_lake += decoded;
+        }
+        Ok(())
+    }
+
+    /// Decodes `logs` and appends their rows, which `blocks` holds, in one commit to each
+    /// table, placed as `placement` says, and fills the database with them. Returns the records decoded and the rows
+    /// appended.
+    async fn commit(
+        &mut self,
+        reader: &LogReader,
+        blocks: RangeInclusive<u64>,
+        logs: &[Log],
+        placement: Placement,
+    ) -> Result<(usize, usize), BackfillError> {
+        let chain = self.chain;
+        let found = decode_all(&mut self.decoder, chain, logs)?;
+        let decoded = found.len();
+        let events = derive(
+            &self.decoder,
+            reader,
+            chain,
+            found,
+            self.derives,
+            self.streams,
+        )
+        .await?;
+        self.lock.check()?;
+        let rows = rows(chain, self.schema, &events)?;
+        let appended = self
+            .tables
+            .fill(blocks, self.protocols, rows, placement)
+            .await?;
+        self.database.fill(chain, events).await?;
+        Ok((decoded, appended))
     }
 }
 

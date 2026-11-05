@@ -82,7 +82,7 @@ async fn before_lake(
         if parents.is_empty() {
             return Ok(());
         }
-        let logs = search.logs(&parents, through).await?;
+        let logs = search.logs(&parents, &[], through).await?;
         tokio::task::block_in_place(|| admit(decoder, &logs, found))?;
         info!(
             factories = parents.len(),
@@ -91,6 +91,42 @@ async fn before_lake(
             "discovered contracts below the lake's first block"
         );
     }
+}
+
+/// The logs of the events `wanted` names, each contract with its events' ids, below the
+/// lake's `first` block and within `blocks`, over `hypersync`, in block and log order.
+/// Empty when none is wanted or `blocks` starts at or above `first`, as a run resumed
+/// from inside the lake does, and without `hypersync`, which a warning says.
+pub(super) async fn events_before_lake(
+    wanted: &[(Address, Vec<B256>)],
+    hypersync: Option<&HyperSyncEndpoint>,
+    blocks: &RangeInclusive<u64>,
+    first: Option<u64>,
+) -> Result<Vec<Log>, BackfillError> {
+    let first = first.unwrap_or_default();
+    if wanted.is_empty() || *blocks.start() >= first || blocks.is_empty() {
+        return Ok(Vec::new());
+    }
+    let Some(hypersync) = hypersync else {
+        warn!(
+            first,
+            "no [backfill.hypersync]: the events manifests ask for from below the lake's \
+            first block are not fetched"
+        );
+        return Ok(Vec::new());
+    };
+    let through = first.saturating_sub(1).min(*blocks.end());
+    let search = LogSearch::new(&hypersync.url, hypersync.token.expose())?;
+    let mut logs = Vec::new();
+    for (address, events) in wanted {
+        let found = search
+            .logs(std::slice::from_ref(address), events, through)
+            .await?;
+        info!(%address, logs = found.len(), through, "events fetched from below the lake's first block");
+        logs.extend(found);
+    }
+    logs.sort_unstable_by_key(|log| (log.block_number, log.log_index));
+    Ok(logs)
 }
 
 /// The decoder's factories not in `read` yet, now added to it.

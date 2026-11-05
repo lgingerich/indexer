@@ -7,6 +7,9 @@ protocol = "uniswap_v4"
 
 [[contract]]
 abi = ["PoolManager.json"]
+# A pool's tokens, fee, tick spacing and hooks are only in its `Initialize`, which for a pool
+# older than the lake a backfill fetches from before it.
+before_lake = ["Initialize"]
 # One pool's history, in order, by its id: every pool has the manager's address. And a
 # pool's tokens, which only its `Initialize` says. Not unique: a reorg's replacement of an
 # `Initialize` has another key, and a unique index would fail that commit.

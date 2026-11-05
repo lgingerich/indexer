@@ -162,6 +162,14 @@ pub enum CatalogError {
         /// The event as written.
         event: String,
     },
+    /// `before_lake` names an event its contract does not declare.
+    #[error("{contract} fetches event {event:?} from before the lake, which it does not declare")]
+    BeforeLakeEvent {
+        /// The contract, as `protocol.name`.
+        contract: String,
+        /// The event as written.
+        event: String,
+    },
     /// A rule's parameter is absent from its event, or not an `address`.
     #[error("{contract} is created_by {event}.{param}, which is not an address argument")]
     Param {

@@ -22,7 +22,7 @@ use crate::config::BackfillRun;
 use crate::decode::{Catalog, Decoder, DecodingSink};
 use crate::sink::SinkError;
 use crate::sink::delta::testing::Dir;
-use crate::sink::delta::{DecodedTables, DeltaSettings, DeltaSink, LockError, RunLock};
+use crate::sink::delta::{DecodedTables, DeltaSettings, DeltaSink, LockError, Placement, RunLock};
 use crate::sink::table::{Schema, Session, SessionEvent};
 use crate::sink::{EnvelopeSink as _, Store as _};
 use crate::window::UndoWindow;
@@ -440,6 +440,7 @@ async fn appends_commit_beside_the_running_stores_appends_and_deletes() {
             FIRST..=FIRST + 9,
             &["uniswap_v4".to_owned()],
             rows_of(&chain, &schema, &records).expect("rows"),
+            Placement::ByHeight,
         )
         .await
         .expect("appended despite the reorg's delete");
@@ -1080,6 +1081,59 @@ fn pool_created(height: u64, pool: Address, log_index: u64) -> Log {
     }
 }
 
+/// The signature of the `PoolManager`'s `Initialize`.
+const INITIALIZE: &str = "Initialize(bytes32,address,address,uint24,int24,address,uint160,int24)";
+
+/// The `PoolManager`'s `Initialize` of a pool in block `height`.
+fn pool_initialized(height: u64) -> Log {
+    let int =
+        |value: i32| DynSolValue::Int(alloy_primitives::I256::try_from(value).expect("int"), 24);
+    Log {
+        transaction_hash: hash(height, 1),
+        address: POOL_MANAGER,
+        topic0: Some(keccak256(INITIALIZE)),
+        topic1: Some(B256::repeat_byte(0x44)),
+        topic2: Some(B256::with_last_byte(1)),
+        topic3: Some(B256::with_last_byte(2)),
+        data: DynSolValue::Tuple(vec![
+            DynSolValue::Uint(U256::from(3_000), 24),
+            int(60),
+            DynSolValue::Address(Address::ZERO),
+            DynSolValue::Uint(U256::from(1) << 96, 160),
+            int(0),
+        ])
+        .abi_encode_params()
+        .into(),
+        block_number: height,
+        block_hash: hash(height, 0),
+        block_timestamp: 1_700_000_000 + height,
+        ..Log::default()
+    }
+}
+
+/// A `HyperSync` search's one page holding `log`, ending below [`FIRST`].
+fn hypersync_page(log: &Log) -> String {
+    let topic = |topic: Option<B256>| format!("{:#x}", topic.expect("a topic"));
+    format!(
+        r#"{{"data":[{{"blocks":[{{"number":{height},"hash":"{block}","timestamp":{timestamp}}}],
+        "logs":[{{"block_hash":"{block}","block_number":{height},"transaction_index":0,
+        "log_index":{log_index},"transaction_hash":"{transaction}","address":"{address:#x}",
+        "data":"{data}","topic0":"{topic0}","topic1":"{topic1}","topic2":"{topic2}",
+        "topic3":"{topic3}"}}]}}],"next_block":{FIRST},"archive_height":{LAST}}}"#,
+        height = log.block_number,
+        block = log.block_hash,
+        timestamp = log.block_timestamp,
+        log_index = log.log_index,
+        transaction = log.transaction_hash,
+        address = log.address,
+        data = log.data,
+        topic0 = topic(log.topic0),
+        topic1 = topic(log.topic1),
+        topic2 = topic(log.topic2),
+        topic3 = topic(log.topic3),
+    )
+}
+
 /// A swap of `pool` in block `height`.
 fn pool_swap(height: u64, pool: Address, log_index: u64) -> Log {
     let envelope: Envelope = serde_json::from_str(
@@ -1366,34 +1420,32 @@ async fn a_pool_created_before_the_lake_is_found_over_hypersync() {
     live.index(LAST).await;
 
     let created = pool_created(FIRST - 500, ANCIENT_POOL, 0);
-    let topic = |topic: Option<B256>| format!("{:#x}", topic.expect("a topic"));
-    let page = format!(
-        r#"{{"data":[{{"blocks":[{{"number":{height},"hash":"{block}","timestamp":{timestamp}}}],
-        "logs":[{{"block_hash":"{block}","block_number":{height},"transaction_index":0,
-        "log_index":0,"transaction_hash":"{transaction}","address":"{address:#x}",
-        "data":"{data}","topic0":"{topic0}","topic1":"{topic1}","topic2":"{topic2}",
-        "topic3":"{topic3}"}}]}}],"next_block":{FIRST},"archive_height":{LAST}}}"#,
-        height = created.block_number,
-        block = created.block_hash,
-        timestamp = created.block_timestamp,
-        transaction = created.transaction_hash,
-        address = created.address,
-        data = created.data,
-        topic0 = topic(created.topic0),
-        topic1 = topic(created.topic1),
-        topic2 = topic(created.topic2),
-        topic3 = topic(created.topic3),
-    );
+    let page = hypersync_page(&created);
     let (url, served) =
-        crate::ingest::source::hypersync::testing::endpoint(vec![(200, page)]).await;
+        crate::ingest::source::hypersync::testing::endpoint(vec![(200, page.clone()), (200, page)])
+            .await;
     let mut settings = dir.backfill(&protocols("uniswap/v3"));
     settings.run.hypersync =
         Some(toml::from_str(&format!("url = '{url}'\ntoken = 'token'")).expect("an endpoint"));
     let done = beside(&mut live, &dir, settings).await;
     assert_eq!((done.discovered, done.handed), (2, 2), "{done:?}");
+    assert_eq!(done.before_lake, 1, "{done:?}");
 
     let asked = served.await.expect("served");
-    assert_eq!(asked.len(), 1);
+    assert_eq!(asked.len(), 2, "to discover, then for the event to write");
+    let event: serde_json::Value = serde_json::from_str(&asked[1]).expect("a query");
+    assert_eq!(
+        event["to_block"], FIRST,
+        "only below the lake's first block"
+    );
+    assert_eq!(
+        event["logs"][0]["topics"],
+        serde_json::json!([[format!(
+            "{:#x}",
+            keccak256("PoolCreated(address,address,uint24,int24,address)")
+        )]]),
+        "only the event the manifest names"
+    );
     let asked: serde_json::Value = serde_json::from_str(&asked[0]).expect("a query");
     assert_eq!(
         asked["to_block"], FIRST,
@@ -1411,6 +1463,131 @@ async fn a_pool_created_before_the_lake_is_found_over_hypersync() {
         usize::try_from(RESTART - FIRST).expect("fits"),
         "every swap of it the lake holds"
     );
+    assert_eq!(
+        rows(
+            &dir,
+            "uniswap_v3_uniswap_v3_factory_pool_created",
+            &format!("block_number = {}", FIRST - 500)
+        )
+        .await
+        .len(),
+        1,
+        "what the pool is, though the lake's logs do not reach its creation"
+    );
+    assert_eq!(
+        rows(&dir, "logs", &format!("block_number = {}", FIRST - 500))
+            .await
+            .len(),
+        0,
+        "the lake's logs still begin where they did"
+    );
+}
+
+/// A pool initialized before the lake's first block is fetched over `HyperSync` on a
+/// chain whose manifest discovers nothing, as Uniswap V4's does: the event alone, not the
+/// manager's every log. It lands in its table and `decoded_logs`, and a rerun writes
+/// nothing more. A run resumed from inside the lake asks for nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_pool_initialized_before_the_lake_is_fetched_over_hypersync() {
+    let dir = Dir::new();
+    let _live = deployed(&dir, RESTART, LAST).await;
+    let page = hypersync_page(&pool_initialized(FIRST - 500));
+    let (url, served) =
+        crate::ingest::source::hypersync::testing::endpoint(vec![(200, page.clone()), (200, page)])
+            .await;
+    let settings = |from| {
+        let mut settings = dir.backfill(&uniswap_v4());
+        settings.run.hypersync =
+            Some(toml::from_str(&format!("url = '{url}'\ntoken = 'token'")).expect("an endpoint"));
+        settings.run.from = from;
+        settings
+    };
+    let done = backfill(&settings(None)).await.expect("backfilled");
+    assert_eq!(done.before_lake, 1, "{done:?}");
+    let older = format!("block_number = {}", FIRST - 500);
+    let table = "uniswap_v4_pool_manager_initialize";
+    assert_eq!(rows(&dir, table, &older).await.len(), 1);
+    assert_eq!(rows(&dir, "decoded_logs", &older).await.len(), 1);
+    assert_eq!(rows(&dir, table, "block_range = 0").await.len(), 1);
+
+    let again = backfill(&settings(None)).await.expect("backfilled");
+    assert_eq!(again.before_lake, 1, "{again:?}");
+    assert_eq!(rows(&dir, table, &older).await.len(), 1, "written once");
+    assert_eq!(
+        rows(&dir, "decoded_logs", &older).await.len(),
+        1,
+        "written once"
+    );
+
+    backfill(&settings(Some(FIRST))).await.expect("backfilled");
+    let asked = served.await.expect("served");
+    assert_eq!(asked.len(), 2, "the resumed run asked nothing");
+    let asked: serde_json::Value = serde_json::from_str(&asked[0]).expect("a query");
+    assert_eq!(
+        asked["logs"][0]["topics"],
+        serde_json::json!([[format!("{:#x}", keccak256(INITIALIZE))]])
+    );
+}
+
+/// Rows placed together share the first partition, however many their heights would
+/// otherwise fall in, and each is written once when filled again. Rows by height keep
+/// theirs, in the same table.
+#[tokio::test(flavor = "multi_thread")]
+async fn rows_placed_together_share_one_partition_and_are_written_once() {
+    let dir = Dir::new();
+    let chain = ChainId::new(CHAIN);
+    let catalog = Catalog::load(uniswap_v4(), &chain).expect("loads");
+    let schema = catalog.schema().clone();
+    let mut decoder = Decoder::new(catalog, []);
+    let width = dir.store().partition_blocks;
+    let mut tables = DecodedTables::open(&dir.uri(), &BTreeMap::new(), &schema, CHAIN, width)
+        .await
+        .expect("opens");
+    let heights = [150_000, 250_000, 350_000];
+    let logs: Vec<Log> = heights
+        .into_iter()
+        .map(|height| donate(height, 0, POOL_MANAGER))
+        .collect();
+    let records: Vec<Event> = decode_all(&mut decoder, &chain, &logs)
+        .expect("decodes")
+        .into_iter()
+        .map(|record| Event::Decoded(Box::new(record.decoded)))
+        .collect();
+    let row_set = || rows_of(&chain, &schema, &records).expect("rows");
+    let protocols = ["uniswap_v4".to_owned()];
+    let blocks = heights[0]..=heights[2];
+    let appended = tables
+        .fill(blocks.clone(), &protocols, row_set(), Placement::Together)
+        .await
+        .expect("appended");
+    assert_eq!(
+        appended,
+        2 * 3,
+        "a row in its table and one in decoded_logs"
+    );
+    let again = tables
+        .fill(blocks, &protocols, row_set(), Placement::Together)
+        .await
+        .expect("filled again");
+    assert_eq!(again, 0, "the keys are read back from that partition");
+
+    for table in ["uniswap_v4_pool_manager_donate", "decoded_logs"] {
+        assert_eq!(
+            rows(&dir, table, "block_range = 0").await.len(),
+            3,
+            "{table}"
+        );
+        assert_eq!(
+            rows(&dir, table, "block_range <> 0").await.len(),
+            0,
+            "{table}"
+        );
+        assert_eq!(
+            rows(&dir, table, "block_number = 250000").await.len(),
+            1,
+            "{table}: found by its height"
+        );
+    }
 }
 
 /// A backfill into another lake is a trial: it opens no database, not even one it

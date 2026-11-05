@@ -69,10 +69,13 @@ struct Query<'a> {
     field_selection: Fields,
 }
 
-/// The logs a search matches: emitted by any of `address`.
+/// The logs a search matches: emitted by any of `address`, and as any of the event ids
+/// `topics` holds, its one entry being the logs' first topic, when it is given.
 #[derive(Debug, Serialize)]
 struct Selection<'a> {
     address: &'a [Address],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    topics: Option<[&'a [B256]; 1]>,
 }
 
 #[derive(Debug, Serialize)]
@@ -131,15 +134,20 @@ impl LogSearch {
         })
     }
 
-    /// Every log `addresses` emitted from the first block through `through`, in block and
-    /// log order, each with its block's timestamp. An endpoint not yet at `through` is
+    /// Every log `addresses` emitted from the first block through `through`, of `events`
+    /// when it names any, in block and log order, each with its block's timestamp. An endpoint not yet at `through` is
     /// asked again every few minutes until it is, keeping what it answered: a search
     /// never returns with the blocks above the endpoint's height missing.
     ///
     /// # Errors
     ///
     /// Returns the first request's error, or a row that is not what was selected.
-    pub async fn logs(&self, addresses: &[Address], through: u64) -> Result<Vec<Log>, SourceError> {
+    pub async fn logs(
+        &self,
+        addresses: &[Address],
+        events: &[B256],
+        through: u64,
+    ) -> Result<Vec<Log>, SourceError> {
         let to_block = through.saturating_add(1);
         let mut logs = Vec::new();
         let mut from_block = 0;
@@ -148,7 +156,10 @@ impl LogSearch {
             let query = Query {
                 from_block,
                 to_block,
-                logs: [Selection { address: addresses }],
+                logs: [Selection {
+                    address: addresses,
+                    topics: (!events.is_empty()).then_some([events]),
+                }],
                 field_selection: Fields {
                     block: BLOCK_FIELDS,
                     log: LOG_FIELDS,
@@ -342,7 +353,7 @@ mod tests {
         .await;
         let search = LogSearch::new(&url, "token").expect("built");
         let logs = search
-            .logs(&[Address::repeat_byte(7)], 200)
+            .logs(&[Address::repeat_byte(7)], &[], 200)
             .await
             .expect("searched");
         assert_eq!(
@@ -358,6 +369,7 @@ mod tests {
             "the refused page asked again, then the next"
         );
         assert!(bodies[2].contains(r#""from_block":50"#), "{}", bodies[2]);
+        assert!(!bodies[2].contains("topics"), "{}", bodies[2]);
         assert!(bodies[3].contains(r#""from_block":100"#), "{}", bodies[3]);
         assert!(
             !format!("{search:?}").contains("token"),
@@ -370,6 +382,25 @@ mod tests {
     async fn a_refused_token_ends_the_search() {
         let (url, _served) = endpoint(vec![(401, "no".to_owned())]).await;
         let search = LogSearch::new(&url, "token").expect("built");
-        assert!(search.logs(&[Address::ZERO], 10).await.is_err());
+        assert!(search.logs(&[Address::ZERO], &[], 10).await.is_err());
+    }
+
+    /// A search for some events asks the endpoint for them alone, as the logs' first topic:
+    /// a contract as busy as Uniswap V4's `PoolManager` is not read whole for its few.
+    #[tokio::test]
+    async fn a_search_for_events_selects_them_by_first_topic() {
+        let (url, served) = endpoint(vec![(200, page(5, 11, 99))]).await;
+        let search = LogSearch::new(&url, "token").expect("built");
+        let event = B256::repeat_byte(9);
+        search
+            .logs(&[Address::repeat_byte(7)], &[event], 10)
+            .await
+            .expect("searched");
+        let bodies = served.await.expect("served");
+        let query: serde_json::Value = serde_json::from_str(&bodies[0]).expect("a query");
+        assert_eq!(
+            query["logs"][0]["topics"],
+            serde_json::json!([[format!("{event:#x}")]])
+        );
     }
 }

@@ -398,7 +398,10 @@ row's sender and recipient read from the lake's `transactions`. Contracts create
 before the lake's first block are not in it to discover: with `[backfill.hypersync]`,
 the backfill asks HyperSync for the factories' logs below that block, and hands over
 and backfills what they created with the rest, their logs from the lake's first block
-on being in the lake.
+on being in the lake. It also fetches the events a manifest's `before_lake` names from
+below that block, such as the `PoolCreated` and `Initialize` that say what an older
+Uniswap pool is, and writes them with the rest. In the lake they all share the first
+partition of their tables, so filter them by `block_number`, not `block_range`.
 
 It fills the lake and, when asked, `PostgreSQL`; not `DuckDB`.
 

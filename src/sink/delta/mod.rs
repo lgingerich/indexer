@@ -107,7 +107,7 @@ pub use self::handoff::{HandoffQueue, HandoffWatch, recorded};
 use self::lake::Lake;
 pub use self::lock::{LockError, RunLock};
 use self::maintenance::Maintenance;
-pub use self::replay::{DecodedTables, LogReader};
+pub use self::replay::{DecodedTables, LogReader, Placement};
 pub use self::settings::DeltaSettings;
 
 /// How many tables an open, a repair, or a delete across the lake works on at once:
@@ -505,7 +505,8 @@ impl DeltaSink {
         appends: Vec<(usize, Vec<Row>)>,
     ) -> Result<(Duration, Duration), StoreError> {
         self.begin(Step::AppendRows)?;
-        let (batches, build) = timed(record_batches(&self.lakes, appends)).await;
+        let (batches, build) =
+            timed(record_batches(&self.lakes, appends, Placement::ByHeight)).await;
         let (appended, write) = timed(self.append_all(batches?)).await;
         appended?;
         Ok((build, write))
@@ -853,6 +854,7 @@ struct Timings {
 async fn record_batches(
     lakes: &[Lake],
     appends: Vec<(usize, Vec<Row>)>,
+    placement: Placement,
 ) -> Result<Vec<(usize, Vec<RecordBatch>)>, StoreError> {
     let tables = appends.len();
     // Every build starts before any is waited for.
@@ -865,7 +867,11 @@ async fn record_batches(
             if part.is_empty() {
                 break;
             }
-            let (arrow, def, width) = (Arc::clone(&lake.arrow), Arc::clone(&lake.def), lake.width);
+            let (arrow, def, width) = (
+                Arc::clone(&lake.arrow),
+                Arc::clone(&lake.def),
+                placement.width(lake.width),
+            );
             builds.spawn(async move {
                 let built =
                     arrow::record_batch(&arrow, &def, width, &part.iter().collect::<Vec<_>>())

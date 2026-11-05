@@ -67,6 +67,17 @@
 //! truncate, is a startup error asking for a shorter `table`. So is a name produced twice:
 //! two contracts given the same `table`, or one contract declaring two events by one name.
 //!
+//! A contract's optional `before_lake` key names events a backfill also fetches from
+//! before the lake's first block, for the contract's listed `addresses`, when it has
+//! `[backfill.hypersync]`: what describes something older than the lake, such as a pool's
+//! tokens, while the rest of its history is left to the lake's range:
+//!
+//! ```toml
+//! [[contract]]
+//! abi = ["UniswapV3Factory.json"]
+//! before_lake = ["PoolCreated"]
+//! ```
+//!
 //! A contract's optional `indexes` key adds indexes to its event tables, by event name,
 //! each index its columns in order, for the reads the block index does not serve:
 //!
@@ -87,7 +98,7 @@ mod error;
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 
-use alloy_primitives::Address;
+use alloy_primitives::{Address, B256};
 use serde::Deserialize;
 use tracing::warn;
 
@@ -132,6 +143,9 @@ struct ContractSpec {
     addresses: BTreeMap<String, Vec<Address>>,
     #[serde(default)]
     created_by: Vec<CreatedBy>,
+    /// The events a backfill also fetches from before the lake's first block.
+    #[serde(default)]
+    before_lake: Vec<String>,
 }
 
 /// One discovery rule, as written.
@@ -158,6 +172,12 @@ pub(crate) struct Entry {
     pub(crate) abi: Abi,
     /// The contracts its instances create, keyed by the creating event.
     pub(crate) rules: HashMap<EventKey, Vec<Rule>>,
+    /// The ids of the events a backfill also fetches from before the lake's first block.
+    #[cfg_attr(
+        not(feature = "delta"),
+        expect(dead_code, reason = "only a backfill reads them, which needs the lake")
+    )]
+    before_lake: Vec<B256>,
 }
 
 /// A discovery rule, held by its parent's entry.
@@ -270,6 +290,7 @@ impl Catalog {
             }
             let abi = load_abi(dir, &spec.abi)?;
             let label = format!("{protocol}.{name}");
+            let before_lake = before_lake_events(&abi, &spec.before_lake, &label)?;
             let prefix = spec.table.unwrap_or_else(|| snake_case(&name));
             self.add_event_tables(&protocol, &name, &prefix, &abi, &label, &spec.indexes)?;
             let seeds = chain_addresses(&spec.addresses, chain, || label)?;
@@ -281,6 +302,7 @@ impl Catalog {
                 name,
                 abi,
                 rules: HashMap::new(),
+                before_lake,
             });
         }
         for (child, rule) in rules {
@@ -440,6 +462,17 @@ impl Catalog {
         self.entries.iter().any(|entry| !entry.rules.is_empty())
     }
 
+    /// Each listed contract with events a manifest asks a backfill to fetch from before
+    /// the lake's first block, and those events' ids.
+    #[cfg(feature = "delta")]
+    pub(crate) fn before_lake(&self) -> Vec<(Address, Vec<B256>)> {
+        self.seeds
+            .iter()
+            .map(|&(address, entry)| (address, self.entries[entry].before_lake.clone()))
+            .filter(|(_, events)| !events.is_empty())
+            .collect()
+    }
+
     /// Whether any derived table is fed from the declared events.
     #[cfg(feature = "delta")]
     pub(crate) fn derives(&self) -> bool {
@@ -483,6 +516,28 @@ fn load_abi(dir: &Path, files: &[PathBuf]) -> Result<Abi, CatalogError> {
             })?;
     }
     Ok(abi)
+}
+
+/// The ids of `events`, a contract's `before_lake` as written; `label` names it in errors.
+fn before_lake_events(
+    abi: &Abi,
+    events: &[String],
+    label: &str,
+) -> Result<Vec<B256>, CatalogError> {
+    let mut ids = Vec::new();
+    for event in events {
+        let keys = abi.events_named(event);
+        if keys.is_empty() {
+            return Err(CatalogError::BeforeLakeEvent {
+                contract: label.to_owned(),
+                event: event.clone(),
+            });
+        }
+        ids.extend(keys.into_iter().map(|(id, _)| id));
+    }
+    ids.sort_unstable();
+    ids.dedup();
+    Ok(ids)
 }
 
 /// The addresses a contract, `contract` for messages, lists on `chain`, after checking
@@ -616,6 +671,45 @@ addresses = { base = ["0x33128a8fC17869897dcE68Ed026d694621f6FDfD"], ethereum = 
                 ("dedupe_key", ColumnType::Text),
             ]
         );
+    }
+
+    /// What says what an older Uniswap pool is comes from before the lake: V3's factory's
+    /// `PoolCreated` and V4's manager's `Initialize`, each from its listed contract alone.
+    #[cfg(feature = "delta")]
+    #[test]
+    fn the_shipped_uniswap_contracts_fetch_what_describes_a_pool_from_before_the_lake() {
+        let catalog = shipped("base");
+        let ids: std::collections::BTreeSet<super::B256> = catalog
+            .before_lake()
+            .into_iter()
+            .flat_map(|(_, events)| events)
+            .collect();
+        let expected: std::collections::BTreeSet<super::B256> = [
+            "PoolCreated(address,address,uint24,int24,address)",
+            "Initialize(bytes32,address,address,uint24,int24,address,uint160,int24)",
+        ]
+        .into_iter()
+        .map(alloy_primitives::keccak256)
+        .collect();
+        assert_eq!(ids, expected);
+    }
+
+    /// A `before_lake` naming an event its contract does not declare is a startup error.
+    #[test]
+    fn a_before_lake_naming_nothing_is_a_startup_error() {
+        let abi = super::Abi::from_json(
+            r#"[{"type":"event","name":"Ping","anonymous":false,"inputs":[]}]"#,
+        )
+        .expect("an ABI");
+        assert_eq!(
+            super::before_lake_events(&abi, &["Ping".to_owned()], "p.c").expect("declared"),
+            [alloy_primitives::keccak256("Ping()")]
+        );
+        assert!(matches!(
+            super::before_lake_events(&abi, &["Pong".to_owned()], "p.c"),
+            Err(CatalogError::BeforeLakeEvent { contract, event })
+                if contract == "p.c" && event == "Pong"
+        ));
     }
 
     /// The shipped Uniswap tables are indexed for reading one pool, by its address in V3

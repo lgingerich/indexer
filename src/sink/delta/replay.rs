@@ -317,6 +317,31 @@ impl LogReader {
     }
 }
 
+/// Which partition [`DecodedTables::fill`] writes rows to, and reads them back from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Placement {
+    /// The partition of each row's height, as the running store writes it.
+    ByHeight,
+    /// One partition, the first, whatever the heights: for a few rows sparse across all
+    /// the history below the lake's first block, which by height would be a small file in
+    /// each of thousands of partitions. Nothing else writes there, since the running
+    /// store starts at the lake's first block, and compaction merges its files like any
+    /// finished partition's. Below that block, a reader must filter on the height column,
+    /// not the partition.
+    Together,
+}
+
+impl Placement {
+    /// The partition width that places rows so: as wide as can be puts every height in
+    /// the first.
+    pub(super) const fn width(self, width: u64) -> u64 {
+        match self {
+            Self::ByHeight => width,
+            Self::Together => u64::MAX,
+        }
+    }
+}
+
 /// The tables a backfill writes: `decoded_logs` and every event table of its schema.
 #[derive(Debug)]
 pub struct DecodedTables {
@@ -385,8 +410,9 @@ impl DecodedTables {
     }
 
     /// Appends each of `rows` its table does not hold yet, by key, in one commit per table
-    /// that has any, and returns how many it appended. In `decoded_logs` the keys are
-    /// read for `protocols` alone, since other protocols' records share the table.
+    /// that has any, in the partitions `placement` says, and returns how many it appended.
+    /// In `decoded_logs` the keys are read for `protocols` alone, since other protocols'
+    /// records share the table.
     ///
     /// Only appends, so it never conflicts with the running store's own appends, and only
     /// what is missing, so a rerun, a range the running store decoded too, or a commit
@@ -403,6 +429,7 @@ impl DecodedTables {
         blocks: RangeInclusive<u64>,
         protocols: &[String],
         rows: Vec<Row>,
+        placement: Placement,
     ) -> Result<usize, StoreError> {
         let mut by_table: BTreeMap<usize, Vec<Row>> = BTreeMap::new();
         for row in rows {
@@ -419,12 +446,11 @@ impl DecodedTables {
         let mut pending: Vec<(usize, Vec<Row>)> = by_table.into_iter().collect();
         let mut appended = 0;
         for attempt in 1..=WRITE_ATTEMPTS {
-            let held = futures_util::future::try_join_all(
-                pending
-                    .iter()
-                    .map(|(position, _)| keys(&self.lakes[*position], &blocks, protocols)),
-            )
-            .await?;
+            let held =
+                futures_util::future::try_join_all(pending.iter().map(|(position, _)| {
+                    keys(&self.lakes[*position], &blocks, protocols, placement)
+                }))
+                .await?;
             let missing: Vec<(usize, Vec<Row>)> = pending
                 .into_iter()
                 .zip(held)
@@ -439,7 +465,7 @@ impl DecodedTables {
             if missing.is_empty() {
                 break;
             }
-            let batches = record_batches(&self.lakes, missing.clone()).await?;
+            let batches = record_batches(&self.lakes, missing.clone(), placement).await?;
             let mut failure = None;
             pending = Vec::new();
             let written = append_all(&self.lakes, &self.writer, batches).await;
@@ -476,17 +502,19 @@ impl DecodedTables {
     }
 }
 
-/// The keys `lake` holds in `blocks`: in `decoded_logs` only those of `protocols`.
+/// The keys `lake` holds in `blocks`, in the partitions `placement` says: in
+/// `decoded_logs` only those of `protocols`.
 async fn keys(
     lake: &Lake,
     blocks: &RangeInclusive<u64>,
     protocols: &[String],
+    placement: Placement,
 ) -> Result<HashSet<String>, StoreError> {
     let column = lake.def.block_number.as_deref().unwrap_or("block_number");
     let decoded = lake.def.id == TableId::Dataset(Table::Decoded);
     let batches = lake
         .read(|frame| {
-            let frame = frame.filter(within(column, blocks, lake.width))?;
+            let frame = frame.filter(within(column, blocks, placement.width(lake.width)))?;
             let frame = if decoded {
                 frame.filter(in_texts("protocol", protocols))?
             } else {

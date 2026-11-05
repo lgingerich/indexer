@@ -10,6 +10,10 @@ protocol = "uniswap_v3"
 
 [[contract]]
 abi = ["UniswapV3Factory.json"]
+# A pool's tokens, fee and tick spacing are only in its `PoolCreated`, which for a pool older
+# than the lake a backfill fetches from before it. Every `Swap` carries the pool's price, so
+# its `Initialize` is not needed.
+before_lake = ["PoolCreated"]
 # The factory on each chain, from Uniswap's v3 deployments pages. On Ethereum, BNB Smart
 # Chain, and Robinhood Chain each is verified on Sourcify against these ABIs, as is one
 # of its pools.

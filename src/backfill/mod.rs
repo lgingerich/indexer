@@ -81,6 +81,18 @@
 //! hands over and backfills. Their logs from the lake's first block on are in the lake,
 //! so they are decoded from there like any other. Without it, they are not found, and a
 //! warning says so.
+//!
+//! What such a contract's lake history cannot say comes from a manifest's `before_lake`
+//! (see [`Catalog`]): the events it names, of its listed contracts, such as the
+//! `PoolCreated` naming a Uniswap V3 pool's tokens, or the `Initialize` naming a V4
+//! pool's. The backfill fetches them from below the lake's first block over `HyperSync`,
+//! and writes them to the event tables, `decoded_logs`, and `PostgreSQL` like any other
+//! record, by key, so a rerun writes each once. In the lake they share one partition,
+//! the first, rather than a small file in each of the thousands they would fall in by
+//! height (see [`Placement::Together`](crate::sink::delta::Placement::Together)), so a
+//! read of them filters on the block number, not the partition. `logs` stays as it was,
+//! so the lake's first block does not move, and `only` does not narrow them, as they
+//! describe contracts rather than belong to the ones handed over.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -88,6 +100,7 @@ use std::path::Path;
 use alloy_primitives::Address;
 use tracing::{info, warn};
 
+use crate::config::BackfillRun;
 use crate::decode::{Catalog, Decoder};
 use crate::secret::Secret;
 use crate::sink::delta::{DecodedTables, LogReader, RunLock};
@@ -97,7 +110,7 @@ mod handover;
 mod settings;
 mod write;
 
-use self::handover::{Coverage, adopt, discover, handover, select};
+use self::handover::{Coverage, adopt, discover, events_before_lake, handover, select};
 pub use self::settings::{BackfillError, BackfillSettings, Backfilled};
 use self::write::{Database, Writer, cores};
 
@@ -225,6 +238,7 @@ async fn fill(
     let schema = catalog.schema().clone();
     let derives = catalog.derives();
     let discovers = catalog.discovers();
+    let before_lake = catalog.before_lake();
     let mut decoder = Decoder::new(catalog, []);
     let (lake, run) = (&settings.lake, &settings.run);
     let open = || LogReader::open(lake, &schema, chain.as_str(), derives);
@@ -243,13 +257,7 @@ async fn fill(
     let mut database = Database::open(settings, &schema, chain).await?;
     // Where the running indexer's current run decodes from. With `out` there is none: the
     // running indexer writes the chain's own lake, not this one.
-    let restart = match &run.out {
-        Some(out) => {
-            info!(out, "writing to another lake; the chain's is only read");
-            None
-        }
-        None => Some(coverage.restart(&reader, &mut database).await?),
-    };
+    let restart = running_restart(run, &coverage, &reader, &mut database).await?;
     // The last block, when it is known before handing over: `to`, or with `out`, where
     // nothing is handed over or waited for, the bound.
     let fixed = run.to.or_else(|| run.out.as_ref().map(|_| bound));
@@ -316,6 +324,13 @@ async fn fill(
         (reader, to) = settled.await?;
         to
     };
+    let older = events_before_lake(
+        &before_lake,
+        run.hypersync.as_ref(),
+        &(from..=to),
+        reader.first(),
+    )
+    .await?;
     let mut writer = Writer {
         chain,
         schema: &schema,
@@ -327,11 +342,29 @@ async fn fill(
         derives,
         streams,
     };
+    writer.write_before_lake(&reader, &older, &mut done).await?;
     writer
         .write(&reader, &addresses, from..=to, &mut done)
         .await?;
     report(chain, &done);
     Ok(done)
+}
+
+/// Where the running indexer's current run decodes from, as `coverage` reads it from the
+/// lake and `database`; `None` when `run` writes to another lake.
+async fn running_restart(
+    run: &BackfillRun,
+    coverage: &Coverage<'_>,
+    reader: &LogReader,
+    database: &mut Database,
+) -> Result<Option<u64>, BackfillError> {
+    match &run.out {
+        Some(out) => {
+            info!(out, "writing to another lake; the chain's is only read");
+            Ok(None)
+        }
+        None => Ok(Some(coverage.restart(reader, database).await?)),
+    }
 }
 
 /// Waits, holding the lease `lock`, until the lake's bound reaches `needed` and where the
@@ -376,6 +409,7 @@ where
 fn report(chain: &ChainId, done: &Backfilled) {
     info!(%chain, from = done.from, to = done.to, reads = done.reads, commits = done.commits,
         logs = done.logs, decoded = done.decoded, appended = done.appended,
+        before_lake = done.before_lake,
         discovered = done.discovered, handed = done.handed, "backfill done");
     if let Some(through) = done.rerun_through {
         warn!(%chain, from = done.to.saturating_add(1), through,
