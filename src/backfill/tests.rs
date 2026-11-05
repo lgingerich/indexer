@@ -1439,6 +1439,12 @@ async fn a_backfill_into_another_lake_opens_no_database() {
 #[cfg(feature = "postgres")]
 #[test]
 fn a_subtree_backfill_fills_the_tables_the_database_routes_of_it() {
+    // The tables the settings take back out of `uniswap_v4_*`.
+    const CLAIM_TOKENS: [&str; 3] = [
+        "uniswap_v4_pool_manager_transfer",
+        "uniswap_v4_pool_manager_approval",
+        "uniswap_v4_pool_manager_operator_set",
+    ];
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let running = crate::config::Settings::from_file(root.join("indexer.robinhood.toml"), stand_in)
         .expect("parses");
@@ -1456,6 +1462,7 @@ fn a_subtree_backfill_fills_the_tables_the_database_routes_of_it() {
         .tables()
         .iter()
         .filter(|def| matches!(def.id, crate::sink::table::TableId::Event(_)))
+        .filter(|def| !CLAIM_TOKENS.contains(&def.name.as_ref()))
         .map(|def| def.id)
         .collect();
     assert!(!events.is_empty());

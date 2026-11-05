@@ -41,10 +41,18 @@ tables = [
     # The compressed oracle's, likewise: millions a day on BNB Smart Chain, its prices in
     # `metric_v1_compressed_oracle_prices`.
     "!metric_v1_compressed_oracle_feed_updated",
+    # Each swap's and bin fill's raw record, their words still packed; nothing reads them, and
+    # `metric_v1_swaps` and `metric_v1_bin_fills` hold the same events unpacked.
+    "!metric_v1_metric_omm_pool_swap",
+    "!metric_v1_metric_omm_pool_bin_swapped",
     "chainlink_data_streams_*",
     "pyth_lazer_*",
     "uniswap_v3_*",
     "uniswap_v4_*",
+    # V4's claim tokens, not its pools: ERC-6909 balances held in the `PoolManager`.
+    "!uniswap_v4_pool_manager_transfer",
+    "!uniswap_v4_pool_manager_approval",
+    "!uniswap_v4_pool_manager_operator_set",
 ]
 connection_string = { env = "INDEXER_POSTGRES_URL" }
 batch_records = 10000
