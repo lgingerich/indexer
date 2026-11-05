@@ -154,6 +154,14 @@ pub enum CatalogError {
         /// What is wrong with the table.
         source: TableError,
     },
+    /// An index names an event its contract does not declare.
+    #[error("{contract} indexes event {event:?}, which it does not declare")]
+    IndexEvent {
+        /// The contract, as `protocol.name`.
+        contract: String,
+        /// The event as written.
+        event: String,
+    },
     /// A rule's parameter is absent from its event, or not an `address`.
     #[error("{contract} is created_by {event}.{param}, which is not an address argument")]
     Param {

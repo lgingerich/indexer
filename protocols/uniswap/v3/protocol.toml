@@ -18,6 +18,8 @@ addresses = { base = ["0x33128a8fC17869897dcE68Ed026d694621f6FDfD"], bsc = ["0xd
 [[contract]]
 abi = ["UniswapV3Pool.json"]
 table = "pool"
+# One pool's history, in order, which the block index cannot find.
+indexes = { Burn = [["chain", "address", "block_number", "log_index"]], Mint = [["chain", "address", "block_number", "log_index"]], Swap = [["chain", "address", "block_number", "log_index"]] }
 created_by = [{ contract = "UniswapV3Factory", event = "PoolCreated", param = "pool" }]
 # Seeds: busy pools created before any run, so a short run decodes swaps out of the box.
 # The second is the pool `examples/decode_logs.rs` decodes.

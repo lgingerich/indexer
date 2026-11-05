@@ -66,6 +66,20 @@
 //! A name longer than `PostgreSQL`'s 63-byte identifier limit, which it would silently
 //! truncate, is a startup error asking for a shorter `table`. So is a name produced twice:
 //! two contracts given the same `table`, or one contract declaring two events by one name.
+//!
+//! A contract's optional `indexes` key adds indexes to its event tables, by event name,
+//! each index its columns in order, for the reads the block index does not serve:
+//!
+//! ```toml
+//! [[contract]]
+//! abi = ["UniswapV3Pool.json"]
+//! indexes = { Swap = [["chain", "address", "block_number", "log_index"]] }
+//! ```
+//!
+//! An event or a column the contract's tables do not have is a startup error. A store
+//! builds a missing index when it starts, without `CONCURRENTLY`, which blocks writes to
+//! the table until it is built: declare one before its table holds much, and build it by
+//! hand first otherwise.
 
 mod column;
 mod error;
@@ -110,6 +124,10 @@ struct ContractSpec {
     /// This contract's part of its event tables' names; its name in `snake_case` when
     /// absent.
     table: Option<String>,
+    /// The indexes of this contract's event tables, by event name, each its columns in
+    /// order.
+    #[serde(default)]
+    indexes: BTreeMap<String, Vec<Vec<String>>>,
     #[serde(default)]
     addresses: BTreeMap<String, Vec<Address>>,
     #[serde(default)]
@@ -253,7 +271,7 @@ impl Catalog {
             let abi = load_abi(dir, &spec.abi)?;
             let label = format!("{protocol}.{name}");
             let prefix = spec.table.unwrap_or_else(|| snake_case(&name));
-            self.add_event_tables(&protocol, &name, &prefix, &abi, &label)?;
+            self.add_event_tables(&protocol, &name, &prefix, &abi, &label, &spec.indexes)?;
             let seeds = chain_addresses(&spec.addresses, chain, || label)?;
             self.seeds
                 .extend(seeds.iter().map(|&address| (address, id)));
@@ -272,7 +290,8 @@ impl Catalog {
     }
 
     /// Declares the table of every event of `abi`, contract `name` of `protocol`, named
-    /// with its `prefix`; `label` names the contract in errors.
+    /// with its `prefix` and indexed on `indexes`, by event name; `label` names the
+    /// contract in errors.
     fn add_event_tables(
         &mut self,
         protocol: &str,
@@ -280,7 +299,17 @@ impl Catalog {
         prefix: &str,
         abi: &Abi,
         label: &str,
+        indexes: &BTreeMap<String, Vec<Vec<String>>>,
     ) -> Result<(), CatalogError> {
+        if let Some(event) = indexes
+            .keys()
+            .find(|event| abi.events_named(event).is_empty())
+        {
+            return Err(CatalogError::IndexEvent {
+                contract: label.to_owned(),
+                event: event.clone(),
+            });
+        }
         for event in abi.events() {
             let table = format!("{protocol}_{prefix}_{}", snake_case(event.name));
             if table.len() > MAX_IDENTIFIER {
@@ -291,7 +320,12 @@ impl Catalog {
             }
             let params = event.inputs.iter().map(param).collect();
             self.schema
-                .add_event((protocol, name, event.id), table.clone(), params)
+                .add_event(
+                    (protocol, name, event.id),
+                    table.clone(),
+                    params,
+                    indexes.get(event.name).map_or(&[], Vec::as_slice),
+                )
                 .map_err(|source| event_table_error(source, table, label.to_owned()))?;
         }
         Ok(())
@@ -494,7 +528,7 @@ fn find_manifests(dir: &Path, protocols: &mut Vec<PathBuf>) -> Result<(), Catalo
 mod tests {
     use super::{AddressSlot, Catalog, CatalogError};
     use crate::decode::fixtures::{protocol, protocols, shipped};
-    use crate::sink::table::{ColumnType, TableId};
+    use crate::sink::table::{ColumnType, TableError, TableId};
 
     /// One protocol holding `manifest` and the shipped Uniswap V3 ABIs.
     fn single(manifest: &str) -> Result<Catalog, CatalogError> {
@@ -582,6 +616,71 @@ addresses = { base = ["0x33128a8fC17869897dcE68Ed026d694621f6FDfD"], ethereum = 
                 ("dedupe_key", ColumnType::Text),
             ]
         );
+    }
+
+    /// The shipped Uniswap tables are indexed for reading one pool, by its address in V3
+    /// and its id in V4, where every pool has one address.
+    #[test]
+    fn the_shipped_uniswap_tables_are_indexed_by_pool() {
+        let catalog = shipped("base");
+        let columns = |table: &str| -> Vec<Vec<String>> {
+            catalog
+                .schema()
+                .tables()
+                .iter()
+                .find(|def| def.name == table)
+                .unwrap_or_else(|| panic!("{table} exists"))
+                .indexes
+                .iter()
+                .map(|index| index.columns.iter().map(ToString::to_string).collect())
+                .collect()
+        };
+        let pool = |column: &'static str| vec!["chain", column, "block_number", "log_index"];
+        for (table, expected) in [
+            ("uniswap_v3_pool_swap", pool("address")),
+            ("uniswap_v3_pool_mint", pool("address")),
+            ("uniswap_v3_pool_burn", pool("address")),
+            ("uniswap_v4_pool_manager_swap", pool("id")),
+            ("uniswap_v4_pool_manager_modify_liquidity", pool("id")),
+            ("uniswap_v4_pool_manager_initialize", vec!["chain", "id"]),
+        ] {
+            assert!(
+                columns(table).iter().any(|index| index == &expected),
+                "{table}: {:?}",
+                columns(table)
+            );
+        }
+    }
+
+    /// An index on an event or a column the contract's tables do not have is a startup
+    /// error rather than an index that is never built.
+    #[test]
+    fn an_index_naming_nothing_is_a_startup_error() {
+        let abi = r#"[{"type":"event","name":"Transfer","anonymous":false,"inputs":[]}]"#;
+        let manifest = |indexes: &str| {
+            format!("protocol = \"p\"\n[[contract]]\nabi = [\"Token.json\"]\nindexes = {indexes}\n")
+        };
+        match protocol(&[
+            ("Token.json", abi),
+            ("protocol.toml", &manifest(r#"{ Mint = [["chain"]] }"#)),
+        ]) {
+            Err(CatalogError::IndexEvent { contract, event }) => {
+                assert_eq!((contract.as_str(), event.as_str()), ("p.Token", "Mint"));
+            }
+            other => panic!("an unknown event: {other:?}"),
+        }
+        match protocol(&[
+            ("Token.json", abi),
+            ("protocol.toml", &manifest(r#"{ Transfer = [["nope"]] }"#)),
+        ]) {
+            Err(CatalogError::Table { contract, source }) => {
+                assert_eq!(contract, "p.Token");
+                assert!(
+                    matches!(source, TableError::UnknownColumn { column, .. } if column == "nope")
+                );
+            }
+            other => panic!("an unknown column: {other:?}"),
+        }
     }
 
     /// A name past the limit, two contracts sharing a `table`, and two events by one name

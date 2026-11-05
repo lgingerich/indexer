@@ -845,6 +845,12 @@ created_by = [{ contract = "UniswapV3Factory", event = "PoolCreated", param = "p
 addresses = { base = ["0xd0b53D9277642d899DF5C87A3966A349A798F224"] }   # optional seeds
 ```
 
+**`indexes` adds indexes to a contract's event tables,** by event name, each its columns
+in order: `indexes = { Swap = [["chain", "address", "block_number", "log_index"]] }`. A
+store builds a missing index when it starts, without `CONCURRENTLY`, which blocks writes to
+that table until it is built, so declare one before its table holds much, and build it by
+hand first otherwise.
+
 **A `[[contract]]` is one contract of the protocol,** named after its first ABI file:
 `UniswapV3Pool.json` is `UniswapV3Pool`, so name ABI files after the contract they
 describe. A rule names its parent by that name, and a stored discovery uses it to find

@@ -21,6 +21,7 @@
 //! their types. A derivation is code in this crate, so a field that does not fit is a bug
 //! in it, and building the row fails rather than storing a null or a clipped integer.
 
+use std::borrow::Cow;
 use std::sync::Arc;
 
 use alloy_primitives::{Address, B256, TxHash};
@@ -58,17 +59,19 @@ const TRAILING: [(&str, ColumnType); 3] = [
 
 impl Schema {
     /// Adds the table for one event, whose arguments are `params` in ABI order with their
-    /// ABI names.
+    /// ABI names, indexed on `indexes`, each its columns in order.
     ///
     /// # Errors
     ///
     /// Returns [`TableError::DuplicateTable`], adding nothing, when a table is already
-    /// named `name`, and another [`TableError`] when the generated table is inconsistent.
+    /// named `name`, [`TableError::UnknownColumn`] when an index names a column the table
+    /// does not have, and another [`TableError`] when the generated table is inconsistent.
     pub fn add_event(
         &mut self,
         (protocol, contract, event_id): (&str, &str, B256),
         name: String,
         params: Vec<Column>,
+        indexes: &[Vec<String>],
     ) -> Result<(), TableError> {
         let reserved: Vec<&str> = LEADING
             .iter()
@@ -91,7 +94,7 @@ impl Schema {
             .into_iter()
             .zip(params)
             .map(|(column, param)| Column::new(column, param.kind, param.nullable));
-        let table = self.add_log_table(TableId::Event(self.events.len()), name, own, &[])?;
+        let table = self.add_log_table(TableId::Event(self.events.len()), name, own, indexes)?;
         self.events
             .insert((protocol.to_owned(), contract.to_owned(), event_id), table);
         Ok(())
@@ -129,12 +132,12 @@ impl Schema {
 
     /// Adds a table anchored to one log, written: the log's columns, `own`, then the
     /// block's, reorged by the block, and indexed on `indexes` beside the block.
-    fn add_log_table(
+    fn add_log_table<C: Clone + Into<Cow<'static, str>>, I: AsRef<[C]>>(
         &mut self,
         id: TableId,
         name: String,
         own: impl IntoIterator<Item = Column>,
-        indexes: &[&[&'static str]],
+        indexes: &[I],
     ) -> Result<Arc<TableDef>, TableError> {
         if self.tables.iter().any(|table| table.name == name) {
             return Err(TableError::DuplicateTable { table: name });
@@ -154,7 +157,7 @@ impl Schema {
         }
         let table = indexes.iter().fold(
             table.reorg_by("block_hash", "block_number"),
-            |table, columns| table.index(columns),
+            |table, columns| table.index(columns.as_ref()),
         );
         let table = Arc::new(table.build()?);
         self.written.insert(id);
@@ -589,6 +592,7 @@ mod tests {
                     column("ids", ColumnType::list(ColumnType::Int).expect("a scalar")),
                     column("legs", ColumnType::Document),
                 ],
+                &[],
             )
             .expect("a new table");
         schema
@@ -615,7 +619,7 @@ mod tests {
             ]
         );
         assert!(matches!(
-            schema.add_event(("p", "C", hash(0x0a)), "p_c_e".to_owned(), Vec::new()),
+            schema.add_event(("p", "C", hash(0x0a)), "p_c_e".to_owned(), Vec::new(), &[]),
             Err(TableError::DuplicateTable { table }) if table == "p_c_e"
         ));
     }
@@ -633,6 +637,7 @@ mod tests {
                     .into_iter()
                     .map(|name| Column::new(name, ColumnType::Uint, false))
                     .collect(),
+                &[],
             )
             .expect("a new table");
         let table = schema.tables().last().expect("the event table");

@@ -399,9 +399,9 @@ impl TableBuilder {
 
     /// Adds an index on `columns`.
     #[must_use]
-    pub fn index(mut self, columns: &[&'static str]) -> Self {
+    pub fn index<C: Clone + Into<Cow<'static, str>>>(mut self, columns: &[C]) -> Self {
         self.def.indexes.push(Index {
-            columns: columns.iter().map(|&column| column.into()).collect(),
+            columns: columns.iter().cloned().map(Into::into).collect(),
         });
         self
     }

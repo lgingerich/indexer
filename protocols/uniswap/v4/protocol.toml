@@ -7,5 +7,9 @@ protocol = "uniswap_v4"
 
 [[contract]]
 abi = ["PoolManager.json"]
+# One pool's history, in order, by its id: every pool has the manager's address. And a
+# pool's tokens, which only its `Initialize` says. Not unique: a reorg's replacement of an
+# `Initialize` has another key, and a unique index would fail that commit.
+indexes = { Initialize = [["chain", "id"]], ModifyLiquidity = [["chain", "id", "block_number", "log_index"]], Swap = [["chain", "id", "block_number", "log_index"]] }
 # From Uniswap's deployments page, each verified on Sourcify against this ABI.
 addresses = { base = ["0x498581fF718922c3f8e6A244956aF099B2652b2b"], bsc = ["0x28e2ea090877bf75740558f6bfb36a5ffee9e9df"], ethereum = ["0x000000000004444c5dc75cB358380D2e3dE08A90"], robinhood = ["0x8366a39cc670b4001a1121b8f6a443a643e40951"] }

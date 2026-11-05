@@ -248,10 +248,10 @@ fn every_table_is_keyed_and_indexed_by_block_when_reorgs_delete_from_it() {
             .map(|(_, number)| format!(" (\"chain\", \"{number}\")"))
             .collect();
         let indexes = sql::create_indexes::<Postgres>(table);
-        // A derived table adds the indexes its reads need after the block's.
-        let derived = matches!(table.id, TableId::Derived(_));
+        // A derived or event table adds the indexes its reads need after the block's.
+        let declares = matches!(table.id, TableId::Derived(_) | TableId::Event(_));
         assert!(
-            indexes.len() == by_block.len() || derived && indexes.len() > by_block.len(),
+            indexes.len() == by_block.len() || declares && indexes.len() > by_block.len(),
             "{label} is indexed by block exactly when a reorg deletes from it: {indexes:?}"
         );
         for (index, columns) in indexes.iter().zip(&by_block) {
