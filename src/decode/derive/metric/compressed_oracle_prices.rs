@@ -41,8 +41,12 @@ pub(in crate::decode) const COMPRESSED_ORACLE_PRICES: Derivation = Derivation {
         ("spread1", ColumnType::Uint),
         ("feed_timestamp_ms", ColumnType::Uint),
     ],
-    // A feed's prices, in block order.
-    indexes: &[&["chain", "address", "feed_id", "block_number"]],
+    // A feed's prices in block order, and in time order: metric-tools reads a feed's price as of
+    // a moment, and thins them by time.
+    indexes: &[
+        &["chain", "address", "feed_id", "block_number"],
+        &["chain", "address", "feed_id", "block_timestamp"],
+    ],
     derive: compressed_price,
 };
 
