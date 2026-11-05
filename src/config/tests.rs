@@ -493,7 +493,12 @@ fn the_undo_window_is_the_chains_and_reaches_its_stores() {
         let error = parse(&window(keys)).expect_err(keys).to_string();
         assert!(error.contains(expected), "{keys}: {error}");
     }
+}
 
+/// Every store takes the chain's window, which sets what it gathers into a flush.
+#[cfg(all(feature = "postgres", feature = "delta"))]
+#[test]
+fn the_stores_take_the_chains_undo_window() {
     let settings = parse(&format!(
         "[ingest]\nchain = \"base\"\nundo_window = 512\n{RPC}\n\
          [sink.delta]\ntables = [\"blocks\"]\nuri = \"/tmp/lake\"\n\

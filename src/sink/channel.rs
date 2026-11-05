@@ -86,6 +86,7 @@ const ENVELOPES: usize = 1 << 17;
 /// Resume needs a block both hand back, within that window; the lake's byte limit alone
 /// let a commit gather over ten thousand of Robinhood's small blocks, and a stop left it
 /// further behind the database than resume could reach.
+#[cfg(any(feature = "duckdb", feature = "postgres", test))]
 const MAX_BLOCKS: usize = crate::window::UndoWindow::DEFAULT.flush_blocks();
 
 /// How long a stop gives the drain to commit what it has gathered and wait for what its
