@@ -153,10 +153,14 @@ pub struct IngestSettings {
     /// and a `HyperSync` backfill stops there; only the blocks above it go one at a time
     /// through the reorg-aware path, so a shallower depth hands a backfill to the chain's
     /// head sooner. It is not how deep a fork can be retracted: a run retracts up to
-    /// [`MAX_UNFINALIZED_BLOCKS`](crate::window::MAX_UNFINALIZED_BLOCKS) blocks
-    /// whatever this is. Omitted is that same 4,096, which suits any chain; zero, or more
-    /// than 4,096, is refused.
+    /// [`undo_window`](Self::undo_window) blocks whatever this is. Omitted is that same
+    /// depth; zero, or deeper than the window, is refused.
     pub finality_depth: NonZeroU64,
+    /// `undo_window`: how deep a fork a run can retract, and so how many blocks each
+    /// store's ledger keeps and a restart reads back (see
+    /// [`UndoWindow`](crate::window::UndoWindow)). A deeper fork stops the run. Omitted
+    /// is 4,096, which suits any chain and is the most allowed.
+    pub undo_window: crate::window::UndoWindow,
 }
 
 /// The source `[ingest]` names.
@@ -203,6 +207,8 @@ struct IngestTable {
     backfill_concurrency: Option<NonZeroUsize>,
     #[serde(default)]
     finality_depth: Option<NonZeroU64>,
+    #[serde(default)]
+    undo_window: Option<usize>,
 }
 
 /// Four: enough to keep the node busy while a store commits, few enough that a
@@ -242,12 +248,16 @@ impl TryFrom<IngestTable> for IngestSettings {
             }
             _ => return Err("[ingest] http_url and ws_url are named together"),
         };
-        let deepest = crate::window::MAX_UNFINALIZED_BLOCKS as u64;
+        let undo_window = match table.undo_window {
+            Some(blocks) => crate::window::UndoWindow::new(blocks)
+                .ok_or("[ingest] undo_window is at least 1 and at most 4,096")?,
+            None => crate::window::UndoWindow::DEFAULT,
+        };
+        let deepest = undo_window.blocks() as u64;
         let finality_depth = match table.finality_depth {
             Some(depth) if depth.get() > deepest => {
-                return Err(
-                    "[ingest] finality_depth is at most 4,096, the deepest fork a run retracts",
-                );
+                return Err("[ingest] finality_depth is at most undo_window, \
+                     the deepest fork a run retracts");
             }
             Some(depth) => depth,
             None => NonZeroU64::new(deepest).unwrap_or(NonZeroU64::MIN),
@@ -258,6 +268,7 @@ impl TryFrom<IngestTable> for IngestSettings {
             start_block: table.start_block,
             stop_block: table.stop_block,
             finality_depth,
+            undo_window,
         })
     }
 }
@@ -649,10 +660,30 @@ impl Settings {
     /// misspelled key is caught at startup instead of silently leaving a setting at its
     /// default.
     pub fn parse(text: &str, env: Env) -> Result<Self, SettingsError> {
-        let settings: Self = secret::reading(env, || toml::from_str(text))
+        let mut settings: Self = secret::reading(env, || toml::from_str(text))
             .map_err(|source| SettingsError::Parse { source })?;
         settings.check()?;
+        settings.share_undo_window();
         Ok(settings)
+    }
+
+    /// Hands each store the chain's undo window, which `[ingest]` names and every store's
+    /// ledger is sized by.
+    fn share_undo_window(&mut self) {
+        let window = self.ingest.undo_window;
+        #[cfg(feature = "duckdb")]
+        if let Some(duckdb) = &mut self.sink.duckdb {
+            duckdb.undo_window = window;
+        }
+        #[cfg(feature = "postgres")]
+        if let Some(postgres) = &mut self.sink.postgres {
+            postgres.undo_window = window;
+        }
+        #[cfg(feature = "delta")]
+        if let Some(delta) = &mut self.sink.delta {
+            delta.undo_window = window;
+        }
+        let _ = window;
     }
 
     /// Refuses settings that can only fail once run, whatever the chain and the stores

@@ -62,7 +62,7 @@ use ring::UndoRing;
 use crate::ingest::source::{BlockSource, SourceError};
 use crate::metrics;
 use crate::sink::EnvelopeSink;
-use crate::window::{Ledger, MAX_UNFINALIZED_BLOCKS};
+use crate::window::Ledger;
 use crate::wire::envelope::{BlockMeta, Envelope, Event};
 
 /// How soon a live head the source answered inconsistently is asked about again, and the
@@ -116,7 +116,7 @@ impl<S: BlockSource, K> Machine<S, K> {
     fn finality_depth(&self) -> u64 {
         self.source
             .finality_depth()
-            .clamp(1, MAX_UNFINALIZED_BLOCKS as u64)
+            .clamp(1, self.ring.capacity().blocks() as u64)
     }
 }
 
@@ -126,8 +126,8 @@ impl<S, K> Machine<S, K> {
     ///
     /// An empty ledger starts fresh, at the sampled head or a requested height. Otherwise
     /// the run resumes after the ledger's tip; see the module docs. Only the newest
-    /// parent-linked suffix is kept, and only the newest [`MAX_UNFINALIZED_BLOCKS`] of it
-    /// plus one floor are remembered.
+    /// parent-linked suffix is kept, and only the newest of it, as many as the ledger's
+    /// [`window`](Ledger::window) retracts, plus one floor are remembered.
     #[must_use]
     pub fn new(source: S, sink: K, ledger: impl Into<Ledger>) -> Self {
         Self {

@@ -79,7 +79,7 @@ pool's own logs later in the same block, even the same transaction, decode too. 
 ### A reorg
 
 Height and parent-hash linkage are checked before publishing each block. Ingestion
-retains the most recent 4,096 accepted block identities as a sliding window, plus one
+retains the most recent accepted block identities, `ingest.undo_window` of them and 4,096 by default, as a sliding window, plus one
 predecessor kept only as a linkage floor. The window is a bounded recovery budget, not a
 finality claim: a fork deeper than it stops with an error rather than a guessed retraction.
 
@@ -168,7 +168,7 @@ and the node serves the blocks after it.
 
 The store's `accepted_blocks` table is a ledger of every block it committed, one row per
 block, each written in the same transaction as that block's rows. At startup the newest
-4,097 rows are read back — an orphaned block's row was deleted by its `reorg` — the undo window plus its
+`ingest.undo_window` + 1 rows are read back — an orphaned block's row was deleted by its `reorg` — the undo window plus its
 floor — and every older row for the chain is deleted, so the table stays bounded across
 restarts. Only the newest parent-linked run of those rows is kept; a gap below it is
 logged and the window starts above it.
@@ -333,7 +333,7 @@ most, that `decode` and `ingest` do not depend on each other, CI checks with a g
   rendered from those definitions in `src/sink/sql.rs`, and both stores share one write
   path in `src/sink/store.rs`, so a store is only its engine.
 - **Sliding undo window, no finality assertion.** Ingestion keeps the most recent
-  4,096 accepted block identities plus one predecessor as a recovery floor. It does not
+  `ingest.undo_window` accepted block identities plus one predecessor as a recovery floor. It does not
   read the node's `finalized` tag and does not claim any height is irreversible. The
   window caps how deep a fork reconciliation can reach; a deeper fork stops rather than
   guessing. Each identity is also written to the store's `accepted_blocks` ledger, which
@@ -343,7 +343,7 @@ most, that `decode` and `ingest` do not depend on each other, CI checks with a g
   being canonical, then appends the replacement branch under its own keys. The store
   deletes the orphaned blocks' rows in the same transaction, so its tables hold only the
   current chain and the `reorgs` rows are the history of what was retracted.
-  The sliding window retains up to a fixed 4,096 identities. See `src/ingest/pipeline/ring.rs`.
+  The sliding window retains up to `ingest.undo_window` identities. See `src/ingest/pipeline/ring.rs`.
 - **Headless backfill, then live heads.** Startup samples the head; on an empty store
   `[ingest] start_block` may request earlier inclusive history but defaults to the head.
   Backfill then reads consecutive concrete heights up to `ingest.finality_depth` below
@@ -575,7 +575,8 @@ the field:
 | --- | --- | --- |
 | `ingest.start_block` | the sampled head | First height to index on an empty store. Absent starts live at the observed head; a value backfills that inclusive height forward before following live heads. A value above the sampled head is a startup error. When the store already holds blocks a run resumes from the store: a value the stored history reaches is ignored, and one more than a block past the stored tip is a startup error |
 | `ingest.backfill_concurrency` | `4` | Backfill fetches in flight at once. Blocks are still accepted in height order; this overlaps requests so the node is read while the stores write. Each counts against the provider's rate limit. Zero is refused. Refused beside a [HyperSync backfill](#backfilling-from-hypersync), which takes `ingest.hypersync.concurrency` instead |
-| `ingest.finality_depth` | `4096` | How many blocks under the head a fork may still reach on the chain. Deeper heights are backfilled straight through and a [HyperSync backfill](#backfilling-from-hypersync) stops there; only the blocks above it go one at a time through the reorg-aware path, so a shallower depth hands a backfill to the head sooner. Not how deep a fork is retracted, which is always up to 4,096 blocks. At most 4,096; zero is refused |
+| `ingest.finality_depth` | `ingest.undo_window` | How many blocks under the head a fork may still reach on the chain. Deeper heights are backfilled straight through and a [HyperSync backfill](#backfilling-from-hypersync) stops there; only the blocks above it go one at a time through the reorg-aware path, so a shallower depth hands a backfill to the head sooner. Not how deep a fork is retracted, which is always up to 4,096 blocks. At most 4,096; zero is refused |
+| `ingest.undo_window` | `4096` | How deep a fork a run can retract, from 1 to 4,096; a deeper one stops it. Each store's ledger keeps this many blocks and a restart reads them back, so a narrower window opens a lake faster, the more so on a slow chain. It also bounds how many blocks one flush gathers (half of it), when a partition is compacted, how far apart stores may resume, and a backfill's bound. Keep it deeper than any fork the chain makes and at least twice the blocks of one lake commit. Narrowing is safe; a ledger shorter than the window reads as the store's whole history, so widening is not, until the ledgers have grown back. |
 | `sink.duckdb.batch_records` | `500` | Most records one store commit may cover; a backlog of blocks is folded into one commit up to this, and a block is never split |
 | `sink.duckdb.path` | `indexer.duckdb` | Path to the store, relative to the settings file. Tables live in a schema named for the chain: `base.logs` |
 
@@ -679,9 +680,9 @@ stopped run is simply run again, or continued by setting `from` to the `resume_f
 its last range's log line.
 
 **The bound.** It writes no block above the lake's tip less four ledger windows (16,388
-blocks: about 2.3 days on Ethereum, minutes on a faster chain). The running store deletes
+blocks at the default window; 2,052, about 7 hours, on Ethereum's 512). The running store deletes
 only above some height: a reorg's fork and a stopped commit's leftovers are inside its
-4,096-block window, and the rewind a restart makes to a slower store is refused deeper
+undo window, and the rewind a restart makes to a slower store is refused deeper
 than four windows. So nothing it deletes can reach a backfilled row. `to` may lower the
 bound, never raise it.
 

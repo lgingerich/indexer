@@ -24,7 +24,7 @@
 //! those of blocks that really left it.
 //!
 //! That needs the store's ledger to name every block it holds above the common block. A
-//! restore reads the newest [`LEDGER_WINDOW`](crate::window::LEDGER_WINDOW)
+//! restore reads the newest [`UndoWindow::ledger`](crate::window::UndoWindow::ledger)
 //! blocks, so a full ledger whose oldest block is above the one after the common block
 //! may leave blocks in between unnamed. Such a store is [rewound](Store::rewind) to the
 //! common block instead, and ingest re-fetches its rows above. A rewind is not a retraction, so it writes no `reorgs` row; see
@@ -41,7 +41,7 @@
 //! restore reads may have history below it. When even its oldest block is above the
 //! slowest store's tip, the stores show no conflict, only a lag: a lake whose commit, of
 //! thousands of small blocks, was dropped by a stop the database's commits outlived.
-//! Within `MAX_RESUME_LAG` blocks of that tip it has no say, and is rewound to it, its
+//! Within [`UndoWindow::resume_lag`](crate::window::UndoWindow::resume_lag) blocks of that tip it has no say, and is rewound to it, its
 //! rows above re-fetched; further ahead is a startup error rather than a rewind that
 //! could delete days of rows.
 
@@ -58,7 +58,7 @@ use crate::sink::route::StoreBackend;
 use crate::sink::store_runtime::StoreRuntime;
 use crate::sink::table::TableId;
 use crate::sink::{Restored, Store, StoreError, StoredContract, millis};
-use crate::window::{LEDGER_WINDOW, Ledger};
+use crate::window::{Ledger, UndoWindow};
 use crate::wire::envelope::{BlockMeta, Handoff};
 
 /// A store, opened, with what the run routes to it and the runtime its work runs on.
@@ -186,13 +186,14 @@ pub(crate) struct Resumed {
 /// failed, and [`ResumeError::NoCommonBlock`] when no block is held by them all.
 pub(crate) async fn resume<S: Store>(
     stores: Vec<Opened<S>>,
+    window: UndoWindow,
 ) -> Result<(Vec<Opened<S>>, Resumed), ResumeError> {
     // Each store reads back on its own runtime, so they read at once rather than each
     // waiting out the last: a lake's read is a scan of object storage.
     let read = try_join_all(stores.into_iter().map(restore)).await?;
     let (stores, mut restored): (Vec<_>, Vec<_>) = read.into_iter().unzip();
     let ledgers: Vec<&[BlockMeta]> = restored.iter().map(|r| r.ledger.as_slice()).collect();
-    let common = common_block(&ledgers).map_err(|Disjoint| ResumeError::NoCommonBlock {
+    let common = common_block(&ledgers, window).map_err(|Disjoint| ResumeError::NoCommonBlock {
         tips: stores
             .iter()
             .zip(&ledgers)
@@ -203,7 +204,11 @@ pub(crate) async fn resume<S: Store>(
         // Every ledger is empty: a fresh run, with nothing to agree on.
         return Ok((
             stores,
-            gathered(restored, HashSet::new(), Ledger::default()),
+            gathered(
+                restored,
+                HashSet::new(),
+                Ledger::new(Vec::new(), false, window),
+            ),
         ));
     };
     let blocks: Vec<BlockMeta> = restored[slowest]
@@ -216,10 +221,10 @@ pub(crate) async fn resume<S: Store>(
     let mut held = HashSet::new();
     let mut settled = Vec::with_capacity(stores.len());
     for (opened, restored) in stores.into_iter().zip(&mut restored) {
-        settled.push(settle(opened, restored, common.height, &mut held).await?);
+        settled.push(settle(opened, restored, common.height, window, &mut held).await?);
     }
-    let history_below = history_below(&restored, &blocks);
-    let resumed = gathered(restored, held, Ledger::new(blocks, history_below));
+    let history_below = history_below(&restored, &blocks, window);
+    let resumed = gathered(restored, held, Ledger::new(blocks, history_below, window));
     Ok((settled, resumed))
 }
 
@@ -254,13 +259,13 @@ fn gathered(restored: Vec<Restored>, held: HashSet<B256>, ledger: Ledger) -> Res
 /// Without it, a ledger cut to the common block looked like the slowest store's whole
 /// history, and a fork replacing its oldest block was adopted as if it replaced the first
 /// block ever indexed, where it reaches past what the run can retract.
-fn history_below(restored: &[Restored], blocks: &[BlockMeta]) -> bool {
+fn history_below(restored: &[Restored], blocks: &[BlockMeta], window: UndoWindow) -> bool {
     let Some(floor) = blocks.first() else {
         return false;
     };
     restored.iter().any(|restored| {
         restored.ledger.first().is_some_and(|oldest| {
-            restored.ledger.len() >= LEDGER_WINDOW || oldest.height < floor.height
+            restored.ledger.len() >= window.ledger() || oldest.height < floor.height
         })
     })
 }
@@ -273,6 +278,7 @@ async fn settle<S: Store>(
     mut opened: Opened<S>,
     restored: &mut Restored,
     common: u64,
+    window: UndoWindow,
     held: &mut HashSet<B256>,
 ) -> Result<Opened<S>, ResumeError> {
     let Some(tip) = restored.ledger.last().map(|block| block.height) else {
@@ -283,7 +289,7 @@ async fn settle<S: Store>(
     if tip == common {
         return Ok(opened);
     }
-    if names_all_above(&restored.ledger, common) {
+    if names_all_above(&restored.ledger, common, window) {
         let above: Vec<BlockMeta> = restored
             .ledger
             .iter()
@@ -324,8 +330,8 @@ async fn settle<S: Store>(
 /// Whether `ledger` names every block its store holds above `common`: it is the store's
 /// whole history, being shorter than the window a restore reads, or it reaches down to
 /// the block after `common`.
-fn names_all_above(ledger: &[BlockMeta], common: u64) -> bool {
-    ledger.len() < LEDGER_WINDOW
+fn names_all_above(ledger: &[BlockMeta], common: u64, window: UndoWindow) -> bool {
+    ledger.len() < window.ledger()
         || ledger
             .first()
             .is_some_and(|oldest| oldest.height <= common.saturating_add(1))
@@ -351,13 +357,6 @@ async fn restore<S: Store>(opened: Opened<S>) -> Result<(Opened<S>, Restored), R
     Ok((opened, restored))
 }
 
-/// How far past the slowest store's tip a store whose whole ledger window lies above that
-/// tip may be, and still be rewound to it: four windows of blocks, minutes on a fast
-/// chain and about two days on Ethereum. The storage drain commits at most half a window
-/// at a time (see `channel::MAX_BLOCKS`), so a stop leaves stores at most that far apart;
-/// this allows for more, and refuses a store further ahead.
-pub(crate) const MAX_RESUME_LAG: u64 = 4 * LEDGER_WINDOW as u64;
-
 /// Non-empty ledgers that share no block.
 #[derive(Debug)]
 struct Disjoint;
@@ -366,11 +365,14 @@ struct Disjoint;
 /// of the ledger with the lowest tip, which holds it; `None` when every ledger is empty.
 ///
 /// A ledger has no say about a block below its oldest one when it is shorter than
-/// [`LEDGER_WINDOW`], since a restore reads up to that many: it is the store's whole
+/// [`UndoWindow::ledger`], since a restore reads up to that many: it is the store's whole
 /// history, so the store holds nothing at or below the block. A full one has none
-/// either while its tip is within [`MAX_RESUME_LAG`] of the block: no hash disagrees,
+/// either while its tip is within [`UndoWindow::resume_lag`] of the block: no hash disagrees,
 /// so the store is only ahead. See the module docs.
-fn common_block(ledgers: &[&[BlockMeta]]) -> Result<Option<(BlockMeta, usize)>, Disjoint> {
+fn common_block(
+    ledgers: &[&[BlockMeta]],
+    window: UndoWindow,
+) -> Result<Option<(BlockMeta, usize)>, Disjoint> {
     let held: Vec<HashSet<(u64, B256)>> = ledgers
         .iter()
         .map(|ledger| {
@@ -394,8 +396,8 @@ fn common_block(ledgers: &[&[BlockMeta]]) -> Result<Option<(BlockMeta, usize)>, 
             return false;
         };
         oldest.height <= block.height
-            || (ledger.len() >= LEDGER_WINDOW
-                && tip.height.saturating_sub(block.height) > MAX_RESUME_LAG)
+            || (ledger.len() >= window.ledger()
+                && tip.height.saturating_sub(block.height) > window.resume_lag())
     };
     let common = ledger.iter().rev().find(|block| {
         held.iter().zip(ledgers).all(|(held, ledger)| {
@@ -421,7 +423,8 @@ mod tests {
     use crate::sink::{EnvelopeSink, Restored, SinkError, Store, StoreError};
     use crate::wire::envelope::{BlockMeta, Envelope};
 
-    use super::{Disjoint, LEDGER_WINDOW, Opened, common_block, names_all_above, resume};
+    use super::{Disjoint, Opened, UndoWindow, common_block, names_all_above, resume};
+    use crate::window::LEDGER_WINDOW;
 
     /// A store that holds `ledger` and notes which thread each startup call ran on.
     struct Probe {
@@ -491,7 +494,7 @@ mod tests {
                 ledger(0xa0, 7..=6 + LEDGER_WINDOW as u64),
             ),
         ];
-        let (stores, restored) = resume(stores).await.expect("resumed");
+        let (stores, restored) = resume(stores, UndoWindow::DEFAULT).await.expect("resumed");
         assert_eq!(
             restored.ledger.blocks(),
             ledger(0xa0, 1..=5),
@@ -555,7 +558,7 @@ mod tests {
     }
 
     fn outcome(ledgers: &[&[BlockMeta]]) -> Outcome {
-        match common_block(ledgers) {
+        match common_block(ledgers, UndoWindow::DEFAULT) {
             Ok(Some((block, slowest))) => Outcome::Resume(block.height, slowest),
             Ok(None) => Outcome::Fresh,
             Err(Disjoint) => Outcome::Disjoint,
@@ -581,7 +584,7 @@ mod tests {
     #[test]
     fn the_common_block_is_the_newest_every_ledger_with_a_say_holds() {
         let window = LEDGER_WINDOW as u64;
-        let lag = super::MAX_RESUME_LAG;
+        let lag = UndoWindow::DEFAULT.resume_lag();
         let slow = ledger(0xa0, 1..=5);
         let fast = ledger(0xa0, 1..=9);
         let orphan_held = ledger(0xa0, 1..=6);
@@ -681,12 +684,42 @@ mod tests {
                 opened(StoreBackend::Postgres, slow.clone()),
                 opened(StoreBackend::Delta, fast),
             ];
-            let (_, resumed) = resume(stores).await.expect(label);
+            let (_, resumed) = resume(stores, UndoWindow::DEFAULT).await.expect(label);
             let mut expected = slow;
             expected.retain(|block| block.height <= common);
             assert_eq!(resumed.ledger.blocks(), expected, "{label}");
             assert_eq!(resumed.ledger.history_below(), below, "{label}");
         }
+    }
+
+    /// A narrower window decides as the default does, at its own lengths: a ledger of its
+    /// size may have history below, a store ahead is rewound only within its lag, and
+    /// one a default window would still rewind is refused.
+    #[test]
+    fn resuming_follows_the_chains_undo_window() {
+        let window = UndoWindow::new(8).expect("in range");
+        let (len, lag) = (window.ledger() as u64, window.resume_lag());
+        assert_eq!((len, lag), (9, 36));
+        let slow = ledger(0xa0, 1..=5);
+        let within = ledger(0xa0, 6 + lag - len..=5 + lag);
+        let beyond = ledger(0xa0, 7 + lag - len..=6 + lag);
+        assert_eq!(
+            common_block(&[&slow, &within], window)
+                .expect("a store ahead within the lag")
+                .map(|(block, _)| block.height),
+            Some(5)
+        );
+        assert!(common_block(&[&slow, &beyond], window).is_err());
+        assert!(common_block(&[&slow, &beyond], UndoWindow::DEFAULT).is_ok());
+
+        assert!(
+            names_all_above(&ledger(0xa0, 7..=14), 5, window),
+            "short of a ledger"
+        );
+        assert!(
+            !names_all_above(&ledger(0xa0, 7..=15), 5, window),
+            "a full ledger"
+        );
     }
 
     /// A store ahead keeps its blocks only when its ledger names all of them: its whole
@@ -701,7 +734,11 @@ mod tests {
             ("a full window from the next block", full(6), true),
             ("a full window with a gap below", full(7), false),
         ] {
-            assert_eq!(names_all_above(&ledger, 5), names_all, "{label}");
+            assert_eq!(
+                names_all_above(&ledger, 5, UndoWindow::DEFAULT),
+                names_all,
+                "{label}"
+            );
         }
     }
 }

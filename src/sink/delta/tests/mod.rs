@@ -34,6 +34,7 @@ impl Dir {
             max_buffer_bytes: usize::MAX,
             maintenance: false,
             vacuum_retention_hours: 168,
+            undo_window: crate::window::UndoWindow::DEFAULT,
             partition_blocks: 100_000,
             storage: std::collections::BTreeMap::new(),
         }

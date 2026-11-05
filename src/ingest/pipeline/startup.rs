@@ -820,7 +820,7 @@ mod tests {
     async fn a_fork_while_down_replacing_the_oldest_block_of_a_cut_ledger_stops() {
         let mut source = Source::linear(7);
         fork(&mut source, 3, 7);
-        let stored = Ledger::new(ledger(4..=5), true);
+        let stored = Ledger::new(ledger(4..=5), true, crate::window::UndoWindow::DEFAULT);
         let mut machine = Machine::new(source, Sink::default(), stored);
         fails_with(
             machine.sync_settled(None, None).await,

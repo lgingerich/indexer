@@ -10,8 +10,8 @@ use crate::decode::{CatalogError, DecodeError, DeriveError};
 use crate::sink::StoreError;
 use crate::sink::delta::DeltaSettings;
 use crate::sink::delta::LockError;
-use crate::sink::resume::MAX_RESUME_LAG;
 use crate::sink::table::TableError;
+use crate::window::UndoWindow;
 use crate::wire::envelope::ChainId;
 
 /// What a backfill runs with: the `[backfill]` section of the running indexer's settings
@@ -33,6 +33,17 @@ pub struct BackfillSettings {
     /// routes there get the same rows, upserted. Absent, only the lake is filled.
     #[cfg(feature = "postgres")]
     pub postgres: Option<crate::sink::PostgresSettings>,
+}
+
+impl BackfillError {
+    /// The running indexer's run started at `from`, above the `to` given, under `window`.
+    pub(super) const fn session_above_to(from: u64, to: u64, window: UndoWindow) -> Self {
+        Self::SessionAboveTo {
+            from,
+            to,
+            ready: from + window.resume_lag(),
+        }
+    }
 }
 
 impl BackfillSettings {
@@ -171,14 +182,15 @@ pub enum BackfillError {
     /// the blocks between would be left undecoded.
     #[error(
         "the running indexer decodes from block {from}, above to = {to}: raise `to` to it, or \
-         leave `to` out and the backfill waits until the lake's tip passes {}",
-        from + MAX_RESUME_LAG
+         leave `to` out and the backfill waits until the lake's tip passes {ready}"
     )]
     SessionAboveTo {
         /// The first block of its current run.
         from: u64,
         /// The `to` given.
         to: u64,
+        /// The lake tip whose bound passes `from`.
+        ready: u64,
     },
     /// Another backfill holds the lake, or took it over.
     #[error("{0}")]

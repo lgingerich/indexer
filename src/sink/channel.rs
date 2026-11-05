@@ -77,8 +77,8 @@ const CAPACITY: usize = 1024;
 /// about 256 MB. A block larger than this on its own still passes, alone.
 const ENVELOPES: usize = 1 << 17;
 
-/// The most blocks one flush gathers, whatever a store's own limits allow: half the
-/// window of accepted blocks a store hands back to a restart.
+/// Why [`Batching::blocks`] holds a flush to half the window of accepted blocks a store
+/// hands back to a restart, whatever the store's own limits allow.
 ///
 /// A stop abandons what a store has gathered when its commit does not finish within
 /// [`STOP_FLUSH`], and the stores commit on their own schedules, so one can be this far
@@ -86,7 +86,7 @@ const ENVELOPES: usize = 1 << 17;
 /// Resume needs a block both hand back, within that window; the lake's byte limit alone
 /// let a commit gather over ten thousand of Robinhood's small blocks, and a stop left it
 /// further behind the database than resume could reach.
-const MAX_BLOCKS: usize = crate::window::LEDGER_WINDOW / 2;
+const MAX_BLOCKS: usize = crate::window::UndoWindow::DEFAULT.flush_blocks();
 
 /// How long a stop gives the drain to commit what it has gathered and wait for what its
 /// commits left running.
@@ -126,6 +126,8 @@ pub(crate) struct Batching {
     /// it over, so time spent queued counts. Zero flushes as soon as what is already
     /// waiting is gathered.
     pub(crate) wait: Duration,
+    /// The most blocks one flush gathers.
+    pub(crate) blocks: usize,
 }
 
 impl Batching {
@@ -138,6 +140,7 @@ impl Batching {
             records,
             bytes: usize::MAX,
             wait: Duration::ZERO,
+            blocks: MAX_BLOCKS,
         }
     }
 }
@@ -463,7 +466,7 @@ async fn recv_until(receiver: &mut mpsc::Receiver<Parcel>, deadline: Option<Inst
 /// Whether what is gathered has reached a limit of `batching`.
 fn full<K: EnvelopeSink>(sink: &K, pending: &Pending, batching: Batching) -> bool {
     pending.envelopes >= batching.records
-        || pending.blocks >= MAX_BLOCKS
+        || pending.blocks >= batching.blocks
         || sink.buffered_bytes() >= batching.bytes
 }
 

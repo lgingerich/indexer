@@ -86,6 +86,7 @@ const fn waiting(wait: Duration) -> Batching {
         records: usize::MAX,
         bytes: usize::MAX,
         wait,
+        blocks: MAX_BLOCKS,
     }
 }
 
@@ -309,6 +310,25 @@ async fn a_flush_holds_at_most_half_a_window_of_blocks() {
     drop(sink);
     let (_, flushed) = storage.await.expect("storage");
     assert_eq!(flushed, [keys(0..max), keys(max..max + 10)]);
+}
+
+/// A narrower undo window holds a flush to half of its own ledger.
+#[tokio::test]
+async fn a_flush_follows_the_chains_undo_window() {
+    let (mut sink, receiver) = ChannelSink::new(StoreBackend::DuckDb);
+    let batching = Batching {
+        blocks: crate::window::UndoWindow::new(5)
+            .expect("in range")
+            .flush_blocks(),
+        ..waiting(Duration::from_hours(1))
+    };
+    let storage = spawn_drain(receiver, batching, Stop::never());
+    for height in 0..7 {
+        send_block(&mut sink, height..height + 1).await;
+    }
+    drop(sink);
+    let (_, flushed) = storage.await.expect("storage");
+    assert_eq!(flushed, [keys(0..3), keys(3..6), keys(6..7)]);
 }
 
 /// The channel is bounded, so a stalled store is felt as a waiting sender rather

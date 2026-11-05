@@ -27,6 +27,7 @@ use crate::sink::sql::{Dialect, ident};
 use crate::sink::store::{Engine, SqlStore};
 use crate::sink::store_error::{EngineError, Operation, StoreError};
 use crate::sink::table::{ColumnType, Row, Schema, TableDef, Value};
+use crate::window::UndoWindow;
 
 /// The `DuckDB` database file written when the settings name no path.
 const DEFAULT_PATH: &str = "indexer.duckdb";
@@ -50,6 +51,9 @@ const DEFAULT_BATCH_RECORDS: usize = 500;
 pub struct DuckDbSettings {
     /// The tables this store writes. Required.
     pub tables: Tables,
+    /// The chain's undo window, from `[ingest] undo_window`.
+    #[serde(skip)]
+    pub undo_window: UndoWindow,
     /// The `DuckDB` database file to write, relative to the settings file. Defaults to
     /// `indexer.duckdb`.
     #[serde(default = "default_path")]
@@ -90,7 +94,10 @@ impl DuckDbSettings {
     /// When the store commits: up to [`batch_records`](Self::batch_records) records, as
     /// soon as they are gathered.
     pub(crate) const fn batching(&self) -> Batching {
-        Batching::eager(self.batch_records)
+        Batching {
+            blocks: self.undo_window.flush_blocks(),
+            ..Batching::eager(self.batch_records)
+        }
     }
 }
 
@@ -138,7 +145,14 @@ impl DuckDbSink {
                 .map_err(StoreError::engine(Operation::Open, Some(&path)))?
         };
         info!(store = %path, "storage opened");
-        SqlStore::new(DuckDb { connection }, schema, chain, chain).await
+        SqlStore::new(
+            DuckDb { connection },
+            schema,
+            chain,
+            chain,
+            settings.undo_window,
+        )
+        .await
     }
 }
 
@@ -336,7 +350,7 @@ fn list_literal(values: &[Value], out: &mut String) {
 mod tests {
     use std::sync::Arc;
 
-    use alloy_primitives::U256;
+    use alloy_primitives::{B256, U256};
     use duckdb::types::FromSql;
     use duckdb::{Connection, appender_params_from_iter};
 
@@ -346,12 +360,56 @@ mod tests {
     use crate::sink::table::{Schema, Table, Value};
     use crate::wire::envelope::{ChainId, Envelope, Event};
 
-    use super::{DuckDb, DuckDbSink};
+    use super::{DuckDb, DuckDbSink, UndoWindow};
 
     /// An in-memory database, and the test's own handle to it, with the store's schema
     /// as its default.
     struct Duck {
         reader: DuckDb,
+    }
+
+    /// A store sized by a narrower undo window reads back and keeps that many blocks,
+    /// and the block below them.
+    #[tokio::test]
+    async fn a_narrower_window_sizes_the_ledger() {
+        let connection = memory();
+        let reader = connection.try_clone().expect("a second handle");
+        let window = UndoWindow::new(2).expect("in range");
+        let chain = ChainId::new("base");
+        let mut sink = DuckDbSink::new(DuckDb { connection }, datasets(), "base", "base", window)
+            .await
+            .expect("create the tables");
+        let block = |height: u64| crate::wire::envelope::BlockMeta {
+            height,
+            hash: B256::from(U256::from(height)),
+            parent_hash: B256::from(U256::from(height - 1)),
+            timestamp: 1_700_000_000 + height,
+        };
+        commit(
+            &mut sink,
+            (1..=10)
+                .map(|height| Envelope::new(chain.clone(), Event::AcceptedBlock(block(height)))),
+        )
+        .await;
+        let restored = crate::sink::Store::restore(&mut sink)
+            .await
+            .expect("reads back");
+        let heights: Vec<u64> = restored.ledger.iter().map(|block| block.height).collect();
+        assert_eq!(heights, [8, 9, 10]);
+
+        reader
+            .execute_batch("USE base")
+            .expect("the store's schema");
+        let mut reader = DuckDb { connection: reader };
+        let rows = reader
+            .query("SELECT height FROM accepted_blocks ORDER BY height", &[])
+            .await
+            .expect("the rows");
+        assert_eq!(
+            rows.first(),
+            Some(&vec![Value::Uint(7)]),
+            "pruned below the window"
+        );
     }
 
     impl Harness for Duck {
@@ -397,9 +455,15 @@ mod tests {
 
     /// A store of `chain` over `connection`, with the tables of `schema`.
     async fn connect(connection: Connection, schema: Arc<Schema>, chain: &str) -> DuckDbSink {
-        DuckDbSink::new(DuckDb { connection }, schema, chain, chain)
-            .await
-            .expect("create the tables")
+        DuckDbSink::new(
+            DuckDb { connection },
+            schema,
+            chain,
+            chain,
+            UndoWindow::DEFAULT,
+        )
+        .await
+        .expect("create the tables")
     }
 
     /// The `reorgs` table's DDL.
@@ -464,9 +528,15 @@ mod tests {
             connection
                 .execute_batch(&format!("CREATE SCHEMA base; USE base; {ddl}"))
                 .expect("an old reorgs table");
-            let error = DuckDbSink::new(DuckDb { connection }, datasets(), "base", "base")
-                .await
-                .expect_err("the table drifted");
+            let error = DuckDbSink::new(
+                DuckDb { connection },
+                datasets(),
+                "base",
+                "base",
+                UndoWindow::DEFAULT,
+            )
+            .await
+            .expect_err("the table drifted");
             assert!(
                 matches!(&error, StoreError::Drift { table, difference: found }
                     if table == "reorgs" && found == difference),

@@ -17,6 +17,12 @@ backfill_concurrency = 16
 # epochs, so its finalized block is normally 64 to 95 blocks behind the head; 128 leaves
 # a margin. Only the blocks above it go one at a time through the reorg-aware path.
 finality_depth = 128
+# How deep a fork a run can retract; a deeper one stops it. Each store's ledger keeps this
+# many blocks and a restart reads them back, one lake file a commit: 4,096 blocks of
+# Ethereum is 13.6 hours of files. 512 is about 1.7 hours, four times `finality_depth`,
+# and every reorg seen here was one block. Narrowing is safe; see `src/window.rs` before
+# widening.
+undo_window = 512
 # stop_block = <height>    # index through this height and exit instead
 
 # Instead of http_url and ws_url, a HyperSync backfill that exits `finality_depth` blocks
@@ -102,7 +108,7 @@ protocols = "protocols"
 # indexed, from the logs `[sink.delta]` holds, into that lake and the `[sink.postgres]`
 # tables. The running indexer ignores this section. Before running, deploy the manifests
 # to the running indexer. Run right after the deploy: discovered contracts are handed over
-# at once, then the backfill waits until the lake's tip is four ledger windows (16,388
+# at once, then the backfill waits until the lake's tip is four ledger windows (2,052
 # blocks) past the restart and the handed-over contracts' records, and fills. See
 # `src/backfill/mod.rs` and the README's "Backfilling new protocols from the lake".
 # [backfill]

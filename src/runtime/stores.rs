@@ -85,6 +85,7 @@ impl<B: BlockSource + 'static> Pipeline<B> {
             start_block,
             stop_block,
             catalog,
+            undo_window,
             schema,
             #[cfg(feature = "delta")]
             watch,
@@ -94,7 +95,7 @@ impl<B: BlockSource + 'static> Pipeline<B> {
         let (stores, resumed) = tokio::select! {
             biased;
             () = stop.wait() => return Ok(()),
-            resumed = sink::resume::resume(stores) => resumed?,
+            resumed = sink::resume::resume(stores, undo_window) => resumed?,
         };
         let decoder = restore(catalog, &chain, resumed.contracts);
         let ledger = ledger(&chain, resumed.ledger);

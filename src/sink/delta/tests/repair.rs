@@ -690,3 +690,92 @@ async fn opening_an_older_table_gives_it_the_statistics_columns() {
             .into()]
     );
 }
+
+/// A lake opened with a narrower undo window reads back only that many blocks, and checks
+/// only those for what a stopped commit left behind: a backfill's bound follows it too.
+#[tokio::test]
+async fn a_narrower_window_sizes_what_opening_reads() {
+    let dir = Dir::new();
+    let mut sink = open(&dir).await;
+    for height in 1..=10 {
+        publish(&mut sink, block(height, 0)).await;
+    }
+    drop(sink);
+    let window = crate::window::UndoWindow::new(2).expect("in range");
+    let settings = DeltaSettings {
+        undo_window: window,
+        ..dir.settings()
+    };
+    let schema = Arc::new(Schema::new().expect("the dataset tables"));
+    let mut narrow = DeltaSink::open(&settings, Arc::clone(&schema), CHAIN)
+        .await
+        .expect("opens");
+    let restored = narrow.restore().await.expect("reads back");
+    let heights: Vec<u64> = restored.ledger.iter().map(|block| block.height).collect();
+    assert_eq!(heights, [8, 9, 10]);
+    drop(narrow);
+
+    let reader = crate::sink::delta::LogReader::open(
+        &DeltaSettings {
+            undo_window: crate::window::UndoWindow::new(1).expect("in range"),
+            ..dir.settings()
+        },
+        &schema,
+        CHAIN,
+        false,
+    )
+    .await
+    .expect("the reader opens");
+    assert_eq!(reader.bound(), Some(2), "ten less four ledgers of two");
+}
+
+/// Reading only the files that hold them, the ledger comes back whole, the same however
+/// the blocks were committed: across partitions, through a reorg's rewrite, and from a
+/// partition compacted into one file.
+#[tokio::test]
+async fn the_ledger_reads_the_same_from_its_newest_files() {
+    let dir = Dir::new();
+    let mut sink = open(&dir).await;
+    for height in (99_990..=100_010).chain([100_011]) {
+        publish(&mut sink, block(height, 0)).await;
+    }
+    let window = crate::window::UndoWindow::new(15).expect("in range");
+    let heights = |ledger: &[BlockMeta]| ledger.iter().map(|b| b.height).collect::<Vec<_>>();
+    let lake = sink.lake(Table::AcceptedBlock);
+
+    let ledger = lake.read_ledger(window).await.expect("reads back");
+    assert_eq!(heights(&ledger), (99_996..=100_011).collect::<Vec<_>>());
+    let every = lake
+        .read_ledger(crate::window::UndoWindow::DEFAULT)
+        .await
+        .expect("reads back");
+    assert_eq!(heights(&every), (99_990..=100_011).collect::<Vec<_>>());
+
+    let mut replacement = vec![reorg(100_011..=100_011, 1)];
+    replacement.extend(block(100_011, 1));
+    publish(&mut sink, replacement).await;
+    let lake = sink.lake(Table::AcceptedBlock);
+    let ledger = lake.read_ledger(window).await.expect("reads back");
+    assert_eq!(heights(&ledger), (99_996..=100_011).collect::<Vec<_>>());
+    assert_eq!(ledger.last().map(|b| b.hash), Some(hash(100_011, 1)));
+
+    // Partition 0 compacted into one file, which the window still reaches.
+    let position = sink.positions[&TableId::Dataset(Table::AcceptedBlock)];
+    let mut table = sink.lakes[position].table.clone();
+    let width = sink.lakes[position].width;
+    let compacted = crate::sink::delta::maintenance::compact(
+        "accepted_blocks",
+        &mut table,
+        width,
+        width + crate::window::UndoWindow::DEFAULT.blocks() as u64,
+        crate::window::UndoWindow::DEFAULT,
+        &sink.writer.clone(),
+    )
+    .await
+    .expect("compacts");
+    assert_eq!(compacted, 1);
+    sink.lakes[position].table = table;
+    let lake = sink.lake(Table::AcceptedBlock);
+    let ledger = lake.read_ledger(window).await.expect("reads back");
+    assert_eq!(heights(&ledger), (99_996..=100_011).collect::<Vec<_>>());
+}

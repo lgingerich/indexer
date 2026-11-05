@@ -23,9 +23,9 @@ use crate::decode::{Catalog, Decoder, DecodingSink};
 use crate::sink::SinkError;
 use crate::sink::delta::testing::Dir;
 use crate::sink::delta::{DecodedTables, DeltaSettings, DeltaSink, LockError, RunLock};
-use crate::sink::resume::MAX_RESUME_LAG;
 use crate::sink::table::{Schema, Session, SessionEvent};
 use crate::sink::{EnvelopeSink as _, Store as _};
+use crate::window::UndoWindow;
 use crate::wire::datasets::evm::{Log, Transaction};
 use crate::wire::envelope::{BlockMeta, ChainId, Envelope, Event, Reorg};
 
@@ -42,6 +42,7 @@ const FIRST: u64 = 89_000;
 const RESTART: u64 = FIRST + 2_000;
 
 /// The lake's tip: far enough past the restart that the bound is above it.
+const MAX_RESUME_LAG: u64 = UndoWindow::DEFAULT.resume_lag();
 const LAST: u64 = RESTART + MAX_RESUME_LAG + 1_000;
 
 /// The bound a backfill of the full lake stops at.
@@ -57,6 +58,7 @@ impl Dir {
             max_buffer_bytes: usize::MAX,
             maintenance: false,
             vacuum_retention_hours: 168,
+            undo_window: UndoWindow::DEFAULT,
             partition_blocks: 100_000,
             storage: BTreeMap::new(),
         }
@@ -520,7 +522,7 @@ async fn a_lake_the_running_indexer_does_not_cover_is_refused() {
     below.run.to = Some(0);
     let refused = backfill(&below).await;
     assert!(
-        matches!(refused, Err(BackfillError::SessionAboveTo { from, to: 0 }) if from == FIRST + 5),
+        matches!(refused, Err(BackfillError::SessionAboveTo { from, to: 0, .. }) if from == FIRST + 5),
         "{refused:?}"
     );
 

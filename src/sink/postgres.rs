@@ -30,6 +30,7 @@ use crate::sink::sql::{self, Dialect, ident};
 use crate::sink::store::{Engine, SqlStore};
 use crate::sink::store_error::{EngineError, Operation, StoreError};
 use crate::sink::table::{ColumnType, Row, Schema, TableDef, Value};
+use crate::window::UndoWindow;
 
 /// `PostgreSQL` connection and backlog batching settings for `[sink.postgres]`.
 #[derive(Debug, Clone, Deserialize)]
@@ -37,6 +38,9 @@ use crate::sink::table::{ColumnType, Row, Schema, TableDef, Value};
 pub struct PostgresSettings {
     /// The tables this store writes. Required.
     pub tables: Tables,
+    /// The chain's undo window, from `[ingest] undo_window`.
+    #[serde(skip)]
+    pub undo_window: UndoWindow,
     /// `PostgreSQL` URL or keyword connection string. Required; a [`Secret`], since it
     /// carries the password, so a deployment names it as `{ env = "NAME" }`.
     pub connection_string: Secret,
@@ -67,6 +71,7 @@ impl PostgresSettings {
     pub(crate) const fn batching(&self) -> Batching {
         Batching {
             wait: Duration::from_millis(self.commit_wait_ms),
+            blocks: self.undo_window.flush_blocks(),
             ..Batching::eager(self.batch_records)
         }
     }
@@ -182,7 +187,7 @@ impl PostgresSink {
                 writer,
             }),
         };
-        let store = SqlStore::new(engine, schema, chain, namespace).await?;
+        let store = SqlStore::new(engine, schema, chain, namespace, settings.undo_window).await?;
         tracing::info!("PostgreSQL storage opened");
         Ok(store)
     }

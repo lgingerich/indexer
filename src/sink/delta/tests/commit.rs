@@ -484,8 +484,7 @@ async fn a_read_for_many_contracts_finds_their_logs() {
     }
     drop(sink);
     let reader = crate::sink::delta::LogReader::open(
-        &dir.uri(),
-        &std::collections::BTreeMap::new(),
+        &dir.settings(),
         &Schema::new().expect("the dataset tables"),
         CHAIN,
         false,

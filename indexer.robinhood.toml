@@ -16,7 +16,9 @@ start_block = 63835167
 # provider's requests-per-second limit; at about 10 blocks a second, 4 still gains fast.
 backfill_concurrency = 4
 # No `finality_depth`: an Orbit chain's blocks are final once their batch is final on
-# Ethereum, deeper than a run retracts, so it keeps the default, 4,096 blocks.
+# Ethereum, deeper than a run retracts, so it keeps the default, 4,096 blocks. It keeps the default
+# `undo_window` too: a lake commit gathers about 1,750 blocks, and a window under twice that
+# would cut commits short.
 # stop_block = <height>    # index through this height and exit instead
 
 # Instead of http_url and ws_url, a HyperSync backfill that exits `finality_depth` blocks

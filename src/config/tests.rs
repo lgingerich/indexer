@@ -298,7 +298,11 @@ fn ingest_tuning_is_bounded() {
 
     for (case, text, refusal) in [
         ("finality_depth = 0", depth("0"), "nonzero"),
-        ("finality_depth = 4097", depth("4097"), "at most 4,096"),
+        (
+            "finality_depth = 4097",
+            depth("4097"),
+            "at most undo_window",
+        ),
         (
             "backfill_concurrency = 0",
             ingest(&format!("backfill_concurrency = 0\n{RPC}")),
@@ -455,4 +459,51 @@ tables = ["blocks"]
         message.contains("environment variable `INDEXER_UNSET` is not set"),
         "{message}"
     );
+}
+
+/// `undo_window` is the chain's: it defaults to the most allowed, deepens `finality_depth`'s
+/// default with it, bounds it, and reaches every store a settings file opens.
+#[test]
+fn the_undo_window_is_the_chains_and_reaches_its_stores() {
+    let window = |keys: &str| ingest(&format!("{keys}\n{RPC}"));
+
+    let default = parse(&window("")).expect("no window");
+    assert_eq!(default.ingest.undo_window.blocks(), 4_096);
+    assert_eq!(default.ingest.finality_depth.get(), 4_096);
+
+    let narrow = parse(&window("undo_window = 512")).expect("a narrower window");
+    assert_eq!(narrow.ingest.undo_window.blocks(), 512);
+    assert_eq!(
+        narrow.ingest.finality_depth.get(),
+        512,
+        "omitted is the window"
+    );
+
+    let both = parse(&window("undo_window = 512\nfinality_depth = 128")).expect("both");
+    assert_eq!(both.ingest.finality_depth.get(), 128);
+
+    for (keys, expected) in [
+        ("undo_window = 0", "at least 1"),
+        ("undo_window = 4097", "at most 4,096"),
+        (
+            "undo_window = 512\nfinality_depth = 513",
+            "at most undo_window",
+        ),
+    ] {
+        let error = parse(&window(keys)).expect_err(keys).to_string();
+        assert!(error.contains(expected), "{keys}: {error}");
+    }
+
+    let settings = parse(&format!(
+        "[ingest]\nchain = \"base\"\nundo_window = 512\n{RPC}\n\
+         [sink.delta]\ntables = [\"blocks\"]\nuri = \"/tmp/lake\"\n\
+         [sink.postgres]\ntables = [\"blocks\"]\nconnection_string = \"postgres://x\"\n"
+    ))
+    .expect("two stores");
+    let delta = settings.sink.delta.expect("a lake");
+    assert_eq!(delta.undo_window.blocks(), 512);
+    assert_eq!(delta.batching().blocks, 256);
+    let postgres = settings.sink.postgres.expect("a database");
+    assert_eq!(postgres.undo_window.blocks(), 512);
+    assert_eq!(postgres.batching().blocks, 256);
 }

@@ -9,7 +9,6 @@ use super::{Machine, PipelineError};
 use crate::ingest::source::{BlockSource, FetchedBlock};
 use crate::metrics;
 use crate::sink::EnvelopeSink;
-use crate::window::MAX_UNFINALIZED_BLOCKS;
 use crate::wire::envelope::{BlockMeta, Event, Reorg};
 
 impl<S: BlockSource + 'static, K: EnvelopeSink> Machine<S, K> {
@@ -54,13 +53,13 @@ impl<S: BlockSource + 'static, K: EnvelopeSink> Machine<S, K> {
     /// below the window and stopped the run with
     /// [`PipelineError::UndoWindowExceeded`], although nothing had forked. A head inside
     /// the window, or one that does not link, is left to the fork walk as before. The
-    /// walk is bounded by [`MAX_UNFINALIZED_BLOCKS`] headers; a head further below is too.
+    /// walk is bounded by the window's size in headers; a head further below is too.
     async fn is_ancestor_below_window(&mut self, head: BlockMeta) -> Result<bool, PipelineError> {
         let Some(oldest) = self.ring.oldest() else {
             return Ok(false);
         };
         if head.height >= oldest.height
-            || oldest.height - head.height > MAX_UNFINALIZED_BLOCKS as u64
+            || oldest.height - head.height > self.ring.capacity().blocks() as u64
         {
             return Ok(false);
         }
@@ -563,7 +562,11 @@ mod tests {
     async fn a_fork_down_to_the_floor_replays_on_top_of_it() {
         let mut source = Source::linear(5);
         fork(&mut source, 3, 5);
-        let mut machine = Machine::new(source, Sink::default(), Ledger::new(ledger(2..=4), true));
+        let mut machine = Machine::new(
+            source,
+            Sink::default(),
+            Ledger::new(ledger(2..=4), true, crate::window::UndoWindow::DEFAULT),
+        );
         observe(&mut machine, 5).await;
         let markers = reorgs(&machine);
         assert_eq!(markers.len(), 1);

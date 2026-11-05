@@ -9,7 +9,7 @@ use super::arrow;
 use crate::secret::Secret;
 use crate::sink::channel::Batching;
 use crate::sink::route::Tables;
-use crate::window::LEDGER_WINDOW;
+use crate::window::{LEDGER_WINDOW, UndoWindow};
 
 /// The Delta Lake store's settings: where the tables live, how often to commit, and the
 /// object store's own options, passed through.
@@ -73,6 +73,9 @@ pub struct DeltaSettings {
     /// vacuumed under it.
     #[serde(default = "default_vacuum_retention_hours")]
     pub vacuum_retention_hours: u64,
+    /// The chain's undo window, from `[ingest] undo_window`.
+    #[serde(skip)]
+    pub undo_window: UndoWindow,
     /// How many block heights one partition covers. Defaults to 100,000: about 2.8 hours
     /// of Robinhood, half a day of BSC, two weeks of Ethereum. At least 4,097, the
     /// ledger window: opening reads the ledger from its newest two partitions.
@@ -112,6 +115,7 @@ impl DeltaSettings {
             records: usize::MAX,
             bytes: self.max_buffer_bytes,
             wait: Duration::from_secs(self.commit_interval_secs),
+            blocks: self.undo_window.flush_blocks(),
         }
     }
 }

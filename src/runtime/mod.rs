@@ -244,6 +244,9 @@ pub(crate) struct Pipeline<B = AnySource> {
     /// What the run decodes with. The decoder is built from it once the stores have read
     /// back the contracts a previous run discovered.
     catalog: Catalog,
+    /// The chain's undo window, which resuming stores agree on a block by.
+    #[cfg(feature = "store")]
+    undo_window: crate::window::UndoWindow,
     /// Every table the run has: the dataset tables and each decoded event's.
     schema: Arc<Schema>,
     /// The lake whose backfills hand the run contracts, when it writes one (see
@@ -344,8 +347,11 @@ impl Pipeline {
             }
         };
         #[cfg_attr(
-            not(feature = "delta"),
-            expect(unused_mut, reason = "only a run with a lake watches its backfills")
+            not(feature = "store"),
+            expect(
+                unused_mut,
+                reason = "only a run with a store has an undo window to set"
+            )
         )]
         let mut pipeline = Self::new(
             source,
@@ -353,6 +359,10 @@ impl Pipeline {
             settings.ingest.stop_block,
             catalog,
         );
+        #[cfg(feature = "store")]
+        {
+            pipeline.undo_window = settings.ingest.undo_window;
+        }
         // The first lake's backfills hand the run contracts.
         #[cfg(feature = "delta")]
         if let Routes::Store(stores) = &routes {
@@ -391,6 +401,8 @@ impl<B: BlockSource + 'static> Pipeline<B> {
             source,
             start_block,
             stop_block,
+            #[cfg(feature = "store")]
+            undo_window: crate::window::UndoWindow::DEFAULT,
             schema: Arc::new(catalog.schema().clone()),
             catalog,
             #[cfg(feature = "delta")]

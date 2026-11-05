@@ -62,14 +62,28 @@ async fn maintenance_compacts_finished_partitions_and_vacuums_what_they_replaced
     // Partition 0 ends at 99_999: one height short of the window past it, nothing moves.
     let short = 100_000 + crate::window::MAX_UNFINALIZED_BLOCKS as u64 - 1;
     assert_eq!(
-        maintenance::compact("blocks", &mut table, width, short, &writer)
-            .await
-            .expect("compacts"),
+        maintenance::compact(
+            "blocks",
+            &mut table,
+            width,
+            short,
+            crate::window::UndoWindow::DEFAULT,
+            &writer
+        )
+        .await
+        .expect("compacts"),
         0
     );
-    let compacted = maintenance::compact("blocks", &mut table, width, short + 1, &writer)
-        .await
-        .expect("compacts");
+    let compacted = maintenance::compact(
+        "blocks",
+        &mut table,
+        width,
+        short + 1,
+        crate::window::UndoWindow::DEFAULT,
+        &writer,
+    )
+    .await
+    .expect("compacts");
     assert_eq!(compacted, 1);
     sink.lakes[position].table = table.clone();
     assert_eq!(
@@ -115,6 +129,7 @@ async fn the_writer_commits_past_a_compaction_it_did_not_see() {
         &mut behind,
         sink.lakes[position].width,
         104_097,
+        crate::window::UndoWindow::DEFAULT,
         &writer,
     )
     .await
@@ -349,11 +364,29 @@ async fn a_vacuum_is_recorded_on_its_table_only_once_it_succeeds() {
     };
 
     let undeletable = undeletable(&dir, "blocks").await;
-    maintenance::maintain("blocks", &undeletable, width, tip, Duration::ZERO, &writer).await;
+    maintenance::maintain(
+        "blocks",
+        &undeletable,
+        width,
+        tip,
+        crate::window::UndoWindow::DEFAULT,
+        Duration::ZERO,
+        &writer,
+    )
+    .await;
     assert!(!record.exists(), "a failed vacuum is not recorded");
     assert!(due(&log_store).await, "and is due again");
 
-    maintenance::maintain("blocks", &log_store, width, tip, Duration::ZERO, &writer).await;
+    maintenance::maintain(
+        "blocks",
+        &log_store,
+        width,
+        tip,
+        crate::window::UndoWindow::DEFAULT,
+        Duration::ZERO,
+        &writer,
+    )
+    .await;
     assert!(record.exists(), "a vacuum that succeeded is recorded");
     assert!(!due(&log_store).await, "and not due again the same day");
     drop(sink);
@@ -481,4 +514,31 @@ impl ObjectStore for Undeletable {
     {
         self.0.copy_opts(from, to, options)
     }
+}
+
+/// A narrower undo window finishes a partition sooner: past its last height by that
+/// window, where the default still leaves it alone.
+#[tokio::test]
+async fn a_narrower_window_compacts_a_partition_sooner() {
+    let dir = Dir::new();
+    let mut sink = open(&dir).await;
+    for height in [1, 2, 3, 100_001] {
+        publish(&mut sink, block(height, 0)).await;
+    }
+    let position = sink.positions[&TableId::Dataset(Table::Block)];
+    let mut table = sink.lakes[position].table.clone();
+    let width = sink.lakes[position].width;
+    let writer = sink.writer.clone();
+    let narrow = crate::window::UndoWindow::new(512).expect("in range");
+    let tip = 100_000 + 512;
+    let compact = async |table: &mut _, window| {
+        maintenance::compact("blocks", table, width, tip, window, &writer)
+            .await
+            .expect("compacts")
+    };
+    assert_eq!(
+        compact(&mut table, crate::window::UndoWindow::DEFAULT).await,
+        0
+    );
+    assert_eq!(compact(&mut table, narrow).await, 1);
 }

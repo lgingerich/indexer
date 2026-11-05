@@ -91,6 +91,7 @@ impl DeltaSink {
             batch: Batch::new(Arc::clone(&schema), ChainId::new(chain)),
             schema,
             committed: HashMap::new(),
+            window: settings.undo_window,
             writer: WriterProperties::builder()
                 .set_compression(Compression::ZSTD(ZstdLevel::default()))
                 .build(),
@@ -103,7 +104,10 @@ impl DeltaSink {
             stop_before: None,
         };
         let read = Instant::now();
-        let ledger = sink.lake(Table::AcceptedBlock).read_ledger().await?;
+        let ledger = sink
+            .lake(Table::AcceptedBlock)
+            .read_ledger(settings.undo_window)
+            .await?;
         let read = read.elapsed();
         let repaired = Instant::now();
         let contracts = sink.repair(&ledger).await?;
@@ -132,6 +136,7 @@ impl DeltaSink {
             sink.maintenance = Some(maintenance::spawn(
                 tables,
                 Arc::clone(&sink.published_tip),
+                settings.undo_window,
                 retention,
                 sink.writer.clone(),
             ));

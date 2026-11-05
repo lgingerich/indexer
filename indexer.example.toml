@@ -32,9 +32,17 @@ ws_url = "wss://base-rpc.publicnode.com"
 
 # How many blocks under the head a fork may still reach on the chain: deeper heights are
 # backfilled straight through, and only the blocks above go one at a time through the
-# reorg-aware path. At most 4,096, the default; a chain that finalizes sooner hands a
+# reorg-aware path. At most `undo_window`, its default; a chain that finalizes sooner hands a
 # backfill to its head sooner with less.
 # finality_depth = 128
+
+# How deep a fork a run can retract; a deeper one stops it. Each store's ledger keeps this
+# many blocks and a restart reads them back, so a narrower window opens a lake faster, the
+# more so on a slow chain. From 1 to 4,096, the default. Keep it deeper than any fork the
+# chain makes and at least twice the blocks of one lake commit. Narrowing is safe; a
+# ledger shorter than the window reads as the store's whole history, so widening is not,
+# until the ledgers have grown back.
+# undo_window = 512
 
 # Backfill from Envio HyperSync instead of the two endpoints above: thousands of blocks
 # per request, every dataset, decoding included. HyperSync has no live heads, so the run

@@ -17,6 +17,11 @@ backfill_concurrency = 16
 # finalizes a block within 2 or 3 more, so 128, about a minute, leaves a wide margin;
 # only the blocks above it go one at a time through the reorg-aware path.
 finality_depth = 128
+# How deep a fork a run can retract; a deeper one stops it. Each store's ledger keeps this
+# many blocks and a restart reads them back. At least twice the blocks of a lake commit,
+# about 330, or commits are cut short. 1,024 is about 8 minutes. Narrowing is safe; see
+# `src/window.rs` before widening.
+undo_window = 1024
 # stop_block = <height>    # index through this height and exit instead
 
 # Instead of http_url and ws_url, a HyperSync backfill that exits `finality_depth` blocks
@@ -99,7 +104,7 @@ protocols = "protocols"
 # indexed, from the logs `[sink.delta]` holds, into that lake and the `[sink.postgres]`
 # tables. The running indexer ignores this section. Before running, deploy the manifests
 # to the running indexer. Run right after the deploy: discovered contracts are handed over
-# at once, then the backfill waits until the lake's tip is four ledger windows (16,388
+# at once, then the backfill waits until the lake's tip is four ledger windows (4,100
 # blocks) past the restart and the handed-over contracts' records, and fills. See
 # `src/backfill/mod.rs` and the README's "Backfilling new protocols from the lake".
 # [backfill]

@@ -99,7 +99,7 @@ use crate::sink::batch::Batch;
 use crate::sink::store_error::{Operation, StoreError};
 use crate::sink::table::{Row, Schema, Table, TableId};
 use crate::sink::{EnvelopeSink, Restored, SinkError, Store, millis};
-use crate::window::LEDGER_WINDOW;
+use crate::window::UndoWindow;
 use crate::wire::envelope::{BlockMeta, Envelope};
 
 use self::expr::{at_or_above, of_blocks};
@@ -145,6 +145,8 @@ pub struct DeltaSink {
     batch: Batch,
     /// The committed blocks a reorg could still orphan, by hash, with their heights.
     committed: HashMap<String, u64>,
+    /// The chain's undo window, which sizes the ledger a restart reads.
+    window: UndoWindow,
     writer: WriterProperties,
     /// The highest committed height, as maintenance reads it; zero before the first.
     published_tip: Arc<AtomicU64>,
@@ -642,7 +644,7 @@ impl DeltaSink {
         }
         self.committed.extend(accepted);
         if let Some(tip) = self.tip() {
-            let floor = tip.saturating_sub(LEDGER_WINDOW as u64);
+            let floor = tip.saturating_sub(self.window.ledger() as u64);
             self.committed.retain(|_, height| *height >= floor);
         }
         self.publish_tip();
@@ -676,7 +678,7 @@ impl Store for DeltaSink {
         let (contracts, handoffs, ledger) = tokio::try_join!(
             self.contracts(),
             self.handoffs(),
-            self.lake(Table::AcceptedBlock).read_ledger()
+            self.lake(Table::AcceptedBlock).read_ledger(self.window)
         )?;
         Ok(Restored {
             contracts,

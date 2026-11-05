@@ -37,11 +37,11 @@ use tracing::warn;
 use super::expr::{in_texts, seconds, texts, texts_of, uints, within};
 use super::lake::{CONCURRENT_CHECKPOINTS, Lake};
 use super::open::{Missing, Storage, open_existing, open_table};
-use super::{CONCURRENT_TABLES, append_all, record_batches};
+use super::{CONCURRENT_TABLES, DeltaSettings, append_all, record_batches};
 use crate::secret::Secret;
-use crate::sink::resume::MAX_RESUME_LAG;
 use crate::sink::store_error::{EngineError, InvalidStoredValue, Operation, StoreError};
 use crate::sink::table::{Row, Schema, Session, Table, TableId};
+use crate::window::UndoWindow;
 use crate::wire::datasets::evm::Log;
 
 /// About how many bytes of `logs` files one read takes: enough that a read's round trips
@@ -72,6 +72,8 @@ pub struct LogReader {
     files: Arc<[LogFile]>,
     /// The newest block in the ledger, `None` when it is empty.
     tip: Option<u64>,
+    /// The running store's undo window.
+    window: UndoWindow,
     /// The running store's newest session, `None` when it has written none.
     session: Option<Session>,
     /// `transactions`, when the reader was opened to read senders (see
@@ -91,14 +93,14 @@ impl LogReader {
     /// [`StoreError::Drift`] when one does not match its definition, and
     /// [`StoreError::Restore`] when a stored value does not parse.
     pub async fn open(
-        uri: &str,
-        storage: &BTreeMap<String, Secret>,
+        lake: &DeltaSettings,
         schema: &Schema,
         chain: &str,
         senders: bool,
     ) -> Result<Self, StoreError> {
-        let root = uri.trim_end_matches('/');
-        let storage = Storage::new(root, storage)?;
+        let window = lake.undo_window;
+        let root = lake.uri.trim_end_matches('/');
+        let storage = Storage::new(root, &lake.storage)?;
         let checkpoints = Arc::new(Semaphore::new(CONCURRENT_CHECKPOINTS));
         let read = |table: Table| {
             let def = schema.dataset(table);
@@ -117,7 +119,11 @@ impl LogReader {
         } else {
             None
         };
-        let tip = ledger.read_ledger().await?.last().map(|block| block.height);
+        let tip = ledger
+            .read_ledger(window)
+            .await?
+            .last()
+            .map(|block| block.height);
         let sessions = schema.dataset(Table::Session);
         let uri = format!("{root}/{chain}/{}", sessions.name);
         let session = match open_existing(&storage, uri, sessions).await? {
@@ -129,6 +135,7 @@ impl LogReader {
             width: logs.width,
             table: logs.table,
             tip,
+            window,
             session,
             transactions,
         })
@@ -228,7 +235,8 @@ impl LogReader {
     /// a block at or below this one. `None` when the ledger is empty.
     #[must_use]
     pub fn bound(&self) -> Option<u64> {
-        self.tip.map(|tip| tip.saturating_sub(MAX_RESUME_LAG))
+        self.tip
+            .map(|tip| tip.saturating_sub(self.window.resume_lag()))
     }
 
     /// The running store's newest session: from which block, and with which event

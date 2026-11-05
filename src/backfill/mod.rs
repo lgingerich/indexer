@@ -227,7 +227,7 @@ async fn fill(
     let discovers = catalog.discovers();
     let mut decoder = Decoder::new(catalog, []);
     let (lake, run) = (&settings.lake, &settings.run);
-    let open = || LogReader::open(&lake.uri, &lake.storage, &schema, chain.as_str(), derives);
+    let open = || LogReader::open(lake, &schema, chain.as_str(), derives);
     let mut reader = open().await?;
     let bound = reader.bound().ok_or(BackfillError::EmptyLedger)?;
     if let Some(to) = run.to
@@ -256,7 +256,7 @@ async fn fill(
     if let (Some(from), Some(to)) = (restart, fixed)
         && from > to
     {
-        return Err(BackfillError::SessionAboveTo { from, to });
+        return Err(BackfillError::session_above_to(from, to, lake.undo_window));
     }
     let target = run.out.as_deref().unwrap_or(&lake.uri);
     let tables =

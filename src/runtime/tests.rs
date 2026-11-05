@@ -160,9 +160,15 @@ fn schema() -> Arc<Schema> {
 
 /// A `base` store of [`schema`]'s tables over `connection`.
 async fn duckdb_store(connection: duckdb::Connection) -> DuckDbSink {
-    DuckDbSink::new(DuckDb { connection }, schema(), "base", "base")
-        .await
-        .expect("open the store")
+    DuckDbSink::new(
+        DuckDb { connection },
+        schema(),
+        "base",
+        "base",
+        crate::window::UndoWindow::DEFAULT,
+    )
+    .await
+    .expect("open the store")
 }
 
 /// `store`, writing every table of [`schema`].
@@ -635,6 +641,7 @@ fn lake(test: &str, tables: &str) -> (LakeDir, sink::DeltaSettings) {
         max_buffer_bytes: usize::MAX,
         maintenance: false,
         vacuum_retention_hours: 168,
+        undo_window: crate::window::UndoWindow::DEFAULT,
         partition_blocks: 100_000,
         storage: std::collections::BTreeMap::new(),
     };

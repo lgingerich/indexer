@@ -38,7 +38,7 @@ use crate::sink::table::{
     TableError, TableId, Value,
 };
 use crate::sink::{EnvelopeSink, Restored, SinkError, Store, StoredContract};
-use crate::window::LEDGER_WINDOW;
+use crate::window::UndoWindow;
 use crate::wire::envelope::{BlockMeta, ChainId, Envelope, Handoff};
 
 /// What runs a [`SqlStore`]'s statements.
@@ -170,6 +170,9 @@ pub struct SqlStore<E> {
     batch: Batch,
     tables: Vec<Prepared>,
     reads: Reads,
+    /// The chain's undo window, which sizes the ledger a restart reads and each flush
+    /// prunes to.
+    window: UndoWindow,
 }
 
 impl<E: Engine> SqlStore<E> {
@@ -191,6 +194,7 @@ impl<E: Engine> SqlStore<E> {
         schema: Arc<Schema>,
         chain: &str,
         namespace: &str,
+        window: UndoWindow,
     ) -> Result<Self, StoreError> {
         for statement in [
             sql::create_schema(namespace),
@@ -234,6 +238,7 @@ impl<E: Engine> SqlStore<E> {
                 .collect(),
             reads: Reads::new(&schema)?,
             batch: Batch::new(schema, ChainId::new(chain)),
+            window,
         };
         store.create_staging().await?;
         Ok(store)
@@ -350,7 +355,7 @@ impl<E: Engine> SqlStore<E> {
     /// Read by [`restore`](Store::restore), before the first write: the result is the
     /// undo window a restart resumes from. Each flush drops the rows below that window
     /// (see [`prune_ledger`](Self::prune_ledger)), so this reads a table of about
-    /// [`LEDGER_WINDOW`] rows. Contiguity is not checked; the pipeline does that.
+    /// [`UndoWindow::ledger`] rows. Contiguity is not checked; the pipeline does that.
     ///
     /// # Errors
     ///
@@ -445,7 +450,7 @@ impl<E: Engine> SqlStore<E> {
         Ok(())
     }
 
-    /// Deletes the ledger rows more than [`LEDGER_WINDOW`] below `tip`, the newest block
+    /// Deletes the ledger rows more than [`UndoWindow::ledger`] below `tip`, the newest block
     /// this flush accepts, as the lake keeps its window: no restart reads them, and left
     /// in place they grow the table, and the cost of every write to it, a row a block.
     ///
@@ -453,7 +458,7 @@ impl<E: Engine> SqlStore<E> {
     /// and at or below the chain's tip, so the window kept is never short. Nothing is
     /// deleted for a flush that accepts no block, or one within the window of the start.
     async fn prune_ledger(&mut self, tip: Option<u64>) -> Result<(), StoreError> {
-        let Some(floor) = tip.and_then(|tip| tip.checked_sub(LEDGER_WINDOW as u64)) else {
+        let Some(floor) = tip.and_then(|tip| tip.checked_sub(self.window.ledger() as u64)) else {
             return Ok(());
         };
         let params = [self.chain_param(), Value::Uint(floor)];
@@ -528,7 +533,7 @@ impl<E: Engine + 'static> Store for SqlStore<E> {
         Ok(Restored {
             contracts: self.contracts().await?,
             handoffs: self.handoffs().await?,
-            ledger: self.ledger(LEDGER_WINDOW).await?,
+            ledger: self.ledger(self.window.ledger()).await?,
         })
     }
 

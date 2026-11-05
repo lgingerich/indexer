@@ -186,6 +186,7 @@ impl StorePlan {
                 records: usize::MAX,
                 bytes: usize::try_from(512 + rng.below(16 * 1024)).unwrap_or(usize::MAX),
                 wait: Duration::from_secs(1 + rng.below(150)),
+                blocks: crate::window::UndoWindow::DEFAULT.flush_blocks(),
             },
             counts_bytes: true,
             raw,
@@ -425,12 +426,18 @@ async fn open(
         landed: false,
     };
     let tables = store.tables(schema);
-    let inner = SqlStore::new(engine, Arc::new(schema.select(&tables)), CHAIN, CHAIN)
-        .await
-        .map_err(|source| RuntimeError::OpenStore {
-            store: store.backend,
-            source,
-        })?;
+    let inner = SqlStore::new(
+        engine,
+        Arc::new(schema.select(&tables)),
+        CHAIN,
+        CHAIN,
+        crate::window::UndoWindow::DEFAULT,
+    )
+    .await
+    .map_err(|source| RuntimeError::OpenStore {
+        store: store.backend,
+        source,
+    })?;
     Ok(Opened {
         backend: store.backend,
         store: SimStore {

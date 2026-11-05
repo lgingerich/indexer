@@ -6,7 +6,7 @@ use std::collections::VecDeque;
 use alloy_primitives::B256;
 use tracing::warn;
 
-use crate::window::{Ledger, MAX_UNFINALIZED_BLOCKS};
+use crate::window::{Ledger, UndoWindow};
 use crate::wire::envelope::BlockMeta;
 
 /// Accepted chain identities: an ordered sliding tail, and what lies below it.
@@ -19,8 +19,10 @@ pub(super) struct UndoRing {
     /// What the window knows of the history below [`Self::entries`].
     window: Window,
     /// Published tail above the floor, if there is one, oldest first, at most
-    /// [`MAX_UNFINALIZED_BLOCKS`] identities.
+    /// [`Self::capacity`] identities.
     entries: VecDeque<BlockMeta>,
+    /// The undo window's size.
+    capacity: UndoWindow,
 }
 
 /// How much of a run's history the undo window holds.
@@ -42,6 +44,11 @@ enum Window {
 }
 
 impl UndoRing {
+    /// How many blocks the window retracts at most.
+    pub(super) const fn capacity(&self) -> UndoWindow {
+        self.capacity
+    }
+
     /// Returns the newest accepted block: the newest entry, or the floor when a rewind
     /// to it left nothing above. `None` only before any block is accepted, when
     /// [`Self::oldest`] is `None` too.
@@ -123,7 +130,7 @@ impl UndoRing {
     /// Appends an accepted identity, sliding the window: the oldest tail entry
     /// becomes the floor when the window is full.
     pub(super) fn push(&mut self, meta: BlockMeta) {
-        if self.entries.len() >= MAX_UNFINALIZED_BLOCKS
+        if self.entries.len() >= self.capacity.blocks()
             && let Some(evicted) = self.entries.pop_front()
         {
             self.window = Window::Bounded { floor: evicted };
@@ -137,12 +144,16 @@ impl UndoRing {
 impl From<Ledger> for UndoRing {
     fn from(ledger: Ledger) -> Self {
         let history_below = ledger.history_below();
+        let capacity = ledger.window();
         let blocks = ledger.into_blocks();
         let stored = blocks.len();
         let linked = linked_suffix(blocks);
         let bounded = history_below || linked.len() < stored;
         let mut linked = linked.into_iter();
-        let mut ring = Self::default();
+        let mut ring = Self {
+            capacity,
+            ..Self::default()
+        };
         // Rows may sit below the oldest kept block, so it is the floor: no fork replacing
         // it is adopted, and none is retracted past it.
         if bounded && let Some(oldest) = linked.next() {
@@ -224,16 +235,19 @@ mod tests {
         assert_eq!(machine.ring.oldest(), Some(meta(5)));
         assert_eq!(machine.tip(), Some(meta(8)));
 
-        let window = MAX_UNFINALIZED_BLOCKS as u64;
+        let window = crate::window::MAX_UNFINALIZED_BLOCKS as u64;
         let machine = Machine::new(Source::linear(0), Sink::default(), ledger(0..=window));
         assert_eq!(machine.ring.window, Window::Bounded { floor: meta(0) });
-        assert_eq!(machine.ring.entries.len(), MAX_UNFINALIZED_BLOCKS);
+        assert_eq!(
+            machine.ring.entries.len(),
+            crate::window::MAX_UNFINALIZED_BLOCKS
+        );
         assert_eq!(machine.tip(), Some(meta(window)));
 
         let machine = Machine::new(
             Source::linear(0),
             Sink::default(),
-            Ledger::new(ledger(3..=3), true),
+            Ledger::new(ledger(3..=3), true, UndoWindow::DEFAULT),
         );
         assert_eq!(machine.ring.window, Window::Bounded { floor: meta(3) });
         assert!(machine.ring.entries.is_empty());
@@ -245,11 +259,27 @@ mod tests {
     /// block for history to sit below.
     #[test]
     fn an_empty_ledger_never_has_history_below() {
-        let ledger = Ledger::new(Vec::new(), true);
+        let ledger = Ledger::new(Vec::new(), true, UndoWindow::DEFAULT);
         assert!(!ledger.history_below());
         let ring = UndoRing::from(ledger);
         assert!(ring.holds_whole_history());
         assert_eq!((ring.tip(), ring.oldest()), (None, None));
+    }
+
+    /// A narrower window slides at its own size, and a ledger carries it to the ring.
+    #[test]
+    #[expect(
+        clippy::expect_used,
+        reason = "a failed one means the fixture is wrong"
+    )]
+    fn a_ring_slides_at_the_window_its_ledger_names() {
+        let window = UndoWindow::new(3).expect("in range");
+        let mut ring = UndoRing::from(Ledger::new(ledger(1..=3), false, window));
+        assert!(ring.holds_whole_history());
+        ring.push(meta(4));
+        assert_eq!(ring.window, Window::Bounded { floor: meta(1) });
+        assert_eq!(ring.capacity(), window);
+        assert_eq!(ring.entries.len(), 3);
     }
 
     /// The window holds the whole history until it is full; the next block slides the
@@ -257,7 +287,7 @@ mod tests {
     /// moves the floor up past it.
     #[test]
     fn the_ring_slides_and_keeps_a_recoverable_floor() {
-        let window = MAX_UNFINALIZED_BLOCKS as u64;
+        let window = crate::window::MAX_UNFINALIZED_BLOCKS as u64;
         let mut ring = UndoRing::default();
         for height in 0..window {
             ring.push(meta(height));
@@ -270,7 +300,7 @@ mod tests {
             !ring.holds_whole_history(),
             "the first block slid into the floor"
         );
-        assert_eq!(ring.entries.len(), MAX_UNFINALIZED_BLOCKS);
+        assert_eq!(ring.entries.len(), crate::window::MAX_UNFINALIZED_BLOCKS);
         assert_eq!(ring.window, Window::Bounded { floor: meta(0) });
         assert_eq!(ring.entries.front(), Some(&meta(1)));
         assert_eq!(ring.tip(), Some(meta(window)));

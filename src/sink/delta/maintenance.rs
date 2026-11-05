@@ -52,7 +52,7 @@ use tracing::{info, warn};
 use super::arrow::PARTITION;
 use super::lake::commit_properties;
 use crate::metrics;
-use crate::window::MAX_UNFINALIZED_BLOCKS;
+use crate::window::UndoWindow;
 
 /// How often the task looks for finished partitions to compact.
 const COMPACT_EVERY: Duration = Duration::from_hours(1);
@@ -89,19 +89,22 @@ impl Drop for Maintenance {
 
 /// Starts maintaining `tables`, each by name, the log store it is read through, and the
 /// partition width it was opened with, against the committed tip the writer publishes in
-/// `tip`. Files go after `retention`.
+/// `tip`, compacting what the deepest reorg of `window` cannot reach. Files go after
+/// `retention`.
 pub(super) fn spawn(
     tables: Vec<(String, LogStoreRef, u64)>,
     tip: Arc<AtomicU64>,
+    window: UndoWindow,
     retention: Duration,
     writer: WriterProperties,
 ) -> Maintenance {
-    Maintenance(tokio::spawn(run(tables, tip, retention, writer)))
+    Maintenance(tokio::spawn(run(tables, tip, window, retention, writer)))
 }
 
 async fn run(
     tables: Vec<(String, LogStoreRef, u64)>,
     tip: Arc<AtomicU64>,
+    window: UndoWindow,
     retention: Duration,
     writer: WriterProperties,
 ) {
@@ -111,7 +114,7 @@ async fn run(
         passes.tick().await;
         for (name, log_store, width) in &tables {
             let tip = tip.load(Ordering::Acquire);
-            maintain(name, log_store, *width, tip, retention, &writer).await;
+            maintain(name, log_store, *width, tip, window, retention, &writer).await;
         }
     }
 }
@@ -125,6 +128,7 @@ pub(super) async fn maintain(
     log_store: &LogStoreRef,
     width: u64,
     tip: u64,
+    window: UndoWindow,
     retention: Duration,
     writer: &WriterProperties,
 ) {
@@ -134,7 +138,7 @@ pub(super) async fn maintain(
         warn!(table = %name, %error, "lake table unreadable for maintenance; retrying next pass");
         return;
     }
-    if let Err(error) = compact(name, &mut table, width, tip, writer).await {
+    if let Err(error) = compact(name, &mut table, width, tip, window, writer).await {
         metrics::lake_maintenance_failed("compact");
         warn!(table = %name, %error, "lake compaction failed; retrying next pass");
     }
@@ -219,6 +223,7 @@ pub(super) async fn compact(
     table: &mut DeltaTable,
     width: u64,
     tip: u64,
+    window: UndoWindow,
     writer: &WriterProperties,
 ) -> Result<usize, DeltaTableError> {
     table.update_state().await?;
@@ -230,7 +235,7 @@ pub(super) async fn compact(
         let Ok(partition) = partition.parse::<i64>() else {
             continue;
         };
-        if file.size() < SMALL_FILE_BYTES && finished(partition, width, tip) {
+        if file.size() < SMALL_FILE_BYTES && finished(partition, width, tip, window) {
             *small.entry(partition).or_default() += 1;
         }
     }
@@ -264,13 +269,13 @@ pub(super) async fn compact(
 /// Whether nothing at `tip` or after can still write to `partition`, `width` heights
 /// wide: the tip is past its last height by more than the deepest reorg the pipeline
 /// retracts.
-fn finished(partition: i64, width: u64, tip: u64) -> bool {
+fn finished(partition: i64, width: u64, tip: u64, window: UndoWindow) -> bool {
     let Ok(partition) = u64::try_from(partition) else {
         return false;
     };
     (partition + 1)
         .saturating_mul(width)
-        .saturating_add(MAX_UNFINALIZED_BLOCKS as u64)
+        .saturating_add(window.blocks() as u64)
         <= tip
 }
 
