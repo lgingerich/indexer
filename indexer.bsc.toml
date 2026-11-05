@@ -45,8 +45,8 @@ tables = [
     # `metric_v1_swaps` and `metric_v1_bin_fills` hold the same events unpacked.
     "!metric_v1_metric_omm_pool_swap",
     "!metric_v1_metric_omm_pool_bin_swapped",
-    "chainlink_data_streams_*",
-    "pyth_lazer_*",
+    # Who read which feed, with no price.
+    "!metric_v1_*_price_read",
     # Uniswap goes to the lake only until its backfill: restore these lines in the deploy
     # before it, and the backfill fills Postgres from the lake, these blocks included.
     # "uniswap_v3_*",
