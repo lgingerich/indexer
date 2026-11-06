@@ -512,3 +512,23 @@ fn the_stores_take_the_chains_undo_window() {
     assert_eq!(postgres.undo_window.blocks(), 512);
     assert_eq!(postgres.batching().blocks, 256);
 }
+
+/// A backfill's stream count is its own setting, and at least one.
+#[test]
+fn a_backfill_names_its_streams() {
+    let backfill = |streams: &str| {
+        parse(&format!(
+            "{}\n[backfill]\nprotocols = \"protocols\"\n{streams}\n",
+            minimal()
+        ))
+    };
+    let run = |settings: Settings| settings.backfill.expect("a [backfill]");
+    assert_eq!(run(backfill("").expect("parses")).streams, None);
+    assert_eq!(
+        run(backfill("streams = 4").expect("parses"))
+            .streams
+            .map(std::num::NonZeroUsize::get),
+        Some(4)
+    );
+    assert!(backfill("streams = 0").is_err());
+}

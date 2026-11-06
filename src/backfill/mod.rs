@@ -272,9 +272,10 @@ async fn fill(
 
     let from = run.from.unwrap_or(0);
     // Each read owns a copy of the reader, so the next is read while one is decoded and
-    // written. They share the cores: each Parquet stream holds a row group of up to a
-    // million rows while it reads, so a stream per core per read would hold gigabytes.
-    let streams = cores().div_ceil(READ_AHEAD);
+    // written. They share the cores unless the settings say otherwise: each Parquet
+    // stream holds a row group of up to a million rows while it reads, so a stream per
+    // core per read would hold gigabytes.
+    let streams = streams_of(run);
     let mut done = Backfilled::default();
     let mut addresses = addresses.to_vec();
     // The highest block the fill must reach to leave none between it and the running
@@ -348,6 +349,12 @@ async fn fill(
         .await?;
     report(chain, &done);
     Ok(done)
+}
+
+/// The Parquet streams each read takes: as `run` says, or half the machine's cores.
+fn streams_of(run: &BackfillRun) -> usize {
+    run.streams
+        .map_or_else(|| cores().div_ceil(READ_AHEAD), std::num::NonZeroUsize::get)
 }
 
 /// Where the running indexer's current run decodes from, as `coverage` reads it from the

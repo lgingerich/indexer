@@ -662,8 +662,8 @@ It reads the running indexer's own settings file: the chain is its `[ingest]`, t
 its `[sink.delta]`, and the database to fill too its `[sink.postgres]`, of whose `tables`
 it fills those of the manifests it backfills. The file's `[backfill]` section, commented
 out until a run needs it, names `protocols`, the manifests to backfill (required), `from`
-and `to`, the blocks to cover, `only`, the discovered contracts to hand over, `out`,
-another lake such as a local directory to write to instead, a trial that leaves the
+and `to`, the blocks to cover, `streams`, the Parquet streams each read of the lake takes,
+`only`, the discovered contracts to hand over, `out`, another lake such as a local directory to write to instead, a trial that leaves the
 chain's lake only read and fills no database, and `[backfill.hypersync]`, the chain's
 HyperSync endpoint and token, to find what the factories created before the lake's first
 block. The running indexer ignores the section. A backfill reads every secret the file

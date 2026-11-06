@@ -74,6 +74,7 @@ impl Dir {
                 to: None,
                 only: None,
                 out: None,
+                streams: None,
                 hypersync: None,
             },
             decoded: protocols.to_path_buf(),

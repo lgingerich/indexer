@@ -472,6 +472,38 @@ async fn a_handed_over_contract_is_restored_whole() {
     assert_eq!(restored.handoffs, [handoff]);
 }
 
+/// A read for as many contracts as a scan filters by plans within a worker's default
+/// stack, where a backfill runs its reads, and finds their logs.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_read_for_as_many_contracts_as_the_scan_filters_by_fits_on_a_worker() {
+    let dir = Dir::new();
+    let mut sink = open(&dir).await;
+    for height in 1..=20 {
+        publish(&mut sink, block(height, 0)).await;
+    }
+    drop(sink);
+    let reader = crate::sink::delta::LogReader::open(
+        &dir.settings(),
+        &Schema::new().expect("the dataset tables"),
+        CHAIN,
+        false,
+    )
+    .await
+    .expect("the reader opens");
+    let emitter = alloy_primitives::Address::ZERO;
+    let mut many: Vec<alloy_primitives::Address> = (1..crate::sink::delta::replay::SCAN_ADDRESSES)
+        .map(|n| {
+            let mut bytes = [0xaa; 20];
+            bytes[..8].copy_from_slice(&u64::try_from(n).expect("fits").to_be_bytes());
+            alloy_primitives::Address::from(bytes)
+        })
+        .collect();
+    many.push(emitter);
+    assert_eq!(many.len(), crate::sink::delta::replay::SCAN_ADDRESSES);
+    let read = tokio::spawn(reader.read(1..=20, &many, 2));
+    assert_eq!(read.await.expect("no overflow").expect("read").len(), 20);
+}
+
 /// A backfill's read for more contracts than a scan filters by, as a chain with hundreds
 /// of thousands of pools asks, returns the same logs as a read for the one among them
 /// that emitted any, rather than overflowing the stack planning the filter.

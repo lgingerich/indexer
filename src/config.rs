@@ -573,6 +573,11 @@ pub struct BackfillRun {
     /// options.
     #[serde(default)]
     pub out: Option<String>,
+    /// The Parquet streams each read of the lake takes, so a read holds about this many
+    /// row groups at once; half the machine's cores when absent. Two reads run at once.
+    /// A read mostly waits on object storage, so this may exceed the cores.
+    #[serde(default)]
+    pub streams: Option<NonZeroUsize>,
     /// `[backfill.hypersync]`: the chain's `HyperSync` endpoint, searched for the logs
     /// the factories emitted before the lake's first block, so the contracts they
     /// created then are found too. Absent, only those created in the lake are.

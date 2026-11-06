@@ -50,10 +50,15 @@ use crate::wire::datasets::evm::Log;
 const READ_BYTES: u64 = 256 * 1024 * 1024;
 
 /// The most addresses a read of `logs` filters by in the scan, as `address IN (…)`.
-/// `DataFusion` plans such a list as nested expressions, one deeper per value, so a long
-/// one overflows the stack: a read of more is not filtered in the scan, and keeps only the
-/// rows of its addresses as the batches stream past.
-pub(crate) const SCAN_ADDRESSES: usize = 256;
+/// delta-rs plans such a list as nested expressions, one deeper per value, so a long one
+/// overflows the stack: on a 2 MiB worker stack, past 1,000 in a debug build and 5,000 in
+/// a release build. A read of more is not filtered in the scan, and keeps only the rows
+/// of its addresses as the batches stream past.
+///
+/// The filter pays where the addresses are rare: where none appears a read of 960 MB
+/// fetched 35 MB. Where they appear throughout, it fetches as much as no filter does, and
+/// holds about twice the memory.
+pub(crate) const SCAN_ADDRESSES: usize = 1_000;
 
 /// How many times a backfill's commit is tried before it stops. An append conflicts only
 /// with a concurrent commit that deletes a file it read, such as a reorg's in the running
