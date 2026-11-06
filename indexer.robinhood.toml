@@ -49,14 +49,13 @@ tables = [
     "!metric_v1_metric_omm_pool_bin_swapped",
     # Who read which feed, with no price.
     "!metric_v1_*_price_read",
-    # Uniswap goes to the lake only until its backfill: restore these lines in the deploy
-    # before it, and the backfill fills Postgres from the lake, these blocks included.
-    # "uniswap_v3_*",
-    # "uniswap_v4_*",
-    # V4's claim tokens, not its pools: ERC-6909 balances held in the `PoolManager`.
-    # "!uniswap_v4_pool_manager_transfer",
-    # "!uniswap_v4_pool_manager_approval",
-    # "!uniswap_v4_pool_manager_operator_set",
+    # Each Uniswap pool's tokens and fee, for all time: a backfill fills these from the lake.
+    "uniswap_v3_uniswap_v3_factory_pool_created",
+    "uniswap_v4_pool_manager_initialize",
+    # Each swap's raw amounts and price, from the deploy that routed them on, with no history:
+    # a backfill must never list these. metric-tools keeps the pools it wants and deletes the rest.
+    "uniswap_v3_pool_swap",
+    "uniswap_v4_pool_manager_swap",
 ]
 connection_string = { env = "INDEXER_POSTGRES_URL" }
 batch_records = 10000

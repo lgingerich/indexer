@@ -730,11 +730,20 @@ addresses = { base = ["0x33128a8fC17869897dcE68Ed026d694621f6FDfD"], ethereum = 
                 .collect()
         };
         let pool = |column: &'static str| vec!["chain", column, "block_number", "log_index"];
+        let swap = |column: &'static str| {
+            vec![
+                "chain",
+                column,
+                "block_timestamp",
+                "block_number",
+                "log_index",
+            ]
+        };
         for (table, expected) in [
-            ("uniswap_v3_pool_swap", pool("address")),
+            ("uniswap_v3_pool_swap", swap("address")),
             ("uniswap_v3_pool_mint", pool("address")),
             ("uniswap_v3_pool_burn", pool("address")),
-            ("uniswap_v4_pool_manager_swap", pool("id")),
+            ("uniswap_v4_pool_manager_swap", swap("id")),
             ("uniswap_v4_pool_manager_modify_liquidity", pool("id")),
             ("uniswap_v4_pool_manager_initialize", vec!["chain", "id"]),
         ] {
