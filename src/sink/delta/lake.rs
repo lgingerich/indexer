@@ -8,7 +8,7 @@ use deltalake::arrow::datatypes::DataType as ArrowType;
 use deltalake::arrow::datatypes::Schema as ArrowSchema;
 use deltalake::datafusion::dataframe::DataFrame;
 use deltalake::datafusion::error::DataFusionError;
-use deltalake::datafusion::prelude::{Expr, SessionContext, cast, ident, lit};
+use deltalake::datafusion::prelude::{Expr, SessionConfig, SessionContext, cast, ident, lit};
 use deltalake::kernel::LogicalFileView;
 use deltalake::kernel::transaction::CommitProperties;
 use deltalake::parquet::file::properties::WriterProperties;
@@ -216,18 +216,33 @@ impl Lake {
         &self,
         plan: impl FnOnce(DataFrame) -> Result<DataFrame, DataFusionError>,
     ) -> Result<Vec<RecordBatch>, StoreError> {
-        self.read_files(None, plan).await
+        self.read_files(None, None, plan).await
     }
 
-    /// Runs `plan` over the table, or only its files `paths` when given, and collects
-    /// what it returns.
+    /// As [`read`](Self::read), over `streams` Parquet streams rather than one a core: for
+    /// a table of many small files, where a read mostly waits on the object store.
+    pub(super) async fn read_over(
+        &self,
+        streams: usize,
+        plan: impl FnOnce(DataFrame) -> Result<DataFrame, DataFusionError>,
+    ) -> Result<Vec<RecordBatch>, StoreError> {
+        self.read_files(None, Some(streams), plan).await
+    }
+
+    /// Runs `plan` over the table, or only its files `paths` when given, over `streams`
+    /// Parquet streams, one a core when absent, and collects what it returns.
     async fn read_files(
         &self,
         paths: Option<Vec<String>>,
+        streams: Option<usize>,
         plan: impl FnOnce(DataFrame) -> Result<DataFrame, DataFusionError>,
     ) -> Result<Vec<RecordBatch>, StoreError> {
         let read = async {
-            let ctx = SessionContext::new();
+            let ctx = streams.map_or_else(SessionContext::new, |streams| {
+                SessionContext::new_with_config(
+                    SessionConfig::new().with_target_partitions(streams),
+                )
+            });
             self.table.update_datafusion_session(&ctx.state())?;
             let provider = self.table.table_provider();
             let provider = match paths {
@@ -313,7 +328,7 @@ impl Lake {
         };
         let [height, hash, parent_hash, timestamp] = LEDGER_COLUMNS;
         let batches = self
-            .read_files(paths, |frame| {
+            .read_files(paths, None, |frame| {
                 let frame = match oldest {
                     Some(oldest) => frame.filter(ident(PARTITION).gt_eq(lit(oldest)))?,
                     None => frame,

@@ -8,8 +8,7 @@
 //! - **Compaction.** A partition is finished once the tip is past it by more than the
 //!   reorg window: nothing appends to it or deletes from it again. Each finished
 //!   partition still holding small files is rewritten into a few large ones, once.
-//!   Tables with no partition, `contracts` and `reorgs`, are left alone: a reorg can
-//!   still delete from any of their files.
+//!   The table with no partition, `reorgs`, is left alone.
 //! - **Vacuum.** Files no commit references, and that have not been referenced for
 //!   [`vacuum_retention_hours`](super::DeltaSettings::vacuum_retention_hours), are
 //!   deleted. The retention is how long a reader may still be reading an older version.

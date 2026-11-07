@@ -18,6 +18,12 @@ use crate::sink::table::{CONTRACT_COLUMNS, REORG_COLUMNS, Table, TableId};
 use crate::sink::{StoredContract, hex, millis};
 use crate::wire::envelope::{BlockMeta, Handoff};
 
+/// The Parquet streams a read of `contracts` takes. Each row is in the partition of the
+/// block that created its contract, so a backfill handing over a factory's whole history
+/// leaves a small file in each of thousands of partitions, and one stream a core spent
+/// minutes of every restart waiting on the object store.
+const CONTRACT_STREAMS: usize = 32;
+
 impl DeltaSink {
     /// The contracts discovered on this chain that the lake holds, every one canonical:
     /// one created in an orphaned block was deleted with it, and one the ledger does not
@@ -25,7 +31,7 @@ impl DeltaSink {
     pub(super) async fn contracts(&self) -> Result<Vec<StoredContract>, StoreError> {
         let batches = self
             .lake(Table::Contract)
-            .read(|frame| {
+            .read_over(CONTRACT_STREAMS, |frame| {
                 // Ordered, so a restore reads the rows the same way every time.
                 frame
                     .sort(vec![ident("dedupe_key").sort(true, false)])?
