@@ -5,6 +5,7 @@
 use std::collections::HashSet;
 
 use alloy_primitives::B256;
+use deltalake::datafusion::dataframe::DataFrame;
 use deltalake::datafusion::prelude::ident;
 use futures_util::stream::{self, StreamExt as _, TryStreamExt as _};
 use tokio::time::Instant;
@@ -92,7 +93,8 @@ impl DeltaSink {
     /// [`Step`]: super::Step
     ///
     /// Every block table is read, so the reads overlap; a stray row is rare, and its
-    /// delete runs once they are done.
+    /// delete runs once they are done. Each reads only its files reaching the ledger's
+    /// oldest block (see [`read_reaching`](super::lake::Lake::read_reaching)).
     ///
     /// Returns the contracts the lake keeps once repaired, for a restore: they are read
     /// beside the scan, and again only if the repair deleted some of them.
@@ -115,17 +117,16 @@ impl DeltaSink {
             .map(|(position, lake, (hash, number))| {
                 let named = &named;
                 async move {
-                    let batches = lake
-                        .read(|frame| {
-                            let frame = match floor {
-                                Some(floor) => {
-                                    frame.filter(at_or_above(number, floor, lake.width))?
-                                }
-                                None => frame,
-                            };
-                            frame.select(texts_of(&[hash]))?.distinct()
-                        })
-                        .await?;
+                    let hashes = |frame: DataFrame| frame.select(texts_of(&[hash]))?.distinct();
+                    let batches = match floor {
+                        Some(floor) => {
+                            lake.read_reaching(number, floor, |frame| {
+                                hashes(frame.filter(at_or_above(number, floor, lake.width))?)
+                            })
+                            .await?
+                        }
+                        None => lake.read(hashes).await?,
+                    };
                     let mut stray = Vec::new();
                     for batch in &batches {
                         let hashes = texts(batch, 0, "block_hash")?;

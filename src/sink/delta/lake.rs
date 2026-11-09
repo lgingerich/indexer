@@ -219,6 +219,45 @@ impl Lake {
         self.read_files(None, None, plan).await
     }
 
+    /// As [`read`](Self::read), over only the files whose `column` reaches `floor`, as the
+    /// file list's statistics say, and none at all when no file does.
+    ///
+    /// The tip writes a small file a commit, so the partition `floor` is in holds far more
+    /// files below it than above: Ethereum's day-wide partitions hold some 500 a table by
+    /// their end, of which a 512-block window reaches about 40. A read merely filtered on
+    /// `column` took time in step with every file of the partition rather than those
+    /// few, each one a request to the object store. Every file of a
+    /// partition a file records no statistics on `column` in is read, so a file is
+    /// skipped only when its statistics say it holds nothing at or above `floor`.
+    pub(super) async fn read_reaching(
+        &self,
+        column: &str,
+        floor: u64,
+        plan: impl FnOnce(DataFrame) -> Result<DataFrame, DataFusionError>,
+    ) -> Result<Vec<RecordBatch>, StoreError> {
+        let oldest = arrow::partition_of(floor, self.width);
+        let mut paths = Vec::new();
+        let mut described = true;
+        self.each_file(|partition, file| {
+            if partition < oldest {
+                return Ok(());
+            }
+            match file.stats().and_then(|stats| highest(&stats, column)) {
+                Some(high) if high < floor => {}
+                Some(_) => paths.push(file.path().into_owned()),
+                None => described = false,
+            }
+            Ok(())
+        })?;
+        if !described {
+            return self.read(plan).await;
+        }
+        if paths.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.read_files(Some(paths), None, plan).await
+    }
+
     /// As [`read`](Self::read), over `streams` Parquet streams rather than one a core: for
     /// a table of many small files, where a read mostly waits on the object store.
     pub(super) async fn read_over(
@@ -394,6 +433,13 @@ impl LedgerFile {
     }
 }
 
+/// The highest `column` the statistics Delta wrote for a file record, `None` when they
+/// do not say.
+fn highest(stats: &str, column: &str) -> Option<u64> {
+    let stats: serde_json::Value = serde_json::from_str(stats).ok()?;
+    stats.get("maxValues")?.get(column)?.as_u64()
+}
+
 /// The paths of `files` the newest `rows` rows lie in.
 ///
 /// A height is in the ledger once, so the newest files together holding `rows` rows hold
@@ -442,7 +488,7 @@ pub(super) fn commit_properties() -> CommitProperties {
 
 #[cfg(test)]
 mod tests {
-    use super::{LedgerFile, ledger_files};
+    use super::{LedgerFile, highest, ledger_files};
 
     fn file(path: &str, low: u64, high: u64, rows: u64) -> LedgerFile {
         LedgerFile {
@@ -509,5 +555,16 @@ mod tests {
         );
         assert_eq!(LedgerFile::of("p".to_owned(), r#"{"numRecords":3}"#), None);
         assert_eq!(LedgerFile::of("p".to_owned(), "not json"), None);
+    }
+
+    /// A file's highest height is its statistics' maximum, and unknown when they do not
+    /// record the column.
+    #[test]
+    fn a_files_highest_height_is_read_from_its_statistics() {
+        let stats = r#"{"numRecords":3,"maxValues":{"block_number":9,"block_timestamp":"x"}}"#;
+        assert_eq!(highest(stats, "block_number"), Some(9));
+        assert_eq!(highest(stats, "block_timestamp"), None);
+        assert_eq!(highest(r#"{"numRecords":3}"#, "block_number"), None);
+        assert_eq!(highest("not json", "block_number"), None);
     }
 }
