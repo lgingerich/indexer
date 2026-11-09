@@ -18,7 +18,7 @@ use crate::ingest::pipeline::{Machine, PipelineError};
 use crate::ingest::source::{BlockSource, FetchedBlock, HeadStream, SourceError};
 use crate::sink::channel::Batching;
 use crate::sink::duckdb::DuckDb;
-use crate::sink::resume::Opened;
+use crate::sink::resume::{Opened, ReadBack, read_back_all};
 use crate::sink::route::StoreBackend;
 use crate::sink::stop::Stop;
 use crate::sink::store_runtime::StoreRuntime;
@@ -180,6 +180,11 @@ fn every_table<S>(backend: StoreBackend, store: S, batching: Batching) -> Opened
         tables: schema().tables().iter().map(|def| def.id).collect(),
         runtime: StoreRuntime::current(),
     }
+}
+
+/// `stores`, each read back, as a run opens them.
+async fn read_back<S: sink::Store>(stores: Vec<Opened<S>>) -> Vec<ReadBack<S>> {
+    read_back_all(stores).await.expect("the stores read back")
 }
 
 fn decoder() -> Decoder {
@@ -439,15 +444,14 @@ async fn run_once(connection: &duckdb::Connection, chain: FakeChain, start: Opti
     let store = duckdb_store(connection.try_clone().expect("handle")).await;
     let catalog =
         Catalog::load(protocols(), &ChainId::new("base")).expect("shipped protocols load");
+    let stores = read_back(vec![every_table(
+        StoreBackend::DuckDb,
+        store,
+        Batching::eager(500),
+    )])
+    .await;
     let result = Pipeline::new(chain, start, None, catalog)
-        .run_with_stores(
-            vec![every_table(
-                StoreBackend::DuckDb,
-                store,
-                Batching::eager(500),
-            )],
-            Stop::never(),
-        )
+        .run_with_stores(stores, Stop::never())
         .await;
     ran_to_head(&result);
 }
@@ -659,11 +663,15 @@ async fn run_lake(settings: &sink::DeltaSettings, chain: FakeChain, start: Optio
         .expect("the lake opens");
     let catalog =
         Catalog::load(protocols(), &ChainId::new("base")).expect("shipped protocols load");
-    let result = Box::pin(Pipeline::new(chain, start, None, catalog).run_with_stores(
-        vec![every_table(StoreBackend::Delta, store, settings.batching())],
-        Stop::never(),
-    ))
+    let stores = read_back(vec![every_table(
+        StoreBackend::Delta,
+        store,
+        settings.batching(),
+    )])
     .await;
+    let result =
+        Box::pin(Pipeline::new(chain, start, None, catalog).run_with_stores(stores, Stop::never()))
+            .await;
     ran_to_head(&result);
 }
 
@@ -818,6 +826,7 @@ async fn run_both(
             settings.batching(),
         )),
     ];
+    let stores = read_back(stores).await;
     let result =
         Box::pin(Pipeline::new(chain, start, None, catalog).run_with_stores(stores, Stop::never()))
             .await;

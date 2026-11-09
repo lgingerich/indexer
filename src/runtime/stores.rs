@@ -11,7 +11,7 @@ use crate::decode::{Catalog, Decoder, DecodingSink};
 use crate::ingest::pipeline::{Machine, PipelineError};
 use crate::ingest::source::BlockSource;
 use crate::sink::any_store::AnyStore;
-use crate::sink::resume::Opened;
+use crate::sink::resume::{Opened, ReadBack, read_back};
 use crate::sink::route::{Router, StoreBackend};
 use crate::sink::stop::Stop;
 use crate::sink::store_runtime::StoreRuntime;
@@ -30,16 +30,17 @@ const HANDED_QUEUE: usize = 16;
 impl<B: BlockSource + 'static> Pipeline<B> {
     /// Opens every store `routes` names, each with the tables routed to it and on a
     /// runtime of its own (see `crate::sink::store_runtime`), so what opening spawns — a
-    /// connection's task, the lake's checkpoints and maintenance — runs there too. Opened
-    /// before ingest starts, so a bad path or connection fails at startup rather than
-    /// after the first block.
+    /// connection's task, the lake's checkpoints and maintenance — runs there too, and
+    /// reads each back as soon as it has opened. Opened before ingest starts, so a bad
+    /// path or connection fails at startup rather than after the first block.
     pub(super) async fn open(
         &self,
         routes: Vec<StoreRoute>,
-    ) -> Result<Vec<Opened<AnyStore>>, RuntimeError> {
+    ) -> Result<Vec<ReadBack<AnyStore>>, RuntimeError> {
         let chain = self.source.chain().as_str().to_owned();
-        // Each store opens on its own runtime, so they open at once rather than each
-        // waiting out the last.
+        // Each store opens and reads back on its own runtime, so they do at once rather
+        // than each waiting out the last: the database's read of its contracts, some
+        // 20 s on Robinhood, overlaps the lake's open rather than following it.
         let opens = routes.into_iter().map(|StoreRoute { settings, tables }| {
             let backend = settings.backend();
             let batching = settings.batching();
@@ -56,19 +57,21 @@ impl<B: BlockSource + 'static> Pipeline<B> {
                     .run(async move { AnyStore::open(settings, schema, &chain).await })
                     .await
                     .map_err(opening(backend))?;
-                Ok(Opened {
+                let opened = Opened {
                     backend,
                     store,
                     batching,
                     tables,
                     runtime,
-                })
+                };
+                Ok::<_, RuntimeError>(read_back(opened).await?)
             }
         });
         try_join_all(opens).await
     }
 
-    /// Runs against open `stores`: brings them to one block, then ingests into each the
+    /// Runs against open `stores`, each with what it read back (see
+    /// [`read_back`](sink::resume::read_back)): brings them to one block, then ingests into each the
     /// tables routed to it, every store committing as its batching says, until ingest
     /// or a store stops or `stop` is requested.
     ///
@@ -77,7 +80,7 @@ impl<B: BlockSource + 'static> Pipeline<B> {
     /// As [`Pipeline::run`], less opening the stores.
     pub(crate) async fn run_with_stores<S: sink::Store>(
         self,
-        stores: Vec<Opened<S>>,
+        stores: Vec<ReadBack<S>>,
         mut stop: Stop,
     ) -> Result<(), RuntimeError> {
         let Self {

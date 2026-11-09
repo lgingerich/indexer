@@ -56,7 +56,7 @@ use crate::ingest::source::{EvmSource, RetryLayer, SourceError};
 use crate::runtime::{Pipeline, RuntimeError};
 use crate::sink::channel::Batching;
 use crate::sink::duckdb::DuckDb;
-use crate::sink::resume::{Opened, ResumeError};
+use crate::sink::resume::{Opened, ResumeError, read_back_all};
 use crate::sink::route::StoreBackend;
 use crate::sink::stop::Stop;
 use crate::sink::store_runtime::StoreRuntime;
@@ -522,7 +522,9 @@ fn live(world: &Shared, dir: &Path, plan: &Plan, lifetime: u64, chosen: Lifetime
             for (index, store) in plan.stores.iter().enumerate() {
                 stores.push(open(world, dir, &schema, index, store).await?);
             }
-            pipeline.run_with_stores(stores, stop).await
+            pipeline
+                .run_with_stores(read_back_all(stores).await?, stop)
+                .await
         };
         // A stop is asked for as `SIGTERM` asks it, and the host kills the process if it
         // has not ended by its stop timeout.

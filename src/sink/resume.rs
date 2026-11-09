@@ -50,7 +50,7 @@ use std::time::Instant;
 
 use alloy_primitives::B256;
 use futures_util::FutureExt as _;
-use futures_util::future::{BoxFuture, try_join_all};
+use futures_util::future::BoxFuture;
 use tracing::{info, warn};
 
 use crate::sink::channel::Batching;
@@ -173,8 +173,27 @@ pub(crate) struct Resumed {
     pub(crate) ledger: Ledger,
 }
 
-/// Brings every store to the newest block they all hold, and returns what ingest
-/// resumes from: that block's ledger, and every contract any store discovered.
+/// A store, opened, with what it read back (see [`read_back`]).
+pub(crate) type ReadBack<S> = (Opened<S>, Restored);
+
+/// Reads back every store in `stores`, each on its own runtime, so they read at once
+/// rather than each waiting out the last: a lake's read is a scan of object storage.
+/// For tests and the simulation, which open their stores themselves; a run reads each
+/// back as it opens.
+///
+/// # Errors
+///
+/// Returns [`ResumeError::Restore`] naming the first store that failed.
+#[cfg(test)]
+pub(crate) async fn read_back_all<S: Store>(
+    stores: Vec<Opened<S>>,
+) -> Result<Vec<ReadBack<S>>, ResumeError> {
+    futures_util::future::try_join_all(stores.into_iter().map(read_back)).await
+}
+
+/// Brings every store in `read`, each with what it read back, to the newest block they
+/// all hold, and returns what ingest resumes from: that block's ledger, and every
+/// contract any store discovered.
 ///
 /// The ledger is the slowest store's, cut to the common block. Cut from the top, it can
 /// be shorter than a restore reads while that store, or another, holds blocks below its
@@ -185,12 +204,9 @@ pub(crate) struct Resumed {
 /// Returns [`ResumeError::Restore`] or [`ResumeError::Rewind`] naming the store that
 /// failed, and [`ResumeError::NoCommonBlock`] when no block is held by them all.
 pub(crate) async fn resume<S: Store>(
-    stores: Vec<Opened<S>>,
+    read: Vec<ReadBack<S>>,
     window: UndoWindow,
 ) -> Result<(Vec<Opened<S>>, Resumed), ResumeError> {
-    // Each store reads back on its own runtime, so they read at once rather than each
-    // waiting out the last: a lake's read is a scan of object storage.
-    let read = try_join_all(stores.into_iter().map(restore)).await?;
     let (stores, mut restored): (Vec<_>, Vec<_>) = read.into_iter().unzip();
     let ledgers: Vec<&[BlockMeta]> = restored.iter().map(|r| r.ledger.as_slice()).collect();
     let common = common_block(&ledgers, window).map_err(|Disjoint| ResumeError::NoCommonBlock {
@@ -322,7 +338,7 @@ async fn settle<S: Store>(
     info!(store = %opened.backend, to = common, elapsed_ms = millis(started.elapsed()),
         "store rewound");
     // The contracts it discovered above the block went with their blocks.
-    let (opened, back) = restore(opened).await?;
+    let (opened, back) = read_back(opened).await?;
     *restored = back;
     Ok(opened)
 }
@@ -337,9 +353,16 @@ fn names_all_above(ledger: &[BlockMeta], common: u64, window: UndoWindow) -> boo
             .is_some_and(|oldest| oldest.height <= common.saturating_add(1))
 }
 
-/// Reads back what `opened` holds, and logs how long it took: a lake's read is a scan of
-/// object storage, and one of the slower parts of a start.
-async fn restore<S: Store>(opened: Opened<S>) -> Result<(Opened<S>, Restored), ResumeError> {
+/// Reads back what `opened` holds, on its own runtime, and logs how long it took: a
+/// lake's read is a scan of object storage, and one of the slower parts of a start.
+///
+/// A run reads each store back as soon as it has opened, so a database's read overlaps
+/// the lake's open rather than waiting for it.
+///
+/// # Errors
+///
+/// Returns [`ResumeError::Restore`] when the store's read fails.
+pub(crate) async fn read_back<S: Store>(opened: Opened<S>) -> Result<ReadBack<S>, ResumeError> {
     let started = Instant::now();
     let (opened, result) = opened.on_runtime(|store| store.restore().boxed()).await;
     let restored = result.map_err(|source| ResumeError::Restore {
@@ -423,7 +446,9 @@ mod tests {
     use crate::sink::{EnvelopeSink, Restored, SinkError, Store, StoreError};
     use crate::wire::envelope::{BlockMeta, Envelope};
 
-    use super::{Disjoint, Opened, UndoWindow, common_block, names_all_above, resume};
+    use super::{
+        Disjoint, Opened, UndoWindow, common_block, names_all_above, read_back_all, resume,
+    };
     use crate::window::LEDGER_WINDOW;
 
     /// A store that holds `ledger` and notes which thread each startup call ran on.
@@ -469,7 +494,7 @@ mod tests {
         }
     }
 
-    /// The startup calls `resume` makes run on each store's own runtime, so what they
+    /// The startup calls `read_back_all` and `resume` make run on each store's own runtime, so what they
     /// spawn lands there: the lake's reads read back, and its rewind, on the lake's
     /// threads, and the database's on its own.
     #[tokio::test]
@@ -494,7 +519,8 @@ mod tests {
                 ledger(0xa0, 7..=6 + LEDGER_WINDOW as u64),
             ),
         ];
-        let (stores, restored) = resume(stores, UndoWindow::DEFAULT).await.expect("resumed");
+        let read = read_back_all(stores).await.expect("read back");
+        let (stores, restored) = resume(read, UndoWindow::DEFAULT).await.expect("resumed");
         assert_eq!(
             restored.ledger.blocks(),
             ledger(0xa0, 1..=5),
@@ -684,7 +710,8 @@ mod tests {
                 opened(StoreBackend::Postgres, slow.clone()),
                 opened(StoreBackend::Delta, fast),
             ];
-            let (_, resumed) = resume(stores, UndoWindow::DEFAULT).await.expect(label);
+            let read = read_back_all(stores).await.expect(label);
+            let (_, resumed) = resume(read, UndoWindow::DEFAULT).await.expect(label);
             let mut expected = slow;
             expected.retain(|block| block.height <= common);
             assert_eq!(resumed.ledger.blocks(), expected, "{label}");
