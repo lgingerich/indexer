@@ -18,7 +18,7 @@ use tokio::sync::Semaphore;
 use tracing::warn;
 
 use super::arrow::{self, PARTITION};
-use super::expr::{seconds, texts, uints};
+use super::expr::{seconds, texts, uint, uints};
 use crate::sink::store_error::{EngineError, InvalidStoredValue, Operation, StoreError};
 use crate::sink::table::{LEDGER_COLUMNS, Row, TableDef};
 use crate::window::UndoWindow;
@@ -36,9 +36,19 @@ pub(super) const CHECKPOINT_EVERY: u64 = 100;
 pub(super) const CONCURRENT_CHECKPOINTS: usize = 2;
 
 /// The Parquet streams each of opening's reads of the newest blocks takes: the ledger,
-/// and each table's scan for a stopped commit's rows. They read a few dozen small files a
-/// table, and mostly wait on the object store (see [`Lake::read_over`]).
+/// and each table's scan for a stopped commit's rows (`contracts` takes
+/// [`CONTRACT_STREAMS`]). The tip writes a small file a commit, so each reads a few dozen
+/// small files a table, about 40 of an Ethereum table for a 512-block window, each a
+/// round trip of some 275 ms to R2. One stream a table read them a file at a time, 11 s
+/// a table: the open's scan of 179 tables took 63 s that way, and 6 s over 16 streams.
 pub(super) const STARTUP_STREAMS: usize = 16;
+
+/// The Parquet streams a read of `contracts` takes, its files shared among them whatever
+/// their size (see [`Lake::read_over`]). Each row is in the partition of the block that
+/// created its contract, so a backfill handing over a factory's whole history leaves a
+/// small file in each of thousands of partitions, and one stream a core spent minutes of
+/// every restart waiting on the object store.
+pub(super) const CONTRACT_STREAMS: usize = 32;
 
 /// One table: its definition, the Arrow schema its batches are built against, and the
 /// Delta table as of the last commit this process made to it.
@@ -221,32 +231,26 @@ impl Lake {
         &self,
         plan: impl FnOnce(DataFrame) -> Result<DataFrame, DataFusionError>,
     ) -> Result<Vec<RecordBatch>, StoreError> {
-        self.read_files(None, None, plan).await
+        self.read_files(None, plan).await
     }
 
     /// As [`read`](Self::read), over `streams` Parquet streams rather than one a core, its
     /// files shared among them however few bytes they hold: for a read of many small
-    /// files, where it mostly waits on the object store.
-    ///
-    /// `DataFusion` otherwise reads a scan of under 10 MB as one stream, a file at a time.
-    /// The tip writes a small file a commit, so a read of the newest blocks is just such
-    /// a scan: about 40 files of an Ethereum table for a 512-block window, each a round
-    /// trip of some 275 ms to R2, 11 s a table. The open's scan of 179 tables took 63 s
-    /// that way, and 6 s over 16 streams.
+    /// files, where it mostly waits on the object store. `DataFusion` otherwise reads a
+    /// scan of under 10 MB as one stream, a file at a time (see [`STARTUP_STREAMS`]).
     pub(super) async fn read_over(
         &self,
         streams: usize,
         plan: impl FnOnce(DataFrame) -> Result<DataFrame, DataFusionError>,
     ) -> Result<Vec<RecordBatch>, StoreError> {
-        self.read_files(None, Some(streams), plan).await
+        self.read_files(Some(streams), plan).await
     }
 
-    /// Runs `plan` over the table, or only its files `paths` when given, and collects what
-    /// it returns: over `streams` Parquet streams sharing the files whatever their size
-    /// (see [`read_over`](Self::read_over)), or `DataFusion`'s default when absent.
+    /// Runs `plan` over the table and collects what it returns: over `streams` Parquet
+    /// streams sharing the files whatever their size (see [`read_over`](Self::read_over)),
+    /// or `DataFusion`'s default when absent.
     async fn read_files(
         &self,
-        paths: Option<Vec<String>>,
         streams: Option<usize>,
         plan: impl FnOnce(DataFrame) -> Result<DataFrame, DataFusionError>,
     ) -> Result<Vec<RecordBatch>, StoreError> {
@@ -259,11 +263,7 @@ impl Lake {
                 )
             });
             self.table.update_datafusion_session(&ctx.state())?;
-            let provider = self.table.table_provider();
-            let provider = match paths {
-                Some(paths) => provider.with_file_paths(paths).await?,
-                None => provider.await?,
-            };
+            let provider = self.table.table_provider().await?;
             let frame = ctx.read_table(provider)?;
             Ok::<_, EngineError>(plan(frame)?.collect().await?)
         };
@@ -299,28 +299,23 @@ impl Lake {
         Ok(())
     }
 
-    /// The files of the partitions from `oldest` on that
-    /// [`read_ledger`](Self::read_ledger) needs for `window`, `None` when they are none or
-    /// one has no statistics to tell by.
-    fn ledger_paths(
-        &self,
-        oldest: i64,
-        window: UndoWindow,
-    ) -> Result<Option<Vec<String>>, StoreError> {
+    /// The lowest height of the newest blocks [`read_ledger`](Self::read_ledger) needs for
+    /// `window`, as the statistics of the files of the partitions from `oldest` on say;
+    /// `None` when they hold no file or one has no statistics to tell by.
+    fn ledger_floor(&self, oldest: i64, window: UndoWindow) -> Result<Option<u64>, StoreError> {
         let mut files = Vec::new();
         let mut described = true;
         self.each_file(|partition, file| {
             if partition < oldest {
                 return Ok(());
             }
-            let path = file.path().into_owned();
-            match file.stats().and_then(|stats| LedgerFile::of(path, &stats)) {
+            match file.stats().and_then(|stats| LedgerFile::of(&stats)) {
                 Some(file) => files.push(file),
                 None => described = false,
             }
             Ok(())
         })?;
-        Ok((described && !files.is_empty()).then(|| ledger_files(files, window.ledger())))
+        Ok((described && !files.is_empty()).then(|| ledger_floor(files, window.ledger())))
     }
 
     /// The newest [`UndoWindow::ledger`] accepted blocks of this table, the ledger, oldest
@@ -328,26 +323,32 @@ impl Lake {
     ///
     /// Read from the ledger's newest two partitions alone, which hold at least the window
     /// (a partition is never narrower), so a restart does not scan every file the
-    /// ledger ever wrote; and of those, the files that can hold the blocks, as the file
-    /// list's statistics say (see [`ledger_files`]), since the tip writes a small file a
-    /// commit and a partition holds far more of them than a narrow window needs. A
-    /// partition with a file its log records no statistics for is read whole. Those files
-    /// are small, a commit's blocks each, so they are read over [`STARTUP_STREAMS`]
-    /// streams (see [`read_over`](Self::read_over)).
+    /// ledger ever wrote; and of those, the rows at or above the lowest height the window
+    /// can reach, as the file list's statistics say (see [`ledger_floor`]), since the tip
+    /// writes a small file a commit and a partition holds far more of them than a narrow
+    /// window needs. Filtered on the height rather than handed the files, so the scan
+    /// skips the others by their statistics and still shares the rest among
+    /// [`STARTUP_STREAMS`] streams: delta-rs reads a scan restricted to named files as one
+    /// stream, which took 8 s for Ethereum's 40 files, and 1.5 s filtered. A partition
+    /// with a file its log records no statistics for is read whole.
     pub(super) async fn read_ledger(
         &self,
         window: UndoWindow,
     ) -> Result<Vec<BlockMeta>, StoreError> {
         let oldest = self.newest_partition()?.map(|newest| newest - 1);
-        let paths = match oldest {
-            Some(oldest) => self.ledger_paths(oldest, window)?,
+        let floor = match oldest {
+            Some(oldest) => self.ledger_floor(oldest, window)?,
             None => None,
         };
         let [height, hash, parent_hash, timestamp] = LEDGER_COLUMNS;
         let batches = self
-            .read_files(paths, Some(STARTUP_STREAMS), |frame| {
+            .read_files(Some(STARTUP_STREAMS), |frame| {
                 let frame = match oldest {
                     Some(oldest) => frame.filter(ident(PARTITION).gt_eq(lit(oldest)))?,
+                    None => frame,
+                };
+                let frame = match floor {
+                    Some(floor) => frame.filter(ident(height).gt_eq(uint(floor)))?,
                     None => frame,
                 };
                 frame
@@ -387,7 +388,6 @@ impl Lake {
 /// One of the ledger's files, as its statistics describe it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct LedgerFile {
-    path: String,
     /// Its lowest height.
     low: u64,
     /// Its highest height.
@@ -397,13 +397,12 @@ struct LedgerFile {
 }
 
 impl LedgerFile {
-    /// `path`'s description from the statistics Delta wrote for it, `None` when they do
+    /// A file's description from the statistics Delta wrote for it, `None` when they do
     /// not say.
-    fn of(path: String, stats: &str) -> Option<Self> {
+    fn of(stats: &str) -> Option<Self> {
         let stats: serde_json::Value = serde_json::from_str(stats).ok()?;
         let height = |bound: &str| stats.get(bound)?.get(LEDGER_COLUMNS[0])?.as_u64();
         Some(Self {
-            path,
             low: height("minValues")?,
             high: height("maxValues")?,
             rows: stats.get("numRecords")?.as_u64()?,
@@ -411,14 +410,16 @@ impl LedgerFile {
     }
 }
 
-/// The paths of `files` the newest `rows` rows lie in.
+/// The lowest height the newest `rows` rows of `files` can have: every one of them is at
+/// or above it.
 ///
 /// A height is in the ledger once, so the newest files together holding `rows` rows hold
 /// that many at or above their lowest height, and no row below it is among the newest.
-/// Any other file reaching that height may hold some of them too. Counts rows rather
-/// than subtracting from the tip, so a gap in the heights never comes back short: a
-/// ledger shorter than asked for reads as the store's whole history.
-fn ledger_files(mut files: Vec<LedgerFile>, rows: usize) -> Vec<String> {
+/// Any other file reaching that height may hold some of them too, and a filter on the
+/// height keeps those. Counts rows rather than subtracting from the tip, so a gap in the
+/// heights never comes back short: a ledger shorter than asked for reads as the store's
+/// whole history, from zero.
+fn ledger_floor(mut files: Vec<LedgerFile>, rows: usize) -> u64 {
     files.sort_by_key(|file| std::cmp::Reverse(file.high));
     let wanted = u64::try_from(rows).unwrap_or(u64::MAX);
     let (mut held, mut floor) = (0, 0);
@@ -430,17 +431,10 @@ fn ledger_files(mut files: Vec<LedgerFile>, rows: usize) -> Vec<String> {
             floor.min(file.low)
         };
         if held >= wanted {
-            break;
+            return floor;
         }
     }
-    if held < wanted {
-        floor = 0;
-    }
-    files
-        .into_iter()
-        .filter(|file| file.high >= floor)
-        .map(|file| file.path)
-        .collect()
+    0
 }
 
 /// How every commit to the lake is made, by the store and by `maintenance` alike: without
@@ -459,60 +453,46 @@ pub(super) fn commit_properties() -> CommitProperties {
 
 #[cfg(test)]
 mod tests {
-    use super::{LedgerFile, ledger_files};
+    use super::{LedgerFile, ledger_floor};
 
-    fn file(path: &str, low: u64, high: u64, rows: u64) -> LedgerFile {
-        LedgerFile {
-            path: path.to_owned(),
-            low,
-            high,
-            rows,
-        }
+    fn file(low: u64, high: u64, rows: u64) -> LedgerFile {
+        LedgerFile { low, high, rows }
     }
 
-    fn sorted(mut paths: Vec<String>) -> Vec<String> {
-        paths.sort();
-        paths
-    }
-
-    /// Only the newest files that hold the rows are read, however many sit below them.
+    /// The floor is the newest files' lowest height, however many files sit below them.
     #[test]
-    fn the_ledger_reads_only_the_files_holding_its_newest_rows() {
-        let commits: Vec<_> = (0..100)
-            .map(|n| file(&format!("{n:03}"), n * 10, n * 10 + 9, 10))
-            .collect();
-        assert_eq!(sorted(ledger_files(commits, 25)), ["097", "098", "099"]);
+    fn the_floor_is_where_the_newest_rows_begin() {
+        let commits: Vec<_> = (0..100).map(|n| file(n * 10, n * 10 + 9, 10)).collect();
+        assert_eq!(ledger_floor(commits, 25), 970);
     }
 
-    /// A compacted file reaching the floor is read with the commits above it.
+    /// A compacted file reaching below the commits above it lowers the floor once the
+    /// newest rows reach into it.
     #[test]
-    fn a_compacted_file_is_read_when_the_newest_rows_reach_it() {
-        let files = vec![file("big", 0, 99, 100), file("a", 100, 109, 10)];
-        assert_eq!(sorted(ledger_files(files.clone(), 5)), ["a"]);
-        assert_eq!(sorted(ledger_files(files, 11)), ["a", "big"]);
+    fn a_compacted_file_lowers_the_floor_when_the_newest_rows_reach_it() {
+        let files = vec![file(0, 99, 100), file(100, 109, 10)];
+        assert_eq!(ledger_floor(files.clone(), 5), 100);
+        assert_eq!(ledger_floor(files, 11), 0);
     }
 
     /// A file below the newest by its highest height, but reaching above their floor, may
     /// hold some of the newest rows: a reorg's delete rewrites a file with what it keeps.
+    /// The floor is the newest files' own, and a filter on it keeps that file's rows above.
     #[test]
-    fn an_overlapping_file_is_read_too() {
-        let files = vec![
-            file("new", 20, 30, 6),
-            file("rewritten", 18, 25, 4),
-            file("old", 10, 19, 10),
-        ];
-        assert_eq!(sorted(ledger_files(files, 6)), ["new", "rewritten"]);
+    fn an_overlapping_file_leaves_the_floor_where_the_newest_files_put_it() {
+        let files = vec![file(20, 30, 6), file(18, 25, 4), file(10, 19, 10)];
+        assert_eq!(ledger_floor(files, 6), 20);
     }
 
-    /// Too few rows anywhere reads everything, and a gap in the heights costs a file
-    /// rather than a row: the count, not the tip, decides.
+    /// Too few rows anywhere reads from zero, and a gap in the heights lowers the floor
+    /// rather than losing a row: the count, not the tip, decides.
     #[test]
     fn a_short_table_or_a_gap_never_comes_back_short() {
-        let files = vec![file("a", 1, 5, 5), file("b", 6, 9, 4)];
-        assert_eq!(sorted(ledger_files(files, 100)), ["a", "b"]);
+        let files = vec![file(1, 5, 5), file(6, 9, 4)];
+        assert_eq!(ledger_floor(files, 100), 0);
 
-        let gapped = vec![file("old", 1, 5, 5), file("new", 1_000, 1_003, 4)];
-        assert_eq!(sorted(ledger_files(gapped, 5)), ["new", "old"]);
+        let gapped = vec![file(1, 5, 5), file(1_000, 1_003, 4)];
+        assert_eq!(ledger_floor(gapped, 5), 1);
     }
 
     /// The statistics Delta writes describe a file; ones that do not say leave it
@@ -520,11 +500,8 @@ mod tests {
     #[test]
     fn a_file_is_described_by_its_statistics() {
         let stats = r#"{"numRecords":3,"minValues":{"height":7},"maxValues":{"height":9}}"#;
-        assert_eq!(
-            LedgerFile::of("p".to_owned(), stats),
-            Some(file("p", 7, 9, 3))
-        );
-        assert_eq!(LedgerFile::of("p".to_owned(), r#"{"numRecords":3}"#), None);
-        assert_eq!(LedgerFile::of("p".to_owned(), "not json"), None);
+        assert_eq!(LedgerFile::of(stats), Some(file(7, 9, 3)));
+        assert_eq!(LedgerFile::of(r#"{"numRecords":3}"#), None);
+        assert_eq!(LedgerFile::of("not json"), None);
     }
 }

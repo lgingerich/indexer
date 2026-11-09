@@ -12,18 +12,12 @@ use tracing::{info, warn};
 
 use super::expr::{at_or_above, in_texts, of_blocks, texts, texts_of, uint};
 use super::handoff::handoffs;
-use super::lake::STARTUP_STREAMS;
+use super::lake::{CONTRACT_STREAMS, STARTUP_STREAMS};
 use super::{CONCURRENT_TABLES, DeltaSink};
 use crate::sink::store_error::{InvalidStoredValue, StoreError};
 use crate::sink::table::{CONTRACT_COLUMNS, REORG_COLUMNS, Table, TableId};
 use crate::sink::{StoredContract, hex, millis};
 use crate::wire::envelope::{BlockMeta, Handoff};
-
-/// The Parquet streams a read of `contracts` takes. Each row is in the partition of the
-/// block that created its contract, so a backfill handing over a factory's whole history
-/// leaves a small file in each of thousands of partitions, and one stream a core spent
-/// minutes of every restart waiting on the object store.
-const CONTRACT_STREAMS: usize = 32;
 
 impl DeltaSink {
     /// The contracts discovered on this chain that the lake holds, every one canonical:
