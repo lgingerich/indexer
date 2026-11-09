@@ -12,6 +12,7 @@ use tracing::{info, warn};
 
 use super::expr::{at_or_above, in_texts, of_blocks, texts, texts_of, uint};
 use super::handoff::handoffs;
+use super::lake::STARTUP_STREAMS;
 use super::{CONCURRENT_TABLES, DeltaSink};
 use crate::sink::store_error::{InvalidStoredValue, StoreError};
 use crate::sink::table::{CONTRACT_COLUMNS, REORG_COLUMNS, Table, TableId};
@@ -91,8 +92,8 @@ impl DeltaSink {
     ///
     /// [`Step`]: super::Step
     ///
-    /// Every block table is read, so the reads overlap; a stray row is rare, and its
-    /// delete runs once they are done.
+    /// Every block table is read, so the reads overlap, each over [`STARTUP_STREAMS`]
+    /// streams; a stray row is rare, and its delete runs once they are done.
     ///
     /// Returns the contracts the lake keeps once repaired, for a restore: they are read
     /// beside the scan, and again only if the repair deleted some of them.
@@ -116,7 +117,7 @@ impl DeltaSink {
                 let named = &named;
                 async move {
                     let batches = lake
-                        .read(|frame| {
+                        .read_over(STARTUP_STREAMS, |frame| {
                             let frame = match floor {
                                 Some(floor) => {
                                     frame.filter(at_or_above(number, floor, lake.width))?

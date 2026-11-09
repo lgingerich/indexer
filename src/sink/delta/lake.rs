@@ -35,6 +35,11 @@ pub(super) const CHECKPOINT_EVERY: u64 = 100;
 /// opening's own reads run on the same workers.
 pub(super) const CONCURRENT_CHECKPOINTS: usize = 2;
 
+/// The Parquet streams each of opening's reads of the newest blocks takes: the ledger,
+/// and each table's scan for a stopped commit's rows. They read a few dozen small files a
+/// table, and mostly wait on the object store (see [`Lake::read_over`]).
+pub(super) const STARTUP_STREAMS: usize = 16;
+
 /// One table: its definition, the Arrow schema its batches are built against, and the
 /// Delta table as of the last commit this process made to it.
 #[derive(Debug)]
@@ -219,8 +224,15 @@ impl Lake {
         self.read_files(None, None, plan).await
     }
 
-    /// As [`read`](Self::read), over `streams` Parquet streams rather than one a core: for
-    /// a table of many small files, where a read mostly waits on the object store.
+    /// As [`read`](Self::read), over `streams` Parquet streams rather than one a core, its
+    /// files shared among them however few bytes they hold: for a read of many small
+    /// files, where it mostly waits on the object store.
+    ///
+    /// `DataFusion` otherwise reads a scan of under 10 MB as one stream, a file at a time.
+    /// The tip writes a small file a commit, so a read of the newest blocks is just such
+    /// a scan: about 40 files of an Ethereum table for a 512-block window, each a round
+    /// trip of some 275 ms to R2, 11 s a table. The open's scan of 179 tables took 63 s
+    /// that way, and 6 s over 16 streams.
     pub(super) async fn read_over(
         &self,
         streams: usize,
@@ -229,8 +241,9 @@ impl Lake {
         self.read_files(None, Some(streams), plan).await
     }
 
-    /// Runs `plan` over the table, or only its files `paths` when given, over `streams`
-    /// Parquet streams, one a core when absent, and collects what it returns.
+    /// Runs `plan` over the table, or only its files `paths` when given, and collects what
+    /// it returns: over `streams` Parquet streams sharing the files whatever their size
+    /// (see [`read_over`](Self::read_over)), or `DataFusion`'s default when absent.
     async fn read_files(
         &self,
         paths: Option<Vec<String>>,
@@ -240,7 +253,9 @@ impl Lake {
         let read = async {
             let ctx = streams.map_or_else(SessionContext::new, |streams| {
                 SessionContext::new_with_config(
-                    SessionConfig::new().with_target_partitions(streams),
+                    SessionConfig::new()
+                        .with_target_partitions(streams)
+                        .with_repartition_file_min_size(0),
                 )
             });
             self.table.update_datafusion_session(&ctx.state())?;
@@ -316,7 +331,9 @@ impl Lake {
     /// ledger ever wrote; and of those, the files that can hold the blocks, as the file
     /// list's statistics say (see [`ledger_files`]), since the tip writes a small file a
     /// commit and a partition holds far more of them than a narrow window needs. A
-    /// partition with a file its log records no statistics for is read whole.
+    /// partition with a file its log records no statistics for is read whole. Those files
+    /// are small, a commit's blocks each, so they are read over [`STARTUP_STREAMS`]
+    /// streams (see [`read_over`](Self::read_over)).
     pub(super) async fn read_ledger(
         &self,
         window: UndoWindow,
@@ -328,7 +345,7 @@ impl Lake {
         };
         let [height, hash, parent_hash, timestamp] = LEDGER_COLUMNS;
         let batches = self
-            .read_files(paths, None, |frame| {
+            .read_files(paths, Some(STARTUP_STREAMS), |frame| {
                 let frame = match oldest {
                     Some(oldest) => frame.filter(ident(PARTITION).gt_eq(lit(oldest)))?,
                     None => frame,
