@@ -62,9 +62,9 @@
 //! A stop is heard in one of three places, each a `select!` biased toward it, and what it
 //! abandons differs:
 //!
-//! - **While the stores open** (`Pipeline::run`): the stores opened so far are dropped.
-//!   Opening commits no block, so there is nothing to finish, and a restart opens them
-//!   again.
+//! - **While the stores open and read back** (`Pipeline::run`): the stores opened so far
+//!   are dropped, with any read back under way. Opening commits no block and a read back
+//!   writes nothing, so there is nothing to finish, and a restart opens them again.
 //! - **While the stores are brought to one block** (`Pipeline::run_with_stores`): the
 //!   resume is dropped part-way, as a crash would leave it. A rewind it had under way is
 //!   a store's write like any other, which a crash survives, so the next start repeats

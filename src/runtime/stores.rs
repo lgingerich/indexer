@@ -33,6 +33,12 @@ impl<B: BlockSource + 'static> Pipeline<B> {
     /// connection's task, the lake's checkpoints and maintenance — runs there too, and
     /// reads each back as soon as it has opened. Opened before ingest starts, so a bad
     /// path or connection fails at startup rather than after the first block.
+    ///
+    /// # Errors
+    ///
+    /// A store that fails to open fails the call at once. One that fails to read back
+    /// does so only once every store has opened, so an open's error, which may be a
+    /// fault in the settings, is never hidden behind a read's that is not.
     pub(super) async fn open(
         &self,
         routes: Vec<StoreRoute>,
@@ -64,16 +70,17 @@ impl<B: BlockSource + 'static> Pipeline<B> {
                     tables,
                     runtime,
                 };
-                Ok::<_, RuntimeError>(read_back(opened).await?)
+                Ok::<_, RuntimeError>(read_back(opened).await)
             }
         });
-        try_join_all(opens).await
+        let read = try_join_all(opens).await?;
+        Ok(read.into_iter().collect::<Result<_, _>>()?)
     }
 
-    /// Runs against open `stores`, each with what it read back (see
-    /// [`read_back`](sink::resume::read_back)): brings them to one block, then ingests into each the
-    /// tables routed to it, every store committing as its batching says, until ingest
-    /// or a store stops or `stop` is requested.
+    /// Runs against open `stores`, each with what it read back (see [`read_back`]): brings
+    /// them to one block, then ingests into each the tables routed to it, every store
+    /// committing as its batching says, until ingest or a store stops or `stop` is
+    /// requested.
     ///
     /// # Errors
     ///

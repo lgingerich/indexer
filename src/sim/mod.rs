@@ -56,7 +56,7 @@ use crate::ingest::source::{EvmSource, RetryLayer, SourceError};
 use crate::runtime::{Pipeline, RuntimeError};
 use crate::sink::channel::Batching;
 use crate::sink::duckdb::DuckDb;
-use crate::sink::resume::{Opened, ResumeError, read_back_all};
+use crate::sink::resume::{Opened, ResumeError, read_back};
 use crate::sink::route::StoreBackend;
 use crate::sink::stop::Stop;
 use crate::sink::store_runtime::StoreRuntime;
@@ -518,13 +518,22 @@ fn live(world: &Shared, dir: &Path, plan: &Plan, lifetime: u64, chosen: Lifetime
         });
         let (request, stop) = Stop::new();
         let run = async {
-            let mut stores = Vec::with_capacity(plan.stores.len());
-            for (index, store) in plan.stores.iter().enumerate() {
-                stores.push(open(world, dir, &schema, index, store).await?);
-            }
-            pipeline
-                .run_with_stores(read_back_all(stores).await?, stop)
-                .await
+            // As `Pipeline::run` does: each store reads back as soon as it has opened, and
+            // a stop while they do drops them.
+            let opening = async {
+                let mut stores = Vec::with_capacity(plan.stores.len());
+                for (index, store) in plan.stores.iter().enumerate() {
+                    stores.push(read_back(open(world, dir, &schema, index, store).await?).await?);
+                }
+                Ok::<_, RuntimeError>(stores)
+            };
+            let mut waiting = stop.clone();
+            let stores = tokio::select! {
+                biased;
+                () = waiting.wait() => return Ok(()),
+                stores = opening => stores?,
+            };
+            pipeline.run_with_stores(stores, stop).await
         };
         // A stop is asked for as `SIGTERM` asks it, and the host kills the process if it
         // has not ended by its stop timeout.

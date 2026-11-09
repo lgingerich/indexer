@@ -178,8 +178,7 @@ pub(crate) type ReadBack<S> = (Opened<S>, Restored);
 
 /// Reads back every store in `stores`, each on its own runtime, so they read at once
 /// rather than each waiting out the last: a lake's read is a scan of object storage.
-/// For tests and the simulation, which open their stores themselves; a run reads each
-/// back as it opens.
+/// For tests, which open their stores themselves; a run reads each back as it opens.
 ///
 /// # Errors
 ///
@@ -356,9 +355,6 @@ fn names_all_above(ledger: &[BlockMeta], common: u64, window: UndoWindow) -> boo
 /// Reads back what `opened` holds, on its own runtime, and logs how long it took: a
 /// lake's read is a scan of object storage, and one of the slower parts of a start.
 ///
-/// A run reads each store back as soon as it has opened, so a database's read overlaps
-/// the lake's open rather than waiting for it.
-///
 /// # Errors
 ///
 /// Returns [`ResumeError::Restore`] when the store's read fails.
@@ -494,9 +490,9 @@ mod tests {
         }
     }
 
-    /// The startup calls `read_back_all` and `resume` make run on each store's own runtime, so what they
-    /// spawn lands there: the lake's reads read back, and its rewind, on the lake's
-    /// threads, and the database's on its own.
+    /// The startup calls `read_back_all` and `resume` make run on each store's own
+    /// runtime, so what they spawn lands there: the lake's reads read back, and its
+    /// rewind, on the lake's threads, and the database's on its own.
     #[tokio::test]
     async fn every_startup_call_runs_on_the_stores_own_runtime() {
         let threads = Arc::new(Mutex::new(Vec::new()));

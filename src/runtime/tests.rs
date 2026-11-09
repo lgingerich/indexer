@@ -182,8 +182,8 @@ fn every_table<S>(backend: StoreBackend, store: S, batching: Batching) -> Opened
     }
 }
 
-/// `stores`, each read back, as a run opens them.
-async fn read_back<S: sink::Store>(stores: Vec<Opened<S>>) -> Vec<ReadBack<S>> {
+/// `stores`, opened by the test, each read back.
+async fn read_back_each<S: sink::Store>(stores: Vec<Opened<S>>) -> Vec<ReadBack<S>> {
     read_back_all(stores).await.expect("the stores read back")
 }
 
@@ -444,7 +444,7 @@ async fn run_once(connection: &duckdb::Connection, chain: FakeChain, start: Opti
     let store = duckdb_store(connection.try_clone().expect("handle")).await;
     let catalog =
         Catalog::load(protocols(), &ChainId::new("base")).expect("shipped protocols load");
-    let stores = read_back(vec![every_table(
+    let stores = read_back_each(vec![every_table(
         StoreBackend::DuckDb,
         store,
         Batching::eager(500),
@@ -663,7 +663,7 @@ async fn run_lake(settings: &sink::DeltaSettings, chain: FakeChain, start: Optio
         .expect("the lake opens");
     let catalog =
         Catalog::load(protocols(), &ChainId::new("base")).expect("shipped protocols load");
-    let stores = read_back(vec![every_table(
+    let stores = read_back_each(vec![every_table(
         StoreBackend::Delta,
         store,
         settings.batching(),
@@ -826,7 +826,7 @@ async fn run_both(
             settings.batching(),
         )),
     ];
-    let stores = read_back(stores).await;
+    let stores = read_back_each(stores).await;
     let result =
         Box::pin(Pipeline::new(chain, start, None, catalog).run_with_stores(stores, Stop::never()))
             .await;
