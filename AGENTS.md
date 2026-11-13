@@ -29,7 +29,33 @@ Guidance for AI coding agents working in this repository.
 - Prefer clear public APIs, useful documentation, and focused tests.
 - Do not weaken lint levels, release profiles, or CI checks without calling it out first.
 
-## Data Modeling
+## Verification
+
+After code changes, run the relevant checks:
+
+```bash
+cargo fmt --check
+cargo clippy --all-targets --all-features -- -D warnings
+cargo doc --no-deps --all-features
+cargo test
+```
+
+If `cargo nextest` is installed, also run:
+
+```bash
+cargo nextest run --all-targets --all-features
+```
+
+## Communication
+
+- Never open with filler phrases like "Great question", "Of course", or "Certainly". Start with the answer or action.
+- Match length to the task. Be concise for small tasks and more detailed for design/debugging work.
+- Summarize what changed and how it was verified.
+- Mention useful follow-ups, but do not implement them without being asked.
+
+## Project-Specific
+
+### Data Modeling
 
 Model datasets on Allium's published schemas before inventing a shape. They cover
 many chains (EVM, Solana, and others) and many dataset types (raw, decoded, assets,
@@ -48,22 +74,13 @@ from them (`src/wire/datasets/evm.rs`): one normalized table per dataset, a docu
 natural key that becomes the `dedupe_key`, children referenced by scalar key rather
 than embedded, and no opaque `raw` blobs — every field present and typed.
 
-## Verification
-
-After code changes, run the relevant checks:
-
-```bash
-cargo fmt --check
-cargo clippy --all-targets --all-features -- -D warnings
-cargo doc --no-deps --all-features
-cargo nextest run --all-targets --all-features
-```
+### Simulation
 
 Never run the deterministic simulation (`sim::simulate`, `SIM_SEED`/`SIM_SEEDS`, or
 `--ignore-default-filter`) unless the user asks for it. The default nextest profile
 skips it.
 
-## Production
+### Production
 
 The runbook is `../infra/docs/production.md` §6. Read it before touching
 production. The VM size, container memory caps, alerts and dashboards live in
@@ -103,7 +120,7 @@ Rules:
   (`docker run --memory=<cap>`) and report the numbers. Change one setting per
   deploy so the effect can be attributed.
 
-## Working Alongside Other Sessions
+### Working Alongside Other Sessions
 
 - Other agent sessions may be working in this checkout at the same time. Commit
   only the files this task changed; never `git add -A` or `git add .`.
@@ -113,10 +130,3 @@ Rules:
   uncommitted.
 - When a task pauses partway, end with the open items and the decisions already
   made, so a new session can resume without re-asking.
-
-## Communication
-
-- Never open with filler phrases like "Great question", "Of course", or "Certainly". Start with the answer or action.
-- Match length to the task. Be concise for small tasks and more detailed for design/debugging work.
-- Summarize what changed and how it was verified.
-- Mention useful follow-ups, but do not implement them without being asked.
