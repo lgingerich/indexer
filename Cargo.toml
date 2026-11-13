@@ -101,7 +101,7 @@ tokio = { version = "1.53.2", features = ["io-std", "io-util", "macros", "rt-mul
 # makes tungstenite prefer platform TLS while retaining Alloy's required features.
 # The retry layer around the RPC transport is a tower `Layer`, as alloy's own are.
 tower = { version = "0.5.3", default-features = false, features = ["util"] }
-tokio-tungstenite = { version = "0.29", default-features = false, features = ["connect", "native-tls"] }
+tokio-tungstenite = { version = "0.30", default-features = false, features = ["connect", "native-tls"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", default-features = false, features = ["env-filter", "fmt", "json"] }
 
