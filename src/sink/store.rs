@@ -216,6 +216,7 @@ impl<E: Engine> SqlStore<E> {
             .chain(schema.tables().iter().flat_map(|def| {
                 std::iter::once(sql::create_table::<E::Dialect>(def))
                     .chain(sql::create_indexes::<E::Dialect>(def))
+                    .chain(E::Dialect::tune_table(def))
             }))
             .collect::<Vec<_>>()
             .join(";\n");

@@ -51,6 +51,13 @@ pub trait Dialect {
         None
     }
 
+    /// Storage settings `table` needs beyond its columns, set on every start after it is
+    /// created (so a table that already exists gets them too); `None` when it needs none.
+    #[must_use]
+    fn tune_table(_table: &TableDef) -> Option<String> {
+        None
+    }
+
     /// Lists every table's columns in the session's schema, as table, name, and type
     /// rows in column order: one query for the startup check, not one a table.
     const DESCRIBE: &'static str;

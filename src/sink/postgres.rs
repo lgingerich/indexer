@@ -29,7 +29,7 @@ use crate::sink::route::{StoreBackend, Tables};
 use crate::sink::sql::{self, Dialect, ident};
 use crate::sink::store::{Engine, SqlStore};
 use crate::sink::store_error::{EngineError, Operation, StoreError};
-use crate::sink::table::{ColumnType, Row, Schema, TableDef, Value};
+use crate::sink::table::{ColumnType, Row, Schema, Table, TableDef, Value};
 use crate::window::UndoWindow;
 
 /// `PostgreSQL` connection and backlog batching settings for `[sink.postgres]`.
@@ -392,6 +392,23 @@ impl Dialect for Postgres {
     fn vacuum_staging(staging: &[&str]) -> Option<String> {
         let tables = staging.iter().map(|name| ident(name)).collect::<Vec<_>>();
         Some(format!("VACUUM {}", tables.join(", ")))
+    }
+
+    /// `accepted_blocks` is a rolling window: every block inserts a row and deletes the
+    /// oldest, so a table of a few thousand rows sees millions of changes. By Postgres's
+    /// defaults (50 changes plus a share of the rows) that is a vacuum every minute or two
+    /// and an analyze more often still, on a fast chain. Vacuum after 20k dead or new rows,
+    /// a few megabytes left to reuse, and re-analyze after 100k changes: its lookups go by
+    /// key, and the planner reads the index's own end for heights past the statistics.
+    fn tune_table(table: &TableDef) -> Option<String> {
+        (table.name == Table::AcceptedBlock.name()).then(|| {
+            format!(
+                "ALTER TABLE {} SET (autovacuum_vacuum_threshold = 20000, \
+                 autovacuum_vacuum_insert_threshold = 20000, \
+                 autovacuum_analyze_threshold = 100000)",
+                ident(&table.name)
+            )
+        })
     }
 }
 
