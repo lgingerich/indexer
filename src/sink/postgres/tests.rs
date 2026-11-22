@@ -668,7 +668,7 @@ async fn copy_is_atomic_retains_failed_batches_and_upserts_a_replay() {
     harness.remove().await;
 }
 
-/// A flush leaves its staging tables' deleted rows in place until they have taken twenty
+/// A flush leaves its staging tables' deleted rows in place until they have taken a
 /// thousand rows, then vacuums them back to empty files.
 #[tokio::test]
 #[ignore = "requires INDEXER_TEST_POSTGRES_URL pointing to PostgreSQL 18"]
@@ -710,8 +710,8 @@ async fn staging_tables_are_vacuumed_once_they_take_enough_rows() {
         staged_bytes(&harness).await > 0,
         "a delete leaves the table's pages"
     );
-    publish(&mut sink, 100..20_000).await;
-    assert_eq!(harness.count(Table::Reorg).await, 20_000);
+    publish(&mut sink, 100..1_000).await;
+    assert_eq!(harness.count(Table::Reorg).await, 1_000);
     assert_eq!(
         staged_bytes(&harness).await,
         0,

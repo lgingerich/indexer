@@ -18,8 +18,8 @@
 //! The staging tables are created once a session, not once a flush: a table created and
 //! dropped every commit churns the database's catalog, which at the tip costs more than
 //! the few rows it stages. A flush empties the ones it loaded with a `DELETE`, and once
-//! a table has staged twenty thousand rows since it was last vacuumed, the store vacuums
-//! it after the commit, on an engine that needs it.
+//! a table has staged a thousand rows since it was last vacuumed, the store vacuums it
+//! after the commit, on an engine that needs it.
 
 /// The tests every SQL store runs, over a harness each engine implements.
 #[cfg(test)]
@@ -81,10 +81,16 @@ pub trait Engine: Send {
 /// stands, so a connection that keeps failing as soon as it is restored stops the store.
 const RETRIES: usize = 3;
 
-/// How many rows a staging table takes before the store vacuums it: about one backlog
-/// commit, which leaves it some ten megabytes of dead rows, and at the tip one vacuum in
-/// hundreds of commits. Vacuuming that many takes milliseconds.
-const VACUUM_ROWS: usize = 20_000;
+/// How many rows a staging table takes before the store vacuums it. Every flush scans
+/// the whole table twice, its dead rows included (the merge reads it, the `DELETE`
+/// empties it), so dead rows cost every flush until a vacuum. At the tip a flush stages
+/// a handful of rows, and twenty thousand left each table some 750 pages to rescan per
+/// flush, more than a session's `temp_buffers` holds for all of them, so every flush
+/// re-read them from the operating system. A thousand keeps each table to some 40 pages,
+/// within that cache, at one vacuum every hundred-odd flushes; in a backlog, where one
+/// flush stages more than that, the table is vacuumed after each commit, which takes
+/// milliseconds.
+const VACUUM_ROWS: usize = 1_000;
 
 /// One table, with every statement a flush runs against it rendered once.
 #[derive(Debug)]
