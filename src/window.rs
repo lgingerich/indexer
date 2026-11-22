@@ -61,6 +61,15 @@ impl UndoWindow {
         self.0 + 1
     }
 
+    /// How far a store's ledger floor advances between prunes: an eighth of the ledger,
+    /// at least one block. A store then holds at most this many rows past its ledger, and
+    /// a fast chain deletes a batch of them every so often rather than one row a block.
+    #[must_use]
+    pub const fn prune_every(self) -> u64 {
+        let step = self.ledger() / 8;
+        if step == 0 { 1 } else { step as u64 }
+    }
+
     /// The most blocks one flush gathers, so a stop leaves stores at most this far apart
     /// and resume always finds a block both hand back: half the ledger.
     #[must_use]

@@ -31,7 +31,7 @@ use crate::sink::table::{ColumnType, Schema, Table, TableId, Value};
 use crate::sink::{
     EnvelopeSink as _, Operation, SinkError, Store as _, StoreError, StoredContract,
 };
-use crate::window::LEDGER_WINDOW;
+use crate::window::{LEDGER_WINDOW, UndoWindow};
 use crate::wire::datasets::evm::{Block, Contract, Log, Transaction};
 use crate::wire::envelope::{BlockMeta, ChainId, Envelope, Event, Handoff, Reorg};
 

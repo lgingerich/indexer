@@ -346,6 +346,45 @@ pub(crate) async fn a_flush_prunes_the_ledger_below_the_window<H: Harness>() {
         [2, 3, tip],
         "the row more than the window below the tip was deleted"
     );
+
+    // Once pruned, a floor moved less than `prune_every` deletes nothing; one moved that far
+    // deletes every row below it.
+    let step = UndoWindow::DEFAULT.prune_every();
+    commit(
+        &mut sink,
+        [Envelope::new(
+            chain.clone(),
+            Event::AcceptedBlock(block(tip + 1)),
+        )],
+    )
+    .await;
+    assert_eq!(
+        uints(
+            &mut harness,
+            "SELECT height FROM accepted_blocks ORDER BY height"
+        )
+        .await,
+        [2, 3, tip, tip + 1],
+        "a floor moved one block left the row below it"
+    );
+    let far = tip + step;
+    commit(
+        &mut sink,
+        [Envelope::new(
+            chain.clone(),
+            Event::AcceptedBlock(block(far)),
+        )],
+    )
+    .await;
+    assert_eq!(
+        uints(
+            &mut harness,
+            "SELECT height FROM accepted_blocks ORDER BY height"
+        )
+        .await,
+        [tip, tip + 1, far],
+        "a floor moved a step deleted every row below it"
+    );
     harness.remove().await;
 }
 

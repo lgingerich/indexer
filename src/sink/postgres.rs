@@ -394,8 +394,9 @@ impl Dialect for Postgres {
         Some(format!("VACUUM {}", tables.join(", ")))
     }
 
-    /// `accepted_blocks` is a rolling window: every block inserts a row and deletes the
-    /// oldest, so a table of a few thousand rows sees millions of changes. By Postgres's
+    /// `accepted_blocks` is a rolling window: every block inserts a row and a prune deletes
+    /// the oldest (`UndoWindow::prune_every`), so a table of a few thousand rows sees
+    /// millions of changes. By Postgres's
     /// defaults (50 changes plus a share of the rows) that is a vacuum every minute or two
     /// and an analyze more often still, on a fast chain. Vacuum after 20k dead or new rows,
     /// a few megabytes left to reuse, and re-analyze after 100k changes: its lookups go by

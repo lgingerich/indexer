@@ -179,6 +179,8 @@ pub struct SqlStore<E> {
     /// The chain's undo window, which sizes the ledger a restart reads and each flush
     /// prunes to.
     window: UndoWindow,
+    /// The floor this store last pruned its ledger below, `None` before its first prune.
+    pruned: Option<u64>,
 }
 
 impl<E: Engine> SqlStore<E> {
@@ -246,6 +248,7 @@ impl<E: Engine> SqlStore<E> {
             reads: Reads::new(&schema)?,
             batch: Batch::new(schema, ChainId::new(chain)),
             window,
+            pruned: None,
         };
         store.create_staging().await?;
         Ok(store)
@@ -464,10 +467,19 @@ impl<E: Engine> SqlStore<E> {
     /// `tip` is canonical — a buffered `reorg` dropped the rows of the blocks it orphaned —
     /// and at or below the chain's tip, so the window kept is never short. Nothing is
     /// deleted for a flush that accepts no block, or one within the window of the start.
+    /// After the store's first prune, the next waits until the floor has advanced
+    /// [`UndoWindow::prune_every`] blocks: rows below the window only lengthen the table
+    /// by that much, and a restart reads the newest [`UndoWindow::ledger`] all the same.
     async fn prune_ledger(&mut self, tip: Option<u64>) -> Result<(), StoreError> {
         let Some(floor) = tip.and_then(|tip| tip.checked_sub(self.window.ledger() as u64)) else {
             return Ok(());
         };
+        if self
+            .pruned
+            .is_some_and(|pruned| floor < pruned.saturating_add(self.window.prune_every()))
+        {
+            return Ok(());
+        }
         let params = [self.chain_param(), Value::Uint(floor)];
         self.engine
             .execute(&self.reads.prune_ledger, &params)
@@ -475,7 +487,10 @@ impl<E: Engine> SqlStore<E> {
             .map_err(StoreError::engine(
                 Operation::Delete,
                 Some("accepted_blocks"),
-            ))
+            ))?;
+        // Set before the commit: one that fails leaves rows a later prune takes, nothing more.
+        self.pruned = Some(floor);
+        Ok(())
     }
 
     /// The deletes, then each table's load, merge, and clear, then the ledger's prune.
