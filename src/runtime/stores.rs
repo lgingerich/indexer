@@ -155,7 +155,7 @@ impl<B: BlockSource + 'static> Pipeline<B> {
         let ingest = tokio::select! {
             biased;
             () = stop.wait() => Ok(()),
-            ingest = ingest => ingest,
+            ended = ingest => ended,
         };
         #[cfg(feature = "delta")]
         if let Some(watching) = watching {

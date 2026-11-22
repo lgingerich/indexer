@@ -1,11 +1,6 @@
 //! The lake against a local directory: what it holds after commits, reorgs, and a
 //! commit that stopped part-way.
 
-// The crate denies `expect`/`unwrap` to keep production paths honest; tests are allowed
-// them per the repository test style, since a failed expectation there means the fixture
-// or setup is wrong.
-#![expect(clippy::expect_used)]
-
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::sync::Arc;

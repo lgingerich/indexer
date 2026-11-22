@@ -1,5 +1,4 @@
 //! Catalogs, logs, and decoded records the `decode` tests share.
-#![expect(clippy::expect_used)]
 
 use std::path::PathBuf;
 

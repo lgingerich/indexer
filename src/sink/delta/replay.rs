@@ -132,7 +132,7 @@ impl LogReader {
         let sessions = schema.dataset(Table::Session);
         let uri = format!("{root}/{chain}/{}", sessions.name);
         let session = match open_existing(&storage, uri, sessions).await? {
-            Some(lake) => latest_session(&lake).await?,
+            Some(sessions_lake) => latest_session(&sessions_lake).await?,
             None => None,
         };
         Ok(Self {
@@ -307,7 +307,7 @@ impl LogReader {
                 columns.extend([ident("removed"), seconds("block_timestamp")]);
                 let frame = frame.filter(within("block_number", &blocks, width))?;
                 match &scanned {
-                    Some(addresses) => frame.filter(in_texts("address", addresses))?,
+                    Some(scan_addresses) => frame.filter(in_texts("address", scan_addresses))?,
                     None => frame,
                 }
                 .select(columns)
@@ -387,10 +387,10 @@ impl DecodedTables {
             )
         }))
         .map(|def| {
-            let uri = format!("{root}/{chain}/{}", def.name);
+            let table_uri = format!("{root}/{chain}/{}", def.name);
             open_table(
                 &storage,
-                uri,
+                table_uri,
                 def,
                 Missing::Create { width },
                 Arc::clone(&checkpoints),
@@ -459,12 +459,12 @@ impl DecodedTables {
             let missing: Vec<(usize, Vec<Row>)> = pending
                 .into_iter()
                 .zip(held)
-                .filter_map(|((position, rows), held)| {
-                    let rows: Vec<Row> = rows
+                .filter_map(|((position, table_rows), held)| {
+                    let unheld: Vec<Row> = table_rows
                         .into_iter()
                         .filter(|row| !held.contains(row.dedupe_key()))
                         .collect();
-                    (!rows.is_empty()).then_some((position, rows))
+                    (!unheld.is_empty()).then_some((position, unheld))
                 })
                 .collect();
             if missing.is_empty() {
@@ -474,16 +474,16 @@ impl DecodedTables {
             let mut failure = None;
             pending = Vec::new();
             let written = append_all(&self.lakes, &self.writer, batches).await;
-            for ((position, table), (_, rows)) in written.into_iter().zip(missing) {
+            for ((position, table), (_, table_rows)) in written.into_iter().zip(missing) {
                 match table {
                     // Not `committed`: a backfill starts no checkpoints.
                     Ok(table) => {
                         self.lakes[position].table = table;
-                        appended += rows.len();
+                        appended += table_rows.len();
                     }
                     Err(error) => {
                         failure.get_or_insert(error);
-                        pending.push((position, rows));
+                        pending.push((position, table_rows));
                     }
                 }
             }

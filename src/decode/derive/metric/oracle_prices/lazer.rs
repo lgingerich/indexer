@@ -145,7 +145,7 @@ impl Feed {
         } else {
             U256::from(price) / scale
         };
-        let price_e8 = u64::try_from(scaled).map_err(|_| Refused)?;
+        let price_e8 = u64::try_from(scaled).map_err(|_overflow| Refused)?;
         if price_e8 == 0 {
             return Ok(None);
         }
@@ -153,7 +153,7 @@ impl Feed {
             (u128::from(SPREAD_SCALE) * u128::from(self.confidence)).div_ceil(u128::from(price));
         Ok(Some(Stored {
             price: price_e8,
-            spread0: u16::try_from(spread.min(MAX_SPREAD.into())).map_err(|_| Refused)?,
+            spread0: u16::try_from(spread.min(MAX_SPREAD.into())).map_err(|_overflow| Refused)?,
             timestamp_ms,
         }))
     }

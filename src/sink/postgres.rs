@@ -187,7 +187,7 @@ impl PostgresSink {
                 writer,
             }),
         };
-        let store = SqlStore::new(engine, schema, chain, namespace, settings.undo_window).await?;
+        let store = Self::new(engine, schema, chain, namespace, settings.undo_window).await?;
         tracing::info!("PostgreSQL storage opened");
         Ok(store)
     }
@@ -440,30 +440,30 @@ fn pg_type(kind: ColumnType) -> Result<Type, EngineError> {
 }
 
 /// Parameters as the driver takes them.
-fn params(values: &[Value]) -> Vec<&(dyn ToSql + Sync)> {
+fn to_sql(values: &[Value]) -> Vec<&(dyn ToSql + Sync)> {
     values
         .iter()
-        .map(|value| value as &(dyn ToSql + Sync))
+        .map(|value| -> &(dyn ToSql + Sync) { value })
         .collect()
 }
 
 impl Engine for Postgres {
     type Dialect = Self;
 
-    async fn execute(&mut self, sql: &str, values: &[Value]) -> Result<(), EngineError> {
-        if values.is_empty() {
+    async fn execute(&mut self, sql: &str, params: &[Value]) -> Result<(), EngineError> {
+        if params.is_empty() {
             self.client.batch_execute(sql).await.map_err(pg)?;
         } else {
             self.client
-                .execute(sql, &params(values))
+                .execute(sql, &to_sql(params))
                 .await
                 .map_err(pg)?;
         }
         Ok(())
     }
 
-    async fn query(&mut self, sql: &str, values: &[Value]) -> Result<Vec<Vec<Value>>, EngineError> {
-        let rows = self.client.query(sql, &params(values)).await.map_err(pg)?;
+    async fn query(&mut self, sql: &str, params: &[Value]) -> Result<Vec<Vec<Value>>, EngineError> {
+        let rows = self.client.query(sql, &to_sql(params)).await.map_err(pg)?;
         rows.iter()
             .map(|row| {
                 (0..row.len())

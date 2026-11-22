@@ -224,12 +224,7 @@ fn unix_seconds(at: SystemTime) -> f64 {
 }
 
 #[cfg(test)]
-#[expect(clippy::expect_used)]
 mod tests {
-    use std::time::Duration;
-
-    use metrics_exporter_prometheus::PrometheusBuilder;
-
     use super::*;
 
     /// What a scrape shows: every per-store series labelled with its store, and the

@@ -76,7 +76,7 @@ impl Schema {
         let reserved: Vec<&str> = LEADING
             .iter()
             .chain(&TRAILING)
-            .map(|(name, _)| *name)
+            .map(|(column, _)| *column)
             .chain(PRIMARY_KEY)
             .collect();
         let mut names: Vec<String> = Vec::with_capacity(params.len());
@@ -145,7 +145,7 @@ impl Schema {
         if name.len() > MAX_IDENTIFIER {
             return Err(TableError::LongName { table: name });
         }
-        let required = |(name, kind)| Column::new(name, kind, false);
+        let required = |(column, kind)| Column::new(column, kind, false);
         let mut table = TableDef::builder(id, name);
         for column in LEADING
             .into_iter()
@@ -453,7 +453,6 @@ impl serde::Serialize for Params<'_> {
 }
 
 #[cfg(test)]
-#[expect(clippy::expect_used)]
 mod tests {
     use alloy_primitives::{Address, B256, Bytes, I256, TxHash, U256};
 
@@ -620,7 +619,7 @@ mod tests {
         );
         assert!(matches!(
             schema.add_event(("p", "C", hash(0x0a)), "p_c_e".to_owned(), Vec::new(), &[]),
-            Err(TableError::DuplicateTable { table }) if table == "p_c_e"
+            Err(TableError::DuplicateTable { table: duplicate }) if duplicate == "p_c_e"
         ));
     }
 
@@ -829,7 +828,7 @@ mod tests {
         let long = "p".repeat(MAX_IDENTIFIER + 1);
         assert!(matches!(
             schema.add_derived(&long, &COLUMNS, &[]),
-            Err(TableError::LongName { table }) if table == long
+            Err(TableError::LongName { table: refused }) if refused == long
         ));
         assert_eq!(
             schema
@@ -913,7 +912,7 @@ mod tests {
         assert_eq!(row.value("signed"), Some(&Value::Int(-1)));
 
         let misfit = "the record's value is not of the column's type, or does not fit it";
-        for (case, record, column) in [
+        for (case, unfit, column) in [
             (
                 "an unsigned value past u64",
                 record(U256::from(u64::MAX) + U256::ONE, I256::ZERO),
@@ -926,7 +925,7 @@ mod tests {
             ),
         ] {
             let error = schema
-                .derived_row(&chain(), &record)
+                .derived_row(&chain(), &unfit)
                 .expect_err(case)
                 .to_string();
             assert_eq!(error, format!("p_ints.{column}: {misfit}"), "{case}");

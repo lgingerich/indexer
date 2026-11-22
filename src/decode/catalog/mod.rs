@@ -579,7 +579,6 @@ fn find_manifests(dir: &Path, protocols: &mut Vec<PathBuf>) -> Result<(), Catalo
 }
 
 #[cfg(test)]
-#[expect(clippy::expect_used)]
 mod tests {
     use super::{AddressSlot, Catalog, CatalogError};
     use crate::decode::fixtures::{protocol, protocols, shipped};

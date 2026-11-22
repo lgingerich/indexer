@@ -77,12 +77,12 @@ fn pool_bins(decoded: &Decoded, _: usize, _: Option<&[u8]>) -> Result<Vec<Row>, 
     }
     rows.reverse();
     let mut lower = bin0_lower;
-    let mut index = I256::ZERO;
+    let mut above_index = I256::ZERO;
     for &bin in &above {
-        let upper = lower + I256::from_raw(bin[0]);
-        rows.push(row(index, bin, lower, upper));
-        index += I256::ONE;
-        lower = upper;
+        let bin_upper = lower + I256::from_raw(bin[0]);
+        rows.push(row(above_index, bin, lower, bin_upper));
+        above_index += I256::ONE;
+        lower = bin_upper;
     }
     Ok(rows)
 }
@@ -177,11 +177,11 @@ mod tests {
                 bin(1, 200, 0, 0, 50, 250),
             ]
         );
-        let rows = unnamed(pool_bins(
+        let single = unnamed(pool_bins(
             &pool_created(0, ladder(&[(7, 0, 0)]), Vec::new()),
             0,
             None,
         ));
-        assert_eq!(rows, [bin(0, 7, 0, 0, 0, 7)]);
+        assert_eq!(single, [bin(0, 7, 0, 0, 0, 7)]);
     }
 }

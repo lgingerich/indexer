@@ -1,9 +1,6 @@
 //! A backfill against a local lake the running indexer's store wrote, as it would after
 //! a deploy: blocks without the manifests, a restart with them, and blocks past the bound.
 
-// Test code: a failed expectation means the fixture or setup is wrong.
-#![expect(clippy::expect_used)]
-
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -235,12 +232,12 @@ async fn deployed(dir: &Dir, restart: u64, last: u64) -> Live {
 /// `(rows, distinct keys)` of `table` where `filter` holds.
 async fn count(dir: &Dir, table: &str, filter: &str) -> (i64, i64) {
     let url = deltalake::ensure_table_uri(format!("{}/{CHAIN}/{table}", dir.uri())).expect("uri");
-    let table = deltalake::open_table(url).await.expect("the table opens");
+    let delta = deltalake::open_table(url).await.expect("the table opens");
     let ctx = SessionContext::new();
-    table
+    delta
         .update_datafusion_session(&ctx.state())
         .expect("session");
-    ctx.register_table("t", table.table_provider().await.expect("provider"))
+    ctx.register_table("t", delta.table_provider().await.expect("provider"))
         .expect("registered");
     let batches = ctx
         .sql(&format!(
@@ -264,12 +261,12 @@ async fn count(dir: &Dir, table: &str, filter: &str) -> (i64, i64) {
 /// reader of the table sees, whatever files hold it.
 async fn rows(dir: &Dir, table: &str, filter: &str) -> Vec<String> {
     let url = deltalake::ensure_table_uri(format!("{}/{CHAIN}/{table}", dir.uri())).expect("uri");
-    let table = deltalake::open_table(url).await.expect("the table opens");
+    let delta = deltalake::open_table(url).await.expect("the table opens");
     let ctx = SessionContext::new();
-    table
+    delta
         .update_datafusion_session(&ctx.state())
         .expect("session");
-    ctx.register_table("t", table.table_provider().await.expect("provider"))
+    ctx.register_table("t", delta.table_provider().await.expect("provider"))
         .expect("registered");
     let batches = ctx
         .sql(&format!(
@@ -492,12 +489,14 @@ async fn a_backfill_into_another_lake_leaves_the_chains_alone() {
     );
 
     let resumed = Dir::new();
-    let mut settings = dir.backfill(&uniswap_v4());
-    settings.run.out = Some(resumed.uri());
-    settings.run.from = Some(FIRST + 300);
-    let done = backfill(&settings).await.expect("backfilled from a block");
-    assert_eq!(done.from, FIRST + 300);
-    assert_eq!(done.decoded, 2 * 201);
+    let mut resumed_settings = dir.backfill(&uniswap_v4());
+    resumed_settings.run.out = Some(resumed.uri());
+    resumed_settings.run.from = Some(FIRST + 300);
+    let resumed_done = backfill(&resumed_settings)
+        .await
+        .expect("backfilled from a block");
+    assert_eq!(resumed_done.from, FIRST + 300);
+    assert_eq!(resumed_done.decoded, 2 * 201);
 }
 
 /// A lake whose running indexer recorded no session, decodes none of the protocols, or
@@ -522,29 +521,32 @@ async fn a_lake_the_running_indexer_does_not_cover_is_refused() {
     deployed(&too_recent, FIRST + 5, FIRST + 10).await;
     let mut below = too_recent.backfill(&uniswap_v4());
     below.run.to = Some(0);
-    let refused = backfill(&below).await;
+    let refused_below = backfill(&below).await;
     assert!(
-        matches!(refused, Err(BackfillError::SessionAboveTo { from, to: 0, .. }) if from == FIRST + 5),
-        "{refused:?}"
+        matches!(refused_below, Err(BackfillError::SessionAboveTo { from, to: 0, .. }) if from == FIRST + 5),
+        "{refused_below:?}"
     );
 
     let mut settings = too_recent.backfill(&uniswap_v4());
     settings.run.to = Some(FIRST + 10);
-    let refused = backfill(&settings).await;
+    let refused_past_bound = backfill(&settings).await;
     assert!(
         matches!(
-            refused,
+            refused_past_bound,
             Err(BackfillError::ToAboveBound { to, bound })
             if to == FIRST + 10 && bound == FIRST + 10 - MAX_RESUME_LAG
         ),
-        "{refused:?}"
+        "{refused_past_bound:?}"
     );
 
     std::fs::remove_dir_all(too_recent.0.join(CHAIN).join("sessions")).expect("removed");
-    let refused = backfill(&too_recent.backfill(&uniswap_v4())).await;
+    let refused_no_session = backfill(&too_recent.backfill(&uniswap_v4())).await;
     assert!(
-        matches!(refused, Err(BackfillError::NoSession { store: "lake" })),
-        "{refused:?}"
+        matches!(
+            refused_no_session,
+            Err(BackfillError::NoSession { store: "lake" })
+        ),
+        "{refused_no_session:?}"
     );
 }
 
@@ -565,11 +567,9 @@ fn a_session_with_other_event_definitions_is_refused() {
         block_timestamp: 0,
         events,
     };
-    assert!(
-        coverage
-            .decodes("lake", Some(&session(wanted.clone())))
-            .is_ok()
-    );
+    coverage
+        .decodes("lake", Some(&session(wanted.clone())))
+        .expect("the session decodes the wanted events");
     let mut other = wanted.clone();
     other[0].event_id = B256::repeat_byte(0xee);
     assert!(matches!(

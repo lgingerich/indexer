@@ -196,9 +196,12 @@ impl ChannelSink {
 }
 
 impl EnvelopeSink for ChannelSink {
-    async fn publish(&mut self, envelope: Envelope) -> Result<(), SinkError> {
+    fn publish(
+        &mut self,
+        envelope: Envelope,
+    ) -> impl Future<Output = Result<(), SinkError>> + Send {
         self.batch.push(envelope);
-        Ok(())
+        std::future::ready(Ok(()))
     }
 
     async fn flush(&mut self) -> Result<(), SinkError> {
@@ -218,7 +221,7 @@ impl EnvelopeSink for ChannelSink {
         let room = Arc::clone(&self.room)
             .acquire_many_owned(share)
             .await
-            .map_err(|_| SinkError::StorageClosed)?;
+            .map_err(|_closed| SinkError::StorageClosed)?;
         // Storage has stopped. The batch of envelopes inside `SendError` is this
         // layer's own data and nothing else can use it, so the error is translated to
         // `StorageClosed` and `Vec<Envelope>` stops appearing in the sink's error type:
@@ -231,7 +234,7 @@ impl EnvelopeSink for ChannelSink {
                 _room: room,
             })
             .await
-            .map_err(|_| SinkError::StorageClosed)?;
+            .map_err(|_unsent| SinkError::StorageClosed)?;
         Ok(())
     }
 
@@ -304,8 +307,8 @@ impl ChannelReceiver {
                 Received::Closed => break Exit::Closed,
                 Received::Due => {
                     // Only waited for with something gathered.
-                    if let Some(due) = gathered.take() {
-                        stored += self.flush(sink, due.pending).await?;
+                    if let Some(expired) = gathered.take() {
+                        stored += self.flush(sink, expired.pending).await?;
                     }
                     continue;
                 }
@@ -317,10 +320,10 @@ impl ChannelReceiver {
             });
             self.publish(sink, block, &mut batch.pending).await?;
             while !full(sink, &batch.pending, batching) {
-                let Ok(block) = self.receiver.try_recv() else {
+                let Ok(queued) = self.receiver.try_recv() else {
                     break;
                 };
-                self.publish(sink, block, &mut batch.pending).await?;
+                self.publish(sink, queued, &mut batch.pending).await?;
             }
             if stop.requested() {
                 gathered = Some(batch);
@@ -365,6 +368,10 @@ impl ChannelReceiver {
     /// A flush that runs out of time is dropped part-way, and the sink is still asked to
     /// [`finish`](EnvelopeSink::finish): it waits only for what the flushes before that
     /// one left running, if it still holds any, and stays failed.
+    #[expect(
+        clippy::cognitive_complexity,
+        reason = "one deadline's steps in order; the logging macros' expansion is most of the count"
+    )]
     async fn stop<K: EnvelopeSink>(
         &mut self,
         sink: &mut K,

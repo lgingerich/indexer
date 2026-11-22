@@ -19,19 +19,19 @@ async fn committed_blocks_survive_a_reopen() {
     }
     drop(sink);
 
-    let mut sink = open(&dir).await;
+    let mut reopened = open(&dir).await;
     assert_eq!(
-        ledger_heights(&mut sink).await,
+        ledger_heights(&mut reopened).await,
         (1..=12).collect::<Vec<_>>()
     );
     let heights: Vec<(u64, u8)> = (1..=12).map(|height| (height, 0)).collect();
-    assert_eq!(blocks(&sink).await, expected(&heights));
+    assert_eq!(blocks(&reopened).await, expected(&heights));
     assert_eq!(
-        stored(&sink, Table::Transaction, "value").await,
+        stored(&reopened, Table::Transaction, "value").await,
         BTreeSet::from([U256::MAX.to_string()])
     );
     assert_eq!(
-        stored(&sink, Table::Transaction, "gas_price").await,
+        stored(&reopened, Table::Transaction, "gas_price").await,
         BTreeSet::from([(u128::from(u64::MAX) + 1).to_string()])
     );
 }
@@ -74,9 +74,9 @@ async fn a_reorg_of_committed_blocks_deletes_them_everywhere() {
     assert_eq!(blocks(&sink).await, expected(&canonical));
     drop(sink);
 
-    let mut sink = open(&dir).await;
+    let mut reopened = open(&dir).await;
     assert_eq!(
-        ledger(&mut sink)
+        ledger(&mut reopened)
             .await
             .iter()
             .map(|block| (block.height, block.hash))
@@ -87,8 +87,8 @@ async fn a_reorg_of_committed_blocks_deletes_them_everywhere() {
             .collect::<Vec<_>>(),
         "the ledger names the replacements in the orphans' place"
     );
-    assert_eq!(blocks(&sink).await, expected(&canonical));
-    assert_eq!(retractions(&sink).await, expected(&[(12, 1)]));
+    assert_eq!(blocks(&reopened).await, expected(&canonical));
+    assert_eq!(retractions(&reopened).await, expected(&[(12, 1)]));
 }
 
 /// A batch that accepts a committed block again, with no reorg orphaning it first, is
@@ -137,12 +137,12 @@ async fn a_rewind_takes_the_blocks_above_it_and_they_can_be_written_again() {
     publish(&mut sink, block(4, 0)).await;
     publish(&mut sink, block(5, 1)).await;
     drop(sink);
-    let mut sink = open(&dir).await;
+    let mut reopened = open(&dir).await;
     assert_eq!(
-        blocks(&sink).await,
+        blocks(&reopened).await,
         expected(&[(1, 0), (2, 0), (3, 0), (4, 0), (5, 1)])
     );
-    assert_eq!(ledger_heights(&mut sink).await, [1, 2, 3, 4, 5]);
+    assert_eq!(ledger_heights(&mut reopened).await, [1, 2, 3, 4, 5]);
 }
 
 /// The lake reports what it buffers, so the drain can commit by size: it grows by each
@@ -203,8 +203,8 @@ async fn a_reorg_across_committed_and_buffered_blocks_keeps_only_its_replacement
     let canonical = [(1, 0), (2, 0), (3, 1), (4, 1), (5, 1)];
     assert_eq!(blocks(&sink).await, expected(&canonical));
     drop(sink);
-    let sink = open(&dir).await;
-    assert_eq!(blocks(&sink).await, expected(&canonical));
+    let reopened = open(&dir).await;
+    assert_eq!(blocks(&reopened).await, expected(&canonical));
 }
 
 /// A committed block orphaned and canonical again within one buffer ends up stored, and
@@ -248,8 +248,11 @@ async fn the_ledger_is_read_from_its_newest_partitions() {
     }
     drop(sink);
 
-    let mut sink = open(&dir).await;
-    assert_eq!(ledger_heights(&mut sink).await, [199_999, 200_000, 200_001]);
+    let mut reopened = open(&dir).await;
+    assert_eq!(
+        ledger_heights(&mut reopened).await,
+        [199_999, 200_000, 200_001]
+    );
 }
 
 /// A decoded record is stored twice — its generic row and its event's typed row — with
@@ -346,14 +349,14 @@ async fn a_table_larger_than_one_batch_commits_every_row() {
 
     assert_eq!(rows(&sink, Table::Log).await, logs);
     drop(sink);
-    let mut sink = open(&dir).await;
-    assert_eq!(rows(&sink, Table::Log).await, logs);
+    let mut reopened = open(&dir).await;
+    assert_eq!(rows(&reopened, Table::Log).await, logs);
     assert_eq!(
-        stored(&sink, Table::Log, "dedupe_key").await.len(),
+        stored(&reopened, Table::Log, "dedupe_key").await.len(),
         logs,
         "each row once"
     );
-    assert_eq!(ledger_heights(&mut sink).await, [1]);
+    assert_eq!(ledger_heights(&mut reopened).await, [1]);
 }
 
 /// A commit's ledger append runs on past its flush, beside the next commit's appends,
@@ -409,9 +412,9 @@ async fn a_failed_commit_waits_for_the_last_ledger_append() {
     );
     drop(sink);
 
-    let mut sink = open(&dir).await;
-    assert_eq!(blocks(&sink).await, expected(&[(1, 0)]));
-    assert_eq!(ledger_heights(&mut sink).await, [1]);
+    let mut reopened = open(&dir).await;
+    assert_eq!(blocks(&reopened).await, expected(&[(1, 0)]));
+    assert_eq!(ledger_heights(&mut reopened).await, [1]);
 }
 
 /// The ledger's version as of the last append the sink has taken in.
@@ -444,10 +447,12 @@ async fn a_session_goes_with_its_block_and_each_run_writes_one() {
     );
     drop(sink);
 
-    let mut sink = open(&dir).await;
-    publish(&mut sink, block(2, 1)).await;
+    let mut reopened = open(&dir).await;
+    publish(&mut reopened, block(2, 1)).await;
     assert_eq!(
-        stored(&sink, Table::Session, "block_number").await.len(),
+        stored(&reopened, Table::Session, "block_number")
+            .await
+            .len(),
         2,
         "the reopened run writes its own session"
     );

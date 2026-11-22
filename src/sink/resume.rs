@@ -235,8 +235,8 @@ pub(crate) async fn resume<S: Store>(
     // The blocks stores kept above the common block, which ingest hands them again.
     let mut held = HashSet::new();
     let mut settled = Vec::with_capacity(stores.len());
-    for (opened, restored) in stores.into_iter().zip(&mut restored) {
-        settled.push(settle(opened, restored, common.height, window, &mut held).await?);
+    for (opened, read_back) in stores.into_iter().zip(&mut restored) {
+        settled.push(settle(opened, read_back, common.height, window, &mut held).await?);
     }
     let history_below = history_below(&restored, &blocks, window);
     let resumed = gathered(restored, held, Ledger::new(blocks, history_below, window));
@@ -289,6 +289,10 @@ fn history_below(restored: &[Restored], blocks: &[BlockMeta], window: UndoWindow
 /// `common`, and returns it: a store at that block or with nothing stored is left as it
 /// is, one ahead whose ledger names all it holds above reconciles those blocks (adding
 /// them to `held`), and any other is rewound and read back again into `restored`.
+#[expect(
+    clippy::cognitive_complexity,
+    reason = "three cases over where the store stands, each logged, and the logging macros count toward it"
+)]
 async fn settle<S: Store>(
     mut opened: Opened<S>,
     restored: &mut Restored,
@@ -401,7 +405,7 @@ fn common_block(
                 .collect()
         })
         .collect();
-    let Some((slowest, ledger)) = ledgers
+    let Some((slowest, slowest_ledger)) = ledgers
         .iter()
         .enumerate()
         .filter_map(|(position, ledger)| Some((position, ledger.last()?.height)))
@@ -418,7 +422,7 @@ fn common_block(
             || (ledger.len() >= window.ledger()
                 && tip.height.saturating_sub(block.height) > window.resume_lag())
     };
-    let common = ledger.iter().rev().find(|block| {
+    let common = slowest_ledger.iter().rev().find(|block| {
         held.iter().zip(ledgers).all(|(held, ledger)| {
             !has_say(ledger, block) || held.contains(&(block.height, block.hash))
         })
@@ -427,10 +431,6 @@ fn common_block(
 }
 
 #[cfg(test)]
-// The crate denies `expect`/`unwrap` to keep production paths honest; tests are
-// allowed them per the repository test style, since a failed expectation there
-// means the fixture or setup is wrong.
-#[expect(clippy::expect_used)]
 mod tests {
     use std::sync::{Arc, Mutex};
 
@@ -464,29 +464,32 @@ mod tests {
     }
 
     impl EnvelopeSink for Probe {
-        async fn publish(&mut self, _envelope: Envelope) -> Result<(), SinkError> {
-            Ok(())
+        fn publish(
+            &mut self,
+            _envelope: Envelope,
+        ) -> impl Future<Output = Result<(), SinkError>> + Send {
+            std::future::ready(Ok(()))
         }
     }
 
     impl Store for Probe {
-        async fn restore(&mut self) -> Result<Restored, StoreError> {
+        fn restore(&mut self) -> impl Future<Output = Result<Restored, StoreError>> + Send {
             self.note("restore");
-            Ok(Restored {
+            std::future::ready(Ok(Restored {
                 contracts: Vec::new(),
                 handoffs: Vec::new(),
                 ledger: self.ledger.clone(),
-            })
+            }))
         }
 
         fn reconcile(&mut self, _held: &[BlockMeta]) -> Result<(), StoreError> {
             Ok(())
         }
 
-        async fn rewind(&mut self, height: u64) -> Result<(), StoreError> {
+        fn rewind(&mut self, height: u64) -> impl Future<Output = Result<(), StoreError>> + Send {
             self.note("rewind");
             self.ledger.retain(|block| block.height <= height);
-            Ok(())
+            std::future::ready(Ok(()))
         }
     }
 
@@ -516,7 +519,7 @@ mod tests {
             ),
         ];
         let read = read_back_all(stores).await.expect("read back");
-        let (stores, restored) = resume(read, UndoWindow::DEFAULT).await.expect("resumed");
+        let (resumed, restored) = resume(read, UndoWindow::DEFAULT).await.expect("resumed");
         assert_eq!(
             restored.ledger.blocks(),
             ledger(0xa0, 1..=5),
@@ -527,9 +530,9 @@ mod tests {
             "the rewound store holds nothing below it"
         );
         assert_eq!(
-            stores
+            resumed
                 .iter()
-                .map(|opened| opened.backend)
+                .map(|store| store.backend)
                 .collect::<Vec<_>>(),
             [StoreBackend::Postgres, StoreBackend::Delta],
             "every store comes back, in order"
@@ -732,8 +735,8 @@ mod tests {
                 .map(|(block, _)| block.height),
             Some(5)
         );
-        assert!(common_block(&[&slow, &beyond], window).is_err());
-        assert!(common_block(&[&slow, &beyond], UndoWindow::DEFAULT).is_ok());
+        common_block(&[&slow, &beyond], window).expect_err("a store ahead beyond the lag");
+        common_block(&[&slow, &beyond], UndoWindow::DEFAULT).expect("within the default lag");
 
         assert!(
             names_all_above(&ledger(0xa0, 7..=14), 5, window),

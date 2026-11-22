@@ -122,7 +122,7 @@ impl Pacing {
         // the value `change` was applied to.
         let previous = self
             .delay_ms
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |ms| Some(change(ms)))
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |ms| Some(change(ms)))
             .unwrap_or_else(|ms| ms);
         change(previous)
     }
@@ -325,7 +325,7 @@ impl Backoff {
                 }
                 Attempt::Transient { cause, wait } => (cause, wait),
             };
-            let delay = self.pacing.slow_down(mark);
+            let slowed = self.pacing.slow_down(mark);
             if retries == MAX_RETRIES {
                 return result;
             }
@@ -338,7 +338,7 @@ impl Backoff {
                 source,
                 retry = retries,
                 max_retries = MAX_RETRIES,
-                delay_ms = delay,
+                delay_ms = slowed,
                 %cause,
                 "request failed transiently; backing off"
             );
@@ -411,7 +411,7 @@ where
         self.inner.poll_ready(cx)
     }
 
-    fn call(&mut self, request: RequestPacket) -> Self::Future {
+    fn call(&mut self, req: RequestPacket) -> Self::Future {
         // Tower's contract: the service polled ready takes the call, so keep it for this
         // request and leave a fresh clone behind.
         let clone = self.inner.clone();
@@ -420,7 +420,7 @@ where
         let retries = self.inner.clone();
         let backoff = self.backoff.clone();
         Box::pin(async move {
-            let request = &request;
+            let request = &req;
             let ranged = request.requests().iter().any(spans_heights);
             backoff
                 .run(
@@ -580,7 +580,6 @@ fn spans_heights(call: &SerializedRequest) -> bool {
 }
 
 #[cfg(test)]
-#[expect(clippy::expect_used)]
 mod tests {
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::{Arc, Mutex};
@@ -804,11 +803,11 @@ mod tests {
         let doubled = MIN_DELAY_MS * 2;
         assert_eq!(layer.backoff.pacing.current(), doubled - doubled / 8);
         for _ in 0..40 {
-            let (result, _) = send(&layer, |_| {
+            let (answered, _) = send(&layer, |_| {
                 Ok(response(r#"{"jsonrpc":"2.0","id":1,"result":"0x1"}"#))
             })
             .await;
-            result.expect("succeeds");
+            answered.expect("succeeds");
         }
         assert_eq!(layer.backoff.pacing.current(), 0);
     }

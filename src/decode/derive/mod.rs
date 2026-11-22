@@ -296,7 +296,6 @@ impl Derivations {
 }
 
 #[cfg(test)]
-#[expect(clippy::expect_used)]
 mod tests {
     use alloy_primitives::U256;
 
@@ -367,10 +366,10 @@ mod tests {
         let event = (0, (swap.selector, 3));
         let mut derivations = Derivations::default();
         derivations.bind(SWAPS, event.0, [(0, event.1)]);
-        let rows = |swap: &Decoded| derivations.rows(&chain, event, swap, None).expect("rows");
+        let rows = |record: &Decoded| derivations.rows(&chain, event, record, None).expect("rows");
         assert_eq!(rows(&swap).len(), 1);
         swap.body[0].value = TypedValue::Bool { value: true };
-        assert!(rows(&swap).is_empty());
+        assert_eq!(rows(&swap), []);
     }
 
     /// A row that does not name its table's columns in order is refused as a bug in the

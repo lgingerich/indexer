@@ -61,14 +61,14 @@ async fn carry_on(mut sink: DeltaSink, dir: &Dir) {
     publish(&mut sink, envelopes).await;
     drop(sink);
 
-    let mut sink = open(dir).await;
+    let mut reopened = open(dir).await;
     assert_eq!(
-        blocks(&sink).await,
+        blocks(&reopened).await,
         expected(&[(1, 0), (2, 0), (3, 1), (4, 1)])
     );
-    assert_eq!(ledger_heights(&mut sink).await, [1, 2, 3, 4]);
-    assert_eq!(retractions(&sink).await, expected(&[(3, 1)]));
-    assert_eq!(rows(&sink, Table::Reorg).await, 1, "recorded once");
+    assert_eq!(ledger_heights(&mut reopened).await, [1, 2, 3, 4]);
+    assert_eq!(retractions(&reopened).await, expected(&[(3, 1)]));
+    assert_eq!(rows(&reopened, Table::Reorg).await, 1, "recorded once");
 }
 
 /// Stopped before its first step, the commit left nothing.
@@ -143,7 +143,7 @@ async fn a_rewind_stopped_before_deleting_from_the_rest_is_finished_by_the_repai
     assert_eq!(stopped(&error), Some(Step::DeleteFromRest), "{error:?}");
     drop(sink);
 
-    let mut sink = open(&dir).await;
-    assert_eq!(blocks(&sink).await, expected(&[(1, 0), (2, 0), (3, 0)]));
-    assert_eq!(ledger_heights(&mut sink).await, [1, 2, 3]);
+    let mut reopened = open(&dir).await;
+    assert_eq!(blocks(&reopened).await, expected(&[(1, 0), (2, 0), (3, 0)]));
+    assert_eq!(ledger_heights(&mut reopened).await, [1, 2, 3]);
 }

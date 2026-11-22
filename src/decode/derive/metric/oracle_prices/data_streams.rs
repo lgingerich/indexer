@@ -134,7 +134,6 @@ impl Words<'_> {
 }
 
 #[cfg(test)]
-#[expect(clippy::expect_used)]
 mod tests {
     use alloy_primitives::{B256, I256, U256};
 

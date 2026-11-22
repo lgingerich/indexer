@@ -94,12 +94,12 @@ fn split_range(
         check_height(BLOCK, height, meta.height)?;
         // In order, this height's logs are the next run carrying its number.
         let own = match rest {
-            Some(logs) => {
-                let count = logs
+            Some(remaining) => {
+                let count = remaining
                     .iter()
                     .take_while(|log| log.block_number == Some(height))
                     .count();
-                let (own, after) = logs.split_at(count);
+                let (own, after) = remaining.split_at(count);
                 check_log_order(LOGS, height, own.iter().map(|log| log.log_index))?;
                 rest = Some(after);
                 Some(own)
@@ -248,14 +248,12 @@ impl<C> EvmSource<C> {
 }
 
 #[cfg(test)]
-#[expect(clippy::expect_used)]
 mod tests {
-    use alloy_primitives::B256;
     use serde_json::{Value, json};
 
     use super::*;
+    use crate::ingest::source::BlockSource;
     use crate::ingest::source::evm::testing::*;
-    use crate::ingest::source::{BlockSource, SourceError};
     use crate::wire::datasets::Datasets;
     use crate::wire::envelope::Event;
 

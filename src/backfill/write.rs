@@ -33,6 +33,7 @@ impl Database {
         not(feature = "postgres"),
         expect(
             clippy::unused_async,
+            clippy::unused_async_trait_impl,
             reason = "the same signature as the `postgres` build's, which connects"
         )
     )]
@@ -71,6 +72,8 @@ impl Database {
         not(feature = "postgres"),
         expect(
             clippy::unused_async,
+            clippy::unused_async_trait_impl,
+            clippy::needless_pass_by_ref_mut,
             reason = "the same signature as the `postgres` build's, which reads"
         )
     )]
@@ -93,6 +96,8 @@ impl Database {
         not(feature = "postgres"),
         expect(
             clippy::unused_async,
+            clippy::unused_async_trait_impl,
+            clippy::needless_pass_by_ref_mut,
             reason = "the same signature as the `postgres` build's, which writes"
         )
     )]
@@ -116,7 +121,7 @@ impl Database {
                 .map_err(|source| BackfillError::Database { source })?;
         }
         #[cfg(not(feature = "postgres"))]
-        let _ = (chain, events);
+        drop((chain, events));
         Ok(())
     }
 }
@@ -161,7 +166,7 @@ impl Writer<'_> {
         info!(%chain, ?protocols, contracts = addresses.len(), from = done.from, to,
             reads = reads.len(), "backfilling from the lake's logs");
         let mut logs = stream::iter(reads.clone())
-            .map(|blocks| tokio::spawn(reader.read(blocks, addresses, streams)))
+            .map(|range| tokio::spawn(reader.read(range, addresses, streams)))
             .buffered(READ_AHEAD);
         for read in reads {
             let Some(logs) = logs.next().await else {
@@ -169,9 +174,9 @@ impl Writer<'_> {
             };
             let logs = logs.unwrap_or_else(|join| std::panic::resume_unwind(join.into_panic()))?;
             let (mut records, mut appended) = (0, 0);
-            for (blocks, positions) in parts(&logs, &read) {
+            for (commit, positions) in parts(&logs, &read) {
                 let (decoded, added) = self
-                    .commit(reader, blocks, &logs[positions], Placement::ByHeight)
+                    .commit(reader, commit, &logs[positions], Placement::ByHeight)
                     .await?;
                 records += decoded;
                 appended += added;

@@ -206,7 +206,7 @@ impl DeltaSink {
             let orphans = texts(batch, 1, "reorgs.orphaned_hashes")?;
             for row in 0..batch.num_rows() {
                 let orphans: Vec<B256> =
-                    serde_json::from_str(orphans.value(row)).map_err(|_| {
+                    serde_json::from_str(orphans.value(row)).map_err(|_unparsed| {
                         InvalidStoredValue::new("reorgs.orphaned_hashes", orphans.value(row))
                     })?;
                 if orphans.iter().any(|hash| named.contains(hash)) {

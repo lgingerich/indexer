@@ -250,9 +250,8 @@ impl<K: EnvelopeSink> EnvelopeSink for DecodingSink<K> {
 }
 
 #[cfg(test)]
-#[expect(clippy::expect_used)]
 mod tests {
-    use alloy_primitives::{Address, B256};
+    use alloy_primitives::Address;
 
     use super::*;
     use crate::decode::fixtures::uniswap_v3::{pool_created, swap};
@@ -267,17 +266,22 @@ mod tests {
         refuse: Option<&'static str>,
     }
     impl EnvelopeSink for Collect {
-        async fn publish(&mut self, envelope: Envelope) -> Result<(), SinkError> {
-            if self.refuse == Some(envelope.event.kind()) {
+        fn publish(
+            &mut self,
+            envelope: Envelope,
+        ) -> impl Future<Output = Result<(), SinkError>> + Send {
+            let published = if self.refuse == Some(envelope.event.kind()) {
                 self.refuse = None;
-                return Err(SinkError::StorageClosed);
-            }
-            self.records.push(envelope);
-            Ok(())
+                Err(SinkError::StorageClosed)
+            } else {
+                self.records.push(envelope);
+                Ok(())
+            };
+            std::future::ready(published)
         }
-        async fn flush(&mut self) -> Result<(), SinkError> {
+        fn flush(&mut self) -> impl Future<Output = Result<(), SinkError>> + Send {
             self.flushes += 1;
-            Ok(())
+            std::future::ready(Ok(()))
         }
     }
 
@@ -667,13 +671,13 @@ mod tests {
         sink.publish(log(swap))
             .await
             .expect("a swap of an unfetched transaction");
-        let Some(Event::Derived(derived)) = sink.inner.records.last().map(|e| &e.event) else {
+        let Some(Event::Derived(unfetched)) = sink.inner.records.last().map(|e| &e.event) else {
             panic!("the second swap's row");
         };
         assert_eq!(
             (
-                derived.transaction_from_address,
-                derived.transaction_to_address
+                unfetched.transaction_from_address,
+                unfetched.transaction_to_address
             ),
             (None, None)
         );

@@ -76,12 +76,12 @@ impl HandoffQueue {
     ) -> Result<Self, StoreError> {
         let root = uri.trim_end_matches('/');
         let storage = Storage::new(root, storage)?;
-        let uri = format!("{root}/{chain}/{TABLE}");
+        let table_uri = format!("{root}/{chain}/{TABLE}");
         let checkpoints = Arc::new(Semaphore::new(CONCURRENT_CHECKPOINTS));
         let missing = Missing::Create { width };
         let def = schema.dataset(Table::Contract);
         Ok(Self::of(
-            open_table(&storage, uri, def, missing, checkpoints).await?,
+            open_table(&storage, table_uri, def, missing, checkpoints).await?,
         ))
     }
 
@@ -230,8 +230,8 @@ pub async fn recorded(
     let root = uri.trim_end_matches('/');
     let storage = Storage::new(root, storage)?;
     let def = schema.dataset(Table::Handoff);
-    let uri = format!("{root}/{chain}/{}", def.name);
-    match open_existing(&storage, uri, def).await? {
+    let table_uri = format!("{root}/{chain}/{}", def.name);
+    match open_existing(&storage, table_uri, def).await? {
         Some(lake) => handoffs(&lake).await,
         None => Ok(Vec::new()),
     }
@@ -295,6 +295,10 @@ impl HandoffWatch {
     /// Watches `chain`'s queue until `handed` is dropped, sending what it reads there.
     /// A failed check is logged and tried again at the next: the watch never stops the
     /// run, and what it missed it reads at the next check.
+    #[expect(
+        clippy::cognitive_complexity,
+        reason = "one watch loop with its logged failure branches"
+    )]
     pub async fn run(
         self,
         schema: Arc<Schema>,
@@ -385,7 +389,6 @@ impl HandoffWatch {
 }
 
 #[cfg(test)]
-#[expect(clippy::expect_used)]
 mod tests {
     use std::collections::BTreeMap;
     use std::sync::Arc;
@@ -502,12 +505,12 @@ mod tests {
         let watch = HandoffWatch::new(&settings);
         let storage = Storage::new(&dir.uri(), &BTreeMap::new()).expect("storage");
         let mut watched = None;
-        assert!(
+        assert_eq!(
             watch
                 .read(&storage, &schema, &chain, &mut watched, false)
                 .await
-                .expect("read")
-                .is_empty()
+                .expect("read"),
+            []
         );
 
         queue

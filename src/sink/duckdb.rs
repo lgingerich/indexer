@@ -145,7 +145,7 @@ impl DuckDbSink {
                 .map_err(StoreError::engine(Operation::Open, Some(&path)))?
         };
         info!(store = %path, "storage opened");
-        SqlStore::new(
+        Self::new(
             DuckDb { connection },
             schema,
             chain,
@@ -203,21 +203,50 @@ impl Dialect for DuckDb {
     }
 }
 
+// `DuckDB` runs each call to completion on the calling thread, so the engine's futures
+// are ready at once, holding what the synchronous call returned.
 impl Engine for DuckDb {
     type Dialect = Self;
 
-    async fn execute(&mut self, sql: &str, values: &[Value]) -> Result<(), EngineError> {
-        if values.is_empty() {
+    fn execute(
+        &mut self,
+        sql: &str,
+        params: &[Value],
+    ) -> impl Future<Output = Result<(), EngineError>> + Send {
+        std::future::ready(self.execute_now(sql, params))
+    }
+
+    fn query(
+        &mut self,
+        sql: &str,
+        params: &[Value],
+    ) -> impl Future<Output = Result<Vec<Vec<Value>>, EngineError>> + Send {
+        std::future::ready(self.query_now(sql, params))
+    }
+
+    fn load(
+        &mut self,
+        _: &TableDef,
+        staging: &str,
+        rows: &[&Row],
+    ) -> impl Future<Output = Result<(), EngineError>> + Send {
+        std::future::ready(self.load_now(staging, rows))
+    }
+}
+
+impl DuckDb {
+    fn execute_now(&self, sql: &str, params: &[Value]) -> Result<(), EngineError> {
+        if params.is_empty() {
             self.connection.execute_batch(sql)?;
         } else {
-            self.connection.execute(sql, params_from_iter(values))?;
+            self.connection.execute(sql, params_from_iter(params))?;
         }
         Ok(())
     }
 
-    async fn query(&mut self, sql: &str, values: &[Value]) -> Result<Vec<Vec<Value>>, EngineError> {
+    fn query_now(&self, sql: &str, params: &[Value]) -> Result<Vec<Vec<Value>>, EngineError> {
         let mut statement = self.connection.prepare(sql)?;
-        let mut rows = statement.query(params_from_iter(values))?;
+        let mut rows = statement.query(params_from_iter(params))?;
         let mut read = Vec::new();
         while let Some(row) = rows.next()? {
             let width = row.as_ref().column_count();
@@ -230,12 +259,7 @@ impl Engine for DuckDb {
         Ok(read)
     }
 
-    async fn load(
-        &mut self,
-        _: &TableDef,
-        staging: &str,
-        rows: &[&Row],
-    ) -> Result<(), EngineError> {
+    fn load_now(&self, staging: &str, rows: &[&Row]) -> Result<(), EngineError> {
         let mut appender = self.connection.appender(staging)?;
         for row in rows {
             // Iterator parameters also support tables wider than 32 columns.
@@ -343,10 +367,6 @@ fn list_literal(values: &[Value], out: &mut String) {
 }
 
 #[cfg(test)]
-// The crate denies `expect`/`unwrap` to keep production paths honest; tests are
-// allowed them per the repository test style, since a failed expectation there
-// means the fixture or setup is wrong.
-#[expect(clippy::expect_used)]
 mod tests {
     use std::sync::Arc;
 
@@ -394,7 +414,7 @@ mod tests {
         let restored = crate::sink::Store::restore(&mut sink)
             .await
             .expect("reads back");
-        let heights: Vec<u64> = restored.ledger.iter().map(|block| block.height).collect();
+        let heights: Vec<u64> = restored.ledger.iter().map(|meta| meta.height).collect();
         assert_eq!(heights, [8, 9, 10]);
 
         reader
@@ -557,7 +577,7 @@ mod tests {
 
         let connection = open();
         let reader = connection.try_clone().expect("a second handle");
-        let sink = connect(connection, crate::sink::fixtures::schema(), "base").await;
+        let reconnected = connect(connection, crate::sink::fixtures::schema(), "base").await;
         for table in Table::ALL {
             assert_eq!(
                 column::<i64>(&reader, &format!("SELECT count(*) FROM base.{table}")),
@@ -566,7 +586,7 @@ mod tests {
             );
         }
         // Leave nothing behind; the file is released once both handles drop.
-        drop((sink, reader));
+        drop((reconnected, reader));
         std::fs::remove_file(&path).expect("remove temp database");
     }
 

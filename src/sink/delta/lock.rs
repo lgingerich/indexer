@@ -124,8 +124,8 @@ impl RunLock {
     ) -> Result<Self, LockError> {
         let root = uri.trim_end_matches('/');
         let storage = Storage::new(root, storage)?;
-        let uri = format!("{root}/{chain}/{TABLE}");
-        let table = open(&storage, &uri).await?;
+        let table_uri = format!("{root}/{chain}/{TABLE}");
+        let table = open(&storage, &table_uri).await?;
         let now = unix_now();
         let next = match latest(&table).await? {
             Some(lease) if !lease.free(now) => return Err(held(lease, now)),
@@ -268,6 +268,10 @@ impl Drop for RunLock {
 /// fails is checked against the table: if another run's change is newest, the lease is
 /// lost; otherwise the next renewal tries again, until [`RENEWAL_DEADLINE`] has passed
 /// since the last that succeeded, when the lease counts as lost too.
+#[expect(
+    clippy::cognitive_complexity,
+    reason = "one renewal loop with its stop, retry and lost-lease branches"
+)]
 async fn renew(
     mut table: DeltaTable,
     mut lease: Lease,
@@ -354,7 +358,7 @@ async fn open(storage: &Storage, uri: &str) -> Result<DeltaTable, StoreError> {
         ])
         .await;
     match created {
-        Ok(table) => Ok(table),
+        Ok(made) => Ok(made),
         Err(_) => storage.table(uri).await.map_err(opening()),
     }
 }
@@ -458,8 +462,6 @@ fn unix_now() -> i64 {
 }
 
 #[cfg(test)]
-// Test code: a failed expectation means the fixture or setup is wrong.
-#[expect(clippy::expect_used)]
 mod tests {
     use std::collections::BTreeMap;
 

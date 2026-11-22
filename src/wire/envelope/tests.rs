@@ -1,7 +1,3 @@
-// The crate denies `expect`; a test may use it, since a failed expectation there means
-// the fixture is wrong.
-#![expect(clippy::expect_used)]
-
 use alloy_primitives::{Address, B64, B256, Bloom, Bytes, Function, I256, TxHash, U256};
 use alloy_rpc_types_eth::{
     AccessList, AccessListItem, Authorization, SignedAuthorization, Withdrawal,
@@ -397,8 +393,8 @@ impl<'de> Deserialize<'de> for Keys {
         struct Visitor;
         impl<'de> serde::de::Visitor<'de> for Visitor {
             type Value = Keys;
-            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                f.write_str("a JSON object")
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a JSON object")
             }
             fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Keys, A::Error> {
                 let mut keys = Vec::new();

@@ -1,11 +1,6 @@
 //! The contract tests of retracting and reading back: a replay and a reorg, a rewind, the
 //! ledger window a restart resumes from, and the contracts it restores.
 
-// The crate denies `expect`/`unwrap` to keep production paths honest; tests are allowed
-// them per the repository test style, since a failed expectation there means the fixture
-// or setup is wrong.
-#![expect(clippy::expect_used)]
-
 use super::*;
 
 /// A batch that holds a key twice keeps its last copy, a later flush of the same key
@@ -287,7 +282,7 @@ pub(crate) async fn a_rewind_deletes_blocks_whose_ledger_rows_were_pruned<H: Har
 pub(crate) async fn the_ledger_reads_back_the_newest_canonical_window<H: Harness>() {
     let (mut sink, mut harness) = H::open(datasets()).await;
     let chain = harness.chain();
-    assert!(sink.ledger(3).await.expect("empty").is_empty());
+    assert_eq!(sink.ledger(3).await.expect("empty"), []);
     let mut envelopes: Vec<Envelope> = (1..=10)
         .map(|height| Envelope::new(chain.clone(), Event::AcceptedBlock(accepted(height))))
         .collect();
@@ -380,7 +375,7 @@ pub(crate) async fn stored_contracts_read_back_and_orphaned_ones_are_deleted<H: 
     );
 
     commit(&mut sink, [reorg(&chain, &[0x01])]).await;
-    assert!(sink.contracts().await.expect("read back").is_empty());
+    assert_eq!(sink.contracts().await.expect("read back"), []);
     assert_eq!(row_count(&mut harness, "contracts").await, 0);
     harness.remove().await;
 }

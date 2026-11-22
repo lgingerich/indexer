@@ -1,8 +1,3 @@
-// The crate denies `expect`/`unwrap` to keep production paths honest; tests are
-// allowed them per the repository test style, since a failed expectation there
-// means the fixture or setup is wrong.
-#![expect(clippy::expect_used)]
-
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -46,14 +41,17 @@ struct Batches {
 }
 
 impl EnvelopeSink for Batches {
-    async fn publish(&mut self, envelope: Envelope) -> Result<(), SinkError> {
+    fn publish(
+        &mut self,
+        envelope: Envelope,
+    ) -> impl Future<Output = Result<(), SinkError>> + Send {
         self.open.push(envelope.event.dedupe_key());
-        Ok(())
+        std::future::ready(Ok(()))
     }
 
-    async fn flush(&mut self) -> Result<(), SinkError> {
+    fn flush(&mut self) -> impl Future<Output = Result<(), SinkError>> + Send {
         self.flushed.push(std::mem::take(&mut self.open));
-        Ok(())
+        std::future::ready(Ok(()))
     }
 
     /// Ten bytes an envelope, so a test can state a byte limit in envelopes.
@@ -168,20 +166,24 @@ async fn the_envelope_budget_holds_back_large_blocks() {
         "room again once storage took the first"
     );
 
-    let (mut sink, mut receiver) = ChannelSink::new(StoreBackend::DuckDb);
+    let (mut whole_sink, mut whole_receiver) = ChannelSink::new(StoreBackend::DuckDb);
     let whole = u64::try_from(ENVELOPES + 1).expect("fits");
     assert!(
-        !waits(send_block(&mut sink, 0..whole)).await,
+        !waits(send_block(&mut whole_sink, 0..whole)).await,
         "a block over the whole budget goes"
     );
     assert!(
-        waits(send_block(&mut sink, whole..whole + 1)).await,
+        waits(send_block(&mut whole_sink, whole..whole + 1)).await,
         "and goes alone: it holds the whole budget"
     );
-    let large = receiver.receiver.recv().await.expect("the large block");
+    let large = whole_receiver
+        .receiver
+        .recv()
+        .await
+        .expect("the large block");
     assert_eq!(large.envelopes.len(), ENVELOPES + 1, "whole, never split");
     drop(large);
-    assert!(!waits(send_block(&mut sink, whole..whole + 1)).await);
+    assert!(!waits(send_block(&mut whole_sink, whole..whole + 1)).await);
 }
 
 /// A store that fell behind commits its backlog in one flush, but never splits a
@@ -236,8 +238,11 @@ async fn a_block_queued_behind_a_slow_commit_has_already_waited() {
     }
 
     impl EnvelopeSink for Slow {
-        async fn publish(&mut self, _envelope: Envelope) -> Result<(), SinkError> {
-            Ok(())
+        fn publish(
+            &mut self,
+            _envelope: Envelope,
+        ) -> impl Future<Output = Result<(), SinkError>> + Send {
+            std::future::ready(Ok(()))
         }
 
         async fn flush(&mut self) -> Result<(), SinkError> {
@@ -451,9 +456,9 @@ async fn a_stop_finishes_the_commit_under_way_and_drops_the_rest() {
             self.inner.flush().await
         }
 
-        async fn finish(&mut self) -> Result<(), SinkError> {
+        fn finish(&mut self) -> impl Future<Output = Result<(), SinkError>> + Send {
             self.finished = true;
-            Ok(())
+            std::future::ready(Ok(()))
         }
     }
 
@@ -480,15 +485,15 @@ async fn a_stop_finishes_the_commit_under_way_and_drops_the_rest() {
     request.send(true).expect("the drain is listening");
     release.notify_one();
 
-    let (stored, store) = storage.await.expect("storage ends");
+    let (stored, gated) = storage.await.expect("storage ends");
     assert_eq!(stored, 1);
-    assert_eq!(store.inner.flushed, [keys(0..1)]);
+    assert_eq!(gated.inner.flushed, [keys(0..1)]);
     assert!(
-        store.inner.open.is_empty(),
+        gated.inner.open.is_empty(),
         "the queued block is dropped, not published"
     );
     assert!(
-        store.finished,
+        gated.finished,
         "what the last commit left running is waited on"
     );
 }
@@ -524,17 +529,20 @@ async fn a_stop_abandons_a_commit_that_runs_out_of_time() {
     }
 
     impl EnvelopeSink for Stuck {
-        async fn publish(&mut self, _envelope: Envelope) -> Result<(), SinkError> {
-            Ok(())
+        fn publish(
+            &mut self,
+            _envelope: Envelope,
+        ) -> impl Future<Output = Result<(), SinkError>> + Send {
+            std::future::ready(Ok(()))
         }
 
         async fn flush(&mut self) -> Result<(), SinkError> {
             std::future::pending().await
         }
 
-        async fn finish(&mut self) -> Result<(), SinkError> {
+        fn finish(&mut self) -> impl Future<Output = Result<(), SinkError>> + Send {
             self.finished = true;
-            Ok(())
+            std::future::ready(Ok(()))
         }
     }
 
@@ -610,8 +618,11 @@ async fn a_failing_sink_ends_the_drain_with_its_error() {
     struct OutOfSpace;
 
     impl EnvelopeSink for OutOfSpace {
-        async fn publish(&mut self, _envelope: Envelope) -> Result<(), SinkError> {
-            Err(SinkError::Write(std::io::Error::other("disk is full")))
+        fn publish(
+            &mut self,
+            _envelope: Envelope,
+        ) -> impl Future<Output = Result<(), SinkError>> + Send {
+            std::future::ready(Err(SinkError::Write(std::io::Error::other("disk is full"))))
         }
     }
 

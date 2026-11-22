@@ -53,7 +53,7 @@ impl Session {
     pub(crate) fn events_from(
         document: &str,
     ) -> Result<Vec<SessionEvent>, crate::sink::store_error::InvalidStoredValue> {
-        serde_json::from_str(document).map_err(|_| {
+        serde_json::from_str(document).map_err(|_malformed| {
             crate::sink::store_error::InvalidStoredValue::new("sessions.events", document)
         })
     }

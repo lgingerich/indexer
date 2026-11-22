@@ -1,11 +1,6 @@
 //! Assembling a pipeline and running it against real stores: how a stop, a failed store,
 //! and a restart end up in what the stores hold.
 
-// The crate denies `expect`/`unwrap` to keep production paths honest; tests are allowed
-// them per the repository test style, since a failed expectation there means the fixture
-// or setup is wrong.
-#![expect(clippy::expect_used)]
-
 use alloy_dyn_abi::DynSolValue;
 use alloy_primitives::{Address, B256, keccak256};
 
@@ -310,8 +305,8 @@ async fn a_discovered_contract_is_stored_and_survives_a_restart() {
     assert_eq!(orphans, 0);
 
     // A restart: a fresh decoder knows the pool once the store's rows are restored.
-    let mut store = duckdb_store(reader.try_clone().expect("handle")).await;
-    let stored = store.contracts().await.expect("read back");
+    let mut reopened = duckdb_store(reader.try_clone().expect("handle")).await;
+    let stored = reopened.contracts().await.expect("read back");
     assert_eq!(stored, [stored_pool(pool, creating, 10)]);
     let restarted = restarted(stored);
     assert_eq!(restarted.discovered(), 1);
@@ -321,7 +316,7 @@ async fn a_discovered_contract_is_stored_and_survives_a_restart() {
     assert!(restarted.decode(&log).is_some());
 
     // The creating block is orphaned: the stored row is deleted, so nothing restores.
-    store
+    reopened
         .publish(Envelope::new(
             chain.clone(),
             Event::Reorg(Reorg {
@@ -332,8 +327,8 @@ async fn a_discovered_contract_is_stored_and_survives_a_restart() {
         ))
         .await
         .expect("publish");
-    store.flush().await.expect("flush");
-    assert!(store.contracts().await.expect("read back").is_empty());
+    reopened.flush().await.expect("flush");
+    assert_eq!(reopened.contracts().await.expect("read back"), []);
     assert_eq!(count(&reader, "contracts"), 0);
 }
 
@@ -401,19 +396,23 @@ impl BlockSource for FakeChain {
     fn chain(&self) -> &ChainId {
         &self.chain
     }
-    async fn subscribe_heads(&self) -> Result<HeadStream, SourceError> {
-        Ok(Box::pin(futures_util::stream::empty()))
+    fn subscribe_heads(&self) -> impl Future<Output = Result<HeadStream, SourceError>> + Send {
+        let heads: HeadStream = Box::pin(futures_util::stream::empty());
+        std::future::ready(Ok(heads))
     }
-    async fn fetch_header(&self, height: Option<u64>) -> Result<BlockMeta, SourceError> {
-        Ok(self.blocks[&height.unwrap_or(self.head)].0)
+    fn fetch_header(
+        &self,
+        height: Option<u64>,
+    ) -> impl Future<Output = Result<BlockMeta, SourceError>> + Send {
+        std::future::ready(Ok(self.blocks[&height.unwrap_or(self.head)].0))
     }
-    async fn fetch_block(
+    fn fetch_block(
         &self,
         height: u64,
         _head: Option<&BlockMeta>,
-    ) -> Result<FetchedBlock, SourceError> {
+    ) -> impl Future<Output = Result<FetchedBlock, SourceError>> + Send {
         let (meta, events) = self.blocks[&height].clone();
-        Ok(FetchedBlock { meta, events })
+        std::future::ready(Ok(FetchedBlock { meta, events }))
     }
     async fn fetch_blocks(&self, from: u64, to: u64) -> Result<Vec<FetchedBlock>, SourceError> {
         let mut blocks = Vec::new();
@@ -579,7 +578,7 @@ async fn a_restart_resumes_from_the_store_and_reconciles_a_fork_while_down() {
     );
     let mut store = duckdb_store(connection.try_clone().expect("handle")).await;
     let restored = store.restore().await.expect("restore");
-    assert!(restored.contracts.is_empty());
+    assert_eq!(restored.contracts, []);
     assert_eq!(
         restored
             .ledger
@@ -626,7 +625,7 @@ struct LakeDir(std::path::PathBuf);
 #[cfg(feature = "delta")]
 impl Drop for LakeDir {
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
+        drop(std::fs::remove_dir_all(&self.0));
     }
 }
 
@@ -724,14 +723,14 @@ async fn a_lake_restart_resumes_from_its_ledger_and_reconciles_a_fork_while_down
     forked.log(7, swap(pool));
     run_lake(&settings, forked, None).await;
 
-    let after = restored(&settings).await;
+    let after_fork = restored(&settings).await;
     assert!(
-        after.contracts.is_empty(),
+        after_fork.contracts.is_empty(),
         "the creation went with its block"
     );
-    assert_eq!(ledger_of(&after), chain_through(7, 5));
+    assert_eq!(ledger_of(&after_fork), chain_through(7, 5));
     assert!(
-        after
+        after_fork
             .ledger
             .windows(2)
             .all(|pair| pair[1].parent_hash == pair[0].hash),

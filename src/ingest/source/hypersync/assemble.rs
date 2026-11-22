@@ -232,7 +232,6 @@ fn project(
 }
 
 #[cfg(test)]
-#[expect(clippy::expect_used)]
 mod tests {
     use super::*;
     use crate::ingest::source::hypersync::TRANSACTION_POSITION_FIELDS;
@@ -437,8 +436,8 @@ mod tests {
             transactions: false,
             logs: false,
         };
-        let error = assemble(10, 10, response(&positions[..1]), Plan::new(blocks_only))
+        let blocks_error = assemble(10, 10, response(&positions[..1]), Plan::new(blocks_only))
             .expect_err("blocks");
-        assert_eq!(error.to_string(), dropped);
+        assert_eq!(blocks_error.to_string(), dropped);
     }
 }

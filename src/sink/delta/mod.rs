@@ -488,7 +488,7 @@ impl DeltaSink {
         self.appending = ledger.map(|batch| {
             PendingLedger::start(self.lake(Table::AcceptedBlock), &self.writer, batch)
         });
-        let orphaned = orphans.map(|(_, hashes)| hashes).unwrap_or_default();
+        let orphaned = orphans.map_or_default(|(_, hashes)| hashes);
         self.advance(&orphaned, accepted);
         Ok(Timings {
             build,
@@ -720,9 +720,15 @@ impl EnvelopeSink for DeltaSink {
     /// row is kept as the record of the retraction.
     ///
     /// Refused with [`StoreError::Failed`] once a commit has failed.
-    async fn publish(&mut self, envelope: Envelope) -> Result<(), SinkError> {
-        self.refuse_if_failed()?;
-        self.batch.push(&envelope)
+    fn publish(
+        &mut self,
+        envelope: Envelope,
+    ) -> impl Future<Output = Result<(), SinkError>> + Send {
+        let pushed = match self.refuse_if_failed() {
+            Ok(()) => self.batch.push(&envelope),
+            Err(error) => Err(error.into()),
+        };
+        std::future::ready(pushed)
     }
 
     /// Commits the batch. The drain decides how many blocks it holds; a block still
@@ -909,8 +915,8 @@ async fn append_all(
     batches: Vec<(usize, Vec<RecordBatch>)>,
 ) -> Vec<(usize, Result<DeltaTable, StoreError>)> {
     let mut appends = JoinSet::new();
-    for (position, batches) in batches {
-        let append = lakes[position].append(writer, batches);
+    for (position, table_batches) in batches {
+        let append = lakes[position].append(writer, table_batches);
         appends.spawn(async move { (position, append.await) });
     }
     let mut appended = Vec::with_capacity(appends.len());

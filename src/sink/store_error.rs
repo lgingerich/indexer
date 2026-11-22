@@ -63,7 +63,7 @@ impl fmt::Display for Operation {
 pub enum StoreError {
     /// The engine failed during `operation`, on `target` — a table, a setting, or a path —
     /// when there is one.
-    #[error("{operation}{}: {source}", target.as_ref().map(|target| format!(" {target}")).unwrap_or_default())]
+    #[error("{operation}{}: {source}", target.as_ref().map_or_else(String::new, |target| format!(" {target}")))]
     Engine {
         /// What the store was doing.
         operation: Operation,
@@ -202,7 +202,7 @@ impl InvalidStoredValue {
         column: &'static str,
         value: &str,
     ) -> Result<T, Self> {
-        value.parse().map_err(|_| Self::new(column, value))
+        value.parse().map_err(|_unparsed| Self::new(column, value))
     }
 }
 
@@ -244,8 +244,11 @@ pub(crate) fn check_columns<N: AsRef<str>, M: AsRef<str>, T>(
             return Err(drift(format!("it has no {name} column")));
         };
         match differs(found, declared) {
-            Some(ColumnDrift::Type { found, expected }) => {
-                return Err(drift(format!("{name} is {found}, not {expected}")));
+            Some(ColumnDrift::Type {
+                found,
+                expected: mapped,
+            }) => {
+                return Err(drift(format!("{name} is {found}, not {mapped}")));
             }
             Some(ColumnDrift::Nullability) => {
                 return Err(drift(format!("{name} differs in nullability")));

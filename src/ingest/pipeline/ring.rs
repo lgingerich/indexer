@@ -202,7 +202,6 @@ mod tests {
     use super::*;
     use crate::ingest::pipeline::Machine;
     use crate::ingest::pipeline::testing::*;
-    use crate::wire::envelope::BlockMeta;
 
     /// Only the newest run of a stored ledger whose heights and parent hashes link is
     /// kept, and a window built from a ledger that lost its older part is bounded at its
@@ -228,7 +227,7 @@ mod tests {
             "a parent that is not the block below"
         );
         assert_eq!(kept(ledger(3..=3)), [3], "a single block");
-        assert!(linked_suffix(Vec::new()).is_empty());
+        assert_eq!(linked_suffix(Vec::new()), []);
 
         let machine = Machine::new(Source::linear(0), Sink::default(), gapped);
         assert_eq!(machine.ring.window, Window::Bounded { floor: meta(5) });
@@ -236,23 +235,23 @@ mod tests {
         assert_eq!(machine.tip(), Some(meta(8)));
 
         let window = crate::window::MAX_UNFINALIZED_BLOCKS as u64;
-        let machine = Machine::new(Source::linear(0), Sink::default(), ledger(0..=window));
-        assert_eq!(machine.ring.window, Window::Bounded { floor: meta(0) });
+        let full = Machine::new(Source::linear(0), Sink::default(), ledger(0..=window));
+        assert_eq!(full.ring.window, Window::Bounded { floor: meta(0) });
         assert_eq!(
-            machine.ring.entries.len(),
+            full.ring.entries.len(),
             crate::window::MAX_UNFINALIZED_BLOCKS
         );
-        assert_eq!(machine.tip(), Some(meta(window)));
+        assert_eq!(full.tip(), Some(meta(window)));
 
-        let machine = Machine::new(
+        let single = Machine::new(
             Source::linear(0),
             Sink::default(),
             Ledger::new(ledger(3..=3), true, UndoWindow::DEFAULT),
         );
-        assert_eq!(machine.ring.window, Window::Bounded { floor: meta(3) });
-        assert!(machine.ring.entries.is_empty());
-        assert_eq!(machine.tip(), Some(meta(3)));
-        assert_eq!(machine.ring.oldest(), Some(meta(3)));
+        assert_eq!(single.ring.window, Window::Bounded { floor: meta(3) });
+        assert!(single.ring.entries.is_empty());
+        assert_eq!(single.tip(), Some(meta(3)));
+        assert_eq!(single.ring.oldest(), Some(meta(3)));
     }
 
     /// An empty ledger is a fresh start whatever it was built with: there is no oldest
@@ -268,10 +267,6 @@ mod tests {
 
     /// A narrower window slides at its own size, and a ledger carries it to the ring.
     #[test]
-    #[expect(
-        clippy::expect_used,
-        reason = "a failed one means the fixture is wrong"
-    )]
     fn a_ring_slides_at_the_window_its_ledger_names() {
         let window = UndoWindow::new(3).expect("in range");
         let mut ring = UndoRing::from(Ledger::new(ledger(1..=3), false, window));

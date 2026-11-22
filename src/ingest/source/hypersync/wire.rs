@@ -3,7 +3,7 @@
 use std::fmt;
 
 use alloy_primitives::{Address, B64, B256, Bloom, Bytes, TxHash, U256};
-use serde::de::{self};
+use serde::de;
 use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::ingest::source::{SourceError, malformed};
@@ -32,6 +32,10 @@ pub(super) struct Query {
 
 /// A selection with no filter, which matches every row.
 #[derive(Debug, Serialize)]
+#[expect(
+    clippy::empty_structs_with_brackets,
+    reason = "serde writes a braced struct as `{}` but a unit struct as `null`"
+)]
 pub(super) struct All {}
 
 /// The columns a query returns, per table.
@@ -284,7 +288,7 @@ impl RawTransaction {
             transaction_type: u8::try_from(
                 required(self.transaction_type, "type")?.to_u64("type")?,
             )
-            .map_err(|_| malformed(CONTEXT, "transaction type is above 255"))?,
+            .map_err(|_overflow| malformed(CONTEXT, "transaction type is above 255"))?,
             chain_id: optional_u64(self.chain_id, "chain_id")?,
             access_list: self
                 .access_list
@@ -306,7 +310,8 @@ impl RawTransaction {
             v: optional_u128(self.v, "v")?,
             y_parity: optional_u64(self.y_parity, "y_parity")?
                 .map(|parity| {
-                    u8::try_from(parity).map_err(|_| malformed(CONTEXT, "y_parity is above 255"))
+                    u8::try_from(parity)
+                        .map_err(|_overflow| malformed(CONTEXT, "y_parity is above 255"))
                 })
                 .transpose()?,
             // As alloy reads an RPC receipt: a status when there is one, and success for a
@@ -394,12 +399,12 @@ pub(super) struct Quantity(pub(super) U256);
 impl Quantity {
     pub(super) fn to_u64(self, field: &str) -> Result<u64, SourceError> {
         u64::try_from(self.0)
-            .map_err(|_| malformed(CONTEXT, format!("{field} {} overflows u64", self.0)))
+            .map_err(|_overflow| malformed(CONTEXT, format!("{field} {} overflows u64", self.0)))
     }
 
     pub(super) fn to_u128(self, field: &str) -> Result<u128, SourceError> {
         u128::try_from(self.0)
-            .map_err(|_| malformed(CONTEXT, format!("{field} {} overflows u128", self.0)))
+            .map_err(|_overflow| malformed(CONTEXT, format!("{field} {} overflows u128", self.0)))
     }
 }
 
@@ -410,16 +415,16 @@ impl<'de> Deserialize<'de> for Quantity {
         impl de::Visitor<'_> for Visitor {
             type Value = Quantity;
 
-            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-                f.write_str("an unsigned integer, or `0x` hex")
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("an unsigned integer, or `0x` hex")
             }
 
-            fn visit_u64<E: de::Error>(self, value: u64) -> Result<Quantity, E> {
-                Ok(Quantity(U256::from(value)))
+            fn visit_u64<E: de::Error>(self, v: u64) -> Result<Quantity, E> {
+                Ok(Quantity(U256::from(v)))
             }
 
-            fn visit_str<E: de::Error>(self, value: &str) -> Result<Quantity, E> {
-                parse_quantity(value).map_err(E::custom)
+            fn visit_str<E: de::Error>(self, v: &str) -> Result<Quantity, E> {
+                parse_quantity(v).map_err(E::custom)
             }
         }
 
@@ -456,7 +461,6 @@ fn optional_u128(value: Option<Quantity>, field: &str) -> Result<Option<u128>, S
 }
 
 #[cfg(test)]
-#[expect(clippy::expect_used)]
 mod tests {
     use super::*;
 

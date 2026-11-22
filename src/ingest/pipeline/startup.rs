@@ -152,8 +152,8 @@ impl<S: BlockSource + 'static, K: EnvelopeSink> Machine<S, K> {
                         "the source answered inconsistently at startup; asking again");
                     tokio::time::sleep(STARTUP_RETRY_DELAY).await;
                     result = match self.sample_head().await {
-                        Ok(head) => self.sync(plan, head).await,
-                        Err(error) => Err(error),
+                        Ok(resampled) => self.sync(plan, resampled).await,
+                        Err(sample_error) => Err(sample_error),
                     };
                 }
                 result => return result.map(|()| plan.end.stop()),
@@ -316,15 +316,13 @@ impl<S: BlockSource + 'static, K: EnvelopeSink> Machine<S, K> {
 }
 
 #[cfg(test)]
-#[expect(clippy::expect_used)]
 mod tests {
 
     use super::*;
     use crate::ingest::pipeline::testing::*;
-    use crate::ingest::source::SourceError;
     use crate::window::Ledger;
     use crate::window::MAX_UNFINALIZED_BLOCKS;
-    use crate::wire::envelope::{BlockMeta, Event};
+    use crate::wire::envelope::{Event, Reorg};
 
     #[tokio::test]
     async fn a_near_head_start_seeds_then_extends_one_height_at_a_time() {
@@ -402,10 +400,10 @@ mod tests {
         assert_eq!(reads(&machine), (1, 10));
         // The clock is paused, so the timeout fires only if the run went on to wait for
         // heads: the reconcile timer is the only thing that would advance it.
-        let machine = Machine::new(Source::linear(head), Sink::default(), Vec::new());
+        let runner = Machine::new(Source::linear(head), Sink::default(), Vec::new());
         tokio::time::timeout(
             std::time::Duration::from_secs(5),
-            machine.run(Some(0), Some(9)),
+            runner.run(Some(0), Some(9)),
         )
         .await
         .expect("a stopped run returns without following heads")
@@ -434,7 +432,7 @@ mod tests {
         let mut machine = Machine::new(Source::linear(8), Sink::default(), ledger(0..=6));
         machine.sync_settled(None, Some(6)).await.expect("sync");
         machine.sync_settled(None, Some(4)).await.expect("sync");
-        assert!(machine.sink.events.is_empty());
+        assert_eq!(machine.sink.events, []);
         assert_eq!(reads(&machine), (0, 0), "the chain is not asked at all");
     }
 
@@ -478,10 +476,10 @@ mod tests {
             .expect("every lagging height is caught up");
         assert_eq!(heights(&machine), (1..=head).collect::<Vec<_>>());
 
-        let source = Source::linear(6);
-        source.fail(3, Fault::Inconsistent, u32::MAX);
-        let mut machine = Machine::new(source, Sink::default(), ledger(0..=2));
-        let error = machine
+        let stuck_source = Source::linear(6);
+        stuck_source.fail(3, Fault::Inconsistent, u32::MAX);
+        let mut stuck_machine = Machine::new(stuck_source, Sink::default(), ledger(0..=2));
+        let error = stuck_machine
             .sync_settled(None, Some(6))
             .await
             .expect_err("a height that never settles stops the run");
@@ -493,7 +491,7 @@ mod tests {
             "{error:?}"
         );
         assert_eq!(
-            reads(&machine).1,
+            reads(&stuck_machine).1,
             usize::try_from(attempts).expect("count"),
             "the stuck height is asked once per attempt"
         );
@@ -548,7 +546,7 @@ mod tests {
             &malformed("injected source failure"),
         );
         assert_eq!(reads(&machine), (1, 1));
-        assert!(machine.sink.events.is_empty());
+        assert_eq!(machine.sink.events, []);
     }
 
     /// A run on a source that only backfills indexes every buried height from its start and stops at the
@@ -576,11 +574,14 @@ mod tests {
         assert_eq!(heights(&machine), (2..=90).collect::<Vec<_>>());
 
         let head = MAX_UNFINALIZED_BLOCKS as u64 + 5;
-        let mut source = Source::backfilling(head);
-        source.finality = u64::MAX;
-        let mut machine = Machine::new(source, Sink::default(), Vec::new());
-        machine.sync_settled(Some(2), None).await.expect("backfill");
-        assert_eq!(heights(&machine), (2..=5).collect::<Vec<_>>());
+        let mut deep_source = Source::backfilling(head);
+        deep_source.finality = u64::MAX;
+        let mut deep_machine = Machine::new(deep_source, Sink::default(), Vec::new());
+        deep_machine
+            .sync_settled(Some(2), None)
+            .await
+            .expect("backfill");
+        assert_eq!(heights(&deep_machine), (2..=5).collect::<Vec<_>>());
     }
 
     /// A stop below the reorg window ends a backfill there; one already stored
@@ -595,10 +596,14 @@ mod tests {
             .expect("backfill");
         assert_eq!(heights(&machine), (2..=4).collect::<Vec<_>>());
 
-        let mut machine = Machine::new(Source::backfilling(head), Sink::default(), ledger(0..=5));
-        machine.sync_settled(None, Some(5)).await.expect("backfill");
-        assert!(machine.sink.events.is_empty());
-        assert_eq!(reads(&machine).1, 0, "no block is fetched");
+        let mut stored_machine =
+            Machine::new(Source::backfilling(head), Sink::default(), ledger(0..=5));
+        stored_machine
+            .sync_settled(None, Some(5))
+            .await
+            .expect("backfill");
+        assert_eq!(stored_machine.sink.events, []);
+        assert_eq!(reads(&stored_machine).1, 0, "no block is fetched");
     }
 
     /// A backfill resumes after a stored tip that the source agrees with, and refuses one
@@ -613,15 +618,15 @@ mod tests {
         let mut stored = ledger(0..=5);
         stored[5].hash = hash(105);
         let tip = stored[5];
-        let mut machine = Machine::new(Source::backfilling(head), Sink::default(), stored);
+        let mut forked_machine = Machine::new(Source::backfilling(head), Sink::default(), stored);
         fails_with(
-            machine.sync_settled(None, None).await,
+            forked_machine.sync_settled(None, None).await,
             &PipelineError::IdentityMismatch {
                 expected: Box::new(tip),
                 actual: Box::new(meta(5)),
             },
         );
-        assert!(machine.sink.events.is_empty());
+        assert_eq!(forked_machine.sink.events, []);
     }
 
     /// With no stored blocks and no start, a backfill would start at the head, where
@@ -653,13 +658,17 @@ mod tests {
         );
         assert_eq!(reads(&machine), (1, 0), "one head sample, no block");
 
-        let mut machine = Machine::new(Source::backfilling(head), Sink::default(), Vec::new());
+        let mut buried_machine =
+            Machine::new(Source::backfilling(head), Sink::default(), Vec::new());
         assert_eq!(
-            machine.sync_settled(Some(2), None).await.expect("backfill"),
+            buried_machine
+                .sync_settled(Some(2), None)
+                .await
+                .expect("backfill"),
             Some(5)
         );
-        assert_eq!(heights(&machine), [2, 3, 4, 5]);
-        assert_eq!(reads(&machine).0, 1, "the head is sampled once");
+        assert_eq!(heights(&buried_machine), [2, 3, 4, 5]);
+        assert_eq!(reads(&buried_machine).0, 1, "the head is sampled once");
     }
 
     /// A start the stored history already reaches is ignored, as a followed run ignores
@@ -685,7 +694,7 @@ mod tests {
             machine.sync_settled(Some(7), None).await,
             &PipelineError::StartAboveHistory { start: 7, tip: 5 },
         );
-        assert!(machine.sink.events.is_empty());
+        assert_eq!(machine.sink.events, []);
     }
 
     /// A source that only backfills stops at the reorg window under the head it sampled
@@ -737,7 +746,7 @@ mod tests {
             [6, 7, 8],
             "nothing below the tip is replayed"
         );
-        assert!(reorgs(&machine).is_empty());
+        assert_eq!(reorgs(&machine), Vec::<&Reorg>::new());
     }
 
     #[tokio::test]
@@ -856,7 +865,7 @@ mod tests {
                 }),
             },
         );
-        assert!(machine.sink.events.is_empty());
+        assert_eq!(machine.sink.events, []);
         assert_eq!(machine.tip(), Some(meta(5)));
     }
 
@@ -865,7 +874,7 @@ mod tests {
         let mut machine = Machine::new(Source::linear(8), Sink::default(), ledger(0..=5));
         chain(&mut machine).head = 3;
         settle(&mut machine, None).await;
-        assert!(machine.sink.events.is_empty());
+        assert_eq!(machine.sink.events, []);
         assert_eq!(machine.tip(), Some(meta(5)));
     }
 

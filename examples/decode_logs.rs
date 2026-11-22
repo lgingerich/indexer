@@ -48,7 +48,12 @@
 //! manifest.
 
 // A runnable tool rather than a library, so printing is the whole job.
-#![expect(clippy::print_stdout, clippy::print_stderr, clippy::expect_used)]
+#![expect(
+    clippy::print_stdout,
+    clippy::print_stderr,
+    clippy::expect_used,
+    reason = "a runnable tool: printing is its output, and a bad input stops it"
+)]
 
 use std::process::ExitCode;
 

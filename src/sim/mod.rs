@@ -316,8 +316,8 @@ fn run(seed: u64, dir: &Path) -> Outcome {
         let mut world = lock(&world);
         problems.extend(judge(&end, &world, chosen, true));
         problems.append(&mut world.problems);
-        for (store, stored) in plan.stores.iter().zip(&stored) {
-            problems.extend(oracle::check(&world, &plan, store, stored));
+        for (store, held) in plan.stores.iter().zip(&stored) {
+            problems.extend(oracle::check(&world, &plan, store, held));
         }
     }
 
@@ -338,8 +338,8 @@ fn run(seed: u64, dir: &Path) -> Outcome {
     let mut world = lock(&world);
     problems.extend(judge(&end, &world, chosen, false));
     problems.append(&mut world.problems);
-    for (store, stored) in plan.stores.iter().zip(&stored) {
-        problems.extend(oracle::check(&world, &plan, store, stored));
+    for (store, held) in plan.stores.iter().zip(&stored) {
+        problems.extend(oracle::check(&world, &plan, store, held));
     }
     problems.extend(caught_up(&world, &plan, &stored));
     Outcome {
@@ -652,9 +652,10 @@ fn unexpected(error: &RuntimeError, world: &World, faults: bool) -> Option<Strin
                 | PipelineError::UnstableSource => lagged,
                 PipelineError::SubscriptionClosed => fired("head subscription dropped"),
                 PipelineError::StartAboveHead { .. } => fired("backend lags"),
-                PipelineError::Sink(SinkError::StorageClosed) => {
-                    world.store_faulted.iter().any(|&faulted| faulted)
-                }
+                PipelineError::Sink(SinkError::StorageClosed) => world
+                    .store_faulted
+                    .iter()
+                    .any(|&store_faulted| store_faulted),
                 _ => false,
             },
             RuntimeError::Storage { store, .. }
@@ -676,8 +677,8 @@ fn caught_up(world: &World, plan: &Plan, stored: &[Stored]) -> Vec<String> {
     let canonical = world.at(world.tip()).map(chain::SimBlock::hash);
     let mut problems = Vec::new();
     let mut oldest = None::<u64>;
-    for (store, stored) in plan.stores.iter().zip(stored) {
-        let Some((tip, first)) = oracle::ends(stored) else {
+    for (store, held) in plan.stores.iter().zip(stored) {
+        let Some((tip, first)) = oracle::ends(held) else {
             continue;
         };
         oldest = Some(oldest.map_or(first, |oldest| oldest.min(first)));
@@ -713,10 +714,10 @@ fn seeds() -> Vec<u64> {
 /// Runs `seed` in a scratch directory of its own.
 fn run_fresh(seed: u64) -> Outcome {
     let dir = std::env::temp_dir().join(format!("indexer-sim-{}-{seed}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
+    drop(std::fs::remove_dir_all(&dir));
     std::fs::create_dir_all(&dir).expect("sim directory");
     let outcome = run(seed, &dir);
-    let _ = std::fs::remove_dir_all(&dir);
+    drop(std::fs::remove_dir_all(&dir));
     outcome
 }
 
@@ -733,7 +734,7 @@ fn rerun(seed: u64) -> String {
         .expect("rerun the seed");
     assert!(status.success(), "seed {seed}: the rerun failed");
     let outcome = std::fs::read_to_string(&out).expect("rerun outcome");
-    let _ = std::fs::remove_file(&out);
+    drop(std::fs::remove_file(&out));
     outcome
 }
 
@@ -745,6 +746,12 @@ fn print(text: &str) {
     eprintln!("{text}");
 }
 
+// Not in a `tests` module: the whole module is test-only, and `sim::simulate` is the
+// path nextest's default filter skips and `rerun` selects.
+#[expect(
+    clippy::tests_outside_test_module,
+    reason = "the module is test-only, and nextest's filter and `rerun` name `sim::simulate`"
+)]
 #[test]
 fn simulate() {
     if let Some(out) = std::env::var_os("SIM_CHILD_OUT") {

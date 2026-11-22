@@ -14,11 +14,6 @@
 //! shares; the tests are in `rows`, for what a store writes and what a flush keeps, and
 //! `reorg`, for retracting, rewinding, and reading back.
 
-// The crate denies `expect`/`unwrap` to keep production paths honest; tests are allowed
-// them per the repository test style, since a failed expectation there means the fixture
-// or setup is wrong.
-#![expect(clippy::expect_used)]
-
 mod reorg;
 mod rows;
 

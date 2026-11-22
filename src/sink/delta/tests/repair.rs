@@ -31,18 +31,21 @@ async fn opening_deletes_a_retraction_the_ledger_never_saw() {
     append_only(&mut sink, &reorg(3..=3, 1)).await;
     drop(sink);
 
-    let mut sink = open(&dir).await;
-    assert!(retractions(&sink).await.is_empty());
-    assert_eq!(blocks(&sink).await, expected(&[(1, 0), (2, 0), (3, 0)]));
+    let mut reopened = open(&dir).await;
+    assert!(retractions(&reopened).await.is_empty());
+    assert_eq!(blocks(&reopened).await, expected(&[(1, 0), (2, 0), (3, 0)]));
 
     let mut replacement = vec![reorg(3..=3, 1)];
     replacement.extend(block(3, 1));
-    publish(&mut sink, replacement).await;
-    drop(sink);
+    publish(&mut reopened, replacement).await;
+    drop(reopened);
 
-    let sink = open(&dir).await;
-    assert_eq!(retractions(&sink).await, expected(&[(3, 1)]));
-    assert_eq!(blocks(&sink).await, expected(&[(1, 0), (2, 0), (3, 1)]));
+    let restarted = open(&dir).await;
+    assert_eq!(retractions(&restarted).await, expected(&[(3, 1)]));
+    assert_eq!(
+        blocks(&restarted).await,
+        expected(&[(1, 0), (2, 0), (3, 1)])
+    );
 }
 
 /// A commit that stopped after taking the orphans out of the ledger has already recorded
@@ -59,10 +62,10 @@ async fn a_retraction_out_of_the_ledger_keeps_its_record() {
     delete_only(&mut sink, Table::AcceptedBlock, "hash", hash(3, 0)).await;
     drop(sink);
 
-    let mut sink = open(&dir).await;
-    assert_eq!(retractions(&sink).await, expected(&[(3, 1)]));
-    assert_eq!(blocks(&sink).await, expected(&[(1, 0), (2, 0)]));
-    assert_eq!(ledger_heights(&mut sink).await, [1, 2]);
+    let mut reopened = open(&dir).await;
+    assert_eq!(retractions(&reopened).await, expected(&[(3, 1)]));
+    assert_eq!(blocks(&reopened).await, expected(&[(1, 0), (2, 0)]));
+    assert_eq!(ledger_heights(&mut reopened).await, [1, 2]);
 }
 
 /// A commit that stopped after writing rows but before their ledger entry leaves rows the
@@ -94,9 +97,9 @@ async fn opening_repairs_rows_a_stopped_commit_left_behind() {
     }
     drop(sink);
 
-    let mut sink = open(&dir).await;
-    assert_eq!(blocks(&sink).await, expected(&[(1, 0), (2, 0), (3, 0)]));
-    assert_eq!(ledger_heights(&mut sink).await, [1, 2, 3]);
+    let mut reopened = open(&dir).await;
+    assert_eq!(blocks(&reopened).await, expected(&[(1, 0), (2, 0), (3, 0)]));
+    assert_eq!(ledger_heights(&mut reopened).await, [1, 2, 3]);
 }
 
 /// With no ledger at all, no block row counts: the first commit stopped before its
@@ -114,9 +117,9 @@ async fn opening_with_no_ledger_keeps_no_block_rows() {
     sink.append_some(position, &[&row]).await.expect("appended");
     drop(sink);
 
-    let mut sink = open(&dir).await;
-    assert_eq!(rows(&sink, Table::Block).await, 0);
-    assert!(ledger(&mut sink).await.is_empty());
+    let mut reopened = open(&dir).await;
+    assert_eq!(rows(&reopened, Table::Block).await, 0);
+    assert_eq!(ledger(&mut reopened).await, []);
 }
 
 /// A commit that fails part-way refuses every later write rather than reporting the
@@ -150,9 +153,9 @@ async fn a_failed_commit_refuses_every_later_write() {
     ));
     drop(sink);
 
-    let mut sink = open(&dir).await;
-    assert_eq!(blocks(&sink).await, expected(&[(1, 0)]));
-    assert_eq!(ledger_heights(&mut sink).await, [1]);
+    let mut reopened = open(&dir).await;
+    assert_eq!(blocks(&reopened).await, expected(&[(1, 0)]));
+    assert_eq!(ledger_heights(&mut reopened).await, [1]);
 }
 
 /// The local filesystem, except that no write completes until `release` is closed: an
@@ -187,7 +190,7 @@ impl ObjectStore for Hanging {
         &'life0 self,
         location: &'life1 ObjectPath,
         payload: PutPayload,
-        options: PutOptions,
+        opts: PutOptions,
     ) -> BoxFuture<'async_trait, ObjectResult<PutResult>>
     where
         'life0: 'async_trait,
@@ -196,14 +199,14 @@ impl ObjectStore for Hanging {
     {
         Box::pin(async move {
             self.released().await;
-            self.local.put_opts(location, payload, options).await
+            self.local.put_opts(location, payload, opts).await
         })
     }
 
     fn put_multipart_opts<'life0, 'life1, 'async_trait>(
         &'life0 self,
         location: &'life1 ObjectPath,
-        options: PutMultipartOptions,
+        opts: PutMultipartOptions,
     ) -> BoxFuture<'async_trait, ObjectResult<Box<dyn MultipartUpload>>>
     where
         'life0: 'async_trait,
@@ -212,7 +215,7 @@ impl ObjectStore for Hanging {
     {
         Box::pin(async move {
             self.released().await;
-            self.local.put_multipart_opts(location, options).await
+            self.local.put_multipart_opts(location, opts).await
         })
     }
 
@@ -329,9 +332,9 @@ async fn a_write_past_its_deadline_fails_the_store_and_the_reopen_repairs_it() {
     ));
     drop(sink);
 
-    let mut sink = open(&dir).await;
-    assert_eq!(blocks(&sink).await, expected(&[(1, 0)]));
-    assert_eq!(ledger_heights(&mut sink).await, [1]);
+    let mut reopened = open(&dir).await;
+    assert_eq!(blocks(&reopened).await, expected(&[(1, 0)]));
+    assert_eq!(ledger_heights(&mut reopened).await, [1]);
 }
 
 /// A commit the caller cuts off part-way, as a stop cuts one that runs out of time,
@@ -366,9 +369,9 @@ async fn a_commit_the_caller_cuts_off_leaves_the_store_failed() {
     ));
     drop(sink);
 
-    let mut sink = open(&dir).await;
-    assert_eq!(blocks(&sink).await, expected(&[(1, 0)]));
-    assert_eq!(ledger_heights(&mut sink).await, [1]);
+    let mut reopened = open(&dir).await;
+    assert_eq!(blocks(&reopened).await, expected(&[(1, 0)]));
+    assert_eq!(ledger_heights(&mut reopened).await, [1]);
 }
 
 /// A commit the caller cuts off while the last commit's ledger append still runs leaves
@@ -409,9 +412,9 @@ async fn a_cut_off_commit_leaves_the_last_ledger_append_to_finish() {
     ));
     drop(sink);
 
-    let mut sink = open(&dir).await;
-    assert_eq!(blocks(&sink).await, expected(&[(1, 0), (2, 0)]));
-    assert_eq!(ledger_heights(&mut sink).await, [1, 2]);
+    let mut reopened = open(&dir).await;
+    assert_eq!(blocks(&reopened).await, expected(&[(1, 0), (2, 0)]));
+    assert_eq!(ledger_heights(&mut reopened).await, [1, 2]);
 }
 
 /// A commit that stopped part-way through deleting a retraction's orphans — out of the
@@ -429,10 +432,10 @@ async fn opening_finishes_a_retraction_stopped_between_tables() {
     }
     drop(sink);
 
-    let mut sink = open(&dir).await;
-    assert_eq!(retractions(&sink).await, expected(&[(3, 1)]));
-    assert_eq!(blocks(&sink).await, expected(&[(1, 0), (2, 0)]));
-    assert_eq!(ledger_heights(&mut sink).await, [1, 2]);
+    let mut reopened = open(&dir).await;
+    assert_eq!(retractions(&reopened).await, expected(&[(3, 1)]));
+    assert_eq!(blocks(&reopened).await, expected(&[(1, 0), (2, 0)]));
+    assert_eq!(ledger_heights(&mut reopened).await, [1, 2]);
 }
 
 /// A table already at the lake's location that does not match its definition stops the
@@ -492,9 +495,9 @@ async fn a_restore_after_opening_hands_on_what_opening_read() {
     publish(&mut sink, block(2, 0)).await;
     drop(sink);
 
-    let mut sink = open(&dir).await;
-    let handed_on = sink.restore().await.expect("the lake restores");
-    let read = sink.restore().await.expect("the lake restores again");
+    let mut reopened = open(&dir).await;
+    let handed_on = reopened.restore().await.expect("the lake restores");
+    let read = reopened.restore().await.expect("the lake restores again");
     assert_eq!(handed_on.ledger, read.ledger);
     assert_eq!(handed_on.contracts, read.contracts);
     assert_eq!(
@@ -514,9 +517,9 @@ async fn a_restore_after_opening_hands_on_what_opening_read() {
         [1, 2]
     );
 
-    publish(&mut sink, block(3, 0)).await;
+    publish(&mut reopened, block(3, 0)).await;
     assert_eq!(
-        ledger_heights(&mut sink).await,
+        ledger_heights(&mut reopened).await,
         [1, 2, 3],
         "a commit is read, not handed on"
     );
@@ -535,8 +538,8 @@ async fn opening_hands_on_contracts_as_repaired() {
     append_only(&mut sink, &contract(2, 0)).await;
     drop(sink);
 
-    let mut sink = open(&dir).await;
-    let restored = sink.restore().await.expect("the lake restores");
+    let mut reopened = open(&dir).await;
+    let restored = reopened.restore().await.expect("the lake restores");
     assert_eq!(
         restored
             .contracts
@@ -754,10 +757,16 @@ async fn the_ledger_reads_the_same_from_its_newest_files() {
     let mut replacement = vec![reorg(100_011..=100_011, 1)];
     replacement.extend(block(100_011, 1));
     publish(&mut sink, replacement).await;
-    let lake = sink.lake(Table::AcceptedBlock);
-    let ledger = lake.read_ledger(window).await.expect("reads back");
-    assert_eq!(heights(&ledger), (99_996..=100_011).collect::<Vec<_>>());
-    assert_eq!(ledger.last().map(|b| b.hash), Some(hash(100_011, 1)));
+    let replaced_lake = sink.lake(Table::AcceptedBlock);
+    let replaced_ledger = replaced_lake.read_ledger(window).await.expect("reads back");
+    assert_eq!(
+        heights(&replaced_ledger),
+        (99_996..=100_011).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        replaced_ledger.last().map(|b| b.hash),
+        Some(hash(100_011, 1))
+    );
 
     // Partition 0 compacted into one file, which the window still reaches.
     let position = sink.positions[&TableId::Dataset(Table::AcceptedBlock)];
@@ -775,7 +784,13 @@ async fn the_ledger_reads_the_same_from_its_newest_files() {
     .expect("compacts");
     assert_eq!(compacted, 1);
     sink.lakes[position].table = table;
-    let lake = sink.lake(Table::AcceptedBlock);
-    let ledger = lake.read_ledger(window).await.expect("reads back");
-    assert_eq!(heights(&ledger), (99_996..=100_011).collect::<Vec<_>>());
+    let compacted_lake = sink.lake(Table::AcceptedBlock);
+    let compacted_ledger = compacted_lake
+        .read_ledger(window)
+        .await
+        .expect("reads back");
+    assert_eq!(
+        heights(&compacted_ledger),
+        (99_996..=100_011).collect::<Vec<_>>()
+    );
 }

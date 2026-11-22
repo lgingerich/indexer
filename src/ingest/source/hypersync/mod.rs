@@ -434,8 +434,8 @@ impl BlockSource for HyperSyncSource {
 
     /// Ends at once: `HyperSync` announces no heads, and the pipeline never subscribes to
     /// a source that does not follow them.
-    async fn subscribe_heads(&self) -> Result<HeadStream, SourceError> {
-        Ok(Box::pin(stream::empty()))
+    fn subscribe_heads(&self) -> impl Future<Output = Result<HeadStream, SourceError>> + Send {
+        std::future::ready(Ok::<HeadStream, _>(Box::pin(stream::empty())))
     }
 
     async fn fetch_block(
@@ -496,12 +496,10 @@ impl BlockSource for HyperSyncSource {
 }
 
 #[cfg(test)]
-#[expect(clippy::expect_used)]
 mod tests {
     use super::*;
+    use crate::ingest::source::EvmSource;
     use crate::ingest::source::evm::{http_client, ws_connect};
-    use crate::ingest::source::{BlockSource, EvmSource};
-    use crate::wire::datasets::Datasets;
     use crate::wire::envelope::Event;
 
     /// The ranges the live comparisons fetch in: one at a time, as many heights as a test
@@ -591,11 +589,11 @@ mod tests {
                 );
                 for &height in heights {
                     let expected = rpc.fetch_block(height, None).await.expect("rpc block");
-                    let mut got = hypersync
+                    let mut fetched = hypersync
                         .fetch_blocks(height, height)
                         .await
                         .expect("hypersync block");
-                    let got = got.pop().expect("one block");
+                    let got = fetched.pop().expect("one block");
                     assert_eq!(got.meta, expected.meta, "{chain} {height} meta");
                     assert_eq!(
                         got.events.len(),
@@ -603,14 +601,14 @@ mod tests {
                         "{chain} {height} {datasets} event count"
                     );
                     let at = format!("{chain} {height} [{datasets}]");
-                    for (index, (got, expected)) in
+                    for (index, (got_event, expected_event)) in
                         got.events.iter().zip(&expected.events).enumerate()
                     {
                         differences.extend(differ(
                             chain,
                             &format!("{at} event {index}"),
-                            got,
-                            expected,
+                            got_event,
+                            expected_event,
                         ));
                     }
                 }

@@ -1,7 +1,5 @@
 //! The fake chains and sinks the pipeline's tests drive a machine with.
 
-#![expect(clippy::expect_used)]
-
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -199,10 +197,13 @@ impl BlockSource for Source {
     fn follows_heads(&self) -> bool {
         self.follows
     }
-    async fn subscribe_heads(&self) -> Result<HeadStream, SourceError> {
-        Ok(Box::pin(stream::pending()))
+    fn subscribe_heads(&self) -> impl Future<Output = Result<HeadStream, SourceError>> + Send {
+        std::future::ready(Ok::<HeadStream, _>(Box::pin(stream::pending())))
     }
-    async fn fetch_header(&self, height: Option<u64>) -> Result<BlockMeta, SourceError> {
+    fn fetch_header(
+        &self,
+        height: Option<u64>,
+    ) -> impl Future<Output = Result<BlockMeta, SourceError>> + Send {
         if height.is_some() {
             self.header_calls.fetch_add(1, Ordering::Relaxed);
         }
@@ -211,7 +212,7 @@ impl BlockSource for Source {
             let sample = self.samples.lock().expect("samples").pop_front();
             sample.unwrap_or(self.head)
         });
-        self.meta_at(height)
+        std::future::ready(self.meta_at(height))
     }
     async fn fetch_blocks(&self, from: u64, to: u64) -> Result<Vec<FetchedBlock>, SourceError> {
         self.wait(Duration::from_secs(if from == 0 { 2 } else { 1 }))
@@ -255,12 +256,15 @@ impl Drop for Sink {
 }
 
 impl EnvelopeSink for Sink {
-    async fn publish(&mut self, envelope: Envelope) -> Result<(), SinkError> {
+    fn publish(
+        &mut self,
+        envelope: Envelope,
+    ) -> impl Future<Output = Result<(), SinkError>> + Send {
         if self.fail {
-            return Err(SinkError::StorageClosed);
+            return std::future::ready(Err(SinkError::StorageClosed));
         }
         self.events.push(envelope.event);
-        Ok(())
+        std::future::ready(Ok(()))
     }
     async fn flush(&mut self) -> Result<(), SinkError> {
         if self.stall {
@@ -296,8 +300,12 @@ impl BlockSource for LiveSource {
     fn follows_heads(&self) -> bool {
         self.lock().follows
     }
-    async fn fetch_blocks(&self, from: u64, to: u64) -> Result<Vec<FetchedBlock>, SourceError> {
-        self.lock().read_range(from, to)
+    fn fetch_blocks(
+        &self,
+        from: u64,
+        to: u64,
+    ) -> impl Future<Output = Result<Vec<FetchedBlock>, SourceError>> + Send {
+        std::future::ready(self.lock().read_range(from, to))
     }
     fn backfill_span(&self) -> u64 {
         self.lock().range
@@ -308,30 +316,34 @@ impl BlockSource for LiveSource {
     fn backfill_concurrency(&self) -> usize {
         self.lock().concurrency
     }
-    async fn subscribe_heads(&self) -> Result<HeadStream, SourceError> {
+    fn subscribe_heads(&self) -> impl Future<Output = Result<HeadStream, SourceError>> + Send {
         let hints = self
             .hints
             .lock()
             .expect("hints lock")
             .take()
             .expect("subscribe once");
-        Ok(Box::pin(stream::unfold(hints, |mut hints| async move {
-            hints.recv().await.map(|hint| (Ok(hint), hints))
-        })))
+        std::future::ready(Ok::<HeadStream, _>(Box::pin(stream::unfold(
+            hints,
+            |mut hints| async move { hints.recv().await.map(|hint| (Ok(hint), hints)) },
+        ))))
     }
-    async fn fetch_header(&self, height: Option<u64>) -> Result<BlockMeta, SourceError> {
+    fn fetch_header(
+        &self,
+        height: Option<u64>,
+    ) -> impl Future<Output = Result<BlockMeta, SourceError>> + Send {
         let chain = self.lock();
-        match height {
-            Some(height) => Ok(chain.read(height)?.meta),
+        std::future::ready(match height {
+            Some(height) => chain.read(height).map(|block| block.meta),
             None => Ok(chain.head_meta()),
-        }
+        })
     }
-    async fn fetch_block(
+    fn fetch_block(
         &self,
         height: u64,
         _head: Option<&BlockMeta>,
-    ) -> Result<FetchedBlock, SourceError> {
-        self.lock().read(height)
+    ) -> impl Future<Output = Result<FetchedBlock, SourceError>> + Send {
+        std::future::ready(self.lock().read(height))
     }
 }
 
@@ -344,16 +356,21 @@ struct LiveSink {
 }
 
 impl EnvelopeSink for LiveSink {
-    async fn publish(&mut self, envelope: Envelope) -> Result<(), SinkError> {
+    fn publish(
+        &mut self,
+        envelope: Envelope,
+    ) -> impl Future<Output = Result<(), SinkError>> + Send {
         if matches!(envelope.event, Event::AcceptedBlock(_)) {
-            return Ok(());
+            return std::future::ready(Ok(()));
         }
-        self.events
-            .send(envelope.event)
-            .map_err(|_| SinkError::StorageClosed)
+        std::future::ready(
+            self.events
+                .send(envelope.event)
+                .map_err(|_receiver_gone| SinkError::StorageClosed),
+        )
     }
-    async fn flush(&mut self) -> Result<(), SinkError> {
-        Ok(())
+    fn flush(&mut self) -> impl Future<Output = Result<(), SinkError>> + Send {
+        std::future::ready(Ok(()))
     }
     fn observe_head(&mut self, height: u64) {
         self.head.store(height, Ordering::Relaxed);

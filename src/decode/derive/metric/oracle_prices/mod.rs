@@ -68,13 +68,14 @@ fn oracle_price(
     _: usize,
     input: Option<&[u8]>,
 ) -> Result<Vec<Row>, DeriveError> {
-    let id: [u8; 32] = fixed_bytes(decoded, 0, "feedId", 32)?
-        .try_into()
-        .map_err(|_| DeriveError::Argument {
-            position: 0,
-            name: "feedId",
-            expected: "fixed bytes of its declared size",
-        })?;
+    let id: [u8; 32] =
+        fixed_bytes(decoded, 0, "feedId", 32)?
+            .try_into()
+            .map_err(|_wrong_length| DeriveError::Argument {
+                position: 0,
+                name: "feedId",
+                expected: "fixed bytes of its declared size",
+            })?;
     let input = input.ok_or(DeriveError::Input {
         reason: "was not fetched",
     })?;
@@ -111,7 +112,6 @@ fn lazer_feed(id: &[u8; 32]) -> Option<u32> {
 }
 
 #[cfg(test)]
-#[expect(clippy::expect_used)]
 mod tests {
     use alloy_primitives::{B256, Bytes, U256, b256, hex};
 
@@ -210,8 +210,8 @@ mod tests {
             (STREAM, chainlink_update(), 325 + 9 * 32 - 1),
         ] {
             let cases = [None, Some(&input[..truncated]), Some(&[][..])];
-            for input in cases {
-                assert!(matches!(row(feed, input), Err(DeriveError::Input { .. })));
+            for given in cases {
+                assert!(matches!(row(feed, given), Err(DeriveError::Input { .. })));
             }
         }
         let cases = [

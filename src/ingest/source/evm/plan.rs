@@ -89,7 +89,7 @@ impl Span {
             // Doubled in one step, so a shrink racing it is not overwritten.
             let _ = self
                 .heights
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |heights| {
+                .try_update(Ordering::Relaxed, Ordering::Relaxed, |heights| {
                     Some(heights.saturating_mul(2).min(RANGE_LIMIT))
                 });
         }

@@ -24,7 +24,7 @@ pub(super) fn hashes(bytes: Option<&Bytes>, field: &str) -> Result<Vec<B256>, So
             ),
         ));
     }
-    Ok(bytes.chunks_exact(32).map(B256::from_slice).collect())
+    Ok(bytes.as_chunks::<32>().0.iter().map(B256::from).collect())
 }
 
 /// An access list, from `HyperSync`'s bincode: a list of items, each an optional address
@@ -65,7 +65,7 @@ pub(super) fn authorization_list(bytes: &[u8]) -> Result<Vec<SignedAuthorization
         let address = reader.parse::<Address>()?;
         let nonce = reader.quantity()?.to_u64("authorization nonce")?;
         let y_parity = u8::try_from(reader.quantity()?.to_u64("authorization y_parity")?)
-            .map_err(|_| malformed(CONTEXT, "authorization y_parity is above 255"))?;
+            .map_err(|_above_u8| malformed(CONTEXT, "authorization y_parity is above 255"))?;
         let r = reader.quantity()?.0;
         let s = reader.quantity()?.0;
         authorizations.push(SignedAuthorization::new_unchecked(
@@ -134,7 +134,8 @@ impl<'a> Bincode<'a> {
     fn len(&mut self) -> Result<usize, SourceError> {
         let mut word = [0; 8];
         word.copy_from_slice(self.take(8)?);
-        usize::try_from(u64::from_le_bytes(word)).map_err(|_| self.error("has a length past usize"))
+        usize::try_from(u64::from_le_bytes(word))
+            .map_err(|_past_usize| self.error("has a length past usize"))
     }
 
     fn option(&mut self) -> Result<bool, SourceError> {
@@ -148,12 +149,13 @@ impl<'a> Bincode<'a> {
     fn string(&mut self) -> Result<&'a str, SourceError> {
         let len = self.len()?;
         std::str::from_utf8(self.take(len)?)
-            .map_err(|_| self.error("has a string that is not UTF-8"))
+            .map_err(|_not_utf8| self.error("has a string that is not UTF-8"))
     }
 
     fn parse<T: std::str::FromStr>(&mut self) -> Result<T, SourceError> {
         let text = self.string()?;
-        T::from_str(text).map_err(|_| self.error(&format!("has {text:?}, which does not parse")))
+        T::from_str(text)
+            .map_err(|_unparsed| self.error(&format!("has {text:?}, which does not parse")))
     }
 
     fn quantity(&mut self) -> Result<Quantity, SourceError> {
@@ -183,7 +185,6 @@ impl<'a> Bincode<'a> {
 }
 
 #[cfg(test)]
-#[expect(clippy::expect_used)]
 mod tests {
     use super::*;
 

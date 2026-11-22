@@ -98,7 +98,7 @@ fn liquidity(
             } else {
                 Sign::Positive
             };
-            let shares = I256::checked_from_sign_and_abs(sign, *minted)
+            let signed_shares = I256::checked_from_sign_and_abs(sign, *minted)
                 .ok_or_else(|| element(4, "shares", "entries within int256"))?;
             Ok(vec![
                 (
@@ -113,7 +113,7 @@ fn liquidity(
                 ("bin_idx", bin),
                 ("delta0_scaled", signed(delta0, 256)),
                 ("delta1_scaled", signed(delta1, 256)),
-                ("shares", signed(shares, 256)),
+                ("shares", signed(signed_shares, 256)),
             ])
         })
         .collect()
@@ -173,9 +173,9 @@ mod tests {
                 ],
             ]
         );
-        let rows = unnamed(liquidity(&event(true, &[(1, -5, -6, 10)]), 1, None));
+        let removed_rows = unnamed(liquidity(&event(true, &[(1, -5, -6, 10)]), 1, None));
         assert_eq!(
-            rows,
+            removed_rows,
             [vec![
                 text("remove"),
                 owner,

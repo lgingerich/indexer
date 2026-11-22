@@ -1,8 +1,3 @@
-// The crate denies `expect`/`unwrap` to keep production paths honest; tests are allowed
-// them per the repository test style, since a failed expectation there means the fixture
-// or setup is wrong.
-#![expect(clippy::expect_used)]
-
 use super::*;
 use alloy_primitives::U256;
 
@@ -284,12 +279,12 @@ fn an_address_argument_is_read_from_its_slot() {
         .into(),
         ..Log::default()
     };
-    let slot = abi.address_input(*key, "child").expect("an address input");
-    assert_eq!(slot, AddressSlot::Word(5 * 32));
-    assert_eq!(slot.read(&log), Some(child));
-    let slot = abi.address_input(*key, "owner").expect("an address input");
-    assert_eq!(slot, AddressSlot::Topic(1));
-    assert_eq!(slot.read(&log), Some(owner));
+    let child_slot = abi.address_input(*key, "child").expect("an address input");
+    assert_eq!(child_slot, AddressSlot::Word(5 * 32));
+    assert_eq!(child_slot.read(&log), Some(child));
+    let owner_slot = abi.address_input(*key, "owner").expect("an address input");
+    assert_eq!(owner_slot, AddressSlot::Topic(1));
+    assert_eq!(owner_slot.read(&log), Some(owner));
     assert_eq!(abi.address_input(*key, "note"), None, "not an address");
 }
 

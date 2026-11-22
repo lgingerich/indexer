@@ -218,6 +218,13 @@ impl<S: BlockSource + 'static, K: EnvelopeSink> Machine<S, K> {
     /// that only backfills holds another block at the stored tip,
     /// [`PipelineError::SubscriptionClosed`] when the subscription ends, and permanent
     /// source, invariant, or sink failures.
+    #[cfg_attr(
+        feature = "store",
+        expect(
+            clippy::cognitive_complexity,
+            reason = "one loop over heads, retries and the reconcile timer, whose order is the point"
+        )
+    )]
     pub async fn run(mut self, start: Option<u64>, stop: Option<u64>) -> Result<(), PipelineError> {
         info!(chain = %self.source.chain(), start_block = ?start, stop_block = ?stop,
             "ingest started");
@@ -343,7 +350,6 @@ impl<S: BlockSource + 'static, K: EnvelopeSink> Machine<S, K> {
 }
 
 #[cfg(test)]
-#[expect(clippy::expect_used)]
 mod tests {
     use std::sync::atomic::Ordering;
     use std::time::Duration;

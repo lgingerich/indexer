@@ -312,8 +312,8 @@ async fn fill(
                 .collect(),
         };
         done.handed = handed.len();
-        let restart = session.map(|session| session.block_number);
-        let through = adopt(&mut decoder, &mut addresses, &handed, restart);
+        let session_start = session.map(|session| session.block_number);
+        let through = adopt(&mut decoder, &mut addresses, &handed, session_start);
         needed = needed.max(through.unwrap_or(0));
     }
     let to = if let Some(to) = fixed {

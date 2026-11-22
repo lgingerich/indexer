@@ -387,10 +387,6 @@ fn value_size(value: &Value) -> usize {
 }
 
 #[cfg(test)]
-// The crate denies `expect`/`unwrap` to keep production paths honest; tests are
-// allowed them per the repository test style, since a failed expectation there
-// means the fixture or setup is wrong.
-#[expect(clippy::expect_used)]
 mod tests {
     use alloy_primitives::B256;
 
@@ -702,10 +698,10 @@ mod tests {
             Err(StoreError::LateReconcile)
         ));
 
-        let mut batch = on_base(crate::sink::fixtures::schema());
-        batch.reconcile(&[]).expect("named first");
+        let mut named = on_base(crate::sink::fixtures::schema());
+        named.reconcile(&[]).expect("named first");
         assert!(matches!(
-            batch.reconcile(&[meta(6, 0xa1)]),
+            named.reconcile(&[meta(6, 0xa1)]),
             Err(StoreError::LateReconcile)
         ));
     }

@@ -141,12 +141,12 @@ async fn the_writer_commits_past_a_compaction_it_did_not_see() {
     publish(&mut sink, replacement).await;
     drop(sink);
 
-    let sink = open(&dir).await;
+    let reopened = open(&dir).await;
     assert_eq!(
-        blocks(&sink).await,
+        blocks(&reopened).await,
         expected(&[(1, 0), (2, 0), (104_096, 0), (104_097, 1), (104_098, 0)])
     );
-    assert_eq!(files_by_partition(&sink, Table::Block)["0"], 1);
+    assert_eq!(files_by_partition(&reopened, Table::Block)["0"], 1);
 }
 
 /// Log cleanup deletes the transaction log's entries a checkpoint replaces, and keeps
@@ -189,9 +189,9 @@ async fn log_cleanup_keeps_what_a_checkpoint_does_not_replace() {
     assert_eq!(entries(), vec![checkpoint, checkpoint + 1]);
     drop(sink);
 
-    let sink = open(&dir).await;
+    let reopened = open(&dir).await;
     assert_eq!(
-        blocks(&sink).await,
+        blocks(&reopened).await,
         expected(&[(1, 0), (2, 0), (3, 0), (4, 0)])
     );
 }
@@ -208,8 +208,8 @@ async fn the_checkpoint_interval_counts_across_reopens() {
     accept(&mut sink, 1..=half).await;
     drop(sink);
     assert!(!log.join("_last_checkpoint").exists(), "checkpointed early");
-    let mut sink = open(&dir).await;
-    accept(&mut sink, half + 1..=CHECKPOINT_EVERY).await;
+    let mut reopened = open(&dir).await;
+    accept(&mut reopened, half + 1..=CHECKPOINT_EVERY).await;
     assert_eq!(
         wait_for_checkpoint(&log).await,
         CHECKPOINT_EVERY,
@@ -357,8 +357,8 @@ async fn a_vacuum_is_recorded_on_its_table_only_once_it_succeeds() {
     // retention deletes the files it replaced.
     let tip = 100_000 + crate::window::MAX_UNFINALIZED_BLOCKS as u64;
     let record = PathBuf::from(dir.table("blocks")).join(maintenance::VACUUMED);
-    let due = async |log_store| {
-        maintenance::vacuum_due(log_store)
+    let due = async |checked| {
+        maintenance::vacuum_due(checked)
             .await
             .expect("the record reads")
     };
@@ -391,16 +391,19 @@ async fn a_vacuum_is_recorded_on_its_table_only_once_it_succeeds() {
     assert!(!due(&log_store).await, "and not due again the same day");
     drop(sink);
 
-    let sink = open(&dir).await;
-    let log_store = sink.lakes[position].table.log_store();
-    assert!(!due(&log_store).await, "a restart does not make it due");
+    let reopened = open(&dir).await;
+    let reopened_log = reopened.lakes[position].table.log_store();
+    assert!(!due(&reopened_log).await, "a restart does not make it due");
     std::fs::File::options()
         .write(true)
         .open(&record)
         .expect("the record")
         .set_modified(SystemTime::now() - Duration::from_hours(25))
         .expect("backdated");
-    assert!(due(&log_store).await, "a day after the record, it is due");
+    assert!(
+        due(&reopened_log).await,
+        "a day after the record, it is due"
+    );
 }
 
 /// The log store of `table` in the lake at `dir`, through [`Undeletable`].
@@ -434,27 +437,27 @@ impl ObjectStore for Undeletable {
         &'life0 self,
         location: &'life1 ObjectPath,
         payload: PutPayload,
-        options: PutOptions,
+        opts: PutOptions,
     ) -> BoxFuture<'async_trait, ObjectResult<PutResult>>
     where
         'life0: 'async_trait,
         'life1: 'async_trait,
         Self: 'async_trait,
     {
-        self.0.put_opts(location, payload, options)
+        self.0.put_opts(location, payload, opts)
     }
 
     fn put_multipart_opts<'life0, 'life1, 'async_trait>(
         &'life0 self,
         location: &'life1 ObjectPath,
-        options: PutMultipartOptions,
+        opts: PutMultipartOptions,
     ) -> BoxFuture<'async_trait, ObjectResult<Box<dyn MultipartUpload>>>
     where
         'life0: 'async_trait,
         'life1: 'async_trait,
         Self: 'async_trait,
     {
-        self.0.put_multipart_opts(location, options)
+        self.0.put_multipart_opts(location, opts)
     }
 
     fn get_opts<'life0, 'life1, 'async_trait>(
@@ -531,8 +534,8 @@ async fn a_narrower_window_compacts_a_partition_sooner() {
     let writer = sink.writer.clone();
     let narrow = crate::window::UndoWindow::new(512).expect("in range");
     let tip = 100_000 + 512;
-    let compact = async |table: &mut _, window| {
-        maintenance::compact("blocks", table, width, tip, window, &writer)
+    let compact = async |lake: &mut _, window| {
+        maintenance::compact("blocks", lake, width, tip, window, &writer)
             .await
             .expect("compacts")
     };

@@ -127,7 +127,7 @@ pub(super) fn record_batch(
             .iter()
             .map(|row| {
                 row.block_number()
-                    .map(|height| partition_of(height, width))
+                    .map(|number| partition_of(number, width))
                     .ok_or_else(|| invalid(&def.name, height))
             })
             .collect::<Result<Int64Array, _>>()?;
@@ -265,7 +265,6 @@ fn invalid(table: &str, column: &str) -> ArrowError {
 }
 
 #[cfg(test)]
-#[expect(clippy::expect_used)]
 mod tests {
     use alloy_primitives::U256;
 

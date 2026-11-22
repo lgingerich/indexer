@@ -264,7 +264,6 @@ fn rows(batch: Batch) -> Result<Vec<Log>, SourceError> {
 
 /// A stand-in `HyperSync` endpoint, for tests here and elsewhere.
 #[cfg(test)]
-#[expect(clippy::expect_used)]
 pub(crate) mod testing {
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
@@ -316,7 +315,6 @@ pub(crate) mod testing {
 }
 
 #[cfg(test)]
-#[expect(clippy::expect_used)]
 mod tests {
     use alloy_primitives::{Address, B256};
 
@@ -382,7 +380,10 @@ mod tests {
     async fn a_refused_token_ends_the_search() {
         let (url, _served) = endpoint(vec![(401, "no".to_owned())]).await;
         let search = LogSearch::new(&url, "token").expect("built");
-        assert!(search.logs(&[Address::ZERO], &[], 10).await.is_err());
+        search
+            .logs(&[Address::ZERO], &[], 10)
+            .await
+            .expect_err("a refused token");
     }
 
     /// A search for some events asks the endpoint for them alone, as the logs' first topic:

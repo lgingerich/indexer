@@ -130,9 +130,7 @@ fn words(input: &[u8]) -> impl Iterator<Item = &[u8; 32]> {
         _ if input.starts_with(&UPDATE_BY_SIGNATURE) => input.get(4 + 32..4 + 64).unwrap_or(&[]),
         _ => &[],
     };
-    pushed
-        .chunks_exact(32)
-        .filter_map(|word| word.try_into().ok())
+    pushed.as_chunks::<32>().0.iter()
 }
 
 /// A slot word's timestamp, milliseconds: its 7 bytes before the slot's index.
@@ -143,7 +141,6 @@ fn timestamp_ms(word: &[u8; 32]) -> u64 {
 }
 
 #[cfg(test)]
-#[expect(clippy::expect_used)]
 mod tests {
     use alloy_primitives::{B256, Bytes, U256, b256};
 

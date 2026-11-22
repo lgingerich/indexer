@@ -150,8 +150,8 @@ impl SimTransaction {
 
     /// A transaction from one of a few senders to one of a few contracts.
     fn draw(rng: &mut Rng) -> Self {
-        let pick = |rng: &mut Rng, base: u8| {
-            Address::repeat_byte(base + u8::try_from(rng.below(4)).unwrap_or(0))
+        let pick = |draws: &mut Rng, base: u8| {
+            Address::repeat_byte(base + u8::try_from(draws.below(4)).unwrap_or(0))
         };
         let from = pick(rng, 0x10);
         let length = usize::try_from(rng.below(33)).unwrap_or(0);

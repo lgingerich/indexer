@@ -54,7 +54,7 @@ impl<S: BlockSource + 'static, K: EnvelopeSink> Machine<S, K> {
     /// [`PipelineError::UndoWindowExceeded`], although nothing had forked. A head inside
     /// the window, or one that does not link, is left to the fork walk as before. The
     /// walk is bounded by the window's size in headers; a head further below is too.
-    async fn is_ancestor_below_window(&mut self, head: BlockMeta) -> Result<bool, PipelineError> {
+    async fn is_ancestor_below_window(&self, head: BlockMeta) -> Result<bool, PipelineError> {
         let Some(oldest) = self.ring.oldest() else {
             return Ok(false);
         };
@@ -274,7 +274,7 @@ impl<S: BlockSource + 'static, K: EnvelopeSink> Machine<S, K> {
             let block = block?;
             let meta = Self::marker(block.meta, height)?;
             let expected = match walked_at(height) {
-                Some(walked) => meta == walked,
+                Some(walked_meta) => meta == walked_meta,
                 None => {
                     Self::validate_link(tip, meta).is_ok()
                         && (height != target.height || meta == target)
@@ -301,7 +301,6 @@ impl<S: BlockSource + 'static, K: EnvelopeSink> Machine<S, K> {
 }
 
 #[cfg(test)]
-#[expect(clippy::expect_used)]
 mod tests {
     use std::sync::atomic::Ordering;
 
@@ -309,7 +308,6 @@ mod tests {
     use crate::ingest::pipeline::testing::*;
     use crate::sink::SinkError;
     use crate::window::{Ledger, MAX_UNFINALIZED_BLOCKS};
-    use crate::wire::envelope::BlockMeta;
 
     /// A gap is fetched ahead, as many heights in flight as the source allows, and still
     /// accepted one at a time in height order, each height read once and none taken for
@@ -427,7 +425,7 @@ mod tests {
             .sync_settled(None, None)
             .await
             .expect("a lagging head is not a fork");
-        assert!(machine.sink.events.is_empty());
+        assert_eq!(machine.sink.events, []);
         assert_eq!(machine.tip(), Some(meta(13)));
     }
 
@@ -449,7 +447,7 @@ mod tests {
                 }),
             },
         );
-        assert!(machine.sink.events.is_empty());
+        assert_eq!(machine.sink.events, []);
         assert_eq!(machine.tip(), Some(meta(13)));
     }
 
@@ -517,7 +515,7 @@ mod tests {
             machine.process_head(machine.source.head_meta()).await,
             &malformed("injected source failure"),
         );
-        assert!(reorgs(&machine).is_empty());
+        assert_eq!(reorgs(&machine), Vec::<&Reorg>::new());
         assert_eq!(machine.tip(), Some(meta(3)));
         machine
             .process_head(machine.source.head_meta())
@@ -594,7 +592,7 @@ mod tests {
         // the reorg record itself never reached the sink.
         assert_eq!(machine.tip(), Some(meta(head)));
         assert_eq!(heights(&machine), (0..=head).collect::<Vec<_>>());
-        assert!(reorgs(&machine).is_empty());
+        assert_eq!(reorgs(&machine), Vec::<&Reorg>::new());
     }
 
     #[tokio::test]
@@ -619,6 +617,6 @@ mod tests {
         );
         assert_eq!(machine.tip(), Some(meta(head)));
         assert_eq!(heights(&machine), (0..=head).collect::<Vec<_>>());
-        assert!(reorgs(&machine).is_empty());
+        assert_eq!(reorgs(&machine), Vec::<&Reorg>::new());
     }
 }

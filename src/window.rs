@@ -155,9 +155,6 @@ impl From<Vec<BlockMeta>> for Ledger {
 }
 
 #[cfg(test)]
-// `expect` is allowed here per the repository test style: a failed one means the fixture
-// is wrong.
-#[expect(clippy::expect_used)]
 mod tests {
     use super::{MAX_UNFINALIZED_BLOCKS, UndoWindow};
 

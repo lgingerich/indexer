@@ -258,7 +258,7 @@ pub(crate) fn event_key(log: &Log) -> Option<EventKey> {
         .iter()
         .filter(|topic| topic.is_some())
         .count();
-    Some((log.topic0?, count)).filter(|_| present == count)
+    (present == count).then_some((log.topic0?, count))
 }
 
 /// How many head words a body argument of type `ty` takes: one for a dynamic type, which
@@ -521,7 +521,7 @@ fn convert(ty: &DynSolType, value: &DynSolValue) -> Result<TypedValue, DecodeErr
         (DynSolType::Array(inner), DynSolValue::Array(values)) => TypedValue::Array {
             value: values
                 .iter()
-                .map(|value| convert(inner, value))
+                .map(|element| convert(inner, element))
                 .collect::<Result<_, _>>()?,
         },
         (DynSolType::FixedArray(inner, size), DynSolValue::FixedArray(values))
@@ -530,7 +530,7 @@ fn convert(ty: &DynSolType, value: &DynSolValue) -> Result<TypedValue, DecodeErr
             TypedValue::FixedArray {
                 value: values
                     .iter()
-                    .map(|value| convert(inner, value))
+                    .map(|element| convert(inner, element))
                     .collect::<Result<_, _>>()?,
                 size: *size,
             }
@@ -540,7 +540,7 @@ fn convert(ty: &DynSolType, value: &DynSolValue) -> Result<TypedValue, DecodeErr
                 value: types
                     .iter()
                     .zip(values)
-                    .map(|(ty, value)| convert(ty, value))
+                    .map(|(field_ty, field)| convert(field_ty, field))
                     .collect::<Result<_, _>>()?,
             }
         }
@@ -576,7 +576,7 @@ fn valid_bits(bits: usize) -> bool {
 }
 
 fn width(value: usize) -> Result<u16, DecodeError> {
-    u16::try_from(value).map_err(|_| DecodeError::Shape)
+    u16::try_from(value).map_err(|_overflow| DecodeError::Shape)
 }
 
 /// Failures while loading and preparing an ABI, before any logs are processed.

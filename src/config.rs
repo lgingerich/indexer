@@ -674,6 +674,13 @@ impl Settings {
 
     /// Hands each store the chain's undo window, which `[ingest]` names and every store's
     /// ledger is sized by.
+    #[cfg_attr(
+        not(any(feature = "duckdb", feature = "postgres", feature = "delta")),
+        expect(
+            clippy::needless_pass_by_ref_mut,
+            reason = "a build without stores has no store to hand the window to"
+        )
+    )]
     fn share_undo_window(&mut self) {
         let window = self.ingest.undo_window;
         #[cfg(feature = "duckdb")]
@@ -772,8 +779,4 @@ impl Settings {
 }
 
 #[cfg(test)]
-// The crate denies `expect`/`unwrap` to keep production paths honest; tests are
-// allowed them per the repository test style, since a failed expectation there
-// means the fixture or setup is wrong.
-#[expect(clippy::expect_used)]
 mod tests;

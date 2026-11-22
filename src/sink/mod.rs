@@ -297,7 +297,6 @@ pub enum SinkError {
 /// Fixtures the sink tests share: the shipped catalog's event tables, a derived table, and
 /// records to write into them.
 #[cfg(test)]
-#[expect(clippy::expect_used)]
 pub(crate) mod fixtures {
     use std::sync::Arc;
 

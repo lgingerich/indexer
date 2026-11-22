@@ -9,7 +9,11 @@
 //! can report percentiles rather than means, which is the number that matters for
 //! a latency target.
 
-#![expect(clippy::print_stdout, clippy::expect_used)]
+#![expect(
+    clippy::print_stdout,
+    clippy::expect_used,
+    reason = "a benchmark prints its report, and a fixture that fails to build is a bug in the benchmark"
+)]
 
 use std::hint::black_box;
 use std::time::{Duration, Instant};
@@ -125,13 +129,13 @@ fn synthetic_batch(tx_count: usize, logs_per_tx: usize) -> RpcBatch {
     let parent_hash: alloy_primitives::B256 = format!("0x{:064x}", 0xdef)
         .parse()
         .expect("parent hash fixture");
-    let block_hash: alloy_primitives::B256 = format!("0x{:064x}", 0xabc)
+    let header_hash: alloy_primitives::B256 = format!("0x{:064x}", 0xabc)
         .parse()
         .expect("block hash fixture");
     RpcBatch {
         meta: indexer::wire::envelope::BlockMeta {
             height: 18_000_000,
-            hash: block_hash,
+            hash: header_hash,
             parent_hash,
             timestamp: 0x6530_a1b0,
         },
@@ -173,14 +177,14 @@ fn main() {
             .into_iter()
             .map(|event| Envelope::new(ChainId::new("ethereum"), event))
             .collect();
-        let mut samples = Vec::with_capacity(SAMPLES);
+        let mut render_samples = Vec::with_capacity(SAMPLES);
         for _ in 0..SAMPLES {
             let start = Instant::now();
             for envelope in &envelopes {
                 let rendered = serde_json::to_string(envelope).expect("envelope serialises");
                 black_box(&rendered);
             }
-            samples.push(start.elapsed());
+            render_samples.push(start.elapsed());
         }
         let [marker, transaction, log, ..] = envelopes.as_slice() else {
             panic!("every benchmark block has a marker, a transaction, and a log");
@@ -192,7 +196,7 @@ fn main() {
                 median_serialise(transaction),
                 median_serialise(log),
             ),
-            &mut samples,
+            &mut render_samples,
             "block",
         );
     }

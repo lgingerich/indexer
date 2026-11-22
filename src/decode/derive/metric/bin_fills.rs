@@ -52,7 +52,6 @@ fn bin_fill(decoded: &Decoded, _: usize, _: Option<&[u8]>) -> Result<Vec<Row>, D
 }
 
 #[cfg(test)]
-#[expect(clippy::expect_used)]
 mod tests {
     use alloy_primitives::{I256, U256};
 

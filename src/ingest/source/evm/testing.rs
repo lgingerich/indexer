@@ -1,13 +1,8 @@
 //! The fixtures and fake node the EVM source's tests read from.
 
-#![expect(clippy::expect_used)]
-
 use serde_json::{Value, json};
 
 use super::*;
-use crate::ingest::source::{BlockSource, FetchedBlock, SourceError};
-use crate::wire::datasets::Datasets;
-use crate::wire::envelope::BlockMeta;
 
 /// A source over real HTTP and WebSocket endpoints, as a deployment builds one.
 pub(super) fn from_urls(

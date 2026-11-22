@@ -34,7 +34,10 @@
 //! bytes in the same format, see `decode_logs` and its `uniswap_v3_swaps.ndjson` fixture.
 
 // A runnable tool rather than a library, so writing and printing is the whole job.
-#![expect(clippy::print_stdout)]
+#![expect(
+    clippy::print_stdout,
+    reason = "a runnable tool: printing is its output"
+)]
 
 use std::fs::File;
 use std::io::{BufWriter, Write as _};

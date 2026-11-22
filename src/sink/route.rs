@@ -377,10 +377,6 @@ impl<K: EnvelopeSink> EnvelopeSink for Router<K> {
 }
 
 #[cfg(test)]
-// The crate denies `expect`/`unwrap` to keep production paths honest; tests are
-// allowed them per the repository test style, since a failed expectation there
-// means the fixture or setup is wrong.
-#[expect(clippy::expect_used)]
 mod tests {
     use std::collections::HashSet;
     use std::sync::Arc;
@@ -557,14 +553,17 @@ mod tests {
     }
 
     impl EnvelopeSink for Seen {
-        async fn publish(&mut self, envelope: Envelope) -> Result<(), SinkError> {
+        fn publish(
+            &mut self,
+            envelope: Envelope,
+        ) -> impl Future<Output = Result<(), SinkError>> + Send {
             self.keys.push(envelope.event.dedupe_key());
-            Ok(())
+            std::future::ready(Ok(()))
         }
 
-        async fn flush(&mut self) -> Result<(), SinkError> {
+        fn flush(&mut self) -> impl Future<Output = Result<(), SinkError>> + Send {
             self.flushes += 1;
-            Ok(())
+            std::future::ready(Ok(()))
         }
     }
 
@@ -634,8 +633,8 @@ mod tests {
     }
 
     impl EnvelopeSink for Gate {
-        async fn publish(&mut self, _: Envelope) -> Result<(), SinkError> {
-            Ok(())
+        fn publish(&mut self, _: Envelope) -> impl Future<Output = Result<(), SinkError>> + Send {
+            std::future::ready(Ok(()))
         }
 
         async fn flush(&mut self) -> Result<(), SinkError> {
@@ -674,8 +673,8 @@ mod tests {
             parse(r#"["logs", "!accepted_blocks"]"#).resolve(&schema),
             Err(RouteError::Bookkeeping { .. })
         ));
-        assert!(serde_json::from_str::<Tables>(r#"["!logs"]"#).is_err());
-        assert!(serde_json::from_str::<Tables>(r#"["logs", "!"]"#).is_err());
+        serde_json::from_str::<Tables>(r#"["!logs"]"#).unwrap_err();
+        serde_json::from_str::<Tables>(r#"["logs", "!"]"#).unwrap_err();
     }
 
     /// A sink stuck in its flush, as a store with a full channel is, does not hold the

@@ -122,10 +122,6 @@ fn workers(store: StoreBackend) -> NonZeroUsize {
 }
 
 #[cfg(test)]
-// The crate denies `expect`/`unwrap` to keep production paths honest; tests are
-// allowed them per the repository test style, since a failed expectation there
-// means the fixture or setup is wrong.
-#[expect(clippy::expect_used)]
 mod tests {
     use super::StoreRuntime;
     use crate::sink::route::StoreBackend;

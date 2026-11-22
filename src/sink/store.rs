@@ -557,8 +557,11 @@ impl<E: Engine + 'static> Store for SqlStore<E> {
 }
 
 impl<E: Engine> EnvelopeSink for SqlStore<E> {
-    async fn publish(&mut self, envelope: Envelope) -> Result<(), SinkError> {
-        self.batch.push(&envelope)
+    fn publish(
+        &mut self,
+        envelope: Envelope,
+    ) -> impl Future<Output = Result<(), SinkError>> + Send {
+        std::future::ready(self.batch.push(&envelope))
     }
 
     fn buffered_bytes(&self) -> usize {
@@ -601,7 +604,7 @@ async fn begin<E: Engine>(engine: &mut E) -> Result<(), StoreError> {
 /// simulation's faulty engine recognizes a commit by it.
 async fn end<E: Engine>(engine: &mut E, work: Result<(), StoreError>) -> Result<(), StoreError> {
     if let Err(error) = work {
-        let _ = engine.execute("ROLLBACK", &[]).await;
+        drop(engine.execute("ROLLBACK", &[]).await);
         return Err(error);
     }
     engine
@@ -682,7 +685,7 @@ fn uint(column: &'static str, value: &Value) -> Result<u64, InvalidStoredValue> 
         Value::BigInt {
             negative: false,
             magnitude,
-        } => u64::try_from(*magnitude).map_err(|_| invalid(column, value)),
+        } => u64::try_from(*magnitude).map_err(|_too_wide| invalid(column, value)),
         other => Err(invalid(column, other)),
     }
 }

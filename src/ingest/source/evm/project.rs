@@ -571,17 +571,14 @@ fn log_record(
 }
 
 #[cfg(test)]
-#[expect(clippy::expect_used)]
 mod tests {
     use alloy_consensus::TxType;
-    use alloy_network::any::AnyRpcBlock;
-    use alloy_primitives::{Address, B256, U256};
+    use alloy_primitives::Address;
     use serde_json::{Value, json};
 
     use super::*;
 
     use crate::ingest::source::evm::testing::*;
-    use crate::wire::envelope::{BlockMeta, Event};
 
     /// The typed projection input; RPC behavior is tested through the source below.
     ///

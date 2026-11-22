@@ -322,7 +322,7 @@ fn partition_width(table: &DeltaTable, name: &str) -> Result<u64, StoreError> {
     else {
         return Ok(arrow::DEFAULT_PARTITION_BLOCKS);
     };
-    recorded.parse().map_err(|_| StoreError::Drift {
+    recorded.parse().map_err(|_not_a_number| StoreError::Drift {
         table: name.to_owned(),
         difference: format!("its partition width is recorded as `{recorded}`, not a number"),
     })

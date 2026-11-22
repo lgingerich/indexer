@@ -49,10 +49,10 @@ impl<S: BlockSource + 'static, K: EnvelopeSink> Machine<S, K> {
         stop: Option<u64>,
     ) -> Result<(u64, BlockMeta), PipelineError> {
         let depth = self.finality_depth();
-        let bound = |head| {
+        let bound = |sampled| {
             stop.map_or_else(
-                || Self::buried(head, depth),
-                |stop| Self::buried(head, depth).min(stop),
+                || Self::buried(sampled, depth),
+                |stop| Self::buried(sampled, depth).min(stop),
             )
         };
         let mut end = bound(head);
@@ -101,7 +101,6 @@ impl<S: BlockSource + 'static, K: EnvelopeSink> Machine<S, K> {
 }
 
 #[cfg(test)]
-#[expect(clippy::expect_used)]
 mod tests {
     use std::sync::atomic::Ordering;
 
@@ -168,7 +167,7 @@ mod tests {
                 returned: 3,
             },
         );
-        assert!(machine.sink.events.is_empty());
+        assert_eq!(machine.sink.events, []);
         assert!(machine.tip().is_none());
     }
 

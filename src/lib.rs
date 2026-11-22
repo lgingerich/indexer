@@ -67,8 +67,10 @@ pub mod metrics;
 pub mod runtime;
 pub mod secret;
 #[cfg(all(test, feature = "duckdb"))]
-// Test code: a failed expectation means the harness itself is wrong.
-#[expect(clippy::expect_used)]
+#[expect(
+    clippy::expect_used,
+    reason = "test code: a failed expectation means the harness itself is wrong"
+)]
 mod sim;
 pub mod sink;
 pub mod window;

@@ -100,6 +100,10 @@ pub(super) fn spawn(
     Maintenance(tokio::spawn(run(tables, tip, window, retention, writer)))
 }
 
+#[expect(
+    clippy::infinite_loop,
+    reason = "the task runs until its handle aborts it, and an async fn cannot return `!`"
+)]
 async fn run(
     tables: Vec<(String, LogStoreRef, u64)>,
     tip: Arc<AtomicU64>,
@@ -122,6 +126,10 @@ async fn run(
 /// partition: compacts what the committed `tip` has finished, and vacuums and cleans
 /// its log when they are [due](vacuum_due), recording when both succeed. A failure is
 /// logged and counted, and the step tried again on the next pass.
+#[expect(
+    clippy::cognitive_complexity,
+    reason = "one pass of steps, each with its own logged failure branch"
+)]
 pub(super) async fn maintain(
     name: &str,
     log_store: &LogStoreRef,

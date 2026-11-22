@@ -49,7 +49,7 @@ impl Service<RequestPacket> for SimNode {
         Poll::Ready(Ok(()))
     }
 
-    fn call(&mut self, packet: RequestPacket) -> Self::Future {
+    fn call(&mut self, req: RequestPacket) -> Self::Future {
         let world = Arc::clone(&self.world);
         Box::pin(async move {
             let (delay, timeout) = {
@@ -70,7 +70,7 @@ impl Service<RequestPacket> for SimNode {
                 world.reached("rpc refused");
                 return Err(TransportErrorKind::http_error(503, String::new()));
             }
-            let response = match &packet {
+            let response = match &req {
                 RequestPacket::Single(request) => {
                     let view = world.pick_view();
                     respond(&mut world, view, request)
@@ -189,7 +189,9 @@ fn transaction_receipt(view: &View<'_>, params: &Value) -> Answer {
 fn logs(view: &View<'_>, params: &Value) -> Answer {
     let filter = &params[0];
     if let Some(hash) = filter["blockHash"].as_str() {
-        let hash = hash.parse().map_err(|_| (-32602, "bad block hash"))?;
+        let hash = hash
+            .parse()
+            .map_err(|_unparsed| (-32602, "bad block hash"))?;
         let block = view.known(&hash).ok_or((-32000, "unknown block"))?;
         return Ok(Value::Array(render_logs(block)));
     }
@@ -280,7 +282,7 @@ fn rpc_log(block: &SimBlock, log: &SimLog, index: u64) -> Log {
         .transactions()
         .iter()
         .position(|hash| *hash == log.transaction_hash)
-        .map(|index| index as u64);
+        .map(|position| position as u64);
     Log {
         inner: alloy_primitives::Log::new_unchecked(
             log.address,
@@ -318,11 +320,11 @@ impl PubSubConnect for SimHeads {
         true
     }
 
-    async fn connect(&self) -> TransportResult<ConnectionHandle> {
+    fn connect(&self) -> impl Future<Output = TransportResult<ConnectionHandle>> + Send {
         let (handle, interface) = ConnectionHandle::new();
         let heads = lock(&self.world).subscribe();
         tokio::spawn(serve_heads(Arc::clone(&self.world), interface, heads));
-        Ok(handle.with_retry_interval(Duration::from_secs(1)))
+        std::future::ready(Ok(handle.with_retry_interval(Duration::from_secs(1))))
     }
 }
 
@@ -355,7 +357,7 @@ async fn serve_heads(
                 };
                 let response = json!({"jsonrpc": "2.0", "id": request["id"], "result": result});
                 if let Ok(item) = serde_json::from_value::<PubSubItem>(response) {
-                    let _ = interface.send_to_frontend(item);
+                    drop(interface.send_to_frontend(item));
                 }
             }
             head = heads.recv() => {
@@ -393,7 +395,7 @@ async fn serve_heads(
                         "params": {"subscription": SUBSCRIPTION, "result": header},
                     });
                     if let Ok(item) = serde_json::from_value::<PubSubItem>(notification) {
-                        let _ = interface.send_to_frontend(item);
+                        drop(interface.send_to_frontend(item));
                     }
                 }
             }

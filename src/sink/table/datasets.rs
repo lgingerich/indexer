@@ -375,7 +375,6 @@ impl DatasetTables {
 }
 
 #[cfg(test)]
-#[expect(clippy::expect_used)]
 mod tests {
     use alloy_primitives::{Address, B256, TxHash, U256};
 
@@ -560,17 +559,17 @@ mod tests {
     /// value.
     #[test]
     fn an_absent_field_is_null_and_not_zero() {
-        let row = row_for(&chain(), &Event::Block(Box::default()));
+        let block = row_for(&chain(), &Event::Block(Box::default()));
         assert_eq!(
-            row.value("withdrawals_root").expect("a column"),
+            block.value("withdrawals_root").expect("a column"),
             &Value::Null
         );
-        let row = row_for(&chain(), &Event::Transaction(Box::default()));
+        let legacy = row_for(&chain(), &Event::Transaction(Box::default()));
         assert_eq!(
-            row.value("max_fee_per_gas").expect("a column"),
+            legacy.value("max_fee_per_gas").expect("a column"),
             &Value::Null
         );
-        let row = row_for(
+        let zero_cap = row_for(
             &chain(),
             &Event::Transaction(Box::new(Transaction {
                 max_fee_per_gas: Some(0),
@@ -578,7 +577,7 @@ mod tests {
             })),
         );
         assert_eq!(
-            row.value("max_fee_per_gas").expect("a column"),
+            zero_cap.value("max_fee_per_gas").expect("a column"),
             &Value::unsigned(U256::ZERO)
         );
     }

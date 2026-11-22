@@ -29,11 +29,10 @@ pub(in crate::decode) use swaps::SWAPS;
 fn bin_index(value: I256, position: usize, name: &'static str) -> Result<TypedValue, DeriveError> {
     i16::try_from(value)
         .map(|_| signed(value, 16))
-        .map_err(|_| element(position, name, "bin indexes in the int16 range"))
+        .map_err(|_out_of_range| element(position, name, "bin indexes in the int16 range"))
 }
 
 #[cfg(test)]
-#[expect(clippy::expect_used)]
 mod tests {
     use alloy_primitives::{Address, B256, I256, TxHash, U256};
 

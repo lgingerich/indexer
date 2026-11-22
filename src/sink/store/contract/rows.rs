@@ -1,11 +1,6 @@
 //! The contract tests of what a store writes: every column and value of a row, what a
 //! flush makes durable and what a failed one keeps, and which tables a store fills.
 
-// The crate denies `expect`/`unwrap` to keep production paths honest; tests are allowed
-// them per the repository test style, since a failed expectation there means the fixture
-// or setup is wrong.
-#![expect(clippy::expect_used)]
-
 use super::*;
 
 /// A wei price above `u64::MAX` survives the round trip as an exact number, which is the
@@ -175,8 +170,8 @@ pub(crate) async fn a_late_table_failure_rolls_back_and_a_retry_writes_each_row_
 /// batch, and leaves the table empty; the retry writes the whole batch.
 pub(crate) async fn a_deferred_constraint_failure_keeps_the_batch_and_rolls_back<H: Harness>() {
     let (mut sink, mut harness) = H::open(datasets()).await;
-    let height = format!("\"height\" {}", Sql::<H>::type_name(ColumnType::Uint));
-    let constrained = reorg_ddl::<H>().replace(&height, &format!("{height} CHECK (height < 1)"));
+    let column = format!("\"height\" {}", Sql::<H>::type_name(ColumnType::Uint));
+    let constrained = reorg_ddl::<H>().replace(&column, &format!("{column} CHECK (height < 1)"));
     harness
         .execute(&format!("DROP TABLE reorgs; {constrained}"))
         .await;

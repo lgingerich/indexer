@@ -25,7 +25,6 @@
 //! chain, and [`HyperSyncSource`] over Envio `HyperSync`, which only backfills.
 
 use std::fmt;
-use std::future::Future;
 use std::pin::Pin;
 
 use futures_util::Stream;

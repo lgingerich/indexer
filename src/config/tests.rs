@@ -54,9 +54,7 @@ fn every_settings_file_in_the_repository_assembles() {
         .map(|entry| entry.expect("a directory entry").path())
         .filter(|path| {
             let name = path.file_name().and_then(|name| name.to_str());
-            let parts: Vec<_> = name
-                .map(|name| name.split('.').collect())
-                .unwrap_or_default();
+            let parts: Vec<_> = name.map_or_else(Vec::new, |name| name.split('.').collect());
             matches!(parts.as_slice(), ["indexer", middle, "toml"] if *middle != "local")
         })
         .collect();
@@ -228,16 +226,16 @@ fn ingest_names_one_source() {
         ("https://example.invalid", "wss://example.invalid")
     );
 
-    let settings =
+    let hypersync =
         parse(&ingest(&format!("start_block = 1\n{HYPERSYNC}"))).expect("hypersync alone parses");
-    let super::IngestSource::HyperSync(source) = &settings.ingest.source else {
-        panic!("expected HyperSync, got {:?}", settings.ingest.source);
+    let super::IngestSource::HyperSync(source) = &hypersync.ingest.source else {
+        panic!("expected HyperSync, got {:?}", hypersync.ingest.source);
     };
     assert_eq!(
         (source.url.as_str(), source.token.expose()),
         ("https://4663.hypersync.xyz", "secret-token")
     );
-    assert!(!format!("{settings:?}").contains("secret-token"));
+    assert!(!format!("{hypersync:?}").contains("secret-token"));
 
     for (case, keys, refusal) in [
         (
@@ -290,8 +288,8 @@ fn ingest_tuning_is_bounded() {
     assert_eq!(backfill_concurrency.get(), 2);
 
     let tuned = format!("start_block = 1\n{HYPERSYNC}span = 500\nconcurrency = 4\n");
-    let settings = parse(&ingest(&tuned)).expect("a tuned hypersync parses");
-    let super::IngestSource::HyperSync(source) = &settings.ingest.source else {
+    let hypersync = parse(&ingest(&tuned)).expect("a tuned hypersync parses");
+    let super::IngestSource::HyperSync(source) = &hypersync.ingest.source else {
         panic!("expected HyperSync");
     };
     assert_eq!((source.span.get(), source.concurrency.get()), (500, 4));
@@ -530,5 +528,5 @@ fn a_backfill_names_its_streams() {
             .map(std::num::NonZeroUsize::get),
         Some(4)
     );
-    assert!(backfill("streams = 0").is_err());
+    backfill("streams = 0").unwrap_err();
 }

@@ -184,7 +184,7 @@ impl<C: PubSubConnect + Clone> BlockSource for EvmSource<C> {
             head.map(BlockMeta::from)
                 .map_err(|source| invalid_json("newHeads", source))
         });
-        Ok(Box::pin(heads) as HeadStream)
+        Ok(Box::pin(heads))
     }
 
     async fn fetch_block(
@@ -332,16 +332,13 @@ impl<C> fmt::Debug for EvmSource<C> {
 }
 
 #[cfg(test)]
-#[expect(clippy::expect_used)]
 mod tests {
     use alloy_primitives::B256;
     use serde_json::{Value, json};
 
     use super::*;
     use crate::ingest::source::evm::testing::*;
-    use crate::ingest::source::{BlockSource, SourceError};
-    use crate::wire::datasets::Datasets;
-    use crate::wire::envelope::{BlockMeta, Event};
+    use crate::wire::envelope::Event;
 
     /// Reads a hex quantity out of a request.
     fn quantity(value: &Value) -> u64 {

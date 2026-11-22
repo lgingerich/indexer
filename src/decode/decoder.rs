@@ -67,7 +67,6 @@ pub struct Claims {
 impl Claims {
     /// The contracts claimed, in rule order: the rows to publish before
     /// [`Decoder::admit`].
-    #[must_use]
     pub fn contracts(&self) -> impl ExactSizeIterator<Item = &Contract> {
         self.contracts.iter().map(|(_, contract)| contract)
     }
@@ -266,10 +265,10 @@ impl Decoder {
                 None => self.records(address, child, log.block_hash),
             };
             if recorded {
-                let entry = &self.catalog.entries[child];
+                let child_entry = &self.catalog.entries[child];
                 let contract = Contract {
-                    protocol: entry.protocol.clone(),
-                    name: entry.name.clone(),
+                    protocol: child_entry.protocol.clone(),
+                    name: child_entry.name.clone(),
                     address,
                     factory_address: log.address,
                     transaction_hash: log.transaction_hash,
@@ -389,7 +388,6 @@ fn conflict(catalog: &Catalog, address: Address, kept: EntryId, ignored: EntryId
 }
 
 #[cfg(test)]
-#[expect(clippy::expect_used)]
 mod tests {
     use alloy_dyn_abi::DynSolValue;
     use alloy_primitives::{Address, B256, keccak256};
@@ -565,8 +563,8 @@ mod tests {
         );
         assert_eq!((contract.block_number, contract.log_index), (10, 4));
 
-        let (outcome, claims) = decoder.decode(&swap(pool)).expect("now known");
-        let record = outcome.expect("decodes").decoded;
+        let (swap_outcome, claims) = decoder.decode(&swap(pool)).expect("now known");
+        let record = swap_outcome.expect("decodes").decoded;
         assert_eq!(
             (record.name.as_str(), record.protocol.as_str()),
             ("Swap", "uniswap_v3")

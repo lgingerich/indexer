@@ -8,17 +8,12 @@
 //! Each opens its store in a database schema named for the test's process and dropped
 //! afterward, so parallel runs do not meet.
 
-// The crate denies `expect`/`unwrap` to keep production paths honest; tests are allowed
-// them per the repository test style, since a failed expectation there means the fixture
-// or setup is wrong.
-#![expect(clippy::expect_used)]
-
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use alloy_primitives::B256;
 
 use crate::sink::store::contract::{Harness, datasets};
-use crate::sink::table::{Table, TableId};
+use crate::sink::table::TableId;
 use crate::sink::{EnvelopeSink as _, SinkError};
 use crate::wire::envelope::{ChainId, Envelope, Event, Reorg};
 
@@ -149,8 +144,10 @@ mod contract {
 fn numeric_words(negative: bool, magnitude: U256) -> Vec<i16> {
     let mut out = BytesMut::new();
     write_numeric(negative, magnitude, &mut out).expect("a uint256 fits");
-    out.chunks_exact(2)
-        .map(|chunk| i16::from_be_bytes([chunk[0], chunk[1]]))
+    out.as_chunks::<2>()
+        .0
+        .iter()
+        .map(|&chunk| i16::from_be_bytes(chunk))
         .collect()
 }
 
@@ -214,7 +211,7 @@ fn a_list_copies_as_its_elements_array() {
         let list = ColumnType::list(element).expect("a scalar list");
         assert_eq!(pg_type(list).expect("an array"), array, "{element:?}");
     }
-    assert!(pg_type(ColumnType::List(&ColumnType::List(&ColumnType::Int))).is_err());
+    pg_type(ColumnType::List(&ColumnType::List(&ColumnType::Int))).expect_err("a nested list");
 }
 
 /// Every table is keyed on its identity, and indexed and deleted by block exactly when a
@@ -692,18 +689,19 @@ async fn staging_tables_are_vacuumed_once_they_take_enough_rows() {
 
     let (mut sink, harness) = Pg::open(datasets()).await;
     let chain = harness.chain();
-    let publish = async |sink: &mut PostgresSink, heads: std::ops::Range<u64>| {
+    let publish = async |store: &mut PostgresSink, heads: std::ops::Range<u64>| {
         for head in heads {
             let reorg = Reorg {
                 height: head,
                 new_head_hash: B256::from(U256::from(head)),
                 orphaned_hashes: vec![B256::ZERO],
             };
-            sink.publish(Envelope::new(chain.clone(), Event::Reorg(reorg)))
+            store
+                .publish(Envelope::new(chain.clone(), Event::Reorg(reorg)))
                 .await
                 .expect("publish");
         }
-        sink.flush().await.expect("commit");
+        store.flush().await.expect("commit");
     };
     publish(&mut sink, 0..100).await;
     assert!(

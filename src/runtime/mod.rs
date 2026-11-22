@@ -308,9 +308,12 @@ impl Pipeline {
             Destination::Store(stores) => Routes::Store(
                 stores
                     .into_iter()
-                    .map(|settings| {
-                        let tables = resolve(settings.backend().into(), settings.tables())?;
-                        Ok(StoreRoute { settings, tables })
+                    .map(|store| {
+                        let tables = resolve(store.backend().into(), store.tables())?;
+                        Ok(StoreRoute {
+                            settings: store,
+                            tables,
+                        })
                     })
                     .collect::<Result<_, RuntimeError>>()?,
             ),
@@ -421,7 +424,13 @@ impl<B: BlockSource + 'static> Pipeline<B> {
     /// carries that part's own error, because "storage stopped" says nothing about why.
     pub(crate) async fn run(self, routes: Routes, mut stop: Stop) -> Result<(), RuntimeError> {
         // A build without a store can only print, so its match has one arm.
-        #[cfg_attr(not(feature = "store"), expect(clippy::infallible_destructuring_match))]
+        #[cfg_attr(
+            not(feature = "store"),
+            expect(
+                clippy::infallible_destructuring_match,
+                reason = "a build without a store has only the print arm"
+            )
+        )]
         let tables = match routes {
             Routes::Print(tables) => tables,
             #[cfg(feature = "store")]
@@ -477,7 +486,7 @@ pub async fn run(path: &str) -> Result<(), RuntimeError> {
         chain = %settings.ingest.chain,
         protocols = settings
             .protocols_path()
-            .map_or_else(|| "-".to_owned(), |path| path.display().to_string()),
+            .map_or_else(|| "-".to_owned(), |protocols| protocols.display().to_string()),
         storage = ?settings.sink,
         "starting"
     );
@@ -552,5 +561,6 @@ async fn termination() -> &'static str {
     interrupt.await
 }
 
-#[cfg(all(test, feature = "duckdb"))]
+#[cfg(test)]
+#[cfg(feature = "duckdb")]
 mod tests;
