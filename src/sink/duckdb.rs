@@ -691,8 +691,8 @@ mod tests {
         }
         let (numbers, read, nulls, empty): (String, Vec<String>, i64, i64) = connection
             .query_row(
-                "SELECT numbers::VARCHAR, list_filter(texts, x -> x IS NOT NULL)::VARCHAR[], \
-                 len(list_filter(texts, x -> x IS NULL)), len(empty) FROM lists",
+                "SELECT numbers::VARCHAR, list_filter(texts, lambda x: x IS NOT NULL)::VARCHAR[], \
+                 len(list_filter(texts, lambda x: x IS NULL)), len(empty) FROM lists",
                 [],
                 |row| {
                     let read = match row.get::<_, duckdb::types::Value>(1)? {

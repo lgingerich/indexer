@@ -463,7 +463,7 @@ fn signature(transaction: &AnyRpcTransaction) -> SignatureFields {
             }
         }
         AnyTxEnvelope::Unknown(unknown) => {
-            let fields = &unknown.inner.fields;
+            let fields = unknown.inner.fields();
             SignatureFields {
                 r: fields.get_deserialized("r").and_then(Result::ok),
                 s: fields.get_deserialized("s").and_then(Result::ok),

@@ -472,14 +472,11 @@ mod tests {
                 |log| {
                     log.as_object_mut().expect("log").remove("logIndex");
                 },
+                // alloy reads an absent `logIndex` as `None`, so it fails the same
+                // invariant as a null one rather than the decode.
                 |error| {
-                    matches!(
-                        error,
-                        SourceError::Transport {
-                            context: "eth_getBlockReceipts",
-                            source: RpcError::DeserError { .. }
-                        }
-                    )
+                    error.to_string()
+                        == "malformed data from eth_getBlockReceipts: log has no logIndex; it cannot be placed in the block"
                 },
             ),
             (
